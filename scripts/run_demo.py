@@ -30,9 +30,11 @@ def rgb_image(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(im).convert("RGB")
 
 
-def find_assets(root: Path, sample: str) -> Tuple[Path, Path, Path]:
+def find_assets(root: Path, sample: str, source_dir: Path | None = None) -> Tuple[Path, Path, Path]:
     data = root / "data"
-    original = data / f"{sample}.jpg"
+    source_root = source_dir.resolve() if source_dir else data
+    candidates = [source_root / f"{sample}.jpg", source_root / f"{sample}.JPG", source_root / f"{sample}.jpeg", source_root / f"{sample}.JPEG"]
+    original = next((p for p in candidates if p.exists()), candidates[0])
     reference = data / f"{sample}参考.png"
     manual = data / f"{sample}.png"
     missing = [str(p) for p in (original, reference, manual) if not p.exists()]
@@ -431,7 +433,7 @@ def comparison_sheet(images: Iterable[Tuple[str, Image.Image]], path: Path):
 
 
 def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
-    original_path, reference_path, manual_path = find_assets(root, sample)
+    original_path, reference_path, manual_path = find_assets(root, sample, getattr(args, "source_dir", None))
     original, reference, manual = rgb_image(original_path), rgb_image(reference_path), rgb_image(manual_path)
     if original.size != manual.size:
         manual = manual.resize(original.size, RESAMPLE.LANCZOS)
@@ -587,6 +589,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sample", action="append", help="sample id; repeat, or omit for all available samples")
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    p.add_argument("--source-dir", type=Path, help="directory containing the true source JPGs; references remain under root/data")
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument("--proxy-side", type=int, default=768)
     p.add_argument("--align-scale-min", type=float, default=0.97, help="minimum centre scale searched on the proxy")

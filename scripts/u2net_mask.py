@@ -60,6 +60,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", action="append", help="sample id; repeat or omit for all polygon samples")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--source-dir", type=Path,
+                        help="directory containing true source JPGs; defaults to root/data")
     parser.add_argument("--model", type=Path, required=True, help="path to u2net_human_seg.onnx")
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--input-size", type=int, default=320)
@@ -69,6 +71,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--body-start", type=float, default=0.52)
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    source_dir = args.source_dir.resolve() if args.source_dir else root / "data"
     model = args.model.resolve()
     if not model.exists():
         raise FileNotFoundError(model)
@@ -76,7 +79,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     samples = args.sample or sorted(POLYGONS)
     rows = []
     for sample in samples:
-        src = root / "data" / f"{sample}.jpg"
+        candidates = [source_dir / f"{sample}.jpg", source_dir / f"{sample}.JPG", source_dir / f"{sample}.jpeg", source_dir / f"{sample}.JPEG"]
+        src = next((p for p in candidates if p.exists()), candidates[0])
         if not src.exists():
             raise FileNotFoundError(src)
         soft = segment(src, model, args.input_size)

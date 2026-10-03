@@ -106,11 +106,11 @@ def find_alpha(root: Path, sample: str, alpha_dir: Optional[Path], alpha_map: Di
     return None
 
 
-def auto_polygon_alpha(root: Path, sample: str, out_root: Path) -> Optional[Path]:
+def auto_polygon_alpha(root: Path, sample: str, out_root: Path, source_dir: Optional[Path]) -> Optional[Path]:
     points = make_mask.POLYGONS.get(sample)
     if not points:
         return None
-    size = make_mask.source_size(root, sample)
+    size = make_mask.source_size(root, sample, source_dir)
     alpha = make_mask.polygon_alpha(size, points, proxy_side=1024, feather=32.0, interior=245)
     alpha = make_mask.apply_confidence_profile(alpha)
     path = out_root / sample / "_auto_alpha.png"
@@ -119,9 +119,9 @@ def auto_polygon_alpha(root: Path, sample: str, out_root: Path) -> Optional[Path
     return path
 
 
-def auto_u2net_alpha(root: Path, sample: str, out_root: Path, model: Path, runtime_dir: Path) -> Path:
+def auto_u2net_alpha(root: Path, sample: str, out_root: Path, model: Path, runtime_dir: Path, source_dir: Optional[Path]) -> Path:
     """Run optional human segmentation, then apply the same confidence prior."""
-    source_path, _, _ = run_demo.find_assets(root, sample)
+    source_path, _, _ = run_demo.find_assets(root, sample, source_dir)
     sys.path.insert(0, str(runtime_dir.resolve()))
     alpha = u2net_mask.segment(source_path, model)
     alpha = make_mask.apply_confidence_profile(alpha)
@@ -135,8 +135,8 @@ def build_args(base: argparse.Namespace, alpha: Optional[Path], alignment_overri
     """Create the small argument object expected by ``run_demo.run_sample``."""
     values = vars(base).copy()
     values["alpha"] = alpha
-    values["fit_alpha"] = None
-    values["fit_full"] = True
+    values["fit_alpha"] = None if getattr(base, "fit_full", False) else alpha
+    values["fit_full"] = bool(getattr(base, "fit_full", False))
     values["alignment_override"] = alignment_override
     # run_demo only needs these fields; keeping this explicit prevents a CLI
     # option added to this wrapper from accidentally changing image behavior.
@@ -146,6 +146,8 @@ def build_args(base: argparse.Namespace, alpha: Optional[Path], alignment_overri
 def main(argv: Optional[Iterable[str]] = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    p.add_argument("--source-dir", type=Path,
+                   help="directory containing true source JPGs; reference/manual files remain under root/data")
     p.add_argument("--out-dir", type=Path, default=None, help="production output directory")
     p.add_argument("--sample", action="append", help="sample id; repeat, or omit for all JPGs")
     p.add_argument("--alpha-dir", type=Path, help="directory containing <sample>/alpha.png")
@@ -170,12 +172,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     p.add_argument("--alpha-center", type=run_demo.parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=run_demo.parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)
+    p.add_argument("--fit-full", action="store_true",
+                   help="fit appearance on the full aligned frame; default fits on the selected alpha")
     p.add_argument("--no-structure-safe", dest="structure_safe", action="store_false",
                    help="disable automatic alpha reduction in structural disagreement regions")
     p.set_defaults(structure_safe=True, structure_threshold=0.28, structure_strength=0.78,
                    structure_blur=1.0, structure_floor=0.08)
     args = p.parse_args(argv)
     root = args.root.resolve()
+    source_dir = args.source_dir.resolve() if args.source_dir else None
     out_root = (args.out_dir or root / "outputs" / "final").resolve()
     alpha_dir = args.alpha_dir.resolve() if args.alpha_dir else None
     alpha_map = load_alpha_map(args.alpha_map.resolve() if args.alpha_map else None)
@@ -183,7 +188,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     samples = args.sample or sorted(p.stem for p in (root / "data").glob("*.jpg"))
     rows = []
     for sample in samples:
-        original, reference, manual = run_demo.find_assets(root, sample)
+        original, reference, manual = run_demo.find_assets(root, sample, source_dir)
         alpha = None if args.force_segmentation else find_alpha(root, sample, alpha_dir, alpha_map)
         alpha_source = "explicit"
         if alpha is None and not args.no_auto_mask:
@@ -192,10 +197,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 runtime_dir = args.segmentation_runtime if args.segmentation_runtime.is_absolute() else root / args.segmentation_runtime
                 if not model.exists():
                     raise FileNotFoundError(f"U2Net model not found: {model}")
-                alpha = auto_u2net_alpha(root, sample, out_root, model, runtime_dir)
+                alpha = auto_u2net_alpha(root, sample, out_root, model, runtime_dir, source_dir)
                 alpha_source = "u2net_human_seg"
             else:
-                alpha = auto_polygon_alpha(root, sample, out_root)
+                alpha = auto_polygon_alpha(root, sample, out_root, source_dir)
                 alpha_source = "auto_polygon" if alpha else "soft_ellipse"
         if alpha is None and args.no_auto_mask:
             raise FileNotFoundError(f"No alpha mask for {sample}; pass --alpha-dir/--alpha-map or omit --no-auto-mask")
@@ -213,6 +218,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             "mask_path": str(alpha) if alpha else None,
             "segmentation_backend": args.segmentation_backend,
             "segmentation_model": str(args.segmentation_model) if args.segmentation_backend == "u2net" else None,
+            "fit_policy": "full_frame" if args.fit_full else "alpha_trust",
             "full_resolution": True,
             "working_space": "sRGB 8-bit (Pillow/NumPy)",
             "icc_profile_embedded": icc_embedded,

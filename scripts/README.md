@@ -11,13 +11,17 @@ alpha、独立搜索 scale + translation，在原始画布尺寸输出成片，�
 backend 自动生成：
 
 ```powershell
-& $py scripts/build_final.py --out-dir outputs/final
+& $py scripts/build_final.py `
+  --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
+  --out-dir outputs/final
 ```
 
 如果已有整理好的 mask：
 
 ```powershell
-& $py scripts/build_final.py --alpha-dir outputs/mask_review --out-dir outputs/final
+& $py scripts/build_final.py `
+  --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
+  --alpha-dir outputs/mask_review --out-dir outputs/final
 ```
 
 也可以用 JSON 为每组样例指定不同文件：
@@ -33,6 +37,7 @@ sRGB 8-bit 计算；若输入是 16-bit，会在 metadata 中如实标记，不�
 RGB PNG 成片中；mask 仍是无 profile 的灰度图。
 生产入口默认开启结构安全调制：对齐后边缘分歧高的区域会自动降低写回 alpha，
 以保留 GPT 参考图的局部重绘；需要严格复现旧版行为时可传 `--no-structure-safe`。
+生产入口默认只在当前样例的 alpha 可信区域拟合 appearance operator，避免真实原片的背景色偏把人物染色；需要兼容旧版整幅拟合时传 `--fit-full`。
 
 如果自动配准在某张图上仍需人工微调，可以用 JSON 覆盖该样例的 proxy 变换：
 

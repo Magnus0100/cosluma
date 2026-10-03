@@ -24,7 +24,7 @@
 
 ## 输入约定
 
-每组样例按相同编号组织。当前文件名的角色是根据尺寸和交接信息作出的**暂定判断**，正式实验前需要用人工最终合成图再次确认：
+每组样例按相同编号组织。真正的高清原片位于 `C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)`；仓库 `data/` 下的同编号 JPG 已经过像素蛋糕追色，只保留作旧实验对照。参考图和人工最终图仍在 `data/`：
 
 - `*.jpg`：高清原片候选；
 - 同编号、无“参考”后缀的 `*.png`：人工最终合成图候选；
@@ -38,7 +38,9 @@
 
 ```powershell
 $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-& $py scripts/build_final.py --alpha-dir outputs/mask_review --out-dir outputs/final
+& $py scripts/build_final.py `
+  --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
+  --alpha-dir outputs/mask_review --out-dir outputs/final
 ```
 
 入口会独立搜索 scale + translation，默认开启结构安全 alpha，并写出每组 `metadata.json` 和总 `manifest.json`。已有 mask 优先；没有 mask 时使用 polygon fallback。需要更自动的人物轮廓时，显式传 `--segmentation-backend u2net --force-segmentation`，详见 [`scripts/README.md`](scripts/README.md)。
