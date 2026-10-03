@@ -52,3 +52,5 @@
 最小 Demo 已实现于 [`scripts/run_demo.py`](scripts/run_demo.py)，使用 Pillow/NumPy 完成局部 affine appearance transfer、参考图放大、软 alpha 和两层合成。运行方式与输出说明见 [`scripts/README.md`](scripts/README.md)。
 
 两组样例的当前结果位于 `outputs/demo/`，其中四联对比图最适合快速判断流程是否成立。
+
+需要替换软椭圆时，按 [`docs/MASK_WORKFLOW.md`](docs/MASK_WORKFLOW.md) 生成并人工修正一次灰度 mask，再传给 `--alpha` 和 `--fit-alpha`。

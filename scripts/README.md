@@ -38,6 +38,30 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 
 控制点位于 `scripts/make_mask.py` 顶部的 `POLYGONS` 表中，坐标是 0–1 归一化的 x,y；需要刷改时也可以用 `--points-file points.json` 覆盖。该后端比软椭圆更贴近人物外轮廓，但仍不是发丝级 matting，轮廓光和半透明饰物应在后续人工 mask 中修正。
 
+## 一次人工编辑
+
+推荐把 `outputs/mask_backend/<sample>/alpha.png` 复制到一个新的目录，用仓库自带的 painter 修正人物边缘：
+
+```powershell
+& $py scripts/edit_mask.py `
+  --image data/DSC02634.jpg `
+  --alpha outputs/mask_backend/DSC02634/alpha.png `
+  --out outputs/mask_review/DSC02634/alpha.png
+```
+
+窗口中左键增加 alpha、右键擦除、滚轮调整笔刷、按 `S` 保存；也可以用 Krita、GIMP 或 Photoshop 编辑同一张灰度 PNG。没有桌面窗口时，`edit_mask.py --cli --points-file edits.json` 支持用归一化点坐标做少量加/擦修补。然后把保存的 mask 传给两个参数：
+
+```powershell
+& $py scripts/run_demo.py --sample DSC02634 `
+  --alpha outputs/mask_review/DSC02634/alpha.png `
+  --fit-alpha outputs/mask_review/DSC02634/alpha.png `
+  --out-dir outputs/mask_demo
+```
+
+mask 需要保持原片画布尺寸和普通灰度 PNG 格式；白色是主体信任区，黑色是参考图区，发丝和轮廓光可以用灰色过渡。完整的生成、编辑和检查步骤见 [`docs/MASK_WORKFLOW.md`](../docs/MASK_WORKFLOW.md)。
+
+`run_demo.py` 会把实际传入的 `--alpha` 路径写入该样例的 `metadata.json`（`alpha.path`），并把 `--fit-alpha` 写入 `fit_trust`，方便比较不同 mask 版本。
+
 ## 轻量验证
 
 ```powershell
@@ -45,3 +69,24 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 ```
 
 验证只检查素材可读性、输出存在性和基本像素范围，不承担大型测试框架的职责。
+
+## 低交互 mask 编辑器
+
+`edit_mask.py` 用 Pillow 加载原图和现有 alpha，在 Tkinter 窗口中显示缩放预览。左键增加主体 alpha，右键擦除，滚轮调整笔刷直径；按 `S` 或“保存”写出全分辨率 L PNG。窗口只显示 proxy，实际绘制和保存仍使用原图尺寸：
+
+```powershell
+& $py scripts/edit_mask.py `
+  --image data/DSC02634.jpg `
+  --alpha outputs/mask_backend/DSC02634/alpha.png `
+  --out outputs/mask_editor/DSC02634/alpha.png
+```
+
+如果环境没有 Tkinter 或图形显示，可用点坐标模式完成同一类快速修补。坐标默认是 0–1 归一化值；`--coords pixels` 改为原图像素坐标。点文件可写成 `{"add": [[x,y]], "erase": [[x,y]]}`：
+
+```powershell
+& $py scripts/edit_mask.py --cli --image data/DSC02634.jpg `
+  --alpha outputs/mask_backend/DSC02634/alpha.png `
+  --points-file points.json --brush 180
+```
+
+输出的 `alpha.png` 可以直接传给 `run_demo.py --alpha` 和 `--fit-alpha`。

@@ -247,7 +247,16 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "operator": "stable per-channel RGB affine y=[r,g,b,1]@coef; local fits shrunk to global; bilinear coefficient interpolation",
         "global_coef": np.round(global_coef, 7).tolist(),
         "local_cell_counts": counts.tolist(),
-        "alpha": {"mode": alpha_mode, "center": list(args.alpha_center), "radii": list(args.alpha_radii), "softness": args.alpha_softness},
+        # Keep the exact mask source in the run record.  A generated alpha has
+        # no input path, while an edited mask should be reproducible from the
+        # path shown here and the command recorded by the caller.
+        "alpha": {
+            "mode": alpha_mode,
+            "path": str(args.alpha) if args.alpha else None,
+            "center": list(args.alpha_center),
+            "radii": list(args.alpha_radii),
+            "softness": args.alpha_softness,
+        },
         "fit_trust": str(args.fit_alpha) if args.fit_alpha else None,
         "parameters": {"proxy_side": args.proxy_side, "tile": args.tile},
         "outputs": {k: str(v) for k, v in files.items()},
