@@ -49,6 +49,50 @@ def proxy_arrays(source: Image.Image, reference: Image.Image, max_side: int = 76
     return s, r, size
 
 
+def _edge_luma(rgb: np.ndarray) -> np.ndarray:
+    gray = rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
+    gx = np.zeros_like(gray)
+    gy = np.zeros_like(gray)
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+    return np.hypot(gx, gy)
+
+
+def estimate_translation(source: np.ndarray, reference: np.ndarray, max_shift: int = 24):
+    """Find a small proxy translation using edge correlation.
+
+    The two images have different appearance, but their bridge and costume
+    edges are shared.  A small translation search is enough for this dataset
+    and avoids blending two slightly offset faces into a ghost.
+    """
+    a, b = _edge_luma(source), _edge_luma(reference)
+    best_score, best_shift = -1.0, (0, 0)
+    h, w = a.shape
+    for dy in range(-max_shift, max_shift + 1):
+        ay0, ay1 = max(0, dy), min(h, h + dy)
+        by0, by1 = max(0, -dy), max(0, -dy) + (ay1 - ay0)
+        for dx in range(-max_shift, max_shift + 1):
+            ax0, ax1 = max(0, dx), min(w, w + dx)
+            bx0, bx1 = max(0, -dx), max(0, -dx) + (ax1 - ax0)
+            x = a[ay0:ay1, ax0:ax1].reshape(-1)
+            y = b[by0:by1, bx0:bx1].reshape(-1)
+            x = x - x.mean()
+            y = y - y.mean()
+            score = float((x @ y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-6))
+            if score > best_score:
+                best_score, best_shift = score, (dx, dy)
+    return best_shift[0], best_shift[1], best_score
+
+
+def translate_image(image: Image.Image, shift_x: float, shift_y: float) -> Image.Image:
+    """Translate an RGB image while replicating pixels at the exposed edge."""
+    arr = np.asarray(image, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    yy = np.clip(np.arange(h) - int(round(shift_y)), 0, h - 1)
+    xx = np.clip(np.arange(w) - int(round(shift_x)), 0, w - 1)
+    return Image.fromarray(arr[yy[:, None], xx[None, :]], mode="RGB")
+
+
 def affine_fit(x: np.ndarray, y: np.ndarray, ridge: float = 0.03) -> np.ndarray:
     """Fit a stable per-channel affine ``y = scale*x + bias``.
 
@@ -210,10 +254,28 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
     if original.size != manual.size:
         manual = manual.resize(original.size, RESAMPLE.LANCZOS)
     proxy_s, proxy_r, proxy_size = proxy_arrays(original, reference, args.proxy_side)
+    shift_x, shift_y, align_score = estimate_translation(proxy_s, proxy_r)
+    if shift_x or shift_y:
+        reference = translate_image(
+            reference,
+            shift_x * reference.width / proxy_size[0],
+            shift_y * reference.height / proxy_size[1],
+        )
+        proxy_s, proxy_r, proxy_size = proxy_arrays(original, reference, args.proxy_side)
+    # An external output mask is also the best trust region for fitting the
+    # appearance operator.  Requiring a second, identical path made the
+    # common one-pass workflow easy to misuse, so ``--alpha`` now supplies
+    # fit trust by default.  ``--fit-alpha`` still wins when a deliberately
+    # different fitting mask is useful.
     fit_trust = None
-    if args.fit_alpha:
-        fit_mask = ImageOps.exif_transpose(Image.open(args.fit_alpha)).convert("L").resize(proxy_size, RESAMPLE.BILINEAR)
+    fit_alpha_path = args.fit_alpha or (args.alpha if not args.fit_full else None)
+    fit_trust_mode = None
+    if fit_alpha_path:
+        fit_mask = ImageOps.exif_transpose(Image.open(fit_alpha_path)).convert("L").resize(proxy_size, RESAMPLE.BILINEAR)
         fit_trust = np.asarray(fit_mask, dtype=np.float32) / 255.0
+        fit_trust_mode = "explicit" if args.fit_alpha else "alpha_default"
+    elif args.fit_full:
+        fit_trust_mode = "full_frame"
     global_coef, local_coef, counts = fit_operator(proxy_s, proxy_r, (args.grid_x, args.grid_y), trust=fit_trust)
     styled = apply_operator(original, local_coef, args.tile)
     upscaled = reference.resize(original.size, RESAMPLE.LANCZOS)
@@ -244,6 +306,11 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "inputs": {"original": str(original_path), "reference": str(reference_path), "manual_final": str(manual_path)},
         "input_size": list(original.size), "proxy_size": list(proxy_size), "grid": [args.grid_x, args.grid_y],
+        "alignment": {
+            "method": "proxy edge translation search",
+            "proxy_shift_xy": [shift_x, shift_y],
+            "score": round(float(align_score), 6),
+        },
         "operator": "stable per-channel RGB affine y=[r,g,b,1]@coef; local fits shrunk to global; bilinear coefficient interpolation",
         "global_coef": np.round(global_coef, 7).tolist(),
         "local_cell_counts": counts.tolist(),
@@ -257,7 +324,10 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
             "radii": list(args.alpha_radii),
             "softness": args.alpha_softness,
         },
-        "fit_trust": str(args.fit_alpha) if args.fit_alpha else None,
+        "fit_trust": {
+            "path": str(fit_alpha_path) if fit_alpha_path else None,
+            "mode": fit_trust_mode,
+        },
         "parameters": {"proxy_side": args.proxy_side, "tile": args.tile},
         "outputs": {k: str(v) for k, v in files.items()},
     }
@@ -283,6 +353,7 @@ def main(argv=None):
     p.add_argument("--tile", type=int, default=768)
     p.add_argument("--alpha", type=Path, help="optional grayscale mask; resized to original dimensions")
     p.add_argument("--fit-alpha", type=Path, help="optional grayscale mask; fit the appearance operator only on pixels above 50%")
+    p.add_argument("--fit-full", action="store_true", help="fit on the full aligned frame even when --alpha is supplied")
     p.add_argument("--alpha-center", type=parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)

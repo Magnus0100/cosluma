@@ -1,29 +1,18 @@
 # Appearance operator review
 
-The first 100% crop check exposed two practical failure modes in the demo:
+100% 局部检查确认了两个不同的问题：
 
-1. The original `DSC02634` polygon was a convex, low-point outline. It filled
-   the empty wedge between the raised hand and the shoulder and also extended
-   above the hair. When that alpha was used for compositing, bright reference
-   pixels leaked into the set around the head and arm.
-2. Fitting the affine operator only on the subject mask produced an almost
-   identity mapping (`scale ≈ 1.05` on the DSC02634 run). The final retained
-   the dark source exposure while the manual final used the brighter reference
-   lighting. This is a fitting-policy issue, not a resolution issue.
+1. `DSC02634` 的旧 polygon 轮廓把抬手与肩部之间的背景填进了主体，也覆盖了头发上方的部分背景。
+2. GPT 参考图与原片不能保证逐像素重合。即使做了平移，对脸、发丝、手部和新光效的生成式结构改动仍然存在；把两张图在这些区域按高权重直接平均，会产生双影。
 
-The polygon backend now uses a tighter DSC02634 outline in
-`scripts/make_mask.py`. A fresh run was generated with:
+当前流程的修正是：
 
-```powershell
-& $py scripts/make_mask.py --sample DSC02634 --out-dir outputs/mask_tight --proxy-side 1024 --feather 32
-& $py scripts/run_demo.py --sample DSC02634 --alpha outputs/mask_tight/DSC02634/alpha.png --out-dir outputs/operator_tight
-```
+- proxy 上用边缘相关搜索轻量平移，并把偏移记录到 metadata；
+- `make_mask.py` 使用更紧的 DSC02634 轮廓；
+- mask 默认采用结构安全权重：头发、脸和上半身区域 alpha 接近 0，稳定服装与身体纹理区域逐步升到约 0.72；
+- 外部 alpha 用于最终融合，appearance operator 默认用对齐后的完整画面拟合（`--fit-full`）；
+- `--fit-alpha` 仅保留给需要严格限制拟合区域的实验。
 
-The mask edge is materially better, but the operator-only-on-alpha result is
-still too dark against `data/DSC02634.png`. For the next visual pass, keep the
-external alpha for blending and fit lighting from the full aligned frame (or
-from a separately chosen background trust region); do not let a subject-only
-fit collapse the style transform toward identity.
+实测 `outputs/final_demo/DSC02634/comparison.jpg` 的脸部和轮廓光已回到 GPT 参考图的外观，身体与服装仍能写回高清纹理；比 subject-only fit 或粗 polygon mask 更接近人工成片。
 
-Artifacts: `outputs/mask_tight/DSC02634/alpha.png` and
-`outputs/operator_tight/DSC02634/comparison.jpg`.
+当前仍不能自动恢复 GPT 对人物的不可控重绘。对于这类区域，正确策略是把 alpha 降低，让 GPT 下层完整保留，再用一次人工 mask 修正边界。

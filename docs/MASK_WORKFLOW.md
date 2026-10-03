@@ -2,7 +2,7 @@
 
 更新时间：2026-10-04
 
-当前 Demo 用一张灰度 PNG 同时承担两件事：`--alpha` 决定人物与参考图的合成范围，`--fit-alpha` 决定 appearance operator 从哪些像素估计颜色变化。先用多边形生成可运行的起点，再在图像编辑器里做一次轮廓修正即可；不需要安装模型或运行 GUI 工具。
+当前 Demo 用一张灰度 PNG 决定高清原片与 GPT 参考图的交接权重。GPT 可能改变脸、发丝、服装边缘和光效，不能假设两张图完全重合；先做轻量平移对齐，再用 alpha 把结构变化区域交给 GPT。默认用 `--fit-full` 估计整体外观，`--fit-alpha` 只用于需要严格限制拟合区域的实验。
 
 ## 1. 生成起始 mask
 
@@ -13,7 +13,7 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 & $py scripts/make_mask.py --sample DSC02634 --out-dir outputs/mask_backend --feather 32
 ```
 
-生成文件为 `outputs/mask_backend/DSC02634/alpha.png`。要同时生成两组样例，可以省略 `--sample`；默认轮廓和控制点位于 `scripts/make_mask.py` 顶部的 `POLYGONS` 表中。
+生成文件为 `outputs/mask_backend/DSC02634/alpha.png`。默认 mask 已包含结构安全 confidence profile：脸、头发和上半身偏黑，稳定服装/身体纹理区域偏灰白。要同时生成两组样例，可以省略 `--sample`；轮廓和控制点位于 `scripts/make_mask.py` 顶部的 `POLYGONS` 表中。
 
 ## 2. 在编辑器中修正轮廓
 
@@ -39,7 +39,7 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 `mask_edits.json` 可以是 `{"add": [[0.5, 0.2]], "erase": [[0.7, 0.4]]}`；坐标默认是 0–1 的归一化 `x,y`。也可以用 Krita、GIMP、Photoshop 等编辑器完成同样的操作。无论使用哪种方式，都保持以下约定：
 
 - 画布尺寸保持原片尺寸（当前为 6336×9504）；
-- 灰度通道为 `L`：白色（接近 255）表示可信人物区域，黑色（0）表示交给参考图的背景；
+- 灰度通道为 `L`：白色（接近 255）表示稳定纹理写回区，黑色（0）表示保留 GPT 结构/光效的区域；
 - 头发、薄纱、轮廓光和手指边缘使用灰色过渡，不要用硬锯齿边界；
 - 不要裁剪、旋转或改变画布比例；导出为普通非索引 PNG。
 
@@ -62,21 +62,21 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 
 ## 3. 用 mask 运行 Demo
 
-同一张人工修正后的 mask 同时传给两个参数：
+人工修正后的 mask 传给 `--alpha`，默认让 operator 从对齐后的完整画面估计外观：
 
 ```powershell
 & $py scripts/run_demo.py --sample DSC02634 `
   --alpha outputs/mask_review/DSC02634/alpha.png `
-  --fit-alpha outputs/mask_review/DSC02634/alpha.png `
+  --fit-full `
   --out-dir outputs/mask_demo
 ```
 
-如果只想先看合成边缘，可以省略 `--fit-alpha`；如果想让 operator 只从主体颜色估计，则保留两个参数。`--alpha` 和 `--fit-alpha` 目前按单张样例传入，另一组样例需单独运行：
+如果想让 operator 只从主体颜色估计，再额外传入 `--fit-alpha path/to/trust.png`。`--alpha` 和 `--fit-alpha` 目前按单张样例传入，另一组样例需单独运行：
 
 ```powershell
 & $py scripts/run_demo.py --sample DSC02631 `
   --alpha outputs/mask_review/DSC02631/alpha.png `
-  --fit-alpha outputs/mask_review/DSC02631/alpha.png `
+  --fit-full `
   --out-dir outputs/mask_demo
 ```
 
