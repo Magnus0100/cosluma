@@ -78,6 +78,15 @@ def load_alpha_map(path: Optional[Path]) -> Dict[str, Path]:
     return {str(k): Path(str(v)) for k, v in raw.items()}
 
 
+def load_alignment_map(path: Optional[Path]) -> Dict[str, Dict]:
+    if path is None:
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("--alignment-map must contain a JSON object mapping sample to scale/dx/dy")
+    return {str(k): dict(v) for k, v in raw.items()}
+
+
 def find_alpha(root: Path, sample: str, alpha_dir: Optional[Path], alpha_map: Dict[str, Path]) -> Optional[Path]:
     """Resolve a sample-specific mask, accepting either a file or a directory."""
     if sample in alpha_map:
@@ -122,12 +131,13 @@ def auto_u2net_alpha(root: Path, sample: str, out_root: Path, model: Path, runti
     return path
 
 
-def build_args(base: argparse.Namespace, alpha: Optional[Path]) -> argparse.Namespace:
+def build_args(base: argparse.Namespace, alpha: Optional[Path], alignment_override: Optional[Dict]) -> argparse.Namespace:
     """Create the small argument object expected by ``run_demo.run_sample``."""
     values = vars(base).copy()
     values["alpha"] = alpha
     values["fit_alpha"] = None
     values["fit_full"] = True
+    values["alignment_override"] = alignment_override
     # run_demo only needs these fields; keeping this explicit prevents a CLI
     # option added to this wrapper from accidentally changing image behavior.
     return argparse.Namespace(**values)
@@ -140,6 +150,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     p.add_argument("--sample", action="append", help="sample id; repeat, or omit for all JPGs")
     p.add_argument("--alpha-dir", type=Path, help="directory containing <sample>/alpha.png")
     p.add_argument("--alpha-map", type=Path, help="JSON object mapping sample id to a mask path")
+    p.add_argument("--alignment-map", type=Path,
+                   help="JSON object mapping sample id to {scale,dx,dy}; overrides automatic alignment")
     p.add_argument("--no-auto-mask", action="store_true", help="fail when no sample-specific mask is found")
     p.add_argument("--segmentation-backend", choices=("polygon", "u2net"), default="polygon",
                    help="fallback mask backend when no explicit alpha is found")
@@ -167,6 +179,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     out_root = (args.out_dir or root / "outputs" / "final").resolve()
     alpha_dir = args.alpha_dir.resolve() if args.alpha_dir else None
     alpha_map = load_alpha_map(args.alpha_map.resolve() if args.alpha_map else None)
+    alignment_map = load_alignment_map(args.alignment_map.resolve() if args.alignment_map else None)
     samples = args.sample or sorted(p.stem for p in (root / "data").glob("*.jpg"))
     rows = []
     for sample in samples:
@@ -189,7 +202,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         if alpha is not None and not alpha.exists():
             raise FileNotFoundError(f"Mask for {sample} does not exist: {alpha}")
 
-        run = run_demo.run_sample(root, sample, out_root, build_args(args, alpha))
+        run = run_demo.run_sample(root, sample, out_root, build_args(args, alpha, alignment_map.get(sample)))
         icc_embedded = embed_source_profile(
             [Path(run["outputs"][k]) for k in ("styled_original", "upscaled_reference", "final")],
             original,

@@ -34,6 +34,14 @@ RGB PNG 成片中；mask 仍是无 profile 的灰度图。
 生产入口默认开启结构安全调制：对齐后边缘分歧高的区域会自动降低写回 alpha，
 以保留 GPT 参考图的局部重绘；需要严格复现旧版行为时可传 `--no-structure-safe`。
 
+如果自动配准在某张图上仍需人工微调，可以用 JSON 覆盖该样例的 proxy 变换：
+
+```json
+{"DSC02634": {"scale": 1.01, "dx": -2, "dy": 24}}
+```
+
+然后传入 `--alignment-map alignment.json`；覆盖值会写入该样例的 metadata。
+
 ## 运行 Demo
 
 在仓库根目录运行：

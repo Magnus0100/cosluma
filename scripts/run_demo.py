@@ -440,14 +440,23 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
     align_scale_max = getattr(args, "align_scale_max", 1.03)
     align_scale_step = getattr(args, "align_scale_step", 0.01)
     align_max_shift = getattr(args, "align_max_shift", 24)
-    align_scale, shift_x, shift_y, align_score = estimate_scale_translation(
-        proxy_s,
-        proxy_r,
-        scale_min=align_scale_min,
-        scale_max=align_scale_max,
-        scale_step=align_scale_step,
-        max_shift=align_max_shift,
-    )
+    alignment_override = getattr(args, "alignment_override", None)
+    if alignment_override:
+        align_scale = float(alignment_override.get("scale", 1.0))
+        shift_x = int(round(float(alignment_override.get("dx", 0))))
+        shift_y = int(round(float(alignment_override.get("dy", 0))))
+        align_score = None
+        alignment_method = "manual proxy scale+translation override"
+    else:
+        align_scale, shift_x, shift_y, align_score = estimate_scale_translation(
+            proxy_s,
+            proxy_r,
+            scale_min=align_scale_min,
+            scale_max=align_scale_max,
+            scale_step=align_scale_step,
+            max_shift=align_max_shift,
+        )
+        alignment_method = "proxy edge scale+translation search"
     # Apply the winning proxy transform at full resolution before fitting the
     # RGB operator.  This keeps the existing output contract while avoiding a
     # second interpolation of the generated reference image.
@@ -523,10 +532,11 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "inputs": {"original": str(original_path), "reference": str(reference_path), "manual_final": str(manual_path)},
         "input_size": list(original.size), "proxy_size": list(proxy_size), "grid": [args.grid_x, args.grid_y],
         "alignment": {
-            "method": "proxy edge scale+translation search",
+            "method": alignment_method,
             "proxy_scale": round(float(align_scale), 6),
             "proxy_shift_xy": [shift_x, shift_y],
-            "score": round(float(align_score), 6),
+            "score": round(float(align_score), 6) if align_score is not None else None,
+            "override": alignment_override,
             "scale_range": [align_scale_min, align_scale_max, align_scale_step],
             "max_shift": align_max_shift,
         },
