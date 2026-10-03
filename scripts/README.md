@@ -18,7 +18,10 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 - `alpha.png`：可替换的软主体信任图；
 - `final.png`：两层合成结果；
 - `comparison.jpg`：原片、参考图、人工成片、Demo 成片四联图；
+- `structure_mismatch.png`：对齐后的亮度边缘分歧图；红色越强表示 GPT 参考图的局部结构越不可控，适合决定把 alpha 压低的位置；
 - `metadata.json`：参数和输入记录。
+
+Demo 会在 proxy 尺寸对参考图做受限的 scale + translation 搜索（默认缩放 0.97–1.03、步长 0.01、平移范围 ±24 像素），再把获胜变换应用到全分辨率参考图。`metadata.json` 的 `alignment` 记录尺度、平移和相关分数；`structure_diagnostic` 记录分歧统计。尺度搜索只处理整体构图差异，不会试图修正 GPT 新生成的脸、发丝、手指或光斑。
 
 可用 `--alpha path/to/mask.png` 替换默认软 mask。对于 GPT 可能改动结构的区域，推荐用 `--fit-full` 让 operator 从对齐后的完整画面估计外观，再由 alpha 决定哪里写回原片；只有想严格限制拟合区域时才传 `--fit-alpha path/to/mask.png`。默认 operator 是低分辨率网格 affine 映射，目的是快速验证流程，不是最终 matting 或生成式修复方案。
 
@@ -61,6 +64,17 @@ $py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\p
 mask 需要保持原片画布尺寸和普通灰度 PNG 格式；白色是稳定纹理写回区，黑色是保留 GPT 结构和光效的区域，发丝和轮廓光可以用灰色过渡。完整的生成、编辑和检查步骤见 [`docs/MASK_WORKFLOW.md`](../docs/MASK_WORKFLOW.md)。
 
 `run_demo.py` 会把实际传入的 `--alpha` 路径写入该样例的 `metadata.json`（`alpha.path`），并把 `--fit-alpha` 写入 `fit_trust`，方便比较不同 mask 版本。
+
+也可以单独生成结构诊断，不写高清成片：
+
+```powershell
+& $py scripts/structure_diagnostic.py `
+  --source data/DSC02634.jpg `
+  --reference 'data/DSC02634参考.png' `
+  --out-dir outputs/structure_diagnostic
+```
+
+该脚本输出 proxy 级 `structure_mismatch.png` 和 `structure_mismatch.json`。它只作为修 mask 的依据；不会自动把分歧区强行改回原片。
 
 ## 轻量验证
 
