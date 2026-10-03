@@ -4,27 +4,24 @@
 
 ## 已完成
 
-- 初始化本地 Git 仓库。
-- 保留并盘点 `data/` 中两组共六张图片。
-- 记录每个素材的尺寸、文件大小、ICC 元数据检测结果和 SHA-256。
-- 建立项目约束、素材台账、分析文档和十小时 Demo 计划。
-- 完成两组素材的并排视觉检查和结构/色彩诊断。
-- 实现 `scripts/run_demo.py`：局部 affine appearance transfer、参考图放大、软 alpha 和两层合成。
-- 实现 `scripts/make_mask.py`：两组样例的可编辑归一化多边形 mask。
-- 为 operator 增加 `--fit-alpha`，可只用主体可信区域拟合 appearance operator，减少背景粒子和太阳光对人物增益的影响。
-- 两组样例均已生成默认 Demo 和 polygon mask Demo，输出在 `outputs/demo/`、`outputs/demo_polygon/`。
+- 完成两组素材分析和最小两层合成 Demo。
+- 实现可编辑 polygon mask 与 `--fit-alpha` 主体可信区域拟合。
+- 新增 `scripts/edit_mask.py`：Tkinter 低交互画笔编辑器，支持左键增加 alpha、右键擦除、滚轮调整笔刷、S 保存。
+- 新增无窗口 CLI 修补入口，支持 `--add`、`--erase` 或 `--points-file`。
+- 新增 [MASK_WORKFLOW.md](MASK_WORKFLOW.md)，记录生成、编辑、运行和检查步骤。
+- 已使用 CLI 编辑后的 DSC02634 mask 跑通完整 Demo；metadata 记录 `alpha.path` 和 `fit_trust`。
 
 ## 当前判断
 
-数据已经足够支撑第一版 Demo。DSC02631 的 polygon mask 交接自然；DSC02634 使用扩大头发外缘并增加羽化后的 mask 后，头顶双轮廓明显减轻。主体纹理与 GPT 背景光效的两层交接已经可以继续迭代。
+项目已经具备一次人工 mask 确认的最小操作闭环：生成起始 mask → 画几笔修边 → 使用同一 mask 做合成和 operator 拟合。这个闭环比固定软椭圆更接近实际后期工作流。
 
 ## 已知限制
 
-- polygon mask 是可编辑的传统轮廓，不是发丝级 matting；半透明发丝、轮廓光和薄纱仍需要人工修正。
-- appearance operator 是可解释的局部 RGB affine baseline，不负责生成原片中不存在的光效和粒子。
+- 当前编辑器是低交互工具，不提供图层、撤销历史或发丝级 matting。
+- polygon mask 仍需人工确认头发、手部、轮廓光和半透明饰物。
 - 输出当前为 PNG RGB；正式高质量流程仍需补齐 linear/ICC/16 bit 管理。
-- 未下载大型模型，避免让 Demo 被环境安装阻塞。
+- 暂未下载大型模型；当前数据还没有证明需要它。
 
 ## 下一步
 
-优先把 polygon mask 做成一次人工刷选入口，并在实际修正后的 mask 上使用 `--fit-alpha`。只有 mask 仍明显影响成片，才评估单一 matting backend；暂不扩大测试框架或下载大模型。
+用真实人工修正的 DSC02634 mask 做一次视觉验收；如果边缘仍需大量刷改，再评估单一 matting backend。继续保持单张、单次人工确认和可替换 backend 的范围。
