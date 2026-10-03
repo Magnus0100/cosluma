@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 RESAMPLE = Image.Resampling
@@ -119,6 +119,44 @@ def structure_overlay(reference: np.ndarray, score: np.ndarray) -> Image.Image:
     tint[..., 2] = np.uint8((1.0 - heat) * 20.0)
     out = np.uint8((base.astype(np.float32) * (1.0 - 0.58 * heat[..., None]) + tint.astype(np.float32) * (0.58 * heat[..., None])) + 0.5)
     return Image.fromarray(out, mode="RGB")
+
+
+def structure_safe_alpha(
+    alpha: Image.Image,
+    score: np.ndarray,
+    threshold: float = 0.28,
+    strength: float = 0.78,
+    blur: float = 1.0,
+    floor: float = 0.08,
+) -> Image.Image:
+    """Lower write-back confidence where the generated image changed edges.
+
+    ``alpha`` remains the authoritative subject region.  The edge disagreement
+    map only modulates confidence *inside* that region; it can therefore never
+    grow a mask into the background.  The score is blurred at proxy resolution
+    before it is enlarged, which turns one-pixel edge noise into a narrow soft
+    transition at the full image size.  This is deliberately a conservative
+    rule: a score below ``threshold`` leaves the hand-authored confidence map
+    unchanged, while a score of one still retains ``floor`` of the original
+    confidence for a feathered seam.
+    """
+    if score.ndim != 2:
+        raise ValueError("structure disagreement score must be a 2-D array")
+    # Blur in the small diagnostic domain, where the radius is meaningful and
+    # memory use is bounded even for the 60MP source photos.
+    score_img = Image.fromarray(np.uint8(np.clip(score, 0.0, 1.0) * 255.0 + 0.5), mode="L")
+    if blur > 0:
+        score_img = score_img.filter(ImageFilter.GaussianBlur(float(blur)))
+    score_full = np.asarray(score_img.resize(alpha.size, RESAMPLE.BILINEAR), dtype=np.float32) / 255.0
+    t = float(np.clip(threshold, 0.0, 0.99))
+    s = float(np.clip(strength, 0.0, 1.0))
+    lo = float(np.clip(floor, 0.0, 1.0))
+    disagreement = np.clip((score_full - t) / max(1e-6, 1.0 - t), 0.0, 1.0)
+    factor = np.maximum(lo, 1.0 - s * disagreement)
+    base = np.asarray(alpha, dtype=np.float32)
+    # Multiplication preserves the polygon boundary and all manually painted
+    # zeroes.  Round only once, after modulation, to avoid banding.
+    return Image.fromarray(np.uint8(np.clip(base * factor, 0.0, 255.0) + 0.5), mode="L")
 
 
 def estimate_translation(source: np.ndarray, reference: np.ndarray, max_shift: int = 24):
@@ -450,6 +488,17 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
     else:
         alpha = make_alpha(original.size, args.alpha_center, args.alpha_radii, args.alpha_softness)
         alpha_mode = "soft_ellipse"
+    structure_safe = bool(getattr(args, "structure_safe", False))
+    if structure_safe:
+        alpha = structure_safe_alpha(
+            alpha,
+            mismatch_score,
+            threshold=args.structure_threshold,
+            strength=args.structure_strength,
+            blur=args.structure_blur,
+            floor=args.structure_floor,
+        )
+        alpha_mode += "+structure_safe"
     final = blend_tiles(styled, upscaled, alpha, args.tile)
     out = out_root / sample
     out.mkdir(parents=True, exist_ok=True)
@@ -498,6 +547,13 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
             "center": list(args.alpha_center),
             "radii": list(args.alpha_radii),
             "softness": args.alpha_softness,
+            "structure_safe": {
+                "enabled": structure_safe,
+                "threshold": args.structure_threshold,
+                "strength": args.structure_strength,
+                "blur_proxy_px": args.structure_blur,
+                "floor": args.structure_floor,
+            },
         },
         "fit_trust": {
             "path": str(fit_alpha_path) if fit_alpha_path else None,
@@ -536,6 +592,19 @@ def main(argv=None):
     p.add_argument("--alpha-center", type=parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)
+    p.add_argument(
+        "--structure-safe",
+        action="store_true",
+        help="modulate alpha down at proxy edge/shape disagreements (preserves GPT structure)",
+    )
+    p.add_argument("--structure-threshold", type=float, default=0.28,
+                   help="disagreement score below this value leaves alpha unchanged")
+    p.add_argument("--structure-strength", type=float, default=0.78,
+                   help="maximum alpha reduction at a score of one, 0..1")
+    p.add_argument("--structure-blur", type=float, default=1.0,
+                   help="Gaussian blur radius in proxy pixels before upsampling")
+    p.add_argument("--structure-floor", type=float, default=0.08,
+                   help="minimum fraction of base alpha retained in high-disagreement pixels")
     args = p.parse_args(argv)
     root = args.root.resolve()
     out_root = (args.out_dir or root / "outputs").resolve()

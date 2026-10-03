@@ -90,6 +90,21 @@ Demo 会在 proxy 尺寸对参考图做受限的 scale + translation 搜索（�
   --out-dir outputs/mask_demo
 ```
 
+对于完整版本，可在人工 polygon alpha 之上启用结构安全调制。它读取同一次对齐得到的
+`structure_mismatch` 分数，只在 GPT 边缘/形状分歧处降低写回权重，不会扩大人物范围：
+
+```powershell
+& $py scripts/run_demo.py --sample DSC02634 `
+  --alpha outputs/mask_review/DSC02634/alpha.png `
+  --fit-full --structure-safe `
+  --out-dir outputs/structure_safe
+```
+
+`--structure-threshold`（默认 0.28）控制何时开始衰减，`--structure-strength`
+（默认 0.78）控制最大衰减，`--structure-blur` 以 proxy 像素为单位控制过渡宽度。
+该步骤保留 alpha 的 0 区域和人工轮廓，只让高分歧像素更多依赖 GPT 下层；参数会记录在
+`metadata.json` 的 `alpha.structure_safe` 中。
+
 mask 需要保持原片画布尺寸和普通灰度 PNG 格式；白色是稳定纹理写回区，黑色是保留 GPT 结构和光效的区域，发丝和轮廓光可以用灰色过渡。完整的生成、编辑和检查步骤见 [`docs/MASK_WORKFLOW.md`](../docs/MASK_WORKFLOW.md)。
 
 `run_demo.py` 会把实际传入的 `--alpha` 路径写入该样例的 `metadata.json`（`alpha.path`），并把 `--fit-alpha` 写入 `fit_trust`，方便比较不同 mask 版本。
