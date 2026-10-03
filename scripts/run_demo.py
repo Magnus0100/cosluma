@@ -58,6 +58,69 @@ def _edge_luma(rgb: np.ndarray) -> np.ndarray:
     return np.hypot(gx, gy)
 
 
+def structure_disagreement(source: np.ndarray, reference: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    """Estimate where the generated reference has a different structure.
+
+    Colour and exposure changes are deliberately removed from this diagnostic:
+    it compares normalized luma edge strength in the already aligned proxy
+    images.  A displaced face contour, hair strand, hand or garment edge leaves
+    a high score while a broad colour wash with the same geometry stays low.
+    The returned score is proxy-sized and in ``[0, 1]`` so it can be inspected
+    without allocating a second full-resolution image.
+    """
+    es = _edge_luma(source)
+    er = _edge_luma(reference)
+    # Per-image robust scaling makes the comparison insensitive to different
+    # contrast/exposure in the source and generated reference.
+    ps = float(np.percentile(es, 99.0))
+    pr = float(np.percentile(er, 99.0))
+    es = np.clip(es / max(ps, 1e-5), 0.0, 1.0)
+    er = np.clip(er / max(pr, 1e-5), 0.0, 1.0)
+    score = np.clip(np.abs(es - er), 0.0, 1.0).astype(np.float32)
+
+    # Band means make the result actionable when deciding where alpha should
+    # be lowered.  They are normalized coordinates, independent of image size.
+    by, bx = 8, 6
+    bands = np.zeros((by, bx), dtype=np.float32)
+    h, w = score.shape
+    for iy in range(by):
+        y0, y1 = round(iy * h / by), round((iy + 1) * h / by)
+        for ix in range(bx):
+            x0, x1 = round(ix * w / bx), round((ix + 1) * w / bx)
+            bands[iy, ix] = float(score[y0:y1, x0:x1].mean())
+    stats = {
+        "proxy_size": [int(w), int(h)],
+        "edge_scale_p99": {"source": round(ps, 6), "reference": round(pr, 6)},
+        "mean": round(float(score.mean()), 6),
+        "p50": round(float(np.percentile(score, 50)), 6),
+        "p90": round(float(np.percentile(score, 90)), 6),
+        "p95": round(float(np.percentile(score, 95)), 6),
+        "p99": round(float(np.percentile(score, 99)), 6),
+        "max": round(float(score.max()), 6),
+        "fraction_above": {
+            str(t): round(float((score >= t).mean()), 6)
+            for t in (0.15, 0.25, 0.35, 0.50)
+        },
+        "band_means_y8_x6": np.round(bands, 6).tolist(),
+        "interpretation": "high scores indicate edge/shape disagreement; lower alpha there to preserve GPT structure",
+    }
+    return score, stats
+
+
+def structure_overlay(reference: np.ndarray, score: np.ndarray) -> Image.Image:
+    """Render a compact red/yellow disagreement heatmap over the reference."""
+    base = np.uint8(np.clip(reference, 0.0, 1.0) * 255.0 + 0.5)
+    # Accent only meaningful disagreements; this keeps the image readable when
+    # most of the frame is structurally stable.
+    heat = np.clip((score - 0.05) / 0.35, 0.0, 1.0)
+    tint = np.empty_like(base)
+    tint[..., 0] = 255
+    tint[..., 1] = np.uint8((1.0 - heat) * 110.0)
+    tint[..., 2] = np.uint8((1.0 - heat) * 20.0)
+    out = np.uint8((base.astype(np.float32) * (1.0 - 0.58 * heat[..., None]) + tint.astype(np.float32) * (0.58 * heat[..., None])) + 0.5)
+    return Image.fromarray(out, mode="RGB")
+
+
 def estimate_translation(source: np.ndarray, reference: np.ndarray, max_shift: int = 24):
     """Find a small proxy translation using edge correlation.
 
@@ -91,6 +154,87 @@ def translate_image(image: Image.Image, shift_x: float, shift_y: float) -> Image
     yy = np.clip(np.arange(h) - int(round(shift_y)), 0, h - 1)
     xx = np.clip(np.arange(w) - int(round(shift_x)), 0, w - 1)
     return Image.fromarray(arr[yy[:, None], xx[None, :]], mode="RGB")
+
+
+def scale_center_image(image: Image.Image, scale: float) -> Image.Image:
+    """Scale an image around its centre while keeping the original canvas.
+
+    The alignment search works on a proxy, but the winning transform must be
+    applied to the full-resolution reference before the appearance operator is
+    fitted.  Cropping (or edge-padding) keeps all downstream image sizes and
+    interfaces unchanged.
+    """
+    if abs(float(scale) - 1.0) < 1e-6:
+        return image
+    w, h = image.size
+    nw = max(1, int(round(w * float(scale))))
+    nh = max(1, int(round(h * float(scale))))
+    resized = image.resize((nw, nh), RESAMPLE.BICUBIC)
+    arr = np.asarray(resized, dtype=np.uint8)
+    if nw >= w:
+        x0 = (nw - w) // 2
+        arr = arr[:, x0:x0 + w]
+    else:
+        pad_l = (w - nw) // 2
+        pad_r = w - nw - pad_l
+        arr = np.pad(arr, ((0, 0), (pad_l, pad_r), (0, 0)), mode="edge")
+    if nh >= h:
+        y0 = (nh - h) // 2
+        arr = arr[y0:y0 + h]
+    else:
+        pad_t = (h - nh) // 2
+        pad_b = h - nh - pad_t
+        arr = np.pad(arr, ((pad_t, pad_b), (0, 0), (0, 0)), mode="edge")
+    return Image.fromarray(arr, mode="RGB")
+
+
+def scale_center_proxy(rgb: np.ndarray, scale: float) -> np.ndarray:
+    """Centre-scale a proxy RGB array and preserve its shape."""
+    if abs(float(scale) - 1.0) < 1e-6:
+        return rgb
+    h, w = rgb.shape[:2]
+    image = Image.fromarray(np.uint8(np.clip(rgb, 0.0, 1.0) * 255.0 + 0.5), mode="RGB")
+    scaled = scale_center_image(image, scale)
+    return np.asarray(scaled, dtype=np.float32) / 255.0
+
+
+def alignment_scales(scale_min: float, scale_max: float, scale_step: float):
+    """Return a small, deterministic scale grid and always include 1.0."""
+    if scale_step <= 0:
+        raise ValueError("alignment scale step must be positive")
+    lo, hi = sorted((float(scale_min), float(scale_max)))
+    values = [lo]
+    while values[-1] + scale_step < hi - 1e-8:
+        values.append(values[-1] + scale_step)
+    if hi > values[-1] + 1e-8:
+        values.append(hi)
+    if lo <= 1.0 <= hi and not any(abs(v - 1.0) < 1e-6 for v in values):
+        values.append(1.0)
+    return sorted(set(round(v, 6) for v in values))
+
+
+def estimate_scale_translation(
+    source: np.ndarray,
+    reference: np.ndarray,
+    scale_min: float = 0.97,
+    scale_max: float = 1.03,
+    scale_step: float = 0.01,
+    max_shift: int = 24,
+):
+    """Search a narrow centre-scale plus translation transform on the proxy.
+
+    Each candidate is scored with the existing edge correlation routine.  The
+    search is intentionally small (the default is seven scales) so it remains
+    practical for a one-pass demo while correcting the global size mismatch
+    that a pure translation cannot address.
+    """
+    best = (1.0, 0, 0, -1.0)
+    for scale in alignment_scales(scale_min, scale_max, scale_step):
+        scaled_ref = scale_center_proxy(reference, scale)
+        dx, dy, score = estimate_translation(source, scaled_ref, max_shift=max_shift)
+        if score > best[3]:
+            best = (float(scale), int(dx), int(dy), float(score))
+    return best
 
 
 def affine_fit(x: np.ndarray, y: np.ndarray, ridge: float = 0.03) -> np.ndarray:
@@ -254,14 +398,35 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
     if original.size != manual.size:
         manual = manual.resize(original.size, RESAMPLE.LANCZOS)
     proxy_s, proxy_r, proxy_size = proxy_arrays(original, reference, args.proxy_side)
-    shift_x, shift_y, align_score = estimate_translation(proxy_s, proxy_r)
+    align_scale_min = getattr(args, "align_scale_min", 0.97)
+    align_scale_max = getattr(args, "align_scale_max", 1.03)
+    align_scale_step = getattr(args, "align_scale_step", 0.01)
+    align_max_shift = getattr(args, "align_max_shift", 24)
+    align_scale, shift_x, shift_y, align_score = estimate_scale_translation(
+        proxy_s,
+        proxy_r,
+        scale_min=align_scale_min,
+        scale_max=align_scale_max,
+        scale_step=align_scale_step,
+        max_shift=align_max_shift,
+    )
+    # Apply the winning proxy transform at full resolution before fitting the
+    # RGB operator.  This keeps the existing output contract while avoiding a
+    # second interpolation of the generated reference image.
+    if abs(align_scale - 1.0) > 1e-6:
+        reference = scale_center_image(reference, align_scale)
     if shift_x or shift_y:
         reference = translate_image(
             reference,
             shift_x * reference.width / proxy_size[0],
             shift_y * reference.height / proxy_size[1],
         )
+    if abs(align_scale - 1.0) > 1e-6 or shift_x or shift_y:
         proxy_s, proxy_r, proxy_size = proxy_arrays(original, reference, args.proxy_side)
+    # Keep this diagnostic at proxy resolution.  It is intended to show where
+    # GPT changed geometry (face, hair, hands, garment edges), not to become a
+    # second multi-gigabyte full-resolution render.
+    mismatch_score, mismatch_stats = structure_disagreement(proxy_s, proxy_r)
     # An external output mask is also the best trust region for fitting the
     # appearance operator.  Requiring a second, identical path made the
     # common one-pass workflow easy to misuse, so ``--alpha`` now supplies
@@ -294,12 +459,14 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "alpha": out / "alpha.png",
         "final": out / "final.png",
         "comparison": out / "comparison.jpg",
+        "structure_mismatch": out / "structure_mismatch.png",
         "metadata": out / "metadata.json",
     }
     save_png(styled, files["styled_original"])
     save_png(upscaled, files["upscaled_reference"])
     save_png(alpha, files["alpha"])
     save_png(final, files["final"])
+    save_png(structure_overlay(proxy_r, mismatch_score), files["structure_mismatch"])
     comparison_sheet((("original", original), ("reference", upscaled), ("manual final", manual), ("demo final", final)), files["comparison"])
     metadata = {
         "sample": sample,
@@ -307,9 +474,17 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "inputs": {"original": str(original_path), "reference": str(reference_path), "manual_final": str(manual_path)},
         "input_size": list(original.size), "proxy_size": list(proxy_size), "grid": [args.grid_x, args.grid_y],
         "alignment": {
-            "method": "proxy edge translation search",
+            "method": "proxy edge scale+translation search",
+            "proxy_scale": round(float(align_scale), 6),
             "proxy_shift_xy": [shift_x, shift_y],
             "score": round(float(align_score), 6),
+            "scale_range": [align_scale_min, align_scale_max, align_scale_step],
+            "max_shift": align_max_shift,
+        },
+        "structure_diagnostic": {
+            "method": "proxy normalized luma-edge disagreement after scale+translation alignment",
+            **mismatch_stats,
+            "path": str(files["structure_mismatch"]),
         },
         "operator": "stable per-channel RGB affine y=[r,g,b,1]@coef; local fits shrunk to global; bilinear coefficient interpolation",
         "global_coef": np.round(global_coef, 7).tolist(),
@@ -348,6 +523,10 @@ def main(argv=None):
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument("--proxy-side", type=int, default=768)
+    p.add_argument("--align-scale-min", type=float, default=0.97, help="minimum centre scale searched on the proxy")
+    p.add_argument("--align-scale-max", type=float, default=1.03, help="maximum centre scale searched on the proxy")
+    p.add_argument("--align-scale-step", type=float, default=0.01, help="scale search increment")
+    p.add_argument("--align-max-shift", type=int, default=24, help="maximum proxy translation searched in each axis")
     p.add_argument("--grid-x", type=int, default=8)
     p.add_argument("--grid-y", type=int, default=12)
     p.add_argument("--tile", type=int, default=768)
