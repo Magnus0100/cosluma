@@ -118,6 +118,10 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     p.add_argument("--alpha-center", type=run_demo.parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=run_demo.parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)
+    p.add_argument("--no-structure-safe", dest="structure_safe", action="store_false",
+                   help="disable automatic alpha reduction in structural disagreement regions")
+    p.set_defaults(structure_safe=True, structure_threshold=0.28, structure_strength=0.78,
+                   structure_blur=1.0, structure_floor=0.08)
     args = p.parse_args(argv)
     root = args.root.resolve()
     out_root = (args.out_dir or root / "outputs" / "final").resolve()
