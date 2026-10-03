@@ -123,6 +123,25 @@ mask 需要保持原片画布尺寸和普通灰度 PNG 格式；白色是稳定�
 
 该脚本输出 proxy 级 `structure_mismatch.png` 和 `structure_mismatch.json`。它只作为修 mask 的依据；不会自动把分歧区强行改回原片。
 
+## 可选 U2Net 人体轮廓
+
+批量生产可以显式启用 `u2net_human_seg.onnx` 生成软人体轮廓。它需要额外的
+onnxruntime 和约 176 MB 模型，因此不会成为默认依赖；模型只负责轮廓，仍需
+confidence profile、`--structure-safe` 和必要的人工修边：
+
+```powershell
+& $py -m pip install --target .cache/onnxruntime onnxruntime
+$env:PYTHONPATH = (Resolve-Path .cache/onnxruntime).Path
+& $py scripts/u2net_mask.py --sample DSC02634 `
+  --model .cache/u2net_human_seg.onnx --out-dir outputs/u2net
+& $py scripts/run_demo.py --sample DSC02634 `
+  --alpha outputs/u2net/DSC02634/alpha.png --fit-full --structure-safe `
+  --out-dir outputs/u2net_demo
+```
+
+模型文件可从 rembg 的 release 下载到 `.cache/u2net_human_seg.onnx`。U2Net 对手指、
+飞发和包等细部仍可能漏检，遇到这些区域应在灰度 alpha 上修正。
+
 ## 轻量验证
 
 ```powershell
