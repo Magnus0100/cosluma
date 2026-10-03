@@ -29,7 +29,8 @@ backend 自动生成：
 传给 `--alpha-map` 后，`manifest.json` 和每个样例的 `metadata.json` 会记录
 mask、输入存储位深、对齐参数和最终文件路径。当前 Pillow/NumPy 工作空间以
 sRGB 8-bit 计算；若输入是 16-bit，会在 metadata 中如实标记，不会把 8-bit
-计算结果伪称为 16-bit 成片。
+计算结果伪称为 16-bit 成片。原片带有 ICC profile 时，生产入口会把它保留在
+RGB PNG 成片中；mask 仍是无 profile 的灰度图。
 
 ## 运行 Demo
 
