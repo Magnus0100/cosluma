@@ -21,6 +21,16 @@
 
 产物：每种 backend 的高分辨率结果、参数和对比图。
 
+## 阶段 1.5：可解释几何与结构分歧
+
+在进入 matting 前，先把整体缩放和平移与 GPT 局部重绘分开处理：
+
+- proxy 上搜索小范围 scale + translation，并把获胜变换应用到参考图；
+- 输出 `structure_mismatch.png`，用归一化亮度边缘分歧标出脸、发丝、手部和服装边缘等不宜强行写回的位置；
+- 用 `alpha` 决定高清纹理回写，保留高分歧区的 GPT 结构和新光效。
+
+产物：两组样例的联合对齐 metadata、结构诊断图、四联对比图。当前结果已完成；后续只在诊断图显示大片稳定误差时扩大搜索范围。
+
 ## 阶段 2：alpha 与边缘
 
 在 transfer 基本成立后，只加入一个 matting backend，优先 BiRefNet HR-matting 或同等级单模型；再用 erosion/dilation、guided filter、distance transform 和 feather 做传统 refinement。重点检查发丝、薄纱、脸部、衣服边缘和 GPT 前景特效。
