@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-10-04",
+  "role_confirmation": "provisional",
+  "groups": [
+    {
+      "id": "DSC02631",
+      "assets": [
+        {"path": "data/DSC02631.jpg", "role": "high_res_original_candidate", "width": 6336, "height": 9504, "bytes": 59558761, "sha256": "f8af677c1c3e98fb05a06b264b1442ae234ce06477b3cc230aaeceadc966ec5c", "icc_present": true},
+        {"path": "data/DSC02631.png", "role": "manual_final_candidate", "width": 3168, "height": 4752, "bytes": 11816222, "sha256": "43f0b2d00f56202e1e8d2a0b7cd133d37c11bc624eeecc2724c85a0c67e33c16", "icc_present": false},
+        {"path": "data/DSC02631参考.png", "role": "gpt_reference_candidate", "width": 1024, "height": 1536, "bytes": 1973081, "sha256": "69c3db063c46a4b24ebdc6a9c9087b89c6e0fd81bc178533369ba85fd9825b5e", "icc_present": false}
+      ]
+    },
+    {
+      "id": "DSC02634",
+      "assets": [
+        {"path": "data/DSC02634.jpg", "role": "high_res_original_candidate", "width": 6336, "height": 9504, "bytes": 59541692, "sha256": "591b826da3f2acc8559c55da4967a02b5db25617a0bf7d93428f21979f97a001", "icc_present": true},
+        {"path": "data/DSC02634.png", "role": "manual_final_candidate", "width": 3168, "height": 4752, "bytes": 9966920, "sha256": "9da0070fd3115389b45e7213008f947c374a4d9f4a6a7ae3b4acf41fa39babb6", "icc_present": false},
+        {"path": "data/DSC02634参考.png", "role": "gpt_reference_candidate", "width": 1024, "height": 1536, "bytes": 1917840, "sha256": "caf5b0563859cd328b8f27262b5a14bc370f6b234b8a3f3c6d030c877158acca", "icc_present": false}
+      ]
+    }
+  ]
+}
