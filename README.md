@@ -53,4 +53,5 @@
 
 两组样例的当前结果位于 `outputs/demo/`，其中四联对比图最适合快速判断流程是否成立。
 
-需要替换软椭圆时，按 [`docs/MASK_WORKFLOW.md`](docs/MASK_WORKFLOW.md) 生成并人工修正一次灰度 mask，再传给 `--alpha` 和 `--fit-alpha`。
+需要替换软椭圆时，按 [`docs/MASK_WORKFLOW.md`](docs/MASK_WORKFLOW.md) 生成并人工修正一次灰度 mask，再传给 `--alpha` 和 `--fit-alpha`。质量结论见 [`docs/MASK_QUALITY_REVIEW.md`](docs/MASK_QUALITY_REVIEW.md)，matting 依赖调查见 [`docs/MATTING_OPTIONS.md`](docs/MATTING_OPTIONS.md)。
+

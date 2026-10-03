@@ -70,23 +70,3 @@ mask 需要保持原片画布尺寸和普通灰度 PNG 格式；白色是主体�
 
 验证只检查素材可读性、输出存在性和基本像素范围，不承担大型测试框架的职责。
 
-## 低交互 mask 编辑器
-
-`edit_mask.py` 用 Pillow 加载原图和现有 alpha，在 Tkinter 窗口中显示缩放预览。左键增加主体 alpha，右键擦除，滚轮调整笔刷直径；按 `S` 或“保存”写出全分辨率 L PNG。窗口只显示 proxy，实际绘制和保存仍使用原图尺寸：
-
-```powershell
-& $py scripts/edit_mask.py `
-  --image data/DSC02634.jpg `
-  --alpha outputs/mask_backend/DSC02634/alpha.png `
-  --out outputs/mask_editor/DSC02634/alpha.png
-```
-
-如果环境没有 Tkinter 或图形显示，可用点坐标模式完成同一类快速修补。坐标默认是 0–1 归一化值；`--coords pixels` 改为原图像素坐标。点文件可写成 `{"add": [[x,y]], "erase": [[x,y]]}`：
-
-```powershell
-& $py scripts/edit_mask.py --cli --image data/DSC02634.jpg `
-  --alpha outputs/mask_backend/DSC02634/alpha.png `
-  --points-file points.json --brush 180
-```
-
-输出的 `alpha.png` 可以直接传给 `run_demo.py --alpha` 和 `--fit-alpha`。
