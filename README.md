@@ -46,3 +46,9 @@
 当前阶段只需要 Python、图像查看工具和 Git。依赖尚未锁定，避免在尚未完成模块验证前引入大型模型或复杂运行时。
 
 后续加入脚本后，应优先使用 proxy 做分析，只有最终 operator 应用与合成才处理全分辨率图片。
+
+## 当前 Demo
+
+最小 Demo 已实现于 [`scripts/run_demo.py`](scripts/run_demo.py)，使用 Pillow/NumPy 完成局部 affine appearance transfer、参考图放大、软 alpha 和两层合成。运行方式与输出说明见 [`scripts/README.md`](scripts/README.md)。
+
+两组样例的当前结果位于 `outputs/demo/`，其中四联对比图最适合快速判断流程是否成立。
