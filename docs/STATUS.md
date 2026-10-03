@@ -16,6 +16,7 @@
 - 完成 [MASK_QUALITY_REVIEW.md](MASK_QUALITY_REVIEW.md)：比较软椭圆、polygon 和编辑后 mask 的覆盖率与成片表现。
 - 完成 [MATTING_OPTIONS.md](MATTING_OPTIONS.md)：确认当前环境没有现成 matting 依赖，也没有下载模型。
 - 已使用编辑后的 DSC02634 mask 跑通完整 Demo；metadata 记录 `alpha.path`、对齐偏移和 `fit_trust`。
+- 新增 `--structure-safe`：在 polygon/confidence alpha 内部叠加 proxy 结构分歧调制。高分歧边缘自动降低高清原片写回权重，保持 GPT 下层结构；不扩大遮罩、不依赖模型。压力样本 DSC02634 已生成 A/B 对比：`outputs/structure_safe_dsc02634/DSC02634/structure_safe_ab.jpg`。
 
 ## 当前判断
 
