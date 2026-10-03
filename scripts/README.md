@@ -133,13 +133,23 @@ confidence profile、`--structure-safe` 和必要的人工修边：
 & $py -m pip install --target .cache/onnxruntime onnxruntime
 $env:PYTHONPATH = (Resolve-Path .cache/onnxruntime).Path
 & $py scripts/u2net_mask.py --sample DSC02634 `
-  --model .cache/u2net_human_seg.onnx --out-dir outputs/u2net
+  --model .cache/models/u2net_human_seg.onnx --out-dir outputs/u2net
 & $py scripts/run_demo.py --sample DSC02634 `
   --alpha outputs/u2net/DSC02634/alpha.png --fit-full --structure-safe `
   --out-dir outputs/u2net_demo
 ```
 
-模型文件可从 rembg 的 release 下载到 `.cache/u2net_human_seg.onnx`。U2Net 对手指、
+模型文件可从 rembg 的 release 下载到 `.cache/models/u2net_human_seg.onnx`。也可以让生产入口直接生成轮廓：
+
+```powershell
+& $py scripts/build_final.py --segmentation-backend u2net `
+  --force-segmentation `
+  --segmentation-model .cache/models/u2net_human_seg.onnx `
+  --segmentation-runtime .cache/onnxruntime `
+  --out-dir outputs/final_u2net
+```
+
+U2Net 对手指、
 飞发和包等细部仍可能漏检，遇到这些区域应在灰度 alpha 上修正。
 
 ## 轻量验证

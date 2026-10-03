@@ -31,6 +31,7 @@ from PIL import Image, ImageOps
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import make_mask  # noqa: E402
 import run_demo  # noqa: E402
+import u2net_mask  # noqa: E402
 
 
 def image_storage_info(path: Path) -> Dict:
@@ -109,6 +110,18 @@ def auto_polygon_alpha(root: Path, sample: str, out_root: Path) -> Optional[Path
     return path
 
 
+def auto_u2net_alpha(root: Path, sample: str, out_root: Path, model: Path, runtime_dir: Path) -> Path:
+    """Run optional human segmentation, then apply the same confidence prior."""
+    source_path, _, _ = run_demo.find_assets(root, sample)
+    sys.path.insert(0, str(runtime_dir.resolve()))
+    alpha = u2net_mask.segment(source_path, model)
+    alpha = make_mask.apply_confidence_profile(alpha)
+    path = out_root / sample / "_u2net_alpha.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    alpha.save(path, format="PNG", compress_level=1)
+    return path
+
+
 def build_args(base: argparse.Namespace, alpha: Optional[Path]) -> argparse.Namespace:
     """Create the small argument object expected by ``run_demo.run_sample``."""
     values = vars(base).copy()
@@ -128,6 +141,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     p.add_argument("--alpha-dir", type=Path, help="directory containing <sample>/alpha.png")
     p.add_argument("--alpha-map", type=Path, help="JSON object mapping sample id to a mask path")
     p.add_argument("--no-auto-mask", action="store_true", help="fail when no sample-specific mask is found")
+    p.add_argument("--segmentation-backend", choices=("polygon", "u2net"), default="polygon",
+                   help="fallback mask backend when no explicit alpha is found")
+    p.add_argument("--force-segmentation", action="store_true",
+                   help="ignore existing masks and generate the selected segmentation backend")
+    p.add_argument("--segmentation-model", type=Path, default=Path(".cache/models/u2net_human_seg.onnx"))
+    p.add_argument("--segmentation-runtime", type=Path, default=Path(".cache/onnxruntime"))
     p.add_argument("--proxy-side", type=int, default=768)
     p.add_argument("--align-scale-min", type=float, default=0.97)
     p.add_argument("--align-scale-max", type=float, default=1.03)
@@ -152,11 +171,19 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     rows = []
     for sample in samples:
         original, reference, manual = run_demo.find_assets(root, sample)
-        alpha = find_alpha(root, sample, alpha_dir, alpha_map)
+        alpha = None if args.force_segmentation else find_alpha(root, sample, alpha_dir, alpha_map)
         alpha_source = "explicit"
         if alpha is None and not args.no_auto_mask:
-            alpha = auto_polygon_alpha(root, sample, out_root)
-            alpha_source = "auto_polygon" if alpha else "soft_ellipse"
+            if args.segmentation_backend == "u2net":
+                model = args.segmentation_model if args.segmentation_model.is_absolute() else root / args.segmentation_model
+                runtime_dir = args.segmentation_runtime if args.segmentation_runtime.is_absolute() else root / args.segmentation_runtime
+                if not model.exists():
+                    raise FileNotFoundError(f"U2Net model not found: {model}")
+                alpha = auto_u2net_alpha(root, sample, out_root, model, runtime_dir)
+                alpha_source = "u2net_human_seg"
+            else:
+                alpha = auto_polygon_alpha(root, sample, out_root)
+                alpha_source = "auto_polygon" if alpha else "soft_ellipse"
         if alpha is None and args.no_auto_mask:
             raise FileNotFoundError(f"No alpha mask for {sample}; pass --alpha-dir/--alpha-map or omit --no-auto-mask")
         if alpha is not None and not alpha.exists():
@@ -171,6 +198,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             "entrypoint": "scripts/build_final.py",
             "mask_source": alpha_source,
             "mask_path": str(alpha) if alpha else None,
+            "segmentation_backend": args.segmentation_backend,
+            "segmentation_model": str(args.segmentation_model) if args.segmentation_backend == "u2net" else None,
             "full_resolution": True,
             "working_space": "sRGB 8-bit (Pillow/NumPy)",
             "icc_profile_embedded": icc_embedded,
