@@ -10,20 +10,21 @@
 - 建立项目约束、素材台账、分析文档和十小时 Demo 计划。
 - 完成两组素材的并排视觉检查和结构/色彩诊断。
 - 实现 `scripts/run_demo.py`：局部 affine appearance transfer、参考图放大、软 alpha 和两层合成。
-- 实现 `scripts/validate_outputs.py`：轻量检查输入与生成文件是否可读。
-- 两组样例均已成功生成 `outputs/demo/` 下的 Demo 结果和四联对比图。
+- 实现 `scripts/make_mask.py`：两组样例的可编辑归一化多边形 mask。
+- 为 operator 增加 `--fit-alpha`，可只用主体可信区域拟合 appearance operator，减少背景粒子和太阳光对人物增益的影响。
+- 两组样例均已生成默认 Demo 和 polygon mask Demo，输出在 `outputs/demo/`、`outputs/demo_polygon/`。
 
 ## 当前判断
 
-数据已经足够支撑第一版 Demo。DSC02631 适合验证温和的 appearance 变化；DSC02634 作为强逆光、粒子和局部亮度变化的压力样本。当前输出已经能保留原片人物纹理，同时让 GPT 背景光效进入最终图，但 alpha 仍是软椭圆，不能视为最终 matting。
+数据已经足够支撑第一版 Demo。DSC02631 的 polygon mask 交接自然；DSC02634 使用扩大头发外缘并增加羽化后的 mask 后，头顶双轮廓明显减轻。主体纹理与 GPT 背景光效的两层交接已经可以继续迭代。
 
 ## 已知限制
 
-- 默认 alpha 是可替换的软主体信任图，不是发丝级分割。
+- polygon mask 是可编辑的传统轮廓，不是发丝级 matting；半透明发丝、轮廓光和薄纱仍需要人工修正。
 - appearance operator 是可解释的局部 RGB affine baseline，不负责生成原片中不存在的光效和粒子。
 - 输出当前为 PNG RGB；正式高质量流程仍需补齐 linear/ICC/16 bit 管理。
 - 未下载大型模型，避免让 Demo 被环境安装阻塞。
 
 ## 下一步
 
-优先把 `alpha.png` 替换为一次人工刷选或单一 matting backend，比较是否减少 halo 和背景污染；只有该问题真实影响成片后，再升级 appearance backend 或色彩管理。
+优先把 polygon mask 做成一次人工刷选入口，并在实际修正后的 mask 上使用 `--fit-alpha`。只有 mask 仍明显影响成片，才评估单一 matting backend；暂不扩大测试框架或下载大模型。

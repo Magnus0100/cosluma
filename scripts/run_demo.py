@@ -70,12 +70,15 @@ def affine_fit(x: np.ndarray, y: np.ndarray, ridge: float = 0.03) -> np.ndarray:
     return coef
 
 
-def fit_operator(src: np.ndarray, ref: np.ndarray, grid: Tuple[int, int], seed: int = 17):
+def fit_operator(src: np.ndarray, ref: np.ndarray, grid: Tuple[int, int], seed: int = 17, trust: np.ndarray | None = None):
     h, w, _ = src.shape
     rng = np.random.default_rng(seed)
     n = h * w
+    trusted_ids = np.flatnonzero(trust.reshape(-1) > 0.5) if trust is not None else np.arange(n)
+    if len(trusted_ids) < 1000:
+        trusted_ids = np.arange(n)
     take = min(n, 450_000)
-    ids = rng.choice(n, size=take, replace=False) if take < n else np.arange(n)
+    ids = rng.choice(trusted_ids, size=min(len(trusted_ids), take), replace=False)
     sf = src.reshape(-1, 3)[ids]
     rf = ref.reshape(-1, 3)[ids]
     x = np.concatenate([sf, np.ones((len(sf), 1), dtype=np.float32)], axis=1)
@@ -91,6 +94,9 @@ def fit_operator(src: np.ndarray, ref: np.ndarray, grid: Tuple[int, int], seed: 
             x0, x1 = round(ix * w / gx), round((ix + 1) * w / gx)
             cs = src[y0:y1, x0:x1].reshape(-1, 3)
             cr = ref[y0:y1, x0:x1].reshape(-1, 3)
+            if trust is not None:
+                keep = trust[y0:y1, x0:x1].reshape(-1) > 0.5
+                cs, cr = cs[keep], cr[keep]
             stride = max(1, len(cs) // 20_000)
             cs, cr = cs[::stride], cr[::stride]
             counts[iy, ix] = len(cs)
@@ -204,7 +210,11 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
     if original.size != manual.size:
         manual = manual.resize(original.size, RESAMPLE.LANCZOS)
     proxy_s, proxy_r, proxy_size = proxy_arrays(original, reference, args.proxy_side)
-    global_coef, local_coef, counts = fit_operator(proxy_s, proxy_r, (args.grid_x, args.grid_y))
+    fit_trust = None
+    if args.fit_alpha:
+        fit_mask = ImageOps.exif_transpose(Image.open(args.fit_alpha)).convert("L").resize(proxy_size, RESAMPLE.BILINEAR)
+        fit_trust = np.asarray(fit_mask, dtype=np.float32) / 255.0
+    global_coef, local_coef, counts = fit_operator(proxy_s, proxy_r, (args.grid_x, args.grid_y), trust=fit_trust)
     styled = apply_operator(original, local_coef, args.tile)
     upscaled = reference.resize(original.size, RESAMPLE.LANCZOS)
     if args.alpha:
@@ -238,6 +248,7 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         "global_coef": np.round(global_coef, 7).tolist(),
         "local_cell_counts": counts.tolist(),
         "alpha": {"mode": alpha_mode, "center": list(args.alpha_center), "radii": list(args.alpha_radii), "softness": args.alpha_softness},
+        "fit_trust": str(args.fit_alpha) if args.fit_alpha else None,
         "parameters": {"proxy_side": args.proxy_side, "tile": args.tile},
         "outputs": {k: str(v) for k, v in files.items()},
     }
@@ -262,6 +273,7 @@ def main(argv=None):
     p.add_argument("--grid-y", type=int, default=12)
     p.add_argument("--tile", type=int, default=768)
     p.add_argument("--alpha", type=Path, help="optional grayscale mask; resized to original dimensions")
+    p.add_argument("--fit-alpha", type=Path, help="optional grayscale mask; fit the appearance operator only on pixels above 50%")
     p.add_argument("--alpha-center", type=parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)
