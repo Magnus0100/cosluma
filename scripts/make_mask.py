@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
+import numpy as np
 
 
 RESAMPLE = Image.Resampling
@@ -38,9 +39,9 @@ POLYGONS: Dict[str, List[Tuple[float, float]]] = {
         # coarse outline filled a large triangular patch of background between
         # the hand and shoulder, which made the reference leak into the set.
         (0.335, 0.285), (0.375, 0.265), (0.455, 0.255), (0.530, 0.270),
-        (0.590, 0.315), (0.610, 0.350), (0.625, 0.375), (0.650, 0.390),
-        (0.675, 0.405), (0.665, 0.430), (0.645, 0.445), (0.665, 0.475),
-        (0.690, 0.520), (0.700, 0.580), (0.690, 0.640), (0.660, 0.700),
+        (0.590, 0.315), (0.610, 0.350), (0.625, 0.375), (0.645, 0.390),
+        (0.660, 0.405), (0.650, 0.430), (0.635, 0.445), (0.655, 0.475),
+        (0.680, 0.520), (0.685, 0.580), (0.675, 0.640), (0.660, 0.700),
         (0.620, 0.730), (0.625, 0.820), (0.640, 1.000), (0.520, 1.000),
         (0.490, 0.875), (0.455, 0.770), (0.425, 0.875), (0.400, 1.000),
         (0.235, 1.000), (0.235, 0.885), (0.215, 0.800), (0.155, 0.745),
@@ -85,6 +86,34 @@ def polygon_alpha(
     return mask.resize(size, RESAMPLE.LANCZOS)
 
 
+def apply_confidence_profile(
+    alpha: Image.Image,
+    head_alpha: int = 0,
+    body_alpha: int = 184,
+    head_end: float = 0.43,
+    body_start: float = 0.52,
+) -> Image.Image:
+    """Turn a silhouette into a write-back confidence map.
+
+    GPT edits are least trustworthy to overwrite around the face, hair and
+    upper-body light.  The lower clothing/body region can retain more source
+    texture.  This is deliberately a simple editable prior, not segmentation.
+    """
+    arr = np.asarray(alpha, dtype=np.float32)
+    h, _ = arr.shape
+    y = np.arange(h, dtype=np.float32)[:, None] / max(1, h - 1)
+    cap = np.where(
+        y < head_end,
+        float(head_alpha),
+        np.where(
+            y < body_start,
+            float(head_alpha) + (y - head_end) / max(1e-6, body_start - head_end) * (body_alpha - head_alpha),
+            float(body_alpha),
+        ),
+    )
+    return Image.fromarray(np.uint8(np.minimum(arr, cap)), mode="L")
+
+
 def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", action="append", help="sample id; repeat or omit for both")
@@ -93,6 +122,10 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--proxy-side", type=int, default=1024)
     parser.add_argument("--feather", type=float, default=32.0, help="final-image feather width in pixels")
     parser.add_argument("--interior", type=int, default=245, help="interior opacity, 0..255")
+    parser.add_argument("--head-alpha", type=int, default=0, help="maximum write-back alpha above --head-end")
+    parser.add_argument("--body-alpha", type=int, default=184, help="maximum write-back alpha below --body-start")
+    parser.add_argument("--head-end", type=float, default=0.43, help="normalized y where head confidence reaches the transition")
+    parser.add_argument("--body-start", type=float, default=0.52, help="normalized y where body confidence reaches --body-alpha")
     parser.add_argument("--points-file", type=Path, help="JSON mapping sample -> [[x,y], ...] normalized points")
     args = parser.parse_args(argv)
     root = args.root.resolve()
@@ -105,12 +138,15 @@ def main(argv: Iterable[str] | None = None) -> None:
             raise KeyError(f"No polygon points for {sample}; use --points-file")
         size = source_size(root, sample)
         alpha = polygon_alpha(size, points[sample], args.proxy_side, args.feather, args.interior)
+        alpha = apply_confidence_profile(alpha, args.head_alpha, args.body_alpha, args.head_end, args.body_start)
         path = out_root / sample / "alpha.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         alpha.save(path, format="PNG", compress_level=1)
         rows.append({"sample": sample, "size": list(size), "path": str(path),
                      "backend": "editable_polygon", "points": points[sample],
-                     "feather_px": args.feather, "interior": args.interior})
+                     "feather_px": args.feather, "interior": args.interior,
+                     "confidence_profile": {"head_alpha": args.head_alpha, "body_alpha": args.body_alpha,
+                                             "head_end": args.head_end, "body_start": args.body_start}})
     print(json.dumps({"outputs": rows}, ensure_ascii=False, indent=2))
 
 
