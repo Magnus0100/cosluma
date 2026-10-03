@@ -33,11 +33,11 @@
 
 ## 阶段 2：alpha 与边缘
 
-在 transfer 基本成立后，只加入一个 matting backend，优先 BiRefNet HR-matting 或同等级单模型；再用 erosion/dilation、guided filter、distance transform 和 feather 做传统 refinement。重点检查发丝、薄纱、脸部、衣服边缘和 GPT 前景特效。
+在 transfer 基本成立后，使用可编辑 polygon 作为零依赖后端，并提供可选 U2Net human segmentation 作为轮廓后端；再用 confidence profile、structure-safe 调制和一次人工修边做 refinement。重点检查发丝、手指、脸部、衣服边缘和 GPT 前景特效。U2Net 只负责 silhouette，不能解决 GPT 局部重绘造成的身份/结构不重合。
 
-产物：初始 alpha、refined alpha、少量人工刷 mask 的验证结果。
+产物：初始 alpha、U2Net A/B、refined alpha、少量人工刷 mask 的验证结果。当前两组样例均已完成。
 
-## 阶段 3：两层合成
+## 阶段 3：两层合成与交付
 
 实现：
 
@@ -48,11 +48,11 @@ HighResStyledOriginal
 → Final
 ```
 
-全流程明确 ICC、linear float 和 16 bit 输出，并和人工成片比较实际返工量。
+生产入口 `scripts/build_final.py` 已完成全分辨率两层合成、ICC 保留、manifest 和 metadata。当前工作空间仍以 sRGB 8-bit 计算；16-bit/linear-light 处理列为下一次质量升级，不能把当前结果标记为 16-bit 成片。
 
 ## 暂不实现
 
-暂不做完整 GUI、训练模型、diffusion 主干、dense neural correspondence、多模型 ensemble、自动 QC 拒收、批处理调度、复杂插件系统和自研 LUT 系统。
+暂不做训练模型、diffusion 主干、dense neural correspondence、多模型 ensemble、自动 QC 拒收、复杂插件系统和自研 LUT 系统。GUI 只承担人工 mask 修边和复核。
 
 ## 单次升级原则
 
