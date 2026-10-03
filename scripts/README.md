@@ -2,6 +2,35 @@
 
 脚本使用工作区自带的 Python、Pillow 和 NumPy，不需要先安装 CUDA 或下载模型。
 
+## 生产批量入口
+
+从 Demo 进入实际交付时使用 `build_final.py`。它会对每个样例单独寻找/生成
+alpha、独立搜索 scale + translation，在原始画布尺寸输出成片，并写出总清单
+`manifest.json`。mask 选择顺序是 `--alpha-map`、`--alpha-dir`、已有的
+`outputs/mask_review` / `mask_editor` / `mask_backend`，最后才使用 polygon
+backend 自动生成：
+
+```powershell
+& $py scripts/build_final.py --out-dir outputs/final
+```
+
+如果已有整理好的 mask：
+
+```powershell
+& $py scripts/build_final.py --alpha-dir outputs/mask_review --out-dir outputs/final
+```
+
+也可以用 JSON 为每组样例指定不同文件：
+
+```json
+{"DSC02631": "outputs/mask_backend/DSC02631/alpha.png", "DSC02634": "outputs/mask_review/DSC02634/alpha.png"}
+```
+
+传给 `--alpha-map` 后，`manifest.json` 和每个样例的 `metadata.json` 会记录
+mask、输入存储位深、对齐参数和最终文件路径。当前 Pillow/NumPy 工作空间以
+sRGB 8-bit 计算；若输入是 16-bit，会在 metadata 中如实标记，不会把 8-bit
+计算结果伪称为 16-bit 成片。
+
 ## 运行 Demo
 
 在仓库根目录运行：
