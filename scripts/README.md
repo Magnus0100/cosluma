@@ -31,6 +31,8 @@ mask、输入存储位深、对齐参数和最终文件路径。当前 Pillow/Nu
 sRGB 8-bit 计算；若输入是 16-bit，会在 metadata 中如实标记，不会把 8-bit
 计算结果伪称为 16-bit 成片。原片带有 ICC profile 时，生产入口会把它保留在
 RGB PNG 成片中；mask 仍是无 profile 的灰度图。
+生产入口默认开启结构安全调制：对齐后边缘分歧高的区域会自动降低写回 alpha，
+以保留 GPT 参考图的局部重绘；需要严格复现旧版行为时可传 `--no-structure-safe`。
 
 ## 运行 Demo
 
