@@ -47,6 +47,27 @@ def image_storage_info(path: Path) -> Dict:
         }
 
 
+def embed_source_profile(paths: Iterable[Path], source_path: Path) -> bool:
+    """Carry the source camera profile onto RGB deliverables when available.
+
+    The operator works on the source RGB values and does not perform a colour
+    space transform, so retaining the input profile is the honest operation.
+    Masks remain untagged grayscale images.
+    """
+    with Image.open(source_path) as source:
+        profile = source.info.get("icc_profile")
+    if not profile:
+        return False
+    for path in paths:
+        if not path.exists() or path.suffix.lower() != ".png":
+            continue
+        with Image.open(path) as image:
+            if image.mode not in ("RGB", "RGBA"):
+                continue
+            image.save(path, format="PNG", compress_level=1, icc_profile=profile)
+    return True
+
+
 def load_alpha_map(path: Optional[Path]) -> Dict[str, Path]:
     if path is None:
         return {}
@@ -142,12 +163,17 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             raise FileNotFoundError(f"Mask for {sample} does not exist: {alpha}")
 
         run = run_demo.run_sample(root, sample, out_root, build_args(args, alpha))
+        icc_embedded = embed_source_profile(
+            [Path(run["outputs"][k]) for k in ("styled_original", "upscaled_reference", "final")],
+            original,
+        )
         run["production"] = {
             "entrypoint": "scripts/build_final.py",
             "mask_source": alpha_source,
             "mask_path": str(alpha) if alpha else None,
             "full_resolution": True,
             "working_space": "sRGB 8-bit (Pillow/NumPy)",
+            "icc_profile_embedded": icc_embedded,
             "source_storage": image_storage_info(original),
             "reference_storage": image_storage_info(reference),
             "manual_storage": image_storage_info(manual),
