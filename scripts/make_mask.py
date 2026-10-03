@@ -53,8 +53,13 @@ POLYGONS: Dict[str, List[Tuple[float, float]]] = {
 
 def source_size(root: Path, sample: str, source_dir: Path | None = None) -> Tuple[int, int]:
     source_root = source_dir.resolve() if source_dir else root / "data"
-    candidates = [source_root / f"{sample}.jpg", source_root / f"{sample}.JPG", source_root / f"{sample}.jpeg", source_root / f"{sample}.JPEG"]
-    path = next((p for p in candidates if p.exists()), candidates[0])
+    matches = sorted(
+        (p for p in source_root.iterdir() if p.is_file()
+         and p.stem.casefold() == sample.casefold()
+         and p.suffix.casefold() in {".jpg", ".jpeg"}),
+        key=lambda p: (p.suffix.casefold() != ".jpg", p.name),
+    ) if source_root.exists() else []
+    path = matches[0] if matches else source_root / f"{sample}.jpg"
     if not path.exists():
         raise FileNotFoundError(path)
     with Image.open(path) as im:

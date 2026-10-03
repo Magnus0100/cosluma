@@ -79,8 +79,13 @@ def main(argv: Iterable[str] | None = None) -> None:
     samples = args.sample or sorted(POLYGONS)
     rows = []
     for sample in samples:
-        candidates = [source_dir / f"{sample}.jpg", source_dir / f"{sample}.JPG", source_dir / f"{sample}.jpeg", source_dir / f"{sample}.JPEG"]
-        src = next((p for p in candidates if p.exists()), candidates[0])
+        matches = sorted(
+            (p for p in source_dir.iterdir() if p.is_file()
+             and p.stem.casefold() == sample.casefold()
+             and p.suffix.casefold() in {".jpg", ".jpeg"}),
+            key=lambda p: (p.suffix.casefold() != ".jpg", p.name),
+        ) if source_dir.exists() else []
+        src = matches[0] if matches else source_dir / f"{sample}.jpg"
         if not src.exists():
             raise FileNotFoundError(src)
         soft = segment(src, model, args.input_size)

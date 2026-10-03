@@ -33,8 +33,13 @@ def rgb_image(path: Path) -> Image.Image:
 def find_assets(root: Path, sample: str, source_dir: Path | None = None) -> Tuple[Path, Path, Path]:
     data = root / "data"
     source_root = source_dir.resolve() if source_dir else data
-    candidates = [source_root / f"{sample}.jpg", source_root / f"{sample}.JPG", source_root / f"{sample}.jpeg", source_root / f"{sample}.JPEG"]
-    original = next((p for p in candidates if p.exists()), candidates[0])
+    matches = sorted(
+        (p for p in source_root.iterdir() if p.is_file()
+         and p.stem.casefold() == sample.casefold()
+         and p.suffix.casefold() in {".jpg", ".jpeg"}),
+        key=lambda p: (p.suffix.casefold() != ".jpg", p.name),
+    ) if source_root.exists() else []
+    original = matches[0] if matches else source_root / f"{sample}.jpg"
     reference = data / f"{sample}参考.png"
     manual = data / f"{sample}.png"
     missing = [str(p) for p in (original, reference, manual) if not p.exists()]
