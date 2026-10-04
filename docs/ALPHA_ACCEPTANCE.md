@@ -71,3 +71,16 @@ matting backend 的职责到“提供更好的初始轮廓”为止。它不能�
 3. 若 U2Net 没有减少修边时间，回退 polygon，开始处理 16 bit/ICC 和交付文件命名；不要继续堆 matting 模型。
 4. 若 U2Net 明显减少粗轮廓工作，再考虑单一 matting refinement；仍保持一次人工 alpha 确认，不引入多模型串联。
 
+最小 A/B 命令如下。两条命令只改变 mask 来源，必须使用同一个真实原片目录和同一输出参数：
+
+```powershell
+$src = "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)"
+& $py scripts/build_final.py --source-dir $src --alpha-dir outputs/mask_review `
+  --sample DSC02634 --out-dir outputs/ab_polygon
+& $py scripts/build_final.py --source-dir $src --sample DSC02634 `
+  --segmentation-backend u2net --force-segmentation `
+  --segmentation-model .cache/models/u2net_human_seg.onnx `
+  --segmentation-runtime .cache/onnxruntime --out-dir outputs/ab_u2net
+```
+
+两组输出都要查看 `comparison.jpg`、`structure_mismatch.png` 和人物 100% 局部；U2Net 只有在人工修边更快且不违反硬门槛时才替换 polygon 默认路径。
