@@ -387,6 +387,70 @@ def apply_operator(source: Image.Image, local: np.ndarray, tile: int = 768) -> I
     return result
 
 
+def gaussian_blur_array(values: np.ndarray, sigma: float) -> np.ndarray:
+    """Blur a small proxy float array without converting it to 8-bit.
+
+    Pillow's GaussianBlur does not accept floating-point RGB images.  The
+    residual-transfer path operates at proxy resolution, so a compact
+    separable NumPy kernel is both fast and avoids quantising subtle exposure
+    differences before they are upsampled to the source resolution.
+    """
+    if sigma <= 0:
+        return values.astype(np.float32, copy=True)
+    radius = max(1, int(math.ceil(float(sigma) * 3.0)))
+    axis = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-0.5 * (axis / float(sigma)) ** 2)
+    kernel /= kernel.sum()
+    out = np.asarray(values, dtype=np.float32)
+    if out.ndim == 2:
+        out = out[..., None]
+    blurred = np.empty_like(out)
+    for ch in range(out.shape[2]):
+        plane = out[..., ch]
+        padded = np.pad(plane, ((radius, radius), (radius, radius)), mode="reflect")
+        # Horizontal, then vertical 1-D convolution.  Proxy images are small
+        # enough that explicit channel loops are clearer than a dependency.
+        tmp = np.empty_like(plane)
+        for y in range(plane.shape[0]):
+            tmp[y] = np.convolve(padded[y + radius, :], kernel, mode="valid")
+        padded2 = np.pad(tmp, ((radius, radius), (0, 0)), mode="reflect")
+        for x in range(plane.shape[1]):
+            blurred[:, x, ch] = np.convolve(padded2[:, x], kernel, mode="valid")
+    return blurred[..., 0] if values.ndim == 2 else blurred
+
+
+def apply_residual_transfer(
+    styled: Image.Image,
+    proxy_source: np.ndarray,
+    proxy_reference: np.ndarray,
+    local: np.ndarray,
+    sigma: float = 2.0,
+    strength: float = 1.0,
+    tile: int = 768,
+) -> Image.Image:
+    """Add a blurred reference-vs-styled residual while retaining source detail.
+
+    The affine operator handles channel appearance and high-frequency texture
+    remains in ``styled``.  This residual restores broad generated lighting
+    (for example a warm rim on hair) that a per-channel moment fit cannot
+    synthesize from a dark source pixel.  It is estimated on the proxy and
+    enlarged once, so the reference's new edges or particles are never copied
+    as sharp detail into the high-resolution layer.
+    """
+    proxy_img = Image.fromarray(np.uint8(np.clip(proxy_source, 0.0, 1.0) * 255.0 + 0.5), mode="RGB")
+    proxy_styled = np.asarray(apply_operator(proxy_img, local, tile=tile), dtype=np.float32) / 255.0
+    residual = gaussian_blur_array(np.asarray(proxy_reference, dtype=np.float32) - proxy_styled, sigma)
+    w, h = styled.size
+    full = np.empty((h, w, 3), dtype=np.float32)
+    for ch in range(3):
+        # Mode F resize preserves signed float residuals and avoids an extra
+        # 8-bit round-trip before blending into the full-resolution image.
+        channel = Image.fromarray(residual[..., ch].astype(np.float32), mode="F")
+        full[..., ch] = np.asarray(channel.resize((w, h), RESAMPLE.BICUBIC), dtype=np.float32)
+    base = np.asarray(styled, dtype=np.float32) / 255.0
+    return Image.fromarray(np.uint8(np.clip(base + float(strength) * full, 0.0, 1.0) * 255.0 + 0.5), mode="RGB")
+
+
 def make_alpha(size: Tuple[int, int], center=(0.50, 0.53), radii=(0.26, 0.47), softness=0.16) -> Image.Image:
     w, h = size
     # Build in horizontal strips to avoid a second full-size float image.
@@ -497,6 +561,19 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
         fit_trust_mode = "full_frame"
     global_coef, local_coef, counts = fit_operator(proxy_s, proxy_r, (args.grid_x, args.grid_y), trust=fit_trust)
     styled = apply_operator(original, local_coef, args.tile)
+    residual_enabled = bool(getattr(args, "residual_transfer", False))
+    residual_sigma = float(getattr(args, "residual_sigma", 2.0))
+    residual_strength = float(getattr(args, "residual_strength", 1.0))
+    if residual_enabled:
+        styled = apply_residual_transfer(
+            styled,
+            proxy_s,
+            proxy_r,
+            local_coef,
+            sigma=residual_sigma,
+            strength=residual_strength,
+            tile=args.tile,
+        )
     upscaled = reference.resize(original.size, RESAMPLE.LANCZOS)
     if args.alpha:
         alpha = ImageOps.exif_transpose(Image.open(args.alpha)).convert("L").resize(original.size, RESAMPLE.LANCZOS)
@@ -553,6 +630,12 @@ def run_sample(root: Path, sample: str, out_root: Path, args) -> Dict:
             "path": str(files["structure_mismatch"]),
         },
         "operator": "stable per-channel RGB affine y=[r,g,b,1]@coef; local fits shrunk to global; bilinear coefficient interpolation",
+        "residual_transfer": {
+            "enabled": residual_enabled,
+            "sigma_proxy_px": residual_sigma,
+            "strength": residual_strength,
+            "description": "blurred proxy reference-minus-styled residual, upsampled into styled original",
+        },
         "global_coef": np.round(global_coef, 7).tolist(),
         "local_cell_counts": counts.tolist(),
         # Keep the exact mask source in the run record.  A generated alpha has
@@ -607,6 +690,12 @@ def main(argv=None):
     p.add_argument("--alpha", type=Path, help="optional grayscale mask; resized to original dimensions")
     p.add_argument("--fit-alpha", type=Path, help="optional grayscale mask; fit the appearance operator only on pixels above 50%")
     p.add_argument("--fit-full", action="store_true", help="fit on the full aligned frame even when --alpha is supplied")
+    p.add_argument("--residual-transfer", action="store_true",
+                   help="add a blurred proxy lighting residual while retaining high-resolution source detail")
+    p.add_argument("--residual-sigma", type=float, default=2.0,
+                   help="Gaussian sigma in proxy pixels for residual transfer")
+    p.add_argument("--residual-strength", type=float, default=1.0,
+                   help="residual transfer strength; 0 disables its effect")
     p.add_argument("--alpha-center", type=parse_pair, default=(0.50, 0.53))
     p.add_argument("--alpha-radii", type=parse_pair, default=(0.26, 0.47))
     p.add_argument("--alpha-softness", type=float, default=0.16)

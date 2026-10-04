@@ -174,6 +174,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     p.add_argument("--alpha-softness", type=float, default=0.16)
     p.add_argument("--fit-full", action="store_true",
                    help="fit appearance on the full aligned frame; default fits on the selected alpha")
+    p.add_argument("--residual-transfer", action="store_true",
+                   help="add a blurred proxy lighting residual while retaining high-resolution source detail")
+    p.add_argument("--residual-sigma", type=float, default=2.0,
+                   help="Gaussian sigma in proxy pixels for residual transfer")
+    p.add_argument("--residual-strength", type=float, default=1.0,
+                   help="residual transfer strength; 0 disables its effect")
     p.add_argument("--no-structure-safe", dest="structure_safe", action="store_false",
                    help="disable automatic alpha reduction in structural disagreement regions")
     p.set_defaults(structure_safe=True, structure_threshold=0.28, structure_strength=0.78,
