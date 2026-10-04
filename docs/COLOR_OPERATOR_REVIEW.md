@@ -26,8 +26,8 @@ final = alpha * styled + (1 - alpha) * reference
 & $py scripts/build_final.py `
   --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
   --alpha-dir outputs/mask_review `
-  --residual-transfer --residual-sigma 2 --residual-strength 1 `
+  --residual-transfer --residual-sigma 1 --residual-strength 0.8 `
   --out-dir outputs/final_delivery_residual
 ```
 
-DSC02631 的数值变化很小，但头发和肩部暖光交接更接近 GPT 参考；DSC02634 的亮度与人工成片明显更接近。若某组出现 halo，应先降低该组 `residual-strength`（建议 0.6–0.8），再修 alpha；不要改用 `fit-full`。
+proxy 参数扫显示：DSC02631 以 `sigma=1.0–1.5`、`strength=0.5–0.7` 最稳；DSC02634 的强逆光需要 `sigma=0.75–1.0`、`strength=0.9–1.0` 才能恢复头发 rim。批量默认可从 `sigma=1.0`、`strength=0.8` 开始，再按每张图的结构分歧和 halo 调整。若某组出现 halo，应先降低该组 `residual-strength`（建议 0.6–0.8），再修 alpha；不要改用 `fit-full`。
