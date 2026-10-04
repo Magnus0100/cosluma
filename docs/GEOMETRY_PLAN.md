@@ -13,7 +13,15 @@
 
 ## 十小时内的实现顺序
 
-1. **先做局部配准诊断（约 1 小时）**：在 4×5 或 6×8 proxy 网格中，对每个网格做 ±8 proxy 像素的边缘相关搜索，输出 `local_shift.json` 和箭头叠加图。只采纳相关分数高、邻域位移连续的格子；孤立的大位移标记为结构分歧。
+1. **先做局部配准诊断（约 1 小时）**：`scripts/local_shift_diagnostic.py` 已实现。在 4×5 或 6×8 proxy 网格中，对每个网格做 ±8 proxy 像素的边缘相关搜索，输出 `local_shift.json` 和箭头叠加图。只采纳相关分数高、邻域位移连续的格子；孤立的大位移标记为结构分歧。例如：
+
+   ```powershell
+   python scripts/local_shift_diagnostic.py `
+     --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
+     --sample DSC02631 --sample DSC02634
+   ```
+
+   实测 DSC02634 的躯干格子大多只有 `dx=-1..0, dy=-1..0`，而头脸和背景格子出现 ±8 的低相关极值；这类极值必须拒绝。
 2. **加入可选 mesh displacement（约 3 小时）**：以 source 画布为目标，用网格位移双线性插值采样 reference。位移先限制在画幅的 1–2%，边界使用复制采样。默认不启用，先生成 A/B 图。
 3. **增加保护区（约 2 小时）**：mask 中将脸、头发、抬手和手指设为 `geometry_protected`，这些区域不应用 mesh warp，也不提高 alpha；躯干/服装区域才允许小位移。保护区可以先用归一化矩形/多边形 JSON 配置，后续再换模型分割。
 4. **做两组样本 A/B 验收（约 2 小时）**：比较当前 global alignment、local warp、local warp + structure-safe 三者。验收条件是衣服拉链/肩章/腰线重影减少，脸和手部不出现变形，背景直线不被拖弯。
@@ -53,4 +61,3 @@
 - 脸、头发、手部的生成结构保持完整，不出现可见拉伸或重影。
 - 背景桥架和地砖直线在局部 warp 前后误差不增加。
 - 默认命令行为保持不变；所有局部 warp 参数都写入 `metadata.json`，可以一键复现。
-
