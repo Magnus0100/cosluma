@@ -17,6 +17,7 @@
 - 新增无窗口 CLI 修补入口，支持 `--add`、`--erase` 或 `--points-file`。
 - 新增 [MASK_WORKFLOW.md](MASK_WORKFLOW.md)，记录生成、编辑、运行和检查步骤。
 - 完成 [MASK_QUALITY_REVIEW.md](MASK_QUALITY_REVIEW.md)：比较软椭圆、polygon 和编辑后 mask 的覆盖率与成片表现。
+- 完成 [ALPHA_ACCEPTANCE.md](ALPHA_ACCEPTANCE.md)：明确 polygon、U2Net、structure-safe 的职责边界、alpha 分区规则和真实原片交付硬门槛。
 - 完成 [MATTING_OPTIONS.md](MATTING_OPTIONS.md)：确认当前环境没有现成 matting 依赖，也没有下载模型。
 - 已使用编辑后的 DSC02634 mask 跑通完整 Demo；metadata 记录 `alpha.path`、对齐偏移和 `fit_trust`。
 - 新增 `--structure-safe`：在 polygon/confidence alpha 内部叠加 proxy 结构分歧调制。高分歧边缘自动降低高清原片写回权重，保持 GPT 下层结构；不扩大遮罩、不依赖模型。压力样本 DSC02634 已生成 A/B 对比：`outputs/structure_safe_dsc02634/DSC02634/structure_safe_ab.jpg`。
@@ -32,3 +33,5 @@ GPT 参考图存在两类差异：可由轻量平移处理的几何偏移，以�
 ## 下一步
 
 当前完整版本的验收入口是 `scripts/build_final.py --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)"`。先使用已有 mask 生成真实原片的交付 manifest；需要更自动的轮廓时，再用 `--segmentation-backend u2net --force-segmentation` 做 A/B。无论使用哪种 backend，都要先看 `structure_mismatch.png` 再修边；`--fit-full` 只用于兼容旧实验。
+
+下一阶段按 [ALPHA_ACCEPTANCE.md](ALPHA_ACCEPTANCE.md) 执行：先以人工 `mask_review` 生成真实原片 manifest，再只对 DSC02634 做 U2Net A/B。比较人工修边时间、halo、身份保持和 GPT 光效保留；若没有明显收益就回退 polygon，转入 16 bit/ICC 与交付命名整理。
