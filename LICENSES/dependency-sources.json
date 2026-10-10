@@ -1,0 +1,328 @@
+{
+  "schema": "binary_dependency_sources.v1",
+  "application_license": "GPL-3.0-or-later",
+  "application_corresponding_source": "The matching application source archive must be distributed alongside the Windows release.",
+  "official_archives": [
+    {
+      "component": "qtimageformats",
+      "version": "6.11.2",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtimageformats-everywhere-src-6.11.2.tar.xz",
+      "sha256": "cecd8900f34b6550076309bc94f62f828008b633a4239e0a08c86788f41001f8",
+      "bytes": 2050424
+    },
+    {
+      "component": "qtsvg",
+      "version": "6.11.2",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtsvg-everywhere-src-6.11.2.tar.xz",
+      "sha256": "d594337feca84c26fb67fe87b85e6a5c12fda404b611d905f9d138210c311876",
+      "bytes": 2341860
+    },
+    {
+      "component": "pyside-setup",
+      "version": "6.11.2",
+      "url": "https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.2-src/pyside-setup-everywhere-src-6.11.2.tar.xz",
+      "sha256": "cba47efbaad1bedd529725cbc14e21f156c7a19366f07b3edfbb076ffd7afdf8",
+      "bytes": 18053248
+    },
+    {
+      "component": "LibRaw",
+      "version": "0.22.1",
+      "url": "https://www.libraw.org/data/LibRaw-0.22.1.tar.gz",
+      "sha256": "a789dc4e2409e2901d93793a4e0b80c7b49d0d97cf6ad71c850eb7616acfd786",
+      "bytes": 1682411
+    },
+    {
+      "component": "qtbase",
+      "version": "6.11.2",
+      "url": "https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz",
+      "sha256": "5b2e00eccaf5a4d8c14134ffa0ea8dfd0a35ae1ffc7f8d87fa4305a1ed23cf22",
+      "bytes": 50582668
+    }
+  ],
+  "python": {
+    "version": "3.12.14",
+    "url": "https://www.python.org/ftp/python/3.12.14/Python-3.12.14.tar.xz"
+  },
+  "openssl": {
+    "version": "3.5.8",
+    "source_tag": "https://github.com/openssl/openssl/tree/openssl-3.5.8"
+  },
+  "python_packages": [
+    {
+      "component": "altgraph",
+      "version": "0.17.5",
+      "release_page": "https://pypi.org/project/altgraph/0.17.5/#files",
+      "upstream_project_urls": [
+        "Documentation, https://altgraph.readthedocs.io/en/latest/",
+        "Issue tracker, https://github.com/ronaldoussoren/altgraph/issues",
+        "Repository, https://github.com/ronaldoussoren/altgraph"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/7e/f8/97fdf103f38fed6792a1601dbc16cc8aac56e7459a9fff08c812d8ae177a/altgraph-0.17.5.tar.gz",
+          "sha256": "c87b395dd12fabde9c99573a9749d67da8d29ef9de0125c7f536699b4a9bc9e7",
+          "size": 48428,
+          "filename": "altgraph-0.17.5.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "flatbuffers",
+      "version": "25.12.19",
+      "release_page": "https://pypi.org/project/flatbuffers/25.12.19/#files",
+      "upstream_project_urls": [
+        "Documentation, https://google.github.io/flatbuffers/",
+        "Source, https://github.com/google/flatbuffers"
+      ],
+      "source_distributions": [],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "numpy",
+      "version": "2.5.3",
+      "release_page": "https://pypi.org/project/numpy/2.5.3/#files",
+      "upstream_project_urls": [
+        "homepage, https://numpy.org",
+        "documentation, https://numpy.org/doc/",
+        "source, https://github.com/numpy/numpy",
+        "download, https://pypi.org/project/numpy/#files",
+        "tracker, https://github.com/numpy/numpy/issues",
+        "release notes, https://numpy.org/doc/stable/release"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/13/01/11703282db468b85f6f7b8c7f22d058de5970d5c7e60a3a8aaa313c3de36/numpy-2.5.3.tar.gz",
+          "sha256": "df2d5874ff183595a4ba404edd04f6bd9b5505c1d7708573f6a6c17489a67563",
+          "size": 20791231,
+          "filename": "numpy-2.5.3.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "onnxruntime",
+      "version": "1.30.0",
+      "release_page": "https://pypi.org/project/onnxruntime/1.30.0/#files",
+      "upstream_project_urls": [],
+      "source_distributions": [],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "packaging",
+      "version": "26.3",
+      "release_page": "https://pypi.org/project/packaging/26.3/#files",
+      "upstream_project_urls": [
+        "Documentation, https://packaging.pypa.io/",
+        "Source, https://github.com/pypa/packaging"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/7d/fa/3944b40b07da9ce895c0e6303a5ab7d53da063554f534556b134a54d6093/packaging-26.3.tar.gz",
+          "sha256": "94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79",
+          "size": 313412,
+          "filename": "packaging-26.3.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "pefile",
+      "version": "2024.8.26",
+      "release_page": "https://pypi.org/project/pefile/2024.8.26/#files",
+      "upstream_project_urls": [],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/03/4f/2750f7f6f025a1507cd3b7218691671eecfd0bbebebe8b39aa0fe1d360b8/pefile-2024.8.26.tar.gz",
+          "sha256": "3ff6c5d8b43e8c37bb6e6dd5085658d658a7a0bdcd20b6a07b1fcfc1c4e9d632",
+          "size": 76008,
+          "filename": "pefile-2024.8.26.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "pillow",
+      "version": "12.3.0",
+      "release_page": "https://pypi.org/project/Pillow/12.3.0/#files",
+      "upstream_project_urls": [
+        "Release notes, https://pillow.readthedocs.io/en/stable/releasenotes/index.html",
+        "Changelog, https://github.com/python-pillow/Pillow/releases",
+        "Documentation, https://pillow.readthedocs.io",
+        "Funding, https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=pypi",
+        "Homepage, https://python-pillow.github.io",
+        "Mastodon, https://fosstodon.org/@pillow",
+        "Source, https://github.com/python-pillow/Pillow"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
+          "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce",
+          "size": 47025035,
+          "filename": "pillow-12.3.0.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "protobuf",
+      "version": "7.36.2",
+      "release_page": "https://pypi.org/project/protobuf/7.36.2/#files",
+      "upstream_project_urls": [],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/d9/89/5b8517baa72f84a67b8a307ba953c91057af618bf40bf676f3c03551f8f0/protobuf-7.36.2.tar.gz",
+          "sha256": "497d0463ff3316681da6c0b9e8d06cb465d61abce00b613ab42226175644d1bb",
+          "size": 512737,
+          "filename": "protobuf-7.36.2.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "pyinstaller",
+      "version": "6.22.3",
+      "release_page": "https://pypi.org/project/PyInstaller/6.22.3/#files",
+      "upstream_project_urls": [
+        "Homepage, https://pyinstaller.org",
+        "Documentation, https://pyinstaller.org",
+        "Source Code, https://github.com/pyinstaller/pyinstaller",
+        "Release Notes, https://pyinstaller.org/en/stable/CHANGES.html"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/63/41/f90302845945abd4ed647933ff5ee7c6ac93983187be67f897b6cb613331/pyinstaller-6.22.3.tar.gz",
+          "sha256": "05eb2f5615503e72939a7224d68b4aff572c6b0438ee4a17d0a4b481f399362d",
+          "size": 4437180,
+          "filename": "pyinstaller-6.22.3.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "pyinstaller-hooks-contrib",
+      "version": "2026.8",
+      "release_page": "https://pypi.org/project/pyinstaller-hooks-contrib/2026.8/#files",
+      "upstream_project_urls": [],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/c9/3b/fab1a12a21bf9223af012e5dd002b7d4265683d21d9fabbd0ccb347316e4/pyinstaller_hooks_contrib-2026.8.tar.gz",
+          "sha256": "4d825786ad7a9b7dbcc52d612748a34562fe273461bcfd88f4d549c594bbf8f9",
+          "size": 176955,
+          "filename": "pyinstaller_hooks_contrib-2026.8.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "pywin32-ctypes",
+      "version": "0.2.3",
+      "release_page": "https://pypi.org/project/pywin32-ctypes/0.2.3/#files",
+      "upstream_project_urls": [],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/85/9f/01a1a99704853cb63f253eea009390c88e7131c67e66a0a02099a8c917cb/pywin32-ctypes-0.2.3.tar.gz",
+          "sha256": "d162dc04946d704503b2edc4d55f3dba5c1d539ead017afa00142c38b9885755",
+          "size": 29471,
+          "filename": "pywin32-ctypes-0.2.3.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "rawpy",
+      "version": "0.27.1",
+      "release_page": "https://pypi.org/project/rawpy/0.27.1/#files",
+      "upstream_project_urls": [
+        "Homepage, https://github.com/letmaik/rawpy",
+        "Documentation, https://letmaik.github.io/rawpy/",
+        "Repository, https://github.com/letmaik/rawpy.git",
+        "Issues, https://github.com/letmaik/rawpy/issues",
+        "Changelog, https://github.com/letmaik/rawpy/releases"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/f3/ae/c1c7816ed3f3cbf7ca284a37371243500f4eb39b6a32f7368b585c4ef5c4/rawpy-0.27.1.tar.gz",
+          "sha256": "3194d64ff690ac945e1a43237edae8a18f1f493751924de1ae2bcef473c0fb79",
+          "size": 561347,
+          "filename": "rawpy-0.27.1.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "scipy",
+      "version": "1.18.1",
+      "release_page": "https://pypi.org/project/scipy/1.18.1/#files",
+      "upstream_project_urls": [
+        "homepage, https://scipy.org/",
+        "documentation, https://docs.scipy.org/doc/scipy/",
+        "source, https://github.com/scipy/scipy",
+        "download, https://github.com/scipy/scipy/releases",
+        "tracker, https://github.com/scipy/scipy/issues"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/7e/74/66de6258867beb2ef08f35f9f2ac017a52cacd5081714d239ff1a442d458/scipy-1.18.1.tar.gz",
+          "sha256": "52c4b7422442aba924d03ad4019852b08a92e64ea187b933135687bfe2747307",
+          "size": 30781235,
+          "filename": "scipy-1.18.1.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "setuptools",
+      "version": "84.0.0",
+      "release_page": "https://pypi.org/project/setuptools/84.0.0/#files",
+      "upstream_project_urls": [
+        "Source, https://github.com/pypa/setuptools",
+        "Documentation, https://setuptools.pypa.io/",
+        "Changelog, https://setuptools.pypa.io/en/stable/history.html"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/6d/44/f5da03a8ef95d369145c5bb53050e7877c9f3d312e128605fd9504829143/setuptools-84.0.0.tar.gz",
+          "sha256": "f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73",
+          "size": 1168449,
+          "filename": "setuptools-84.0.0.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    },
+    {
+      "component": "tifffile",
+      "version": "2026.9.20",
+      "release_page": "https://pypi.org/project/tifffile/2026.9.20/#files",
+      "upstream_project_urls": [
+        "Bug Tracker, https://github.com/cgohlke/tifffile/issues",
+        "Source Code, https://github.com/cgohlke/tifffile",
+        "Documentation, https://www.cgohlke.com/docs/tifffile/"
+      ],
+      "source_distributions": [
+        {
+          "url": "https://files.pythonhosted.org/packages/92/66/634db78ebad513038d753830dd8815eea26278b5463ba0f43198b0c24c4e/tifffile-2026.9.20.tar.gz",
+          "sha256": "30e145a7042ce7143ae50a50fe8b7221b0070aae22adab8f9e79a264be6b5cdc",
+          "size": 449417,
+          "filename": "tifffile-2026.9.20.tar.gz"
+        }
+      ],
+      "source_metadata_status": "verified_official_PyPI_metadata"
+    }
+  ],
+  "rawpy_build_observation": {
+    "libraw_version": "0.22.1",
+    "GPL2_demosaic_pack": false,
+    "GPL3_demosaic_pack": false,
+    "source_reference": "rawpy 0.27.1 source distribution and LibRaw 0.22.1 archive"
+  },
+  "qt_modules_in_intended_release": [
+    "QtCore",
+    "QtGui",
+    "QtWidgets",
+    "QtSvg",
+    "QtImageFormats"
+  ],
+  "rebuild_instructions": "docs/BINARY_LICENSES.md",
+  "distribution_condition": "Provide the matching application and applicable dependency corresponding source with equivalent access alongside each binary release; preserve notices and changes."
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "cosplay_local_models.current.v1",
+  "ready": false,
+  "onnx_runtime_root": "",
+  "birefnet_model_path": "",
+  "lama_checkpoint": "",
+  "background_sr_checkpoint": "",
+  "face_model_path": "",
+  "face_python": "",
+  "python": "",
+  "semantics_profile": "sapiens2_seg_0.4b",
+  "semantics_checkpoint": "",
+  "semantics_repo_dir": "",
+  "matting_profile": "vitmatte_small_distinctions",
+  "vitmatte_model_root": "",
+  "dinov3_profile": "dinov3_vitl16",
+  "dinov3_model_root": "",
+  "scene_profile": "sam31_static_detector_v1",
+  "scene_model_root": "",
+  "scene_python": ""
+}

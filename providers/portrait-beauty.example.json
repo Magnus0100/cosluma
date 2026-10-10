@@ -1,0 +1,9 @@
+{
+  "schema": "portrait_beauty_models.v1",
+  "ready": false,
+  "regions_python": "",
+  "regions_model_root": "",
+  "beauty_python": "",
+  "beauty_model_root": "",
+  "face_registry": ""
+}

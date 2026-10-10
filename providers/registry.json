@@ -1,0 +1,246 @@
+{
+  "schema_version": "1.0",
+  "providers": [
+    {
+      "id": "openai-compatible",
+      "display": "OpenAI-compatible",
+      "kind": "openai-compatible",
+      "model": "gpt-image-1",
+      "endpoint_env": "COSPLAY_REFERENCE_API_BASE",
+      "key_env": "COSPLAY_REFERENCE_API_KEY",
+      "capabilities": [
+        "images.edits",
+        "b64_json",
+        "url"
+      ],
+      "timeout": 180,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": [
+          408,
+          429,
+          500,
+          502,
+          503,
+          504
+        ]
+      },
+      "enabled": true
+    },
+    {
+      "id": "ccswitch_sub2api",
+      "display": "CCSwitch/Sub2API",
+      "kind": "openai-compatible",
+      "model": "gpt-image-2.5-sunburst",
+      "endpoint_env": "COSPLAY_REFERENCE_API_BASE",
+      "key_env": "COSPLAY_REFERENCE_API_KEY",
+      "capabilities": [
+        "images.edits",
+        "b64_json",
+        "url"
+      ],
+      "timeout": 180,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": [
+          408,
+          429,
+          500,
+          502,
+          503,
+          504
+        ]
+      },
+      "enabled": true
+    },
+    {
+      "id": "qwen_image_2_1",
+      "vision_provider": "auto",
+      "display": "Qwen Image 2.1 本地 / BF16 高画质",
+      "kind": "comfyui",
+      "adapter": "comfyui-http-v1",
+      "protocol": "comfyui-api",
+      "model": "Qwen-Image-2.1 BF16",
+      "workflow_resource": "providers/workflows/qwen-image-2.1-edit.json",
+      "endpoint": "http://127.0.0.1:8188",
+      "endpoint_env": "COSPLAY_QWEN_API_BASE",
+      "model_env": "COSPLAY_QWEN_WORKFLOW",
+      "key_env": null,
+      "capabilities": [
+        "images.edits",
+        "workflow",
+        "upload.image",
+        "prompt",
+        "history",
+        "view"
+      ],
+      "timeout": 1800,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": true
+    },
+    {
+      "id": "qwen_image_2_1_fast",
+      "vision_provider": "auto",
+      "display": "Qwen Image 2.1 本地速度 / INT8",
+      "kind": "comfyui",
+      "adapter": "comfyui-http-v1",
+      "protocol": "comfyui-api",
+      "model": "Qwen-Image-2.1 INT8 ConvRot",
+      "workflow_resource": "providers/workflows/qwen-image-2.1-fast-edit.json",
+      "endpoint": "http://127.0.0.1:8188",
+      "endpoint_env": "COSPLAY_QWEN_API_BASE",
+      "model_env": "COSPLAY_QWEN_WORKFLOW_FAST",
+      "key_env": null,
+      "capabilities": [
+        "images.edits",
+        "workflow",
+        "upload.image",
+        "prompt",
+        "history",
+        "view"
+      ],
+      "timeout": 1800,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": true
+    },
+    {
+      "id": "qwen_image_2_1_uncensored",
+      "vision_provider": "auto",
+      "display": "Qwen Image 2.1 Uncensored 本地 / BF16 高画质",
+      "kind": "comfyui",
+      "adapter": "comfyui-http-v1",
+      "protocol": "comfyui-api",
+      "model": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF BF16",
+      "workflow_resource": "providers/workflows/qwen-image-2.1-uncensored-edit.json",
+      "endpoint": "http://127.0.0.1:8188",
+      "endpoint_env": "COSPLAY_QWEN_API_BASE",
+      "model_env": "COSPLAY_QWEN_UNCENSORED_WORKFLOW",
+      "key_env": null,
+      "capabilities": [
+        "images.edits",
+        "workflow",
+        "upload.image",
+        "prompt",
+        "history",
+        "view"
+      ],
+      "timeout": 1800,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": true
+    },
+    {
+      "id": "qwen_image_2_1_uncensored_fast",
+      "vision_provider": "auto",
+      "display": "Qwen Image 2.1 Uncensored 本地速度 / Q6_K",
+      "kind": "comfyui",
+      "adapter": "comfyui-http-v1",
+      "protocol": "comfyui-api",
+      "model": "abenzerps/Qwen-Image-2.1-Uncensored-GGUF Q6_K",
+      "workflow_resource": "providers/workflows/qwen-image-2.1-uncensored-fast-edit.json",
+      "endpoint": "http://127.0.0.1:8188",
+      "endpoint_env": "COSPLAY_QWEN_API_BASE",
+      "model_env": "COSPLAY_QWEN_UNCENSORED_WORKFLOW_FAST",
+      "key_env": null,
+      "capabilities": [
+        "images.edits",
+        "workflow",
+        "upload.image",
+        "prompt",
+        "history",
+        "view"
+      ],
+      "timeout": 1800,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": true
+    },
+    {
+      "id": "manual_import",
+      "display": "Manual import",
+      "kind": "manual_import",
+      "model": null,
+      "endpoint_env": null,
+      "key_env": null,
+      "capabilities": [
+        "reference_import"
+      ],
+      "timeout": 0,
+      "retry": {
+        "max_attempts": 0,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true
+    },
+    {
+      "id": "local",
+      "display": "Local model (adapter contract)",
+      "kind": "local",
+      "adapter": "local-http-v1",
+      "protocol": "local-http",
+      "model": null,
+      "model_env": "COSPLAY_LOCAL_MODEL",
+      "endpoint_env": "COSPLAY_LOCAL_API_BASE",
+      "key_env": null,
+      "capabilities": [
+        "images.edits"
+      ],
+      "timeout": 600,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": false
+    },
+    {
+      "id": "comfyui",
+      "display": "ComfyUI",
+      "kind": "comfyui",
+      "adapter": "comfyui-http-v1",
+      "protocol": "comfyui-api",
+      "model": null,
+      "model_env": "COSPLAY_COMFYUI_WORKFLOW",
+      "endpoint_env": "COSPLAY_COMFYUI_API_BASE",
+      "key_env": null,
+      "capabilities": [
+        "images.edits",
+        "workflow",
+        "upload.image",
+        "prompt",
+        "history",
+        "view"
+      ],
+      "timeout": 900,
+      "retry": {
+        "max_attempts": 1,
+        "backoff_seconds": 0,
+        "retry_statuses": []
+      },
+      "enabled": true,
+      "generation_supported": true
+    }
+  ]
+}

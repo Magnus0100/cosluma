@@ -1,0 +1,22 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.cmd]
+end_of_line = crlf
+
+[*.md]
+trim_trailing_whitespace = false
+
+# Frozen analysis/QA byte identities use these unchanged CRLF producers.
+[scripts/{local_face_protection_worker,local_face_protection,material_anchor_review,local_photo_analysis,local_semantics_worker,sapiens_model_profiles,native_subject_detail}.py]
+end_of_line = crlf

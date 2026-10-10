@@ -1,0 +1,7 @@
+The compatibility patch in providers/patches/comfyui-gguf-linear-compat.patch includes context from ComfyUI-GGUF ops.py.
+
+Upstream notice: (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+Upstream: https://github.com/city96/ComfyUI-GGUF
+The original Apache License 2.0 text is preserved in ComfyUI-GGUF-Apache-2.0.txt.
+The patch changes Linear activation/residual argument handling for ComfyUI 0.39.
+No upstream NOTICE file was present in the inspected installation.

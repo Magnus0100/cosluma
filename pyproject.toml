@@ -1,0 +1,8 @@
+# Tool configuration. Install desktop dependencies from scripts/requirements-desktop.txt.
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["scripts", "tests", "providers/comfyui"]
+
+[tool.ruff.lint]
+select = ["F821", "F822", "F823"]

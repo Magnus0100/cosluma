@@ -1,0 +1,50 @@
+name: Prepare release assets
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      QT_QPA_PLATFORM: offscreen
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.14'
+          cache: pip
+          cache-dependency-path: scripts/requirements-desktop.txt
+      - run: python -m pip install -r scripts/requirements-desktop.txt
+      - name: Export and check current public source
+        shell: pwsh
+        run: |
+          python scripts/prepare_source_release.py --output "$env:RUNNER_TEMP/cosplay-source"
+          if ($LASTEXITCODE -ne 0) { throw 'Public source export failed' }
+          Set-Location "$env:RUNNER_TEMP/cosplay-source"
+          python tests/run.py core
+          if ($LASTEXITCODE -ne 0) { throw 'Current behavior checks failed' }
+          python tests/run.py desktop_dependency_gate release_artifacts
+          if ($LASTEXITCODE -ne 0) { throw 'Release failure-path checks failed' }
+      - name: Build and verify frozen Debug and Release
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/cosplay-source/scripts/package_windows.ps1" -PythonExecutable (Get-Command python).Source -SmokeRoot "$env:RUNNER_TEMP/cosplay-smoke" -DistPath "$env:RUNNER_TEMP/cosplay-dist" -WorkPath "$env:RUNNER_TEMP/cosplay-build"
+      - name: Assemble and verify release assets
+        shell: pwsh
+        run: |
+          python "$env:RUNNER_TEMP/cosplay-source/scripts/assemble_windows_release.py" --source "$env:RUNNER_TEMP/cosplay-source" --dist "$env:RUNNER_TEMP/cosplay-dist/cosplay-workbench" --output "$env:RUNNER_TEMP/cosplay-release"
+          if ($LASTEXITCODE -ne 0) { throw 'Release assembly or verification failed' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/cosplay-release/*.zip
+            ${{ runner.temp }}/cosplay-release/SHA256SUMS.txt
+            ${{ runner.temp }}/cosplay-release/release-manifest.json
+            ${{ runner.temp }}/cosplay-release/validation.json
+            ${{ runner.temp }}/cosplay-release/RELEASE_NOTES.md

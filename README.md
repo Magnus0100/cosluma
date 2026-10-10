@@ -1,65 +1,53 @@
-# Cosplay 高分辨率后期自动化
+# Cosplay Studio
 
-这个仓库用于把已经确认的 GPT 后期参考图，落回同一张高清原片的真实纹理上。
+面向Windows的Cos后期工作台：从原片和设计参考出发，保留原人物的结构与纹理，准备材质仿色、明暗、背景和效果，保存可继续编辑的高清草稿。
 
-目标输出满足：
+当前源码版本为 `0.4.8`。项目提供桌面界面、CLI和本机HTTP接口；本地模型和生成服务单独配置。
 
-- 保持原 coser、姿态、动作和主要几何关系；
-- 保留 GPT 参考图确认过的调色、光影、背景和特效设计；
-- 在可信区域补回高清原片的真实纹理；
-- 最多通过一次简单的 alpha mask 确认或涂刷完成交接。
+## 快速开始
 
-当前仓库已经有可交接的完整批处理版本：自动配准、独立 alpha、结构安全融合、全分辨率输出和 manifest 都已实现。GUI 仍用于人工修边，不把人工修边假设成全自动。
+拿到Windows程序包后，解压完整的 `cosplay-workbench` 文件夹，保留EXE旁边的 `_internal`，双击 `cosplay-workbench.exe`。程序默认在 `%LOCALAPPDATA%\CosplayWorkbench\workspace` 创建可写工作区，并自动启动内嵌后台。
 
-## 当前目录
-
-```text
-.
-├─ data/       原始测试素材（大文件，不在代码中复制）
-├─ docs/       项目约束、素材台账、实验计划和状态
-├─ outputs/    实验输出（默认不纳入版本控制）
-├─ scripts/    生产入口、mask 后端和诊断脚本
-└─ .cache/     本地缓存（不纳入版本控制）
-```
-
-## 输入约定
-
-每组样例按相同编号组织。真正的高清原片位于 `C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)`；仓库 `data/` 下的同编号 JPG 已经过像素蛋糕追色，只保留作旧实验对照。参考图和人工最终图仍在 `data/`：
-
-- `*.jpg`：高清原片候选；
-- 同编号、无“参考”后缀的 `*.png`：人工最终合成图候选；
-- `*参考.png`：GPT 后期参考图候选。
-
-详细清单见 [`docs/DATASET.md`](docs/DATASET.md)。
-
-## 完整版本入口
-
-使用生产入口生成每组样例的全分辨率结果：
+需要指定工作区时，在程序目录打开PowerShell：
 
 ```powershell
-$py = "C:\Users\80959\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-& $py scripts/build_final.py `
-  --source-dir "C:\Users\80959\Desktop\新建文件夹\新建文件夹 (7)" `
-  --alpha-dir outputs/mask_review --out-dir outputs/final
+$workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
+.\cosplay-workbench.exe --root "$workspace" --embedded-backend --auto-start-backend
 ```
 
-入口会独立搜索 scale + translation，默认开启结构安全 alpha，并写出每组 `metadata.json` 和总 `manifest.json`。已有 mask 优先；没有 mask 时使用 polygon fallback。需要更自动的人物轮廓时，显式传 `--segmentation-backend u2net --force-segmentation`，详见 [`scripts/README.md`](scripts/README.md)。
+打开“连接设置 → 配置分析模型”，可导入已有JSON或选择已安装的模型与Python路径，保存后软件会记住选择并显示缺失项。导入原片，选择“本地原片精修”“已有参考完整后期”或“创作参考并完成后期”，填写创作要求及保留背景、不要特效等限制。先检查制作计划，查看缺失配置、处理步骤、外部服务和生图预算，再开始制作。检查计划只读取文件和配置，不执行推理或网络请求。
 
-当前正式交付候选位于 `outputs/final_delivery/`；U2Net A/B 候选位于 `outputs/final_u2net/`。
+已有参考会先对原片与参考做成对设计，再进入完整后期，所有图像生成预算为零；文本/视觉规划和审片有独立服务策略。完整参考后期目前需要文本/视觉服务，本地原片路线可离线处理。批量作品共享创作要求，每张分别建立设计、几何、遮罩和质量证据，失败项可独立重试。保存版本后查看整图、眼口及原尺寸证据，按缺项修复或补证据，人工审片后导出图片或可编辑工程。
 
-约束与决策记录见 [`docs/PROJECT.md`](docs/PROJECT.md)，可执行计划见 [`docs/EXPERIMENT_PLAN.md`](docs/EXPERIMENT_PLAN.md)。
+每个桌面窗口绑定自己的工程和内嵌后台。默认端口占用时自动选择可用端口；界面显示实际地址。使用 `--root`打开另一工程的新窗口。
 
-## 本地开发
+审片遇到明确的上游服务失败，或服务已完成但返回损坏的 JSON，会只重试失败审片板一次。成功板保留，两次请求和错误独立记录；缺少结论的区域继续显示未知。
 
-默认路径只需要 Python、Pillow、NumPy 和 Git。U2Net 是可选依赖，需要隔离的 onnxruntime 和约 176 MB 模型；不启用时不会加载它。
+源码运行使用Windows x64和Python 3.12。完整配置、源码运行及打包命令见 [安装指南](docs/INSTALLATION.md)。当前副本尚未配置公开远程仓库或Release下载地址，可从源码构建Windows包。
 
-后续加入脚本后，应优先使用 proxy 做分析，只有最终 operator 应用与合成才处理全分辨率图片。
+## 工作流程
 
-## 低层 Demo 与质量检查
+原片基线 → 原图与参考仿色 → 材质和明暗协调 → 人物、背景、接触与明确独立效果合成 → 整图与原生窗口审片 → 有资格的本地修复或补证据 → 保存、人工批准、重开与导出。
 
-最小 Demo 已实现于 [`scripts/run_demo.py`](scripts/run_demo.py)，使用 Pillow/NumPy 完成局部 affine appearance transfer、参考图放大、软 alpha 和两层合成。运行方式与输出说明见 [`scripts/README.md`](scripts/README.md)。
+- 原片承担人物身份、几何和高频纹理；参考提供目标外观与场景。
+- 颜色和明暗可分别调整，已有冻结版本可重开；支持PNG/JPEG、真实TIFF16/32和portable v2工程。
+- “重新审片并本地修复”会取得新文本/视觉审片，按资格处理一次并保存独立版本，不新增参考或独立效果生图。
+- 对已审查鞋部窗口的地面细节损失，自动核对地面支持和原生透明度，从原片同坐标恢复亮度细节；保留当前背景的低频色彩基础，另存新版本并重新审片。
+- 人物细节先核对实际频带损失和独立结构支持；符合资格才恢复原片亮度细节。仿色、曝光和未确定的噪声不会被当作补纹理的依据，未测得损失时保留原像素与开放审片结论。方法见 [人物细节自动核验](docs/AUTOMATIC_SUBJECT_DETAIL.md)。
+- 审片确认人物缺少局部环境响应时，自动比较当前人物和参考的低频光色残差，协调有可靠对应的头发与衣料，并保存独立子版本。方法见 [人物环境光色协调](docs/AUTOMATIC_SUBJECT_ENVIRONMENT.md)。
+- 图层页可自动准备“参考发梢受光”和“协调肩袖暖光”两个独立层，已有层可重新准备并替换。“同时更新边界受光”依次准备两层，成功后一起应用，预览后另存一个高清版本；失败或取消保留当前编辑。已接受效果包含发梢颗粒减轻及右肩／上臂的柔和暖色布面；完整强边缘光、前臂收益与跨照片效果仍待验证。方法及限制见 [参考边界受光](docs/BOUNDARY_LIGHT.md)。
+- 执行成功、自动诊断和人工批准分别呈现；未知、未支持或失败的问题继续显示。
 
-两组样例的生产结果位于 `outputs/final_delivery/`，其中四联对比图和 `structure_mismatch.png` 用于质量检查。`outputs/final_demo/` 保留低层实验结果。使用外部 alpha 时，按样例分别传入对应的 mask 路径。
+## 当前边界
 
-需要替换软椭圆时，按 [`docs/MASK_WORKFLOW.md`](docs/MASK_WORKFLOW.md) 生成并人工修正一次灰度 mask，再传给 `--alpha` 和 `--fit-alpha`。质量结论见 [`docs/MASK_QUALITY_REVIEW.md`](docs/MASK_QUALITY_REVIEW.md)，matting 依赖调查见 [`docs/MATTING_OPTIONS.md`](docs/MATTING_OPTIONS.md)。
+本地分析需要另行安装模型权重及兼容运行时。模型从各自的开源社区来源下载到用户自己的目录，仓库只提供来源、版本、哈希和许可说明，不上传模型本体。生成、研究和审片可能使用配置的外部服务；程序包不包含权重、凭据或个人工程。仓库中的文件边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。
 
+局部原尺寸通过只覆盖实际检查的窗口。零对应支持、接触/反射细节及低支持区域仍可能需要补证据或人工修复。系统没有完整物理重光照或自动接收面投影/镜面反射，跨人物、妆造和场次的艺术质量泛化尚未完成验收。
+
+## 文档与参与
+
+[安装](docs/INSTALLATION.md) · [开发与构建](docs/DEVELOPMENT.md) · [Release发布](docs/RELEASING.md) · [文档索引](docs/README.md) · [参与贡献](CONTRIBUTING.md) · [安全与隐私](SECURITY.md) · [更新记录](CHANGELOG.md)
+
+当前实现及未解决问题见 [算法选择与范围](docs/ALGORITHM_DECISIONS.md)。0.4.8清理过时源码和文档，沿用现有联合受光流程与已接受艺术范围。
+
+项目代码采用 `GPL-3.0-or-later`，详见 [LICENSE](LICENSE)。第三方依赖和模型权重使用各自许可，见 [第三方声明](docs/THIRD_PARTY_NOTICES.md)。

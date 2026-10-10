@@ -1,3 +1,6 @@
-# Generated experiment outputs
+# Local outputs
 
-Write proxy images, masks, comparison sheets, and final renders here. Outputs are local artifacts and are ignored by Git unless explicitly force-added for a reproducible reference.
+Projects keep versioned working data, previews, review records and exports here.
+Generated files are excluded from public distributions. Source originals and
+saved masters remain independent; export does not mark artwork as approved.
+See [editable projects](../docs/PORTABLE_EDITABLE_PROJECT.md).

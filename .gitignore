@@ -1,20 +1,67 @@
-# Generated files and local state
-.cache/
-outputs/*
-!outputs/README.md
+# Private photos, projects, model weights and generated artifacts
+/data/*
+!/data/README.md
+/output/
+/outputs/*
+!/outputs/README.md
+/project.json
+/workspace/
+*.cosplayproj
+/providers/local-models.current.json
+/providers/qwen-image-2.1-models.json
+/.env
+/.env.local
+/.env.*.local
+/.cache/
+/dist/
+/build/
+/release/
+/SOURCE_MANIFEST.json
+*.zip
+*.7z
+*.onnx
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.model
+*.weights
+*.engine
+*.trt
+*.tflite
+*.mlmodel
+*.mlpackage
+*.pb
+*.npy
+*.npz
 
-# Python
+# Model downloads and local runtimes. Keep only public manifests, URLs,
+# revisions, hashes and license notices in the repository.
+/models/
+/weights/
+/checkpoints/
+/runtime/
+/runtimes/
+**/models/
+**/weights/
+**/checkpoints/
+**/model-cache/
+**/downloaded-models/
+
+# Private execution records; public docs describe current contracts
+/docs/meetings/
+/docs/reviews/
+
+# Python, editors and OS
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-
-# Editors and OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Local reports and logs
 *.log
 *.tmp

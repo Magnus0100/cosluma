@@ -1,0 +1,70 @@
+{
+  "schema_version": "presets.v1",
+  "prompt_template_version": "cosplay-post-v4",
+  "style_prompt_version": "cosplay-complete-v2",
+  "presets": [
+    {
+      "id": "anime_light_color",
+      "name": "清透角色写真",
+      "description": "清理背景杂物、柔和人物精修与清透材质色彩，形成重点明确的角色写真。",
+      "prompt": "Create an airy, polished character portrait with soft directional light, clean complementary colours and a redesigned or refined background that supports the visible costume. Remove distracting background clutter, build gentle depth and give hair and fabrics delicate material highlights. Refine skin transitions while preserving deliberate makeup and texture. Finish a complete photographic portrait; elaborate fantasy effects are unnecessary for this style.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "stage_light",
+      "name": "舞台角色海报",
+      "description": "舞台场景、可见光束与局部雾，人物和服装随舞台光色融合。",
+      "prompt": "Design a finished stage-style character photograph with a clear spotlight hierarchy and a theatrical background at the original framing. Create visible directional light beams through localized stage haze, placed behind or beside the performer with scene depth and occlusion. Carry the light onto facing hair, skin, fabric and metal with falloff. Keep facial makeup, hands and costume readable and the portrait dominant.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "night_scene",
+      "name": "电影夜景",
+      "description": "蓝灰夜景、分层薄雾与有来源的光束，人物和环境共同形成电影画面。",
+      "prompt": "Design a cinematic nocturnal character scene with blue-grey ambient light and a visibly transformed background at the same camera perspective. Create a motivated shaft of light through layered haze behind or beside the person, separating foreground, subject and distant surroundings. Connect its selective highlights and reflections to nearby materials while keeping the face readable and skin transitions coherent. Preserve dark-fabric texture, ground contact and genuine reflection geometry.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "soft_skin",
+      "name": "柔和人像精修",
+      "description": "皮肤和妆造精修、干净背景与柔和主光，保留本人和自然摄影质感。",
+      "prompt": "Deliver a finished, restrained cosplay portrait with skin and deliberate makeup refined through soft directional light and continuous colour transitions. Retain pores, lip pigment, contact-lens patterns and natural facial asymmetry. Clean distracting surroundings and refine background depth and tonal hierarchy so the face leads. Keep skin, hair and fabric within the same illumination; this portrait style requires no added fantasy particles or beams.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "cinematic_backlight",
+      "name": "电影逆光",
+      "description": "有方向的场景逆光、局部氛围与选择性材质高光，面部补光和空间协调。",
+      "prompt": "Design a complete cinematic backlight photograph with a strong source behind and to one side, selective strand highlights and facing material reflections. Make the source perceptible through localized atmospheric depth in the surroundings, with foreground/background separation and controlled bloom near the bright source. Refine the face with environmental fill, preserve textured dark cloth and keep the character dominant without an all-around glowing silhouette.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "fantasy_atmosphere",
+      "name": "幻想氛围",
+      "description": "按角色造型设计一个明确的幻想主效，结合场景改造、遮挡和局部反射。",
+      "prompt": "Create a finished photographic fantasy cosplay scene with one clear luminous motif grounded in the visible character or costume. Redesign the surroundings and create a visible primary effect such as an energy trail, magical mist or a spatial particle flow, chosen for this shot rather than adding every effect. Place it with foreground/background depth, occlusion and scale; connect nearby colour spill and material reflections while keeping the face, hands and signature costume clear.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    },
+    {
+      "id": "shrine_drama",
+      "name": "暗调仪式氛围",
+      "description": "古建与悬纸仪式场景、可见烟流和红金光色，人物材质与环境共同完成。",
+      "prompt": "Create a complete ritual-themed photographic scene grounded in the visible costume, architecture and storytelling objects. Design layered red-and-amber illumination and a visible primary incense-like smoke flow through directional light, placed mainly behind or beside the person. Enrich the background depth and focal hierarchy, integrate local light onto skin, fabric and metal, and preserve readable makeup, ground contact and genuine reflections. Keep creative atmosphere separate from unsupported character lore.",
+      "appearance": {},
+      "manual_layers": {},
+      "denoise_strength": 0
+    }
+  ]
+}
