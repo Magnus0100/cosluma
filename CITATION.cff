@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "Cosplay Studio"
+version: "0.4.8"
+date-released: 2026-10-10
+type: software
+authors:
+  - name: "Magnus0100"
+license: "GPL-3.0-or-later"
+repository-code: "https://github.com/Magnus0100/cosplay"
+url: "https://github.com/Magnus0100/cosplay"
+keywords:
+  - cosplay
+  - image processing
+  - photo editing
+  - Windows

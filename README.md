@@ -1,5 +1,9 @@
 # Cosplay Studio
 
+[![CI](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+
+**English:** Cosplay Studio is a Windows desktop workbench for source-faithful cosplay photo finishing. It keeps source structure and texture while preparing editable appearance, lighting, background and effect layers. See [English overview](README.en.md).
+
 面向Windows的Cos后期工作台：从原片和设计参考出发，保留原人物的结构与纹理，准备材质仿色、明暗、背景和效果，保存可继续编辑的高清草稿。
 
 当前源码版本为 `0.4.8`。项目提供桌面界面、CLI和本机HTTP接口；本地模型和生成服务单独配置。
@@ -23,7 +27,7 @@ $workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
 
 审片遇到明确的上游服务失败，或服务已完成但返回损坏的 JSON，会只重试失败审片板一次。成功板保留，两次请求和错误独立记录；缺少结论的区域继续显示未知。
 
-源码运行使用Windows x64和Python 3.12。完整配置、源码运行及打包命令见 [安装指南](docs/INSTALLATION.md)。当前副本尚未配置公开远程仓库或Release下载地址，可从源码构建Windows包。
+源码运行使用Windows x64和Python 3.12。完整配置、源码运行及打包命令见 [安装指南](docs/INSTALLATION.md)。当前 GitHub 仓库为私有开发仓库，尚未发布公开 Release；可从源码构建 Windows 包。
 
 ## 工作流程
 
@@ -50,4 +54,20 @@ $workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
 
 当前实现及未解决问题见 [算法选择与范围](docs/ALGORITHM_DECISIONS.md)。0.4.8清理过时源码和文档，沿用现有联合受光流程与已接受艺术范围。
 
-项目代码采用 `GPL-3.0-or-later`，详见 [LICENSE](LICENSE)。第三方依赖和模型权重使用各自许可，见 [第三方声明](docs/THIRD_PARTY_NOTICES.md)。
+## 仓库结构
+
+```text
+.github/       CI、发布工作流、Issue 模板和代码所有者
+docs/          使用、开发、算法范围、发布和许可说明
+presets/       可公开的创作预设
+providers/     provider 定义、公开模型清单和工作流模板
+scripts/       桌面、后台、CLI、worker 和构建工具
+tests/         离线行为检查及临时工程 fixture
+LICENSES/      依赖和第三方组件的许可证原文
+```
+
+更详细的提交边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。
+
+## 开源许可
+
+项目代码采用 `GPL-3.0-or-later`，详见 [LICENSE](LICENSE)。这表示基于项目代码发布的衍生版本也应在 GPL 条件下提供对应源码；第三方依赖、provider、模型代码和模型权重继续使用各自许可。分发桌面包前请阅读 [第三方声明](docs/THIRD_PARTY_NOTICES.md) 和 [Windows 依赖许可](docs/BINARY_LICENSES.md)。

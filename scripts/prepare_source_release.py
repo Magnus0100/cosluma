@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 import shutil
 
-TOP_LEVEL = ('README.md', 'LICENSE', 'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md',
+TOP_LEVEL = ('README.md', 'README.en.md', 'LICENSE', 'CONTRIBUTING.md', 'SECURITY.md',
+             'SUPPORT.md', 'CODE_OF_CONDUCT.md', 'CITATION.cff', 'CHANGELOG.md',
              '.gitignore', '.gitattributes', '.editorconfig', '.env.example', 'pyproject.toml',
              'Start-Cosplay-Studio.cmd', 'Start-Qwen-Image.cmd',
              'cosplay-workbench.spec', 'cosplay-workbench-debug.spec')

@@ -73,7 +73,8 @@ def check(root):
         json.loads(path.read_text('utf8'))
     for filename in ('LICENSE', 'README.md', 'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md',
                      'docs/INSTALLATION.md', 'docs/DEVELOPMENT.md', 'docs/THIRD_PARTY_NOTICES.md',
-                     'docs/BINARY_LICENSES.md', 'LICENSES/manifest.json', 'LICENSES/dependency-sources.json'):
+                     'docs/BINARY_LICENSES.md', 'LICENSES/manifest.json', 'LICENSES/dependency-sources.json',
+                     'README.en.md', 'SUPPORT.md', 'CODE_OF_CONDUCT.md', 'CITATION.cff'):
         if not (root/filename).is_file():
             raise VerificationError('Required public file is missing: ' + filename)
     if json.loads((root/'providers/local-models.example.json').read_text('utf8'))['ready']:
@@ -91,7 +92,7 @@ def check(root):
         relative = validate_public_path(path.relative_to(root).as_posix())
         if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
             raise VerificationError('Public source selection contains a missing or external file')
-        if path.suffix.lower() in {'.py', '.md', '.json', '.txt', '.cmd', '.ps1', '.toml', '.yml', '.yaml', '.spec', '.example'}:
+        if path.suffix.lower() in {'.py', '.md', '.json', '.txt', '.cmd', '.ps1', '.toml', '.yml', '.yaml', '.spec', '.example', '.cff'}:
             content = path.read_text(encoding='utf8', errors='replace')
             if re.search(r'\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,})\b', content):
                 raise VerificationError('Credential-like value in public source: ' + relative.as_posix())

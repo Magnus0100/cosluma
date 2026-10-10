@@ -1,3 +1,18 @@
+[project]
+name = "cosplay-studio"
+version = "0.4.8"
+description = "Windows desktop workbench for source-faithful cosplay photo finishing."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { file = "LICENSE" }
+keywords = ["cosplay", "photo-editing", "image-processing", "windows"]
+
+[project.urls]
+Homepage = "https://github.com/Magnus0100/cosplay"
+Repository = "https://github.com/Magnus0100/cosplay"
+Issues = "https://github.com/Magnus0100/cosplay/issues"
+Documentation = "https://github.com/Magnus0100/cosplay/tree/master/docs"
+
 # Tool configuration. Install desktop dependencies from scripts/requirements-desktop.txt.
 [tool.ruff]
 target-version = "py312"

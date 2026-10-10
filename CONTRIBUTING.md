@@ -24,7 +24,7 @@ git diff --check
 
 增加生产模块或外部worker时，同步维护 `scripts/runtime_manifest.json`；涉及打包时按开发指南检查Debug和Release。成功启动、数值一致、自动诊断和人工成片批准分别报告。
 
-当前副本没有配置公开远程仓库。可先准备本地提交或补丁，按维护者提供的渠道交付；仓库公开后再使用其实际Issue和Pull Request入口。贡献的授权条件以根目录 [LICENSE](LICENSE) 为准，第三方代码和模型须保留各自许可及来源。
+当前仓库位于 GitHub 私有仓库；维护者会在开放协作前启用实际的 Issue 和 Pull Request 流程。贡献的授权条件以根目录 [LICENSE](LICENSE) 为准，第三方代码和模型须保留各自许可及来源。
 
 ## 公开源码导出
 

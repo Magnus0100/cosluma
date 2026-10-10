@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a reproducible improvement to Cosplay Studio
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索已有 Issue。不要上传私人照片、模型权重、完整工程或服务凭据。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 描述触发条件、当前限制和受影响的工作流。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的行为
+      description: 描述期望的界面、CLI 或文件行为。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 验证与限制
+      description: 如果有测试、日志或替代方案，请提供脱敏后的信息。
