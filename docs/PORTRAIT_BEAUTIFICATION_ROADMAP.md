@@ -1,6 +1,6 @@
 # 下一大版本：Cos 人像美化调研与路线
 
-调研及首轮实验日期 **2026-10-10**，当前生产版本仍为 0.4.8。已查阅论文、官方源码、权重及许可，并完成 SegFace 和专用美肤的三图真实推理、原始浮点母版回放和独立自动准备入口。BeautyGRPO 底模授权与完整下载已解决，真实推理正在评估。实际范围和使用见 [实跑与回放](PORTRAIT_BEAUTY_POC.md)；同人物/场次三图不证明 Cos 泛化，最终默认模型未定。
+调研及首轮实验日期 **2026-10-10**，当前生产版本仍为 0.4.8。已查阅论文、官方源码、权重及许可，并完成 SegFace、专用美肤和 BeautyGRPO 的三图真实推理及原始浮点母版回放，独立自动准备入口已跑通。实际范围和使用见 [实跑与回放](PORTRAIT_BEAUTY_POC.md)；同人物/场次三图不证明 Cos 泛化，最终默认模型未定。
 
 下一版应新增三条制作路线共用的**学习型人像精修**：自动处理临时瑕疵、肤色不连续与肤质，同时保留本人、角色妆造和场景受光。已有仿色、纹理恢复或滤波不能算作这个新增组件。本次调研未找到公开证据充分、同时覆盖全身 Cos、浓妆、美瞳、高清细节和背景融合的统一模型，必须按任务选型。
 
@@ -50,9 +50,9 @@
 
 | 候选 / 来源 | 真正任务与方法 | 代码 / 权重 / 许可现状 | 本轮决定 |
 |---|---|---|---|
-| **[BeautyGRPO](https://github.com/vivoCameraResearch/BeautyGRPO)，CVPR 2026 Highlight**；[论文](https://arxiv.org/abs/2603.01163) | 专门脸部精修；细粒度偏好学习与 Dynamic Path Guidance，针对微瑕疵、纹理和身份保持 | 已发布推理和 [LoRA](https://huggingface.co/Sehnsucht24/BeautyGRPO)，底模 FLUX.1-Kontext-dev；README 标 MIT，预训练/底模条款独立。本次 HF 模型卡请求超时，未核实完整 LoRA 授权 | **PoC-B，必须实跑的近期 SOTA 对照**；尚未确定可作默认或发行配置 |
+| **[BeautyGRPO](https://github.com/vivoCameraResearch/BeautyGRPO)，CVPR 2026 Highlight**；[论文](https://arxiv.org/abs/2603.01163) | 专门脸部精修；细粒度偏好学习，DPG 用于训练探索，部署采用标准 ODE；针对微瑕疵、纹理和身份保持 | 推理与 [LoRA](https://huggingface.co/Sehnsucht24/BeautyGRPO) 已下载并实际加载；底模 FLUX.1-Kontext-dev 已授权并校验。README 声明 MIT 但固定源码缺独立 LICENSE；LoRA 元数据未声明单独权重条款，底模条款独立 | **PoC-B，近期 SOTA 对照已实跑**；首轮原始输出改动美瞳/妆线，原生受限收益偏轻，默认与发行配置未定 |
 | **[ModelScope 专用美肤](https://modelscope.cn/models/damo/cv_unet_skin-retouching/summary)**；[ABPN，CVPR 2022](https://openaccess.thecvf.com/content/CVPR2022/html/Lei_ABPN_Adaptive_Blend_Pyramid_Network_for_Real-Time_Local_Retouching_of_CVPR_2022_paper.html) | 实装是多模型：U-Net 预测 blend 图匀肤，缺陷分割 + inpainting 去瑕疵，皮肤分割 + 美白；不等同单一原版 ABPN | 四个权重公开；官方模型条目标 Apache-2.0，框架 Apache-2.0，附加 RetinaFace 模型条目标 MIT。Torch/TF 混合依赖，第三方来源需登记 | **PoC-A，可复现学习型基线**；分离美白、匀肤和修复后验证，明确不是最新 SOTA |
-| **[SegFace](https://github.com/Kartik-3004/SegFace)，AAAI 2025** | 长尾脸部语义解析；类专用 token + 多尺度特征，官方报告 LaPa / CelebAMask-HQ 改善 | MIT 代码，公开 HF 多个 checkpoint，512 脸 ROI；权重条款需随固定文件确认 | **脸区解析首选 PoC**；补眼/唇/眉/饰品区域，不替代全身语义或原生抠图 |
+| **[SegFace](https://github.com/Kartik-3004/SegFace)，AAAI 2025** | 长尾脸部语义解析；类专用 token + 多尺度特征，官方报告 LaPa / CelebAMask-HQ 改善 | 固定 MIT 代码及模型卡条款已登记，512 CelebAMask-HQ checkpoint 已完整严格加载，三图实跑 | **脸区解析 PoC**；实测遮挡语义误判需原坐标资格约束，不替代全身语义或原生抠图 |
 | **[FaceXFormer](https://github.com/Kartik-3004/facexformer)，ICCV 2025** | 统一脸部分析，含 parsing、landmark、head pose、visibility 等九任务；不是美化器 | MIT 代码与公开 HF 权重入口 | 候补基础分析方案；仅评估需要的解析/关键点/可见性，不为产品增加无关人物属性推断 |
 | **[RetouchFormer](https://github.com/Davidcoach/RetouchFormer_AAAI_24)，AAAI 2024** | soft inpainting、瑕疵预测与 clean-face prior 的选择性自注意力，专门局部瑕疵 | 官方权重入口存在；未见明确仓库/权重许可 | 第三对照，验证局部性；不列入当前默认依赖 |
 | **[RetouchGPT](https://github.com/Davidcoach/RetouchGPT)，AAAI 2025** | 指令条件的缺陷定位与局部修复，不是普通仿色模型 | MIT 代码，权重百度入口；配置 JSON 有语法缺陷，源码 CUDA 硬绑定；Llama-3.1-8B + Flan-T5-Large，权重授权未核实 | 研究候补。官方 LLM 为 fp32，8B 参数仅理论存储约 32 GB，不能称轻量即插即用；无本机运行成绩 |
@@ -154,7 +154,7 @@ flowchart TD
 
 P0 是瑕疵、肤质、局部匀色/明暗、三路线共用与可编辑闭环。P1 是有限眼唇牙增强、同组风格和适用范围明确的低清恢复。P2 才是默认关闭的结构美化、参考妆容迁移、个性偏好学习和生成式重光照；它们不阻塞基础精修。
 
-本机为 RTX 4080 SUPER 16 GB，约 61.6 GiB RAM。GPU 模型串行驻留，CPU 解码/写出可并行，新增资产优先稀疏 ROI。SegFace 实测峰值约 0.61 GB，专用美肤约 0.64–1.25 GB allocated；这是各自 worker 的实测，不含完整桌面流程。BeautyGRPO 正在测量。官方 FPS、服务配置和推理步数不能当作本机承诺。
+本机为 RTX 4080 SUPER 16 GB，约 61.6 GiB RAM。GPU 模型串行驻留，CPU 解码/写出可并行，新增资产优先稀疏 ROI。SegFace 实测峰值约 0.61 GB，专用美肤约 0.64–1.25 GB allocated；BeautyGRPO 在 sequential CPU offload 下约 2.57 GB allocated，首轮采样约 187–317 秒/图，首次加载约 63 秒。这是各自 worker 的实测，不含完整桌面流程。官方 FPS、服务配置和推理步数不能当作本机承诺。
 
 ## 视觉验收与发行边界
 
@@ -167,3 +167,5 @@ P0 是瑕疵、肤质、局部匀色/明暗、三路线共用与可编辑闭环�
 代码、权重、底模、第三方依赖及数据图像分别核实许可。开源不等于商用授权；非商业条款不等于禁止一切研究或公开代码。通用 adapter 的公开、模型配置推荐、权重再分发和商业使用分别判断，不以“用户自行下载”规避条款，也不把自定义许可一概当作非商业。未经确认的模型不标为已获无限制发行/商用授权。
 
 当前已从调研推进到 **M0 的真实同输入推理对照**；独立工具不更改 0.4.8 生产入口。首轮基线收益较轻，遮挡解析已暴露并修正实际误编辑问题；后续按对照的净收益选择后端进入 M1，不能仅凭加载成功授予视觉通过。
+
+两套美化模型各完成原头部上下文与统一完整脸上下文的三图对照，已保存原始候选、限定原生回放、原生细节及失败结论。裁切改进了检测采样，尚未获得稳定明显的整体美化收益；当前默认后端没有验收。M0 的三图工程可运行性已确认，12–20 张高价值样本、独立人物/场次与已知任务校准仍需补齐，再进入默认选型与 M1 产品集成。
