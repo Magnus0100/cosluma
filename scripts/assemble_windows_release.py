@@ -142,7 +142,7 @@ def main():
     if marker not in changelog:
         raise VerificationError('Current version is missing from changelog')
     changes = changelog.split(marker, 1)[1].split('\n## ', 1)[0]
-    (output/'RELEASE_NOTES.md').write_text('# Cosplay Studio ' + version + '\n\n' +
+    (output/'RELEASE_NOTES.md').write_text('# CosLuma ' + version + '\n\n' +
         changes.split('\n', 1)[1].strip() + '\n\n' +
         '下载 Windows x64 ZIP 并完整解压，保留 `_internal`；使用说明见包内 README.md。\n'
         '同版本 source.zip 提供对应源码，SHA256SUMS.txt 提供两份下载的 SHA-256。\n'

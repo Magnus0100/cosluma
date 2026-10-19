@@ -7,11 +7,13 @@ request and preserve unrelated work already present in the checkout.
 
 ## Project in one minute
 
-Cosplay Studio is a Windows x64, Python 3.12 photo-finishing application with a
+CosLuma is a Windows x64, Python 3.12 photo-finishing application with a
 PySide6 desktop, a local HTTP backend and a CLI. Production Python modules live
 in `scripts/`; this is not a conventional `src/` package. Install the pinned
 dependencies from `scripts/requirements-desktop.txt`, not with `pip install -e .`.
 Model workers use separate registered Python environments.
+The public name is CosLuma; existing `COSPLAY_*` variables, schemas, executable
+filenames and user-data locations remain compatibility identifiers.
 
 All production routes share this flow:
 

@@ -1,6 +1,6 @@
 # 参与开发
 
-欢迎改进 Cosplay Studio 的界面、文档、图像处理和可复现验证。先阅读 [开发指南](docs/DEVELOPMENT.md) 和 [产品数据流](docs/PRODUCT_ARCHITECTURE.md)，了解原片、参考、冻结资产及人工批准的职责。
+欢迎改进 CosLuma 的界面、文档、图像处理和可复现验证。先阅读 [开发指南](docs/DEVELOPMENT.md) 和 [产品数据流](docs/PRODUCT_ARCHITECTURE.md)，了解原片、参考、冻结资产及人工批准的职责。
 
 使用编码 Agent 时，从英文 [AGENTS.md](AGENTS.md) 和 [Agent 开发指南](docs/AGENT_GUIDE.md) 开始；其中提供环境建立、代码归属、最小启动和按改动选择验证的完整入口。
 

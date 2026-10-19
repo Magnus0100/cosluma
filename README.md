@@ -1,8 +1,8 @@
-# Cosplay Studio
+# CosLuma
 
-[![CI](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![CI](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-**English:** Cosplay Studio is a Windows desktop workbench for cosplay photo finishing, with a simple photo workspace and a professional layer/workflow view. It prepares editable portrait beauty, appearance, lighting, background and effect layers. See [English overview](README.en.md).
+**English:** CosLuma is a Windows desktop workbench for cosplay photo finishing, with a simple photo workspace and a professional layer/workflow view. It prepares editable portrait beauty, appearance, lighting, background and effect layers. See [English overview](README.en.md).
 
 面向Windows的Cos后期工作台：从原片出发，完成人像美化、参考仿色、人物与背景融合及独立光效，保存可继续编辑的高清作品。默认使用简洁的“快速制作”，专业模式提供精修工具与 Cos 节点画布，两种模式共用同一工程。
 

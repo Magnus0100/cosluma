@@ -1,12 +1,12 @@
 cff-version: 1.2.0
-title: "Cosplay Studio"
+title: "CosLuma"
 version: "0.5.46"
 type: software
 authors:
   - name: "Magnus0100"
 license: "GPL-3.0-or-later"
-repository-code: "https://github.com/Magnus0100/cosplay"
-url: "https://github.com/Magnus0100/cosplay"
+repository-code: "https://github.com/Magnus0100/cosluma"
+url: "https://github.com/Magnus0100/cosluma"
 keywords:
   - cosplay
   - image processing

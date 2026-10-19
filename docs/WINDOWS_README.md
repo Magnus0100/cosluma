@@ -1,4 +1,4 @@
-# Cosplay Studio — Windows 程序包
+# CosLuma — Windows 程序包
 
 完整解压文件夹后，使用 `Start-Cosplay-Studio.cmd` 或桌面唯一快捷方式。保留 EXE 旁边的 `_internal`；默认工作区为 `%USERPROFILE%\CosplayWorkbench\workspace`。启动会尝试预热人像美化，实际加载成功后才显示完成。Qwen 配置、服务与模型加载状态分别显示；首个任务仍可能需要加载其他模型。
 

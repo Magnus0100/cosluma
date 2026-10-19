@@ -38,7 +38,7 @@ $workspace = Join-Path $env:USERPROFILE 'CosplayWorkbench\workspace'
 
 固定依赖包括PySide6、NumPy/SciPy、Pillow、tifffile、rawpy、ONNX Runtime和PyInstaller。使用明确的Python路径，无需激活虚拟环境。桌面依赖安装成功只表示界面和基础原生处理环境可用。
 
-也可双击桌面唯一的 `Cosplay Studio.lnk`。它调用安装目录自己的 `scripts/start_studio.ps1`，启动桌面下唯一的 `CosplayStudio/cosplay-workbench.exe`，先绑定内嵌后台，再在后台预热已验证的 Beauty 服务。启动器会校验 `install-manifest.json`、EXE SHA 和必需目录，并在工作区写入 `installation-health.json`。安装配置支持 `${PACKAGE_ROOT}` 解析包内 runtime/registry；外部模型根目录仍由健康回执明确列出。预热没有可用模型时不会阻止界面打开，首次任务会按需加载；缺失外部模型/runtime 会显示为 degraded，不会回退源码或旧程序。可通过 `COSPLAY_DESKTOP_EXE` 显式指定构建好的程序，通过 `COSPLAY_WORKSPACE` 指定工作区。源码与发行包共用同一生产管线，源码启动器不会自动选择仓库中的旧 `dist` 程序。
+也可通过安装时创建的桌面快捷方式启动。它调用安装目录自己的 `scripts/start_studio.ps1`，启动安装目录中的 `cosplay-workbench.exe`，先绑定内嵌后台，再在后台预热已验证的 Beauty 服务。启动器会校验 `install-manifest.json`、EXE SHA 和必需目录，并在工作区写入 `installation-health.json`。安装配置支持 `${PACKAGE_ROOT}` 解析包内 runtime/registry；外部模型根目录仍由健康回执明确列出。预热没有可用模型时不会阻止界面打开，首次任务会按需加载；缺失外部模型/runtime 会显示为 degraded，不会回退源码或旧程序。可通过 `COSPLAY_DESKTOP_EXE` 显式指定构建好的程序，通过 `COSPLAY_WORKSPACE` 指定工作区。源码与发行包共用同一生产管线，源码启动器不会自动选择仓库中的旧 `dist` 程序。
 
 启动界面的“人像美化预热完成”只表示 Beauty 返回了实际加载完成回执；已有任务占用、失败或未知回执都不能视为预热成功。Qwen 的“配置已检查”不代表服务可连接或模型已加载。每个制作请求仍检查自身 task plan，预热失败不会授权缺失能力，也不阻止检查其他可用路线。
 

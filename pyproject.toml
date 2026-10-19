@@ -1,5 +1,5 @@
 [project]
-name = "cosplay-studio"
+name = "cosluma"
 version = "0.5.46"
 description = "Windows desktop workbench for source-faithful cosplay photo finishing."
 readme = "README.md"
@@ -8,10 +8,10 @@ license = { file = "LICENSE" }
 keywords = ["cosplay", "photo-editing", "image-processing", "windows"]
 
 [project.urls]
-Homepage = "https://github.com/Magnus0100/cosplay"
-Repository = "https://github.com/Magnus0100/cosplay"
-Issues = "https://github.com/Magnus0100/cosplay/issues"
-Documentation = "https://github.com/Magnus0100/cosplay/tree/master/docs"
+Homepage = "https://github.com/Magnus0100/cosluma"
+Repository = "https://github.com/Magnus0100/cosluma"
+Issues = "https://github.com/Magnus0100/cosluma/issues"
+Documentation = "https://github.com/Magnus0100/cosluma/tree/master/docs"
 
 # Tool configuration. Install desktop dependencies from scripts/requirements-desktop.txt.
 [tool.ruff]

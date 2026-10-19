@@ -6,6 +6,11 @@ Use [README.en.md](../README.en.md) for the product overview. Most detailed
 design documents currently use Chinese; the module and command names below
 are the actual English identifiers used by the implementation.
 
+CosLuma is the public project name. Existing `COSPLAY_*` environment variables,
+`cosplay_*` schemas, `cosplay-workbench` executable/launcher filenames and
+`CosplayWorkbench` user-data locations are compatibility identifiers. Use the
+commands and paths below literally; a branding update does not migrate projects.
+
 For a first coding session, give the agent this request and replace the final
 line with the intended change:
 

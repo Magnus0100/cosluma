@@ -1037,11 +1037,11 @@ if QT_AVAILABLE:
         def build(self):
             from workbench_theme import apply_theme
             apply_theme(QApplication.instance())
-            self.setWindowTitle("Cosplay Studio · 二次元摄影后期"); self.resize(1480, 960)
+            self.setWindowTitle("CosLuma · 二次元摄影后期"); self.resize(1480, 960)
             self.project_images = {}; self.project_proxies = {}; self.project_dimensions = {}
             root = QWidget(); self.setCentralWidget(root); outer = QVBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
             header = QWidget(); header.setObjectName("brandBar"); bar = QHBoxLayout(header); bar.setContentsMargins(22, 12, 18, 12)
-            brand = QLabel("COSPLAY STUDIO"); brand.setObjectName("brandName"); bar.addWidget(brand)
+            brand = QLabel("COSLUMA"); brand.setObjectName("brandName"); bar.addWidget(brand)
             self.project_label = QLabel(self.root_path.name); self.project_label.setObjectName("projectLabel"); bar.addWidget(self.project_label); bar.addStretch()
             self.operation_state = QLabel("就绪"); self.operation_state.setObjectName("statusPill"); self.operation_state.setMaximumWidth(420); self.operation_state.setWordWrap(True); bar.addWidget(self.operation_state)
             self.mode_button = QPushButton('专业模式'); self.mode_button.setCheckable(True)

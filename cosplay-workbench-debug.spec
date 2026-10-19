@@ -18,11 +18,11 @@ _version_info = VSVersionInfo(
     ffi=FixedFileInfo(filevers=_version_numbers, prodvers=_version_numbers,
         mask=0x3f, flags=0, OS=0x40004, fileType=1, subtype=0, date=(0, 0)),
     kids=[StringFileInfo([StringTable('040904B0', [
-        StringStruct('FileDescription', 'Cosplay Workbench Debug'),
+        StringStruct('FileDescription', 'CosLuma Debug'),
         StringStruct('FileVersion', '.'.join(map(str, _version_numbers))),
         StringStruct('InternalName', 'cosplay-workbench-debug'),
         StringStruct('OriginalFilename', 'cosplay-workbench-debug.exe'),
-        StringStruct('ProductName', 'Cosplay Workbench'),
+        StringStruct('ProductName', 'CosLuma'),
         StringStruct('ProductVersion', _software_version),
     ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])])
 

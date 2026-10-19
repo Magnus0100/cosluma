@@ -1,8 +1,8 @@
-# Cosplay Studio
+# CosLuma
 
-[![CI](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![CI](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-Cosplay Studio is a Windows desktop workbench for source-faithful cosplay photo finishing. It keeps the source subject's structure and texture while preparing editable appearance, lighting, background and effect layers. The project includes a desktop UI, CLI and local HTTP backend.
+CosLuma is a Windows desktop workbench for source-faithful cosplay photo finishing. It keeps the source subject's structure and texture while preparing editable appearance, lighting, background and effect layers. The project includes a desktop UI, CLI and local HTTP backend.
 
 The current source version is **0.5.46**. Windows EXE packages are built locally; publication to GitHub is a separate release step.
 
