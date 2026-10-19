@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 import automatic_native_retouch as automatic
 import native_retouch_producer as producer
@@ -17,6 +18,62 @@ from native_retouch_producer_smoke import fixture, Loopback
 from native_source_baseline import open_source_for_run, source_for_plan, retouch_identity
 from raw_support import open_linear
 import vision_transport
+
+
+def check_fresh_beauty(root,source,checks):
+    """A fresh Beauty lock precedes baseline production, never its validation."""
+    from display_transform import source_transform_for_precision
+    from portrait_beauty_layer import freeze_prepared,apply_for_run
+    from raw_support import storage_info
+    from native_source_baseline import prepare_source_only
+    source={**source,**storage_info(Path(source['path']))}
+    source_linear,precision=open_linear(Path(source['path']))
+    directory=root/'beauty-fresh-fixture';directory.mkdir()
+    image=directory/'model.png';Image.new('RGB',(12,12),(180,140,120)).save(image)
+    weights=directory/'weights.npy';np.save(weights,np.ones((12,12),np.float32))
+    prepared={'schema':'beautygrpo_layer_prepare.v1','working_domain':'display_linear_sRGB',
+        'source_path':source['path'],'source_sha256':source['sha256'],
+        'native_size':source['oriented_size'],'source_precision':precision,
+        'source_display':source_transform_for_precision(precision['source_precision']),
+        'model_identity':{'fixture':True},'faces':[{'id':'face-01','native_box':[10,10,22,22],
+            'generated_native_roi':str(image),'generated_native_roi_sha256':automatic.sha(image),
+            'composition_weight':str(weights),'composition_weight_sha256':automatic.sha(weights)}]}
+    layer_path,layer=freeze_prepared(prepared,directory/'frozen')
+    fresh={'run_id':'fresh-beauty','source':source,'options':{'appearance_revision':{
+        'portrait_beauty':{'result':str(layer_path),'strength':1.,'disabled_faces':[]}}}}
+    original=copy.deepcopy(fresh)
+    with patch.object(subprocess_fixture(),'Popen',side_effect=AssertionError('Beauty must not start upstream work')):
+        result=automatic.prepare_once(root,fresh)
+    assert result['status']=='source_locked_by_portrait_beauty' and fresh==original
+    assert result['run']['automatic_native_retouch']['generation_submissions']==0
+    assert result['run']['options']==original['options'] and not (root/'outputs/runs/fresh-beauty').exists()
+    checks.append('fresh_frozen_beauty_lock_requires_no_baseline_process_or_placeholder')
+    def rejected(run):
+        try:automatic.prepare_once(root,run)
+        except ValueError:return
+        raise AssertionError('invalid frozen Beauty source lock accepted')
+    for key,value in [('sha256','unrelated-source'),('decode_version','old-decoder'),('oriented_size',[385,384])]:
+        bad=copy.deepcopy(fresh);bad['source'][key]=value;rejected(bad)
+    for control in [{'strength':2.},{'disabled_faces':['other-face']},{'unknown':True}]:
+        bad=copy.deepcopy(fresh);bad['options']['appearance_revision']['portrait_beauty'].update(control);rejected(bad)
+    for change in ({'source_precision':{**precision,'decode_version':'old-decoder'}},
+                   {'source_precision':{**precision,'source_precision':'raw16_linear'}},
+                   {'source_display':{**layer['source_display'],'application_scope':'after_colour'}},
+                   {'native_source_retouch':{'delta_sha256':'unrelated-delta'}}):
+        bad_layer=copy.deepcopy(layer);bad_layer.update(change)
+        target=directory/('invalid-'+str(len(list(directory.glob('invalid-*.json'))))+'.json')
+        automatic.write(target,bad_layer)
+        bad=copy.deepcopy(fresh);bad['options']['appearance_revision']['portrait_beauty']['result']=str(target);rejected(bad)
+    checks.append('fresh_beauty_rejects_wrong_source_decoder_canvas_controls_transform_and_retouch')
+    displayed,baseline=prepare_source_only(source_linear,fresh,precision)
+    ready=copy.deepcopy(fresh);ready['options']['source_only_plan']=baseline
+    assert automatic.prepare_once(root,ready)['status']=='source_locked_by_portrait_beauty'
+    rendered,receipt=apply_for_run(displayed,ready)
+    assert receipt['applied'] and np.any(rendered!=displayed)
+    bad=copy.deepcopy(ready);bad['options']['source_only_plan']['decode_version']='old-decoder';rejected(bad)
+    bad=copy.deepcopy(fresh);bad['options']['appearance_revision']['design_reconstruction_plan']={};rejected(bad)
+    bad=copy.deepcopy(ready);bad['options']['source_only_plan']['source_display_applied_once']=False;rejected(bad)
+    checks.append('actual_baseline_producer_enables_strict_beauty_replay_and_rejects_invalid_existing_plan')
 
 
 def main():
@@ -27,6 +84,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='automatic-retouch-') as name:
             root=Path(name);manifest,_=fixture(root/'fixture')
             run={'run_id':'parent','source':{'path':manifest['source']['path'],'sha256':manifest['source']['sha256']},'options':{}}
+            check_fresh_beauty(root,run['source'],checks)
             output=root/'outputs/runs/parent/automatic-native-retouch';output.mkdir(parents=True)
             automatic.write(output/'input.json',run)
             connection_arguments=[]

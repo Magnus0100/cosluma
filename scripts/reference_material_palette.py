@@ -14,7 +14,9 @@ import json
 import numpy as np
 from scipy.ndimage import binary_erosion
 
-from reference_colour_fit import REGIONS, apply, region_weights
+from reference_colour_fit import (REGIONS, apply, region_weights,
+                                  _eligible_patch_grid, _patch_batches, _patch_medians,
+                                  _resolve_lab_observation, LabObservation)
 from colour_space import to_lab, from_lab
 
 
@@ -58,37 +60,52 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def _baseline(source, labels, parameters, protection):
+def _baseline(source, labels, parameters, protection, *, source_observation=None):
     # Do not recursively fit/replay a palette being replaced by this producer.
     parameters = {k: v for k, v in parameters.items()
                   if k not in ('material_palette', 'automatic_material_palette')}
-    weights = region_weights(labels, protection, parameters, source_values=source)
-    chroma = region_weights(labels, protection, parameters, chroma=True, source_values=source)
+    weights = region_weights(labels, protection, parameters, source_values=source,
+                             source_observation=source_observation)
+    chroma = region_weights(labels, protection, parameters, chroma=True, source_values=source,
+                            source_observation=source_observation)
     return apply(source, weights, parameters, chroma_weights=chroma,
-                 canvas_size=(source.shape[1], source.shape[0]))
+                 canvas_size=(source.shape[1], source.shape[0]),
+                 values_observation=source_observation)
 
 
-def _samples(rgb, lab, labels, alpha, protection, ids, *, family_floor=None):
+def _photometric_eligibility(rgb, lab, alpha, protection):
+    """Compute the image-wide observation gate once before material sampling."""
+    return ((alpha >= .995) & (protection < .05) & (lab[..., 0] > .10)
+            & (lab[..., 0] < .96) & (rgb.max(-1) < .985))
+
+
+def _samples(rgb, lab, labels, alpha, protection, ids, *, family_floor=None,
+             _photometric_eligible=None):
     """Uniform safe cells; split whole spatial blocks, never colour ranks."""
     cfg = SETTINGS
     selected = binary_erosion(np.isin(labels, ids), iterations=2)
-    selected &= (alpha >= .995) & (protection < .05)
-    selected &= (lab[..., 0] > .10) & (lab[..., 0] < .96) & (rgb.max(-1) < .985)
+    if _photometric_eligible is None:
+        _photometric_eligible = _photometric_eligibility(rgb, lab, alpha, protection)
+    elif (_photometric_eligible.shape != labels.shape or _photometric_eligible.dtype != np.dtype(bool)):
+        raise ValueError('Material observation gate must be a boolean source-canvas plane')
+    selected &= _photometric_eligible
     if family_floor is not None:
         selected &= lab[..., 0] >= family_floor
-    step = cfg['cell_size']; rows = []; locations = []; folds = []
+    step = cfg['cell_size']
     ys, xs = np.nonzero(selected)
     if not len(xs):
         return np.empty((0, 3)), np.empty((0, 2), int), np.empty(0, int)
-    for y in range(int(ys.min()), int(ys.max())+1, step):
-        for x in range(int(xs.min()), int(xs.max())+1, step):
-            mask = selected[y:y+step, x:x+step]
-            if mask.shape != (step, step) or mask.mean() < .75:
-                continue
-            rows.append(np.median(lab[y:y+step, x:x+step][mask], axis=0))
-            locations.append([x+step//2, y+step//2])
-            folds.append(((x//cfg['spatial_split_block'])+2*(y//cfg['spatial_split_block'])) % 3)
-    return np.asarray(rows, float).reshape(-1, 3), np.asarray(locations, int).reshape(-1, 2), np.asarray(folds, int)
+    # Keep the original cell origin, row-major order and compact median
+    # arithmetic. Batch only eligible cells; Python per-cell median dispatch
+    # previously consumed most of palette fitting on the analysis canvas.
+    tops, lefts, masks = _eligible_patch_grid(selected,
+        (int(ys.min()), int(ys.max())+1, int(xs.min()), int(xs.max())+1), step, .75)
+    rows = [_patch_medians(values, valid) for _, values, valid
+            in _patch_batches(lab, tops, lefts, masks)]
+    values = np.concatenate(rows).astype(float) if rows else np.empty((0, 3))
+    locations = np.stack((lefts+step//2, tops+step//2), axis=-1).astype(int)
+    folds = ((lefts//cfg['spatial_split_block'])+2*(tops//cfg['spatial_split_block'])) % 3
+    return values, locations, folds.astype(int)
 
 
 def _normalization(rows):
@@ -284,7 +301,8 @@ def _validation(source_rows, baseline_rows, reference_rows, model):
 
 
 def fit_palette(source_rgb, reference_rgb, source_labels, reference_labels, source_alpha, parameters,
-                *, source_protection=None, reference_protection=None, baseline_rgb=None):
+                *, source_protection=None, reference_protection=None, baseline_rgb=None,
+                source_observation=None, reference_observation=None):
     """Fit one global-config, colour-only, source-driven palette after current T.
 
     Source and reference may have different sizes or poses. Optional automatic
@@ -304,17 +322,30 @@ def fit_palette(source_rgb, reference_rgb, source_labels, reference_labels, sour
         json.dumps(parameters, allow_nan=False)
     except (TypeError, ValueError) as error:
         raise ValueError('T parameters must be finite JSON-safe evidence') from error
-    baseline = _baseline(source, source_labels, parameters, sp) if baseline_rgb is None else _rgb(baseline_rgb, 'T baseline')
+    if source_observation is not None and not isinstance(source_observation, LabObservation):
+        raise ValueError('source_observation must be a LabObservation')
+    if reference_observation is not None and not isinstance(reference_observation, LabObservation):
+        raise ValueError('reference_observation must be a LabObservation')
+    source_lab = _resolve_lab_observation(source, source_observation, 'source_observation')
+    reference_lab = _resolve_lab_observation(reference, reference_observation, 'reference_observation')
+    baseline = (_baseline(source, source_labels, parameters, sp,
+                          source_observation=source_observation)
+                if baseline_rgb is None else _rgb(baseline_rgb, 'T baseline'))
     if baseline.shape != source.shape:
         raise ValueError('T baseline must use the source canvas')
-    sl, rl, bl = to_lab(source), to_lab(reference), to_lab(baseline)
+    sl, rl, bl = source_lab, reference_lab, to_lab(baseline)
+    reference_coverage = np.ones(reference.shape[:2])
+    source_eligible = _photometric_eligibility(source, sl, alpha, sp)
+    reference_eligible = _photometric_eligibility(reference, rl, reference_coverage, rp)
     # Gloves and exposed skin share semantic hand labels. Both images derive
     # their own exposed-skin floor from observed face interiors, never from the
     # closest target colour or a photo-specific rectangle.
     family_floors = []
-    for rgb, lab, labels, coverage, protection in ((source, sl, source_labels, alpha, sp),
-            (reference, rl, reference_labels, np.ones(reference.shape[:2]), rp)):
-        skin, _, _ = _samples(rgb, lab, labels, coverage, protection, REGIONS['face'])
+    for rgb, lab, labels, coverage, protection, eligible in (
+            (source, sl, source_labels, alpha, sp, source_eligible),
+            (reference, rl, reference_labels, reference_coverage, rp, reference_eligible)):
+        skin, _, _ = _samples(rgb, lab, labels, coverage, protection, REGIONS['face'],
+                             _photometric_eligible=eligible)
         family_floors.append(max(.15, .65*float(np.quantile(skin[:, 0], .25))) if len(skin) >= SETTINGS['minimum_cells'] else None)
     result = {'schema': SCHEMA, 'working_domain': 'display_linear_sRGB', 'region_order': list(REGIONS),
         'settings': SETTINGS.copy(), 'regions': {}, 'changes_lightness': False,
@@ -328,16 +359,19 @@ def fit_palette(source_rgb, reference_rgb, source_labels, reference_labels, sour
             result['regions'][name] = {'status': 'identity', 'reason': 'no_auto_skin_evidence_to_separate_glove'}
             continue
         floor_s, floor_r = family_floors if name.endswith('_hand') else (None, None)
-        sr, xy, sf = _samples(source, sl, source_labels, alpha, sp, ids, family_floor=floor_s)
-        rr, _, rf = _samples(reference, rl, reference_labels, np.ones(reference.shape[:2]), rp, ids, family_floor=floor_r)
+        sr, xy, sf = _samples(source, sl, source_labels, alpha, sp, ids, family_floor=floor_s,
+                             _photometric_eligible=source_eligible)
+        rr, _, rf = _samples(reference, rl, reference_labels, reference_coverage, rp, ids,
+                            family_floor=floor_r, _photometric_eligible=reference_eligible)
         record = {'source_cells': len(sr), 'reference_cells': len(rr), 'paired_anchor_count': 0,
                   'spatial_correspondence_allowed': False, 'nonzero_colour_residual': False}
         if min(len(sr), len(rr)) < SETTINGS['minimum_cells']:
             result['regions'][name] = {**record, 'status': 'identity', 'reason': 'insufficient_independent_safe_material_cells'}
             continue
         half = SETTINGS['cell_size']//2
-        baseline_rows = np.asarray([np.median(bl[y-half:y+half, x-half:x+half].reshape(-1, 3), axis=0)
-                                    for x, y in xy], float)
+        baseline_masks = np.ones((len(xy), 2*half, 2*half), bool)
+        baseline_rows = np.concatenate([_patch_medians(values, valid) for _, values, valid
+            in _patch_batches(bl, xy[:, 1]-half, xy[:, 0]-half, baseline_masks)]).astype(float)
         model = _fit_model(sr, baseline_rows, rr)
         if model is None or not any(model['accepted_groups']):
             result['regions'][name] = {**record, 'status': 'identity', 'reason': 'no_supported_transport_groups'}
@@ -398,32 +432,85 @@ def validate_palette(palette):
     return palette
 
 
-def apply_palette(values, palette, weights, *, source_values, strength=1.):
+def apply_palette(values, palette, weights, *, source_values, strength=1., _trusted=False,
+                  source_observation=None, values_observation=None):
     """Add colour-only residual to T; native replay depends only on source RGB.
 
     Crops have no origin/canvas dependency. Caller crops immutable source RGB
     and frozen source-coordinate region weights with the same pixel box.
     """
     untouched_values = np.asarray(values)
-    values = _rgb(values, 'T values')
+    values = _rgb(values, 'T values') if not _trusted else np.asarray(values, np.float32)
     source = np.asarray(source_values)
-    if (source.ndim != 3 or source.shape[-1] != 3 or not source.size
-            or not np.issubdtype(source.dtype, np.number) or not np.isfinite(source).all()):
-        raise ValueError('Immutable source colours must be finite RGB')
+    if source_observation is not None:
+        if not isinstance(source_observation, LabObservation):
+            raise ValueError('source_observation must be a LabObservation')
+        source_lab_full = _resolve_lab_observation(source, source_observation, 'source_observation')
+    else:
+        source_lab_full = None
+    if values_observation is not None:
+        if not isinstance(values_observation, LabObservation):
+            raise ValueError('values_observation must be a LabObservation')
+        values_lab_full = _resolve_lab_observation(values, values_observation, 'values_observation')
+    else:
+        values_lab_full = None
+    if not _trusted:
+        if (source.ndim != 3 or source.shape[-1] != 3 or not source.size
+                or not np.issubdtype(source.dtype, np.number) or not np.isfinite(source).all()):
+            raise ValueError('Immutable source colours must be finite RGB')
     source_domain_support = ((source.min(-1) >= 0) & (source.max(-1) <= 1)).reshape(-1)
-    validate_palette(palette)
+    if not _trusted:
+        validate_palette(palette)
     weights = np.asarray(weights)
-    if (source.shape != values.shape or weights.shape != (*values.shape[:2], len(REGIONS))
-            or not np.isfinite(weights).all() or weights.min() < 0 or weights.max() > 1+1e-6
-            or np.any(weights.sum(-1) > 1+1e-6) or not np.isfinite(strength) or not 0 <= strength <= 1):
-        raise ValueError('Invalid palette replay source/weights/strength')
+    if not _trusted:
+        if (source.shape != values.shape or weights.shape != (*values.shape[:2], len(REGIONS))
+                or not np.isfinite(weights).all() or weights.min() < 0 or weights.max() > 1+1e-6
+                or np.any(weights.sum(-1) > 1+1e-6) or not np.isfinite(strength) or not 0 <= strength <= 1):
+            raise ValueError('Invalid palette replay source/weights/strength')
     active = [name for name, row in palette['regions'].items() if row['status'] == 'supported']
     if not active or strength == 0:
         return untouched_values.copy()
+    supported = source_domain_support.reshape(values.shape[:2])
+    eligible = np.zeros(values.shape[:2], bool)
+    for name in active:
+        eligible |= (weights[..., list(REGIONS).index(name)] > 1e-8) & supported
+    rows = np.flatnonzero(eligible.any(axis=1))
+    columns = np.flatnonzero(eligible.any(axis=0))
+    # Keep all saved/input checks above even when no material can add a dose.
+    # Existing nonzero-strength replay returns float32, including zero dose.
+    result_canvas = values.copy()
+    if not len(rows):
+        return result_canvas
+    top, left, right = int(rows[0]), int(columns[0]), int(columns[-1])+1
+    # Preserve the ordinary multi-column float32 matrix kernel for a thin ROI.
+    if right-left == 1 and values.shape[1] > 1:
+        if right < values.shape[1]:
+            right += 1
+        else:
+            left -= 1
+    region = np.s_[top:int(rows[-1])+1, left:right]
+    original_source_count = int(source_domain_support.sum())
+    values, source, weights = values[region], source[region], weights[region]
+    source_domain_support = supported[region].reshape(-1)
+    source_region_lab = source_lab_full[region] if source_lab_full is not None else None
+    values_region_lab = values_lab_full[region] if values_lab_full is not None else None
+    from native_cuda_fields import eligible, palette as cuda_palette
+    if eligible(values.shape):
+        models = [(list(REGIONS).index(name), palette['regions'][name]) for name in active]
+        result_canvas[region] = cuda_palette(values, source, weights, source_domain_support,
+            models, strength, SETTINGS)
+        return result_canvas
     source_lab = np.zeros(values.shape, np.float32)
-    source_lab.reshape(-1, 3)[source_domain_support] = to_lab(
-        source.reshape(-1, 3)[source_domain_support].astype(np.float32))
-    baseline_lab = to_lab(values)
+    source_rgb = source.reshape(-1, 3)[source_domain_support].astype(np.float32)
+    # A single valid source pixel must retain the original packed matrix
+    # kernel when the uncropped tile had several. The duplicate has no dose.
+    if len(source_rgb) == 1 and original_source_count > 1:
+        source_rgb = np.repeat(source_rgb, 2, axis=0)
+    if source_region_lab is not None:
+        source_lab.reshape(-1, 3)[source_domain_support] = source_region_lab.reshape(-1, 3)[source_domain_support]
+    else:
+        source_lab.reshape(-1, 3)[source_domain_support] = to_lab(source_rgb)[:int(source_domain_support.sum())]
+    baseline_lab = values_region_lab if values_region_lab is not None else to_lab(values)
     flat_source = source_lab.reshape(-1, 3).astype(float)
     delta = np.zeros((len(flat_source), 2), float)
     flat_weights = weights.reshape(-1, len(REGIONS))
@@ -438,6 +525,8 @@ def apply_palette(values, palette, weights, *, source_values, strength=1.):
             shift *= dose[:, None]
         delta[selected] += shift*mask[selected, None]
     delta = _limited(delta*strength, SETTINGS['maximum_residual_chroma'])
+    if np.all(np.linalg.norm(delta, axis=1) <= 1e-10):
+        return result_canvas
     base_shift = baseline_lab.reshape(-1, 3)[:, 1:]-flat_source[:, 1:]
     combined = base_shift+delta
     allowance = np.maximum(SETTINGS['maximum_total_chroma'], np.linalg.norm(base_shift, axis=1))
@@ -463,4 +552,5 @@ def apply_palette(values, palette, weights, *, source_values, strength=1.):
     result = np.clip(rgb, 0, 1).astype(np.float32)
     inactive = np.linalg.norm(delta, axis=1).reshape(values.shape[:2]) <= 1e-10
     result[inactive] = values[inactive]
-    return result
+    result_canvas[region] = result
+    return result_canvas

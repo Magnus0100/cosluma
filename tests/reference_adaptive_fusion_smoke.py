@@ -2,10 +2,44 @@
 from __future__ import annotations
 import json,time
 import numpy as np
-from reference_adaptive_fusion import CONFIG,solve_field
+from reference_adaptive_fusion import CONFIG,solve_field,_upsample
+
+
+def reference_upsample(field, small_labels, small_lab, labels, lab, scale):
+    """Frozen four-corner sampler for ownership/edge and gather regression."""
+    h,w=labels.shape;sh,sw=small_labels.shape
+    result=np.zeros((h,w,field.shape[-1]),np.float32)
+    xs=np.linspace(0,sw-1,w,dtype=np.float32);x0=np.floor(xs).astype(int);x1=np.minimum(x0+1,sw-1);fx=xs-x0
+    ys=np.linspace(0,sh-1,h,dtype=np.float32)
+    for top in range(0,h,128):
+        end=min(h,top+128);yy=ys[top:end];y0=np.floor(yy).astype(int);y1=np.minimum(y0+1,sh-1);fy=yy-y0
+        denominator=np.zeros((end-top,w),np.float32);numerator=np.zeros((end-top,w,field.shape[-1]),np.float32)
+        for iy,wy in ((y0,1-fy),(y1,fy)):
+            for ix,wx in ((x0,1-fx),(x1,fx)):
+                grid=(iy[:,None],ix[None,:])
+                distance=np.linalg.norm(lab[top:end]-small_lab[grid],axis=-1)
+                weight=(wy[:,None]*wx[None,:])*(labels[top:end]==small_labels[grid])
+                weight*=np.exp(-.5*(distance/scale)**2)*(distance<=CONFIG['edge_cutoff_sigmas']*scale)
+                numerator+=field[grid]*weight[...,None];denominator+=weight
+        result[top:end]=numerator/np.maximum(denominator[...,None],1e-12)
+    return result
 
 
 def main():
+    rng=np.random.default_rng(671)
+    guide=rng.uniform([.25,-.02,-.02],[.65,.02,.02],(131,197,3)).astype(np.float32)
+    owners=np.ones((131,197),np.int32);owners[:,99:]=2
+    field=rng.uniform(-.03,.03,(131,197,3)).astype(np.float32)
+    fine_labels=np.repeat(np.repeat(owners,2,0),2,1)
+    fine_lab=np.repeat(np.repeat(guide,2,0),2,1)
+    fine_lab[:,199:,0]=.99
+    for channels in (1,2,3):
+        # Reverse/strided storage also exercises row-major gathers that must
+        # preserve the original two-index lookup and channel accumulation.
+        args=(field[:,::-1,:channels],owners[:,::-1],guide[:,::-1],fine_labels[:,::-1],fine_lab[:,::-1],.05)
+        actual=_upsample(*args);expected=reference_upsample(*args)
+        assert np.array_equal(actual.view(np.uint32),expected.view(np.uint32))
+    assert not _upsample(field,owners,guide,fine_labels,fine_lab,.05)[:,199:].any()
     h,w=61,73
     lab=np.full((h,w,3),[.5,.02,-.01],np.float32)
     labels=np.ones((h,w),np.uint8);c=np.ones((h,w),np.float32)

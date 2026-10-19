@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import tifffile
 from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
@@ -65,6 +66,17 @@ def resolve_observation(root, run, plan):
         item=run[role]; path=Path(item['path']); path=path if path.is_absolute() else Path(root)/path
         if sha(path) != item['sha256']:
             raise ValueError('Scene input bytes changed: '+role)
+    if assets.get('background_observation'):
+        candidate=read(bound(assets['background_observation']))
+        if candidate.get('schema')=='source_scene_enhancement.v1':
+            from source_scene_enhancement import validate_observation
+            receipt=validate_observation(plan,run)
+            return {'origin':'source_native_scene','background':copy.deepcopy(receipt['output_background']),
+                    'validity':copy.deepcopy(receipt['validity']),
+                    'source_scene_receipt':copy.deepcopy(assets['background_observation']),
+                    'source_environment':copy.deepcopy(receipt['source_environment']),
+                    'origin_map':copy.deepcopy(receipt['origin_map']),
+                    'regional_refinement':copy.deepcopy(receipt.get('regional_refinement'))}
     explicit = bool(assets.get('compact_observation') and assets.get('compact_validity'))
     cached=plan; cache_path=None
     inherited={}; inherited_receipt={}
@@ -246,6 +258,15 @@ def audit_scene_stages(root, run, output, *, diagnosis=None):
         if not bg.get('enabled') or float(bg.get('strength', 1)) != 1:
             raise ValueError('Scene repair requires a complete enabled background endpoint')
         observation = resolve_observation(root, run, plan)
+        if observation.get('origin')=='source_native_scene':
+            # Intentional source-native enhancement is not SR observation drift.
+            # Never backproject it toward a low-resolution generated reference.
+            report.update(status='audited_no_repair',reason='source_native_scene_has_no_SR_ancestry',
+                input_background=copy.deepcopy(bg['assets']['background']),
+                validity=copy.deepcopy(bg['assets']['validity']),observation=observation,
+                qualification_scope='source_native_assets_and_regional_receipt; visual_review_required')
+            path=output/'scene-stage-audit.json';write(path,report)
+            return {**report,'receipt_asset':file_record(path)}
         clean_preservation=audit_clean_preservation(root,run,plan,observation)
         current, validity = array(bg['assets']['background']), array(bg['assets']['validity'])
         weight, support = eligibility(plan, observation, arrays=(current, validity))
@@ -264,10 +285,10 @@ def audit_scene_stages(root, run, output, *, diagnosis=None):
             qualification_scope='SR_data_consistency_only; no_smoke_or_physical_light_quality_claim')
         final_path = Path(run.get('artifacts', {}).get('render_scene_master', ''))
         if final_path.is_file():
-            final = cv2.imread(str(final_path), cv2.IMREAD_UNCHANGED)
+            final = tifffile.imread(final_path)
             if final is None or final.dtype != np.float32 or final.shape != current.shape:
                 raise ValueError('Final scene evidence is not the actual native float32 master')
-            final = cv2.resize(final[..., ::-1], size, interpolation=cv2.INTER_AREA)
+            final = cv2.resize(final, size, interpolation=cv2.INTER_AREA)
             report['final_background_consumption'] = metrics(down, final, weight)
             report['final_scene'] = file_record(final_path)
         if diagnosis is not None:

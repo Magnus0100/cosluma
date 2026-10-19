@@ -1,7 +1,6 @@
 """Run small real T/B/S preparations with optional comparison evidence absent."""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -10,7 +9,6 @@ import tempfile
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
 
 import evaluate_reference_colour as evaluate
 import reference_colour_blend as blend
@@ -73,35 +71,33 @@ def main(scenario='clothing'):
               'protected_regions':[],'identity':'no-face-fixture'}
         analysis={'semantic_result':{'labels_path':str(semantic_path)},'analysis_directory':str(root)}
         reference_analysis={'semantic_result':{'labels_path':str(reference_semantic_path)},'analysis_directory':str(root)}
-        # Directly prove nonempty comparison crops retain the captured source,
-        # rather than executing an absent/incompatible old matching layer.
-        source_crop=Image.new('RGB',(12,15),(31,52,73))
-        crops,descriptor=evaluate.comparison_crops(plan,run,{'arms':(0,0,12,15)},native,{'arms':source_crop})
-        assert descriptor['kind']=='source_display_appearance'
-        assert descriptor['label']=='Original appearance baseline'
-        assert crops['arms'].tobytes()==source_crop.tobytes()
-        incompatible=copy.deepcopy(plan)
-        incompatible['layers'].append({'kind':'source_reference_colour_match','params':{}})
-        try:
-            evaluate.comparison_crops(incompatible,run,{'arms':(0,0,12,15)},native,{'arms':source_crop})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('Retired matching layer entered current evaluation')
-        assert evaluate.optional_review_boxes({},native)=={}
-        assert evaluate.optional_review_boxes({'native_crop_boxes':{'face':[10,10,10,20],'arms':[-2,1,22,25]}},native)=={'arms':(0,1,22,25)}
+        incompatible=json.loads(json.dumps(run))
+        incompatible['options']['appearance_revision']['design_reconstruction_plan']['layers'].append(
+            {'kind':'source_reference_colour_match','params':{}})
+        incompatible_path=root/'retired-run.json'
+        incompatible_path.write_text(json.dumps(incompatible),encoding='utf8')
+        with patch.object(sys,'argv',['evaluate','--run',str(incompatible_path),'--output',str(output)]):
+            try:
+                evaluate.main()
+            except ValueError as error:
+                assert 'Retired colour matching' in str(error)
+            else:
+                raise AssertionError('Retired matching layer entered current evaluation')
         # Only expensive observation/decoding is substituted. The real fitting,
         # blending, scene field production, hashes, receipts and native TIFF IO
         # execute on a 96x128 clothing fixture.
         with patch.object(evaluate,'prepare_local_appearance',side_effect=[analysis,reference_analysis]), \
-             patch.object(evaluate,'prepare_face_protection',return_value=face), \
+             patch.object(evaluate,'prepare_face_protection_pair',return_value=(face,face)), \
              patch.object(raw_support,'open_linear',side_effect=lambda path:(values.copy(),{
                  'source_precision':'raster8_srgb','decode_version':raw_support.RGB_DECODE_VERSION})), \
              patch.object(sys,'argv',['evaluate','--run',str(manifest),'--output',str(output)]):
             evaluate.main()
         validation=json.loads((output/'validation.json').read_text('utf8'))
         assert validation['accepted_anchor_count']>=3 if scenario == 'clothing' else validation['accepted_anchor_count']==0
-        assert validation['comparison_baseline']['kind']=='source_display_appearance'
+        assert validation['schema']=='reference_colour_evaluation.v3'
+        assert validation['scope']=='proxy_parameter_diagnostics'
+        assert validation['native_render_executed'] is False
+        assert not list(output.glob('native-*.png'))
         assert 'face' not in validation['native_crop_boxes']
         assert validation['zero_strength_exact'] and validation['finite_and_bounded']
         parameters=json.loads((output/'parameters.json').read_text('utf8'))
@@ -136,7 +132,7 @@ def main(scenario='clothing'):
         local_receipt.write_text(json.dumps(fixture_receipt),encoding='utf8')
         observed={'receipt':fixture_receipt,'receipt_path':str(local_receipt),'asset':fixture_receipt['asset']}
         with patch.object(local_photo_analysis,'prepare_local_appearance',side_effect=[analysis,reference_analysis]), \
-             patch.object(local_face_protection,'prepare_face_protection',return_value=face), \
+             patch.object(local_face_protection,'prepare_face_protection_pair',return_value=(face,face)), \
              patch.object(reference_local_correspondence,'prepare_local_correspondence',return_value=observed), \
              patch.object(reference_local_correspondence,'local_correspondence_identity',return_value=fixture_identity), \
              patch.object(raw_support,'open_linear',side_effect=lambda path:(values.copy(),{
@@ -163,13 +159,14 @@ def main(scenario='clothing'):
             else:
                 assert parameters['fallback']['mode']=='identity_statistical' and not parameters['operators']
         assert not (output/'fusion-colour-review.jpg').exists()
+        assert (output/'fusion-colour-proxy-review.jpg').is_file()
         assert fit_bytes==(output/'parameters.json').read_bytes()
         colour_hash=digest(colour_path)
         master=output/'appearance-composite.tif'
         with np.load(output/'source-weights.npz',allow_pickle=False) as prepared:
             matched=evaluate.apply(values,prepared['values'],parameters,canvas_size=native,
                                    chroma_weights=prepared['chroma_values'])
-        baseline=blend.apply_colour_layer(matched,colour_field)
+        baseline=blend.fuse_reference_colour(matched,colour_field,source_values=values)
         raw_support.save_render_master(baseline,master,display_transform={'method':'clip_sdr'})
         baseline_receipt={'output_sha256':digest(master),'size':list(native),
             'parameters_sha256':digest(output/'parameters.json'),
@@ -181,8 +178,17 @@ def main(scenario='clothing'):
              patch.object(reference_local_correspondence,'local_correspondence_identity',return_value=fixture_identity), \
              patch.object(sys,'argv',['balance','--run',str(manifest),'--match-dir',str(output),'--warm-colour']):
             balance.main()
-        field,receipt=balance.validate_scene_layer(output/'scene-balance-layer.json',parameters,
-            colour_path,plan,native,native)
+        assert (output/'scene-balance-proxy-review.jpg').is_file()
+        assert not list(output.glob('scene-balance-native-*.png'))
+        with patch.object(balance.np,'load',wraps=np.load) as scene_load:
+            field,receipt,donor_baseline=balance.validate_scene_layer(
+                output/'scene-balance-layer.json',parameters,colour_path,plan,native,native)
+        assert scene_load.call_count==1, 'Scene field and baseline must share one validated NPZ read'
+        with np.load(receipt['asset']['path'],allow_pickle=False) as saved_scene:
+            expected_baseline=saved_scene['baseline_rgb']
+        assert donor_baseline.dtype==expected_baseline.dtype==np.float32
+        assert np.array_equal(donor_baseline.view(np.uint32),expected_baseline.view(np.uint32)), \
+            'Reused baseline must retain every serialized float32 bit'
         assert receipt['regions']['head_hair']['rejected']=='no_valid_local_person_correspondence'
         if scenario == 'clothing':
             assert receipt['regions']['clothing']['observed_pixels']>0
@@ -191,15 +197,15 @@ def main(scenario='clothing'):
             assert not field.any()
         assert np.isfinite(field).all() and not receipt['visual_acceptance']
         assert not (output/'scene-balance-native-face.png').exists()
-        assert (output/'scene-balance-native-clothing.png').is_file() if scenario == 'clothing' else True
         assert fit_bytes==(output/'parameters.json').read_bytes() and colour_hash==digest(colour_path)
         assert digest(master)==baseline_receipt['output_sha256']
         print(json.dumps({'ok':True,'fixture_native_size':list(native),'scenario':scenario,
-            'comparison_uses_current_source_appearance':True,
+            'fit_diagnostics_are_explicitly_proxy_only':True,
             'retired_matcher_rejected':True,
             'actual_T_B_S_cli_preparation_without_face':True,
             'supported_clothing_still_prepared':scenario=='clothing',
-            'optional_face_images_skipped':True,'upstream_numeric_assets_unchanged':True},ensure_ascii=False))
+            'optional_face_images_skipped':True,'upstream_numeric_assets_unchanged':True,
+            'validated_scene_baseline_read_once':True,'scene_baseline_float32_bits_preserved':True},ensure_ascii=False))
 
 
 if __name__=='__main__':

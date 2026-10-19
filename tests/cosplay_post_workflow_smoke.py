@@ -14,7 +14,7 @@ import cosplay_post_review as review
 from cosplay_post_review_smoke import fake_transport, multi_fake_transport, response, verdict
 from cosplay_native_review_smoke import make_native_fixture
 from generation_design import DESIGN_VERSION
-from generation_prompt import DEFAULT_PROMPT
+from generation_prompt import DEFAULT_PROMPT, STYLE_MARKER
 import single_source_workflow as workflow
 
 
@@ -68,6 +68,11 @@ def main():
             return {path: workflow.sha256(Path(path)) for path in paths}
 
         def renderer(_root, run, _args):
+            if run['run_id'] == 'complete-generated':
+                # The production tail gets explicit saved task permission.
+                from creative_task import normalize_task_intent
+                run['task_intent'] = normalize_task_intent({'schema_version': 'cosplay_task_intent.v1',
+                    'mode': 'create_reference', 'services': {'text_vision': True, 'visual_review': True}})
             output = root / workflow.RUNS_DIR / run['run_id']
             output.mkdir(parents=True, exist_ok=True)
             fixture = make_native_fixture(output/'frozen-inputs', native_size)
@@ -88,7 +93,7 @@ def main():
                     'review': {'status': 'not_checked',
                                'checks': {key: 'not_checked' for key in workflow.VISUAL_CHECK_KEYS}}}
 
-        def args_for(name, *, generate=True, reference=None):
+        def args_for(name, *, generate=True, reference=None, planning=False):
             argv = ['--root', str(root), '--source', str(source), '--run-id', name]
             if generate:
                 argv.append('--generate')
@@ -96,6 +101,13 @@ def main():
                 argv += ['--reference', str(reference)]
             args = workflow.parse_args(argv)
             args.character_profile = profile
+            if planning:
+                from creative_task import normalize_task_intent
+                args.task_intent = normalize_task_intent({'schema_version':'cosplay_task_intent.v1',
+                    'mode':'create_reference','services':{'text_vision':True,'visual_review':True}})
+                args.task_plan = {'schema_version':'cosplay_task_plan.v2',
+                    'inputs':{'source':{'sha256':workflow.sha256(source)}},
+                    'image_budget':{'initial_reference':1,'reference_correction':0,'independent_effect':0}}
             return args
 
         payload = response(True)
@@ -107,6 +119,9 @@ def main():
                    return_value={'provider': 'offline_fixture', 'model': 'fixture_image_model'}), \
              patch('reference_provider.main', side_effect=provider) as image_sender, \
              patch('generation_design.prepare_generation_design', side_effect=planner), \
+             patch('creative_task.validate_task_plan', side_effect=lambda plan, _intent: copy.deepcopy(plan)), \
+             patch('automatic_native_retouch.prepare_once', side_effect=lambda _root, current, *_args, **_kw:
+                   {'run':current,'status':'offline_source_fixture'}), \
              patch.object(workflow, 'render_candidate', side_effect=renderer), \
              patch('native_source_baseline.source_for_plan', side_effect=frozen_source) as source_reader, \
              patch.object(review, 'review_cosplay_post', wraps=review.review_cosplay_post) as reviewer, \
@@ -115,7 +130,7 @@ def main():
             # pass a direct unit call to the helper. Use a non-default revision.
             parent = root / workflow.RUNS_DIR / 'revision-parent' / 'manifest.json'
             workflow.write_json(parent, {'revision': 6})
-            args = args_for('complete-generated')
+            args = args_for('complete-generated', planning=True)
             args.parent_run_id = 'revision-parent'
             run = workflow.create_run(args)
             assert len(generated) == 1 and len(rendered) == 1 and len(planned) == 1
@@ -223,7 +238,7 @@ def main():
             imported_args.generation_design = copy.deepcopy(run['generation_design'])
             imported = workflow.create_run(imported_args)
             assert_pending(imported)
-            assert 'cosplay_post_review' not in imported and image_sender.call_count == 1
+            assert imported['cosplay_post_review']['status'] == 'not_requested' and image_sender.call_count == 1
             exact_args = args_for('legacy-exact-create-run')
             exact_args.effective_prompt = 'The exact saved legacy editing text.'
             exact_args.preserve_effective_prompt = True
@@ -233,6 +248,53 @@ def main():
             assert len(planned) == 1 and image_sender.call_count == 1
             assert before == (reviewer.call_count, vision.call_count, source_reader.call_count)
             assert snapshot(imported) == snapshots[imported['run_id']]
+
+            # Default complete-post saves real pixels without submitting QA,
+            # reserving an attempt, or dispatching diagnostic correction.
+            default_args = args_for('default-no-visual-review')
+            default_args.complete_post = True
+            default_args.cosplay_correction_budget = 1
+            full_brief = '丹恒的角色摄影、人像美化和纵深。\n保持真实面孔、妆造与摄影质感。'
+            default_args.prompt = default_args.input_prompt = full_brief + STYLE_MARKER + 'OLD STYLE'
+            default_args.preset = 'night_scene'
+            default_args.variant_count = 2
+            default_args.variant_styles = ['night_scene', 'cinematic_backlight']
+            from creative_task import normalize_task_intent
+            creative_requirements = '一看就是角色主导的 COS 大片，同时保持真实摄影质感。'
+            default_args.task_intent = normalize_task_intent({'schema_version':'cosplay_task_intent.v1',
+                'mode':'create_reference','brief':creative_requirements,
+                'constraints':{'preserve_background':True,'no_effects':True}})
+            default_args.task_plan = copy.deepcopy(args.task_plan)
+            default_args.task_plan['image_budget']['initial_reference'] = 2
+            default_args.character_profile = None
+            before = (reviewer.call_count, vision.call_count, source_reader.call_count)
+            with patch('system_post_completion.complete_once') as coordinator, \
+                    patch('character_profile.analyze_character') as recognizer:
+                default_run = workflow.create_run(default_args)
+                coordinator.assert_not_called()
+                recognizer.assert_not_called()
+            assert_pending(default_run)
+            from preset_store import get_preset
+            assert len(default_run['variants']) == 2
+            for variant, style_id in zip(default_run['variants'], default_args.variant_styles):
+                actual_prompt = variant['prompt']
+                assert full_brief in actual_prompt and get_preset(style_id)['prompt'] in actual_prompt
+                assert creative_requirements in actual_prompt and 'OLD STYLE' not in actual_prompt
+                assert '保留原背景，不更换或重建场景。' in actual_prompt
+                assert '不要添加特效。' in actual_prompt
+            assert default_run['generation_design']['status'] == 'not_requested'
+            assert default_run['generation_design']['text_vision_submissions'] == 0
+            assert default_run['generation_design']['character_research']['status'] == 'not_requested'
+            assert len(planned) == 1
+            assert snapshot(default_run) == snapshots[default_run['run_id']]
+            assert before == (reviewer.call_count, vision.call_count, source_reader.call_count)
+            disabled = default_run['cosplay_post_review']
+            assert disabled['status'] == 'not_requested' and disabled['human_review_required']
+            assert not disabled['actual_api_evidence_valid'] and not disabled['automatic_accepted']
+            assert disabled['text_vision_submissions'] == 0 and not disabled['visual_acceptance']
+            assert workflow.read_json(root / workflow.RUNS_DIR / default_run['run_id'] / 'manifest.json')['cosplay_post_review'] == disabled
+            assert not (root / workflow.RUNS_DIR / default_run['run_id'] / 'cosplay-post-review').exists()
+            assert not (root / workflow.RUNS_DIR / default_run['run_id'] / 'system-post-completion').exists()
 
     print(json.dumps({'ok': True, 'real_create_run_tail_hook': True,
         'frozen_display_source_used': True, 'actual_source_reference_final_run_revision_bound': True,

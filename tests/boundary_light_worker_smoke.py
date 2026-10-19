@@ -17,6 +17,7 @@ import cloth_boundary_runtime as cloth
 import design_reconstruction as design
 from cloth_boundary_runtime_smoke import fixture
 from native_subject_detail_runtime_smoke import record, write, sha, closure
+from native_roi_render import has_active_operations
 
 
 def run_smoke():
@@ -36,6 +37,10 @@ def run_smoke():
             run['root'] = str(root); plan = design.plan_for_run(run)
             plan['mask_roles']['candidate_occupancy'] = plan['mask_roles']['foreground_alpha']
             run['options']['appearance_revision']['params'] = {}; run['options']['manual_layers'] = {}
+            require(not has_active_operations(run))
+            changed_controls = copy.deepcopy(run)
+            changed_controls['options']['appearance_revision']['params'] = {'global': {'exposure': .1}}
+            require(has_active_operations(changed_controls))
             run['auto_draft'] = {'path': run['source']['path']}
             old_hair = next(row for row in plan['layers'] if row['kind'] == hair.KIND)
             old_hair['id'] = 'user-hair-layer'
@@ -116,7 +121,7 @@ def run_smoke():
             run_dirs = sorted(path.name for path in (root/'outputs/runs').iterdir())
             with patch.object(worker, 'prepare', return_value=identical), patch.object(sys, 'argv', [
                     'boundary_light_worker.py', '--root', str(root), '--run-json', str(snapshot),
-                    '--output', str(root/'identical'), '--save-child']): worker.main()
+                    '--output', str(root/'identical')]): worker.main()
             require(sorted(path.name for path in (root/'outputs/runs').iterdir()) == run_dirs)
             duplicate = copy.deepcopy(run); design.plan_for_run(duplicate)['layers'].append(copy.deepcopy(old_hair))
             with patch.object(worker, 'observations', side_effect=AssertionError('Duplicate entered observations')):
@@ -140,19 +145,18 @@ def run_smoke():
             snapshot = root/'edited-input.json'; write(snapshot, edited)
             with patch.object(worker, 'prepare', return_value=edited_result), patch.object(sys, 'argv', [
                     'boundary_light_worker.py', '--root', str(root), '--run-json', str(snapshot),
-                    '--output', str(root/'edited-prepared'), '--save-child']): worker.main()
+                    '--output', str(root/'edited-prepared')]): worker.main()
             saved = json.loads((root/'edited-prepared/result.json').read_text('utf8'))
-            child = json.loads(Path(saved['child_manifest']).read_text('utf8')); child_plan = design.plan_for_run(child)
-            saved_hair = next(row for row in child_plan['layers'] if row['kind'] == hair.KIND)
-            require(child['options']['appearance_revision']['params'] == edited['options']['appearance_revision']['params'])
-            require(Path(saved_hair['assets']['frozen_delta']['path']).is_relative_to(root/'outputs/runs'/child['run_id']))
-            require(hair.validate_layer(saved_hair, child_plan, child)['bypass_reason'] is None)
-            require(child['options']['preserve_project_selection'] is True and closure(child_plan) > 20)
+            saved_plan = saved['design_reconstruction_plan']
+            saved_hair = next(row for row in saved_plan['layers'] if row['kind'] == hair.KIND)
+            require(Path(saved_hair['assets']['frozen_delta']['path']).is_file())
+            require(hair.validate_layer(saved_hair, saved_plan, edited)['bypass_reason'] is None)
+            require(closure(saved_plan) > 20 and 'child_manifest' not in saved)
             require((parent.read_bytes(), pointer.read_bytes()) == retained)
     return {'ok': True, 'checks': checks, 'actual_worker_endpoint_and_frozen_runtime': True,
         'producer_observations_and_matte_mocked': True, 'upsert_preserves_id_enabled_strength_and_cloth_order': True,
         'new_hair_retains_old_cloth_with_explicit_stale_bypass': True, 'same_array_different_npz_no_child': True,
-        'duplicate_and_corrupt_results_rejected': True, 'cli_edited_background_and_child_owned_plan': True,
+        'duplicate_and_corrupt_results_rejected': True, 'cli_writes_preparation_receipt_only': True,
         'parent_and_original_hair_assets_retained': True, 'model_inferences': 0,
         'image_generation_submissions': 0, 'visual_acceptance': False}
 

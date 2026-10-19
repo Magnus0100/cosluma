@@ -9,7 +9,6 @@ import copy
 import importlib
 import json
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 import types
@@ -22,7 +21,6 @@ import design_reconstruction as design
 from cloth_boundary_runtime_smoke import fixture
 from native_subject_detail_runtime import array_sha
 from native_subject_detail_runtime_smoke import record, write, sha, closure
-from portable_project import export_project, import_project
 
 
 def run_smoke():
@@ -148,7 +146,7 @@ def run_smoke():
             run_dirs = sorted(path.name for path in (root/'outputs/runs').iterdir())
             with patch.object(worker, 'prepare', return_value=identical), patch.object(sys, 'argv', [
                     'cloth_boundary_worker.py', '--root', str(root), '--run-json', str(existing_snapshot),
-                    '--output', str(root/'identical'), '--save-child']):
+                    '--output', str(root/'identical')]):
                 worker.main()
             require(sorted(path.name for path in (root/'outputs/runs').iterdir()) == run_dirs)
             require('child_run_id' not in json.loads((root/'identical/result.json').read_text('utf8')))
@@ -172,21 +170,18 @@ def run_smoke():
                 rejects(lambda: worker.prepare(root, duplicate, root/'duplicate'))
             with patch.object(worker, 'prepare', return_value=unchanged), patch.object(sys, 'argv', [
                     'cloth_boundary_worker.py', '--root', str(root), '--run-id', 'fixture',
-                    '--output', str(root/'unchanged'), '--save-child']):
+                    '--output', str(root/'unchanged')]):
                 worker.main()
             require([path.name for path in (root/'outputs/runs').iterdir()] == ['fixture'])
             with patch.object(worker, 'prepare', return_value=result), patch.object(sys, 'argv', [
                     'cloth_boundary_worker.py', '--root', str(root), '--run-id', 'fixture',
-                    '--output', str(root/'prepared'), '--save-child']):
+                    '--output', str(root/'prepared')]):
                 worker.main()
             saved_result = json.loads((root/'prepared/result.json').read_text('utf8'))
-            child = json.loads(Path(saved_result['child_manifest']).read_text('utf8'))
-            child_plan = design.plan_for_run(child)
-            require(child['parent_run_id'] == 'fixture' and child['revision'] == 2)
-            require(child['options']['preserve_project_selection'] is True and 'auto_draft' not in child)
-            require(child['cosplay_post_review']['visual_acceptance'] is False)
-            require(cloth.validate_layer(child_plan['layers'][-1], child_plan, child)['bypass_reason'] is None)
-            require(closure(child_plan) > 20 and (parent_path.read_bytes(), pointer.read_bytes()) == retained)
+            prepared_plan = saved_result['design_reconstruction_plan']
+            require('child_manifest' not in saved_result)
+            require(cloth.validate_layer(prepared_plan['layers'][-1], prepared_plan, run)['bypass_reason'] is None)
+            require(closure(prepared_plan) > 20 and (parent_path.read_bytes(), pointer.read_bytes()) == retained)
             # --run-json must save the operative edit snapshot, rather than
             # rebuilding its settings from the unchanged saved parent.
             saved_no_hair = copy.deepcopy(run); saved_no_hair['run_id'] = 'edited-parent'
@@ -208,24 +203,13 @@ def run_smoke():
             edited_result = {**result, 'design_reconstruction_plan': edited_plan}
             with patch.object(worker, 'prepare', return_value=edited_result), patch.object(sys, 'argv', [
                     'cloth_boundary_worker.py', '--root', str(root), '--run-json', str(snapshot),
-                    '--output', str(root/'edited-prepared'), '--save-child']):
+                    '--output', str(root/'edited-prepared')]):
                 worker.main()
             edited_saved = json.loads((root/'edited-prepared/result.json').read_text('utf8'))
-            edited_child = json.loads(Path(edited_saved['child_manifest']).read_text('utf8'))
-            require(edited_child['options']['appearance_revision']['params'] == edited['options']['appearance_revision']['params'])
-            saved_plan = design.plan_for_run(edited_child)
-            require(cloth.validate_layer(saved_plan['layers'][-1], saved_plan, edited_child)['bypass_reason'] is None)
-            require(Path(saved_plan['layers'][-1]['assets']['frozen_delta']['path']).is_relative_to(
-                root/'outputs/runs'/edited_child['run_id']))
-            require(Path(saved_plan['layers'][-1]['assets']['frozen_delta']['path']) != Path(edited_layer['assets']['frozen_delta']['path']))
-            archive = base/'worker-child.cosplay'; export_project(root, child['run_id'], archive)
-            moved = import_project(base/'portable', archive, run_id='relocated')['run']
-            require(cloth.endpoint_binding(design.plan_for_run(moved), moved) == layer['params']['binding'])
-            shutil.rmtree(root/'inputs'); shutil.rmtree(cache); shutil.rmtree(root/'prepared')
-            for replay in (child, moved):
-                replay_plan = design.plan_for_run(replay)
-                values, state = cloth.apply_cloth_boundary_light(before, replay_plan['layers'][-1], replay_plan, replay)
-                require(np.array_equal(values, after) and state['applied'])
+            saved_plan = edited_saved['design_reconstruction_plan']
+            require(cloth.validate_layer(saved_plan['layers'][-1], saved_plan, edited)['bypass_reason'] is None)
+            require(Path(saved_plan['layers'][-1]['assets']['frozen_delta']['path']).is_file())
+            require('child_manifest' not in edited_saved)
             # Wrapper cancellation and no-change routing exercise the real wrapper.
             cancelled = base/'cancelled'
             rejects(lambda: worker.prepare_for_workbench(base, run, cancelled, cancel=lambda: True), InterruptedError)
@@ -248,10 +232,10 @@ def run_smoke():
             require((parent_path.read_bytes(), pointer.read_bytes()) == retained)
     return {'ok': True, 'checks': checks, 'actual_worker_sampling_and_frozen_runtime': True,
         'mock_producer_and_observations': True, 'sampling_keys_shapes_source_rgb_and_native_maps_checked': True,
-        'producer_contract_rejected_before_success': True, 'save_child_no_change_cancel_and_portable': True,
+        'producer_contract_rejected_before_success': True, 'preparation_only_no_change_and_cancel': True,
         'original_hair_assets_unchanged': True, 'model_inferences': 0, 'image_generation_submissions': 0,
         'upsert_preserves_id_enabled_and_strength': True, 'same_array_different_npz_transport_preserves_original_plan_without_child': True,
-        'duplicate_rejected_before_observations': True, 'cli_edited_background_and_child_owned_plan_preserved': True,
+        'duplicate_rejected_before_observations': True, 'cli_edited_background_and_preparation_plan_preserved': True,
         'visual_acceptance': False}
 
 

@@ -2,18 +2,35 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter, maximum_filter
+from asset_identity import sha256_file
+
+
+def build_many(items, model_path):
+    """One IMAGE-mode CPU detector; each photograph keeps an independent result."""
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    options = vision.FaceLandmarkerOptions(base_options=python.BaseOptions(model_asset_path=str(model_path),
+        delegate=python.BaseOptions.Delegate.CPU),
+        num_faces=1, min_face_detection_confidence=.3, min_face_presence_confidence=.3)
+    if not items:
+        return []
+    with vision.FaceLandmarker.create_from_options(options) as detector:
+        return [_build(item['input'], item['semantics'], model_path, item['output_dir'], detector)
+                for item in items]
 
 
 def build(input_path, semantics_path, model_path, output_dir):
+    return build_many([{'input': input_path, 'semantics': semantics_path, 'output_dir': output_dir}], model_path)[0]
+
+
+def _build(input_path, semantics_path, model_path, output_dir, detector):
     import mediapipe as mp
-    from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
 
     image = Image.open(input_path).convert('RGB')
@@ -30,11 +47,7 @@ def build(input_path, semantics_path, model_path, output_dir):
     else:
         box = (0,0,width,height)
     crop = image.crop(box)
-    options = vision.FaceLandmarkerOptions(base_options=python.BaseOptions(model_asset_path=str(model_path),
-        delegate=python.BaseOptions.Delegate.CPU),
-        num_faces=1, min_face_detection_confidence=.3, min_face_presence_confidence=.3)
-    with vision.FaceLandmarker.create_from_options(options) as detector:
-        result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.asarray(crop)))
+    result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.asarray(crop)))
     protection = np.zeros((height,width), np.float32)
     polygons = []
     points = []
@@ -68,7 +81,7 @@ def build(input_path, semantics_path, model_path, output_dir):
     metadata = {'schema_version':'source_face_protection.v1','field_path':str(field_path),'size':[width,height],
         'method':method,'input_path':str(Path(input_path).resolve()),'semantics_path':str(Path(semantics_path).resolve()),
         'crop_source':'learned Face_Neck semantic bbox with relative context','detector_crop':list(box),
-        'model_path':str(Path(model_path).resolve()),'model_sha256':hashlib.sha256(Path(model_path).read_bytes()).hexdigest(),
+        'model_path':str(Path(model_path).resolve()),'model_sha256':sha256_file(model_path),
         'mediapipe_version':importlib.metadata.version('mediapipe'),'landmarks':points,'protected_regions':polygons,
         'contract':'source-derived eye/lip protection for colour adjustments'}
     (directory/'result.json').write_text(json.dumps(metadata,indent=2),encoding='utf8')
@@ -78,7 +91,14 @@ def build(input_path, semantics_path, model_path, output_dir):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('input','semantics','model','output-dir'):
-        parser.add_argument('--'+name,type=Path,required=True)
+        parser.add_argument('--'+name,type=Path,required=name == 'model')
+    parser.add_argument('--batch', type=Path, help='JSON list of independent image/cache preparations')
     args = parser.parse_args()
-    result = build(args.input,args.semantics,args.model,args.output_dir)
-    print(json.dumps({key:value for key,value in result.items() if key not in ('landmarks','protected_regions')},indent=2))
+    if args.batch:
+        result = build_many(json.loads(args.batch.read_text(encoding='utf8')), args.model)
+        print(json.dumps([{'field_path': row['field_path']} for row in result]))
+    else:
+        if any(value is None for value in (args.input, args.semantics, args.output_dir)):
+            parser.error('Provide --batch or all of --input, --semantics, --output-dir')
+        result = build(args.input,args.semantics,args.model,args.output_dir)
+        print(json.dumps({key:value for key,value in result.items() if key not in ('landmarks','protected_regions')},indent=2))

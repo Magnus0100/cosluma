@@ -2,9 +2,8 @@
 """Native single-source project shell.
 
 The product entry is ``one-click`` (a real JPG/RAW source through the
-source-bound native renderer).  Dataset-lock, paired-image and promotion
-commands are omitted; historical manifests remain readable through the
-read-only status/recovery views and are never a production fallback.
+source-bound native renderer). Dataset-lock, paired-image and promotion
+commands are not part of the current project contract.
 """
 
 from __future__ import annotations
@@ -22,7 +21,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from runtime_resources import configure_cpu_runtime  # noqa: E402
+configure_cpu_runtime()
+
 import single_source_workflow  # noqa: E402
+from asset_identity import configure_persistent_cache  # noqa: E402
 
 
 MANIFEST_NAME = "project.json"
@@ -109,7 +112,7 @@ def native_project_record(root: Path, *, default_sample: str = "source") -> dict
             "staging_root": "outputs/staging",
             "canonical_root": "outputs/final_delivery",
         },
-        "assets": {"source_dirs": [], "reference_dirs": [], "manual_dirs": []},
+        "assets": {"source_dirs": [], "reference_dirs": []},
         "state": {"status": "initialized", "updated_at": now()},
     }
 
@@ -128,17 +131,17 @@ def project_init(args: argparse.Namespace) -> int:
         print(json.dumps({"project": str(root), "manifest": str(existing), "status": "already_initialized"}, ensure_ascii=False, indent=2))
         return 0
 
-    for name in ("data/raw", "data/reference", "data/manual", "outputs", "docs"):
+    for name in ("inputs", "outputs", "docs"):
         (root / name).mkdir(parents=True, exist_ok=True)
     create_native_project_if_missing(root)
     docs_ref = root / "docs" / "PROJECT.md"
     if not docs_ref.exists():
         docs_ref.write_text(
             "# Cosplay project\n\nProject configuration is recorded in `../project.json`.\n"
-            "Large source/reference/manual files stay in their registered directories.\n",
+            "Source images and references are bound by each current task manifest.\n",
             encoding="utf-8",
         )
-    print(json.dumps({"project": str(root), "manifest": str(existing), "status": "initialized", "directories": [str(root / n) for n in ("data/raw", "data/reference", "data/manual", "outputs", "docs")]}, ensure_ascii=False, indent=2))
+    print(json.dumps({"project": str(root), "manifest": str(existing), "status": "initialized", "directories": [str(root / n) for n in ("inputs", "outputs", "docs")]}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -162,7 +165,7 @@ def status_cmd(args: argparse.Namespace, root: Path) -> int:
         "status": state.get("status", "initialized"),
         "last_sample": state.get("last_sample"),
         "last_source_only_run": state.get("last_source_only_run"),
-        "next": "use `project_cli.py one-click --source <JPG-or-RAW>` or `source-status <run-id>`",
+        "next": "use `project_cli.py task-plan` then `task-start`, or `source-status <run-id>`",
     }, ensure_ascii=False, indent=2))
     return 0
 
@@ -176,26 +179,76 @@ def recovery_cmd(_args: argparse.Namespace, root: Path) -> int:
     return 0
 
 
-def reference_cmd(args: argparse.Namespace, root: Path) -> int:
-    # Candidate registration is part of the native finite-generation path;
-    # unlike historical dataset/review commands it remains in the release.
-    import register_reference
-    call = ["--root", str(root), "--image", str(resolve(args.image, root)), "--sample", args.sample, "--out-dir", str(resolve(args.out_dir, root))]
-    for flag, value in (("--model", args.model), ("--provider", args.provider), ("--prompt", args.prompt), ("--generation-id", args.generation_id)):
-        append_option(call, flag, value)
-    if args.source:
-        call += ["--source", str(resolve(args.source, root))]
-    if args.force:
-        call.append("--force")
-    code = register_reference.main(call)
-    record = read_manifest(root)
-    record.setdefault("state", {}).update({"updated_at": now(), "last_reference": args.sample})
-    write_manifest(root, record)
-    return int(code or 0)
+def _checked_one_click_args(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    """Resolve a CLI request through the content-bound creative task contract.
+
+    ``project_cli one-click`` is retained as the process boundary used by the
+    backend worker. It is not a second planner: every invocation must
+    carry the checked plan from ``task-start`` before the native workflow is entered.
+    """
+    from creative_task import REQUEST_FIELDS, validate_task_plan
+
+    values = vars(args)
+    request = {}
+    for key in REQUEST_FIELDS:
+        if key in values and values[key] is not None:
+            value = values[key]
+            if isinstance(value, Path):
+                value = str(value)
+            request[key] = value
+    source = request.get("source")
+    if isinstance(source, Path):
+        request["source"] = str(source)
+    if request.get("reference") is not None:
+        request["reference"] = str(request["reference"])
+    if request.get("model_registry") is not None:
+        request["model_registry"] = str(request["model_registry"])
+    request["generate"] = bool(getattr(args, "generate", False))
+    request["local_only"] = bool(getattr(args, "local_only", False))
+    request["complete_post"] = bool(getattr(args, "complete_post", False))
+    intent = getattr(args, "task_intent", None)
+    plan = getattr(args, "task_plan", None)
+    if isinstance(intent, dict) and isinstance(plan, dict):
+        # A saved plan is still checked against the current process arguments
+        # (source/reference, route flags and execution strategy).  The plan
+        # does not contain every parser default, so re-planning the raw CLI
+        # namespace would manufacture a different request identity.
+        validate_task_plan(plan, intent)
+        from creative_task import sha
+        for role, supplied in (("source", request.get("source")),
+                               ("reference", request.get("reference"))):
+            recorded = (plan.get("inputs") or {}).get(role)
+            if recorded is None:
+                if supplied not in (None, ""):
+                    raise ValueError("Task inputs changed; check the task plan again")
+                continue
+            path = Path(str(supplied)).expanduser().resolve() if supplied else None
+            recorded_path = Path(str(recorded.get("path"))).expanduser().resolve() if recorded.get("path") else None
+            if (path is None or not path.is_file() or recorded_path is None
+                    or path != recorded_path or sha(path) != recorded.get("sha256")):
+                raise ValueError("Task inputs changed; check the task plan again")
+        mode = intent.get("mode")
+        if bool(getattr(args, "local_only", False)) != (mode == "local_portrait"):
+            raise ValueError("Task route changed; check the task plan again")
+        if mode == "existing_reference" and not request.get("reference"):
+            raise ValueError("Task reference changed; check the task plan again")
+        if mode != "existing_reference" and request.get("reference"):
+            raise ValueError("Task reference changed; check the task plan again")
+        requested_strategy = getattr(args, "execution_strategy", None)
+        if requested_strategy and requested_strategy != plan.get("execution_strategy"):
+            raise ValueError("Task execution strategy changed; check the task plan again")
+        request.update(task_intent=intent, task_plan=plan,
+                       execution_strategy=plan.get("execution_strategy"),
+                       generate=mode == "create_reference",
+                       local_only=mode == "local_portrait",
+                       complete_post=mode != "local_portrait")
+        request.pop("creative_task", None)
+        return request
+    raise ValueError("Internal one-click requires a current checked task; use task-plan and task-start")
 
 
 def one_click_cmd(args: argparse.Namespace, root: Path) -> int:
-    """Create a source-bound native run from one JPG/RAW input."""
+    """Enter the native workflow only with a checked creative task."""
     call: list[str] = ["--root", str(root), "--source", str(resolve(args.source, root))]
     for flag, value in (
         ("--sample", args.sample),
@@ -237,8 +290,7 @@ def one_click_cmd(args: argparse.Namespace, root: Path) -> int:
             if flag not in call:
                 call.append(flag)
     workflow_args = single_source_workflow.parse_args(call)
-    # The product entry reserves one diagnosed correction up front. Imported,
-    # local and exact historical retries are kept outside this new workflow.
+    # The product entry reserves one diagnosed correction up front.
     if (workflow_args.generate and not args.reference) or args.complete_post:
         workflow_args.cosplay_correction_budget = 1
     if getattr(args, 'final_repair_only', False):
@@ -248,19 +300,56 @@ def one_click_cmd(args: argparse.Namespace, root: Path) -> int:
     if args.options_json or args.options_file:
         settings = json.loads(args.options_json) if args.options_json else json.loads(resolve(args.options_file, root).read_text(encoding='utf-8'))
         single_source_workflow.apply_workflow_settings(workflow_args, settings)
+    requested_correction_budget = getattr(workflow_args, 'cosplay_correction_budget', None)
+    checked = _checked_one_click_args(workflow_args, root)
+    checked_settings = {key: checked[key] for key in (
+        "task_intent", "task_plan", "execution_strategy", "model_registry",
+        "appearance_revision", "manual_layers", "generation_design",
+        "character_profile", "preset_snapshot", "variant_count",
+        "variant_styles", "cosplay_correction_budget", "preserve_project_selection",
+    ) if key in checked}
+    single_source_workflow.apply_workflow_settings(workflow_args, checked_settings)
+    workflow_args.generate = checked.get("generate", False) is True
+    workflow_args.local_only = checked.get("local_only", False) is True
+    workflow_args.complete_post = checked.get("complete_post", False) is True
+    if "cosplay_correction_budget" in checked and requested_correction_budget != 0:
+        workflow_args.cosplay_correction_budget = checked["cosplay_correction_budget"]
+    # The correction allowance is an execution control rather than a route
+    # selector.  Preserve an explicit zero supplied by a saved/retry request
+    # after the checked task contract has been validated; a fresh
+    # create-reference request still receives the planner's default allowance.
+    if requested_correction_budget == 0:
+        workflow_args.cosplay_correction_budget = 0
     if getattr(workflow_args, 'preserve_effective_prompt', False):
         workflow_args.cosplay_correction_budget = 0
-    run = single_source_workflow.create_run(workflow_args)
-    from pipeline_stage_report import read_stage_report
-    report = read_stage_report(root, run, root/'outputs/runs'/run['run_id']/'manifest.json')
+    from production_coordinator import execute_workflow
+    run = execute_workflow(root, workflow_args)
+    try:
+        # A runtime preflight block is intentionally cheap and may occur in a
+        # launcher Python without SciPy.  Building the detailed stage report
+        # imports the native review stack, so do not turn the diagnosed block
+        # into a second traceback before the JSON result reaches the caller.
+        from pipeline_stage_report import read_stage_report
+        report = read_stage_report(root, run, root/'outputs/runs'/run['run_id']/'manifest.json')
+    except (ImportError, OSError) as exc:
+        if run.get('status') != 'blocked':
+            raise
+        report = {'status': 'blocked', 'error': str(exc),
+                  'runtime_preflight_block': True}
     print(json.dumps({**run, 'stage_report':report}, ensure_ascii=False, indent=2))
     return 0 if run.get("status") != "blocked" else 2
 
 
 def source_status_cmd(args: argparse.Namespace, root: Path) -> int:
     path, run = single_source_workflow.load_run(root, args.run_id)
-    from pipeline_stage_report import read_stage_report
-    report = read_stage_report(root, run, path)
+    try:
+        from pipeline_stage_report import read_stage_report
+        report = read_stage_report(root, run, path)
+    except (ImportError, OSError) as exc:
+        if run.get('status') != 'blocked':
+            raise
+        report = {'status': 'blocked', 'error': str(exc),
+                  'runtime_preflight_block': True}
     print(json.dumps({"ok": True, "manifest": str(path), "run": run,
                       "stage_report": report}, ensure_ascii=False, indent=2))
     return 0
@@ -306,18 +395,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument('--request-file', type=Path, required=True)
         if name == 'task-plan':
             p.add_argument('--batch', action='store_true')
-
-    p = sub.add_parser("reference", help="register a generated reference candidate")
-    root_override(p)
-    p.add_argument("--image", required=True)
-    p.add_argument("--sample", required=True)
-    p.add_argument("--out-dir", default="data/reference")
-    p.add_argument("--model", default="gpt-image-2.5-sunburst")
-    p.add_argument("--provider", help="provider label; defaults to saved settings or discovered credentials")
-    p.add_argument("--prompt", default="")
-    p.add_argument("--source")
-    p.add_argument("--generation-id")
-    p.add_argument("--force", action="store_true")
 
     p = sub.add_parser(
         "one-click",
@@ -375,6 +452,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "init":
         return project_init(args)
     root = (Path(args.root) if args.root else DEFAULT_ROOT).expanduser().resolve()
+    configure_persistent_cache(root)
     if args.command == "status":
         return status_cmd(args, root)
     if args.command == "recovery":
@@ -389,8 +467,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             result = Backend(root).start_task({**body, 'async': False})
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get('ok') else 2
-    if args.command == "reference":
-        return reference_cmd(args, root)
     if args.command == "one-click":
         return one_click_cmd(args, root)
     if args.command == "source-status":

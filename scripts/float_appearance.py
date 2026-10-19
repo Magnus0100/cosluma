@@ -20,40 +20,21 @@ def linear_to_srgb(values: np.ndarray) -> np.ndarray:
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055).astype(np.float32)
 
 
-def apply_native_source_retouch_float(values, layer, *, source_sha256, working_domain,
-                                     box=None, canvas_size=None, premultiplied_alpha=None):
-    """Replay approved source differences before colour and composition.
-
-    This dedicated entry consumes native frozen healing, including an exact
-    source-coordinate ROI. Its working domain must equal the observed source
-    domain; calling from a late manual-colour stage would change that meaning.
-    Install the layer only after ``validate_frozen_retouch_layer`` succeeds.
-    """
-    from native_retouch_producer import apply_frozen_retouch, frozen_working_domain
-    if working_domain != frozen_working_domain(layer):
-        raise ValueError('native retouch difference cannot cross scene/display linear working domains')
-    return apply_frozen_retouch(values, layer, source_sha256=source_sha256, box=box,
-                               canvas_size=canvas_size, premultiplied_alpha=premultiplied_alpha)
 
 
 def _gaussian_float(values: np.ndarray, sigma: float = 0.9) -> np.ndarray:
-    """Small separable float32 Gaussian; caller supplies neighboring pixels."""
+    """Use SciPy's compiled separable Gaussian with the current edge recipe."""
+    from scipy.ndimage import gaussian_filter
+    values = np.asarray(values, dtype=np.float32)
     radius = max(1, int(np.ceil(3 * sigma)))
-    positions = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-positions * positions / np.float32(2 * sigma * sigma))
-    kernel /= kernel.sum()
-    result = values
-    for axis in (0, 1):
-        pads = [(0, 0)] * values.ndim
-        pads[axis] = (radius, radius)
-        padded = np.pad(result, pads, mode="edge")
-        out = np.zeros_like(values, dtype=np.float32)
-        for offset, weight in enumerate(kernel):
-            slices = [slice(None)] * values.ndim
-            slices[axis] = slice(offset, offset + values.shape[axis])
-            out += padded[tuple(slices)] * weight
-        result = out
-    return result
+    if values.ndim == 3:
+        axes_sigma, axes_radius = (sigma, sigma, 0.), (radius, radius, 0)
+    elif values.ndim == 2:
+        axes_sigma, axes_radius = (sigma, sigma), (radius, radius)
+    else:
+        raise ValueError('Gaussian detail input must be HW or HWC')
+    return np.asarray(gaussian_filter(values, sigma=axes_sigma, radius=axes_radius,
+                                      mode='nearest', output=np.float32), dtype=np.float32)
 
 
 def _detail_tiled(values: np.ndarray, *, denoise: float = 0.0, sharpness: float = 0.0,
@@ -94,13 +75,85 @@ def _detail_tiled(values: np.ndarray, *, denoise: float = 0.0, sharpness: float 
 
 
 
-def render_source_float(source_linear: np.ndarray, run: dict) -> tuple[np.ndarray, dict]:
+def prepare_registered_style_input(values):
+    """Enter the existing final clip_sdr domain before a frozen style.
+
+    Manual exposure/optics may produce finite working values beyond SDR. The
+    final renderer previously clipped these on encoding. Do that same pixelwise
+    conversion once before fitting/applying style, in bounded row blocks.
+    Ordinary renders without a style never call this helper.
+    """
+    values = np.asarray(values)
+    if values.dtype != np.float32 or values.ndim != 3 or values.shape[-1] != 3:
+        raise ValueError('Registered-style input requires float32 display-linear RGB')
+    needs_clip = False
+    for top in range(0, len(values), 128):
+        row = values[top:top+128]
+        if not np.isfinite(row).all():
+            raise ValueError('Registered-style input contains nonfinite working RGB')
+        needs_clip |= bool(np.any(row < 0) or np.any(row > 1))
+    if not needs_clip:
+        return values
+    result = np.empty_like(values)
+    for top in range(0, len(values), 128):
+        # Equivalent to display_linear(..., {'method':'clip_sdr'}) for the
+        # finite working values above; preserve the caller's owned buffer.
+        np.clip(values[top:top+128], 0, 1, out=result[top:top+128])
+    return result
+
+
+def apply_registered_style_layers(values, plan, run, *, box=None, canvas_size=None):
+    """Consume one frozen pointwise style operator after composition/optics."""
+    layers=[layer for layer in plan.get('layers',[]) if layer.get('kind')=='registered_reference_style']
+    if not plan.get('enabled') or not layers:
+        return values, []
+    if len(layers)!=1:
+        raise ValueError('A native scene permits one registered reference style operator')
+    from registered_reference_style import validate_layer, apply_with_report
+    layer=layers[0]; receipt=validate_layer(layer)
+    binding=receipt['identity']['reference_contract']
+    if (binding['source_sha256']!=(run.get('source') or {}).get('sha256')
+            or binding['reference_sha256']!=(run.get('reference') or {}).get('sha256')):
+        raise ValueError('Frozen style does not belong to the current source/reference')
+    material=receipt['identity'].get('material_context')
+    if material is not None:
+        # Replay the owned frozen masks, but never carry skin permission into
+        # another brief or grant it retrospectively to an old checked plan.
+        from creative_direction import skin_cast_contract_for
+        from skin_illumination import _digest
+        task=run.get('task_plan') or {}
+        intent=run.get('task_intent') or task.get('intent') or {}
+        goal=(task.get('creative_direction') or {}).get('material_refinement')
+        if (task.get('ready') is not True or task.get('intent')!=intent
+                or goal is None or goal!=skin_cast_contract_for(intent)
+                or material.get('goal_sha256')!=_digest(goal)):
+            raise ValueError('Frozen skin illumination does not belong to the checked user permission')
+    if not layer.get('enabled') or not float(layer.get('strength',1.)):
+        return values,[{'id':layer['id'],'kind':layer['kind'],'enabled':bool(layer.get('enabled')),
+            'strength':layer.get('strength',1.),'assets':layer['assets'],'applied':False,
+            'execution_stage':'final_source_guided_photometric_style'}]
+    values=prepare_registered_style_input(values)
+    height,width=values.shape[:2];canvas_size=tuple(canvas_size or (width,height))
+    box=tuple(box or (0,0,width,height))
+    native=tuple(plan['canvas']['source_oriented_size'])
+    if canvas_size==native:
+        result,report=apply_with_report(values,layer,box,native)
+    else:
+        result,report=apply_with_report(values,layer,box,canvas_size,preview=True)
+    return result,[{'id':layer['id'],'kind':layer['kind'],'enabled':bool(layer.get('enabled')),
+        'strength':layer.get('strength',1.),'assets':layer['assets'],
+        'execution_stage':'final_source_guided_photometric_style',
+        'input_domain_policy':'final_clip_sdr_before_frozen_style',**report}]
+
+
+def render_source_float(source_linear: np.ndarray, run: dict, *, geometry=None) -> tuple[np.ndarray, dict]:
     """Render the current frozen display-linear paired source and its layers."""
     from design_reconstruction import (plan_for_run,apply_plan,geometry_for_plan,apply_optics,
         render_mode_for_run,validate_current_native_plan)
     plan=validate_current_native_plan(plan_for_run(run));render_mode_for_run(run)
     height,width=source_linear.shape[:2]
-    geometry=geometry_for_plan(plan,(width,height))
+    if geometry is None:
+        geometry=geometry_for_plan(plan,(width,height))
     active=plan
     if not plan['enabled']:
         import copy
@@ -114,6 +167,11 @@ def render_source_float(source_linear: np.ndarray, run: dict) -> tuple[np.ndarra
     result=apply_appearance_revision_float(result,run,geometry,branch='composite')
     result=apply_manual_layers_float(result,run,geometry,branch='composite')
     result,execution=apply_optics(result,active,execution)
+    result,style_records=apply_registered_style_layers(result,active,run)
+    for record in style_records:
+        saved=next((row for row in execution['layers'] if row['id']==record['id']),None)
+        if saved is None:execution['layers'].append(record)
+        else:saved.update(record)
     from display_transform import plan_for_run as display_plan_for_run
     return result,{'engine':ENGINE,'calibration_rgb8':False,'working_space':'display-linear-sRGB-float32',
         'working_domain':'display_linear_sRGB','fit_space':'frozen_native_appearance_delta',
@@ -122,6 +180,10 @@ def render_source_float(source_linear: np.ndarray, run: dict) -> tuple[np.ndarra
         'composition_policy':'native_premultiplied_source_design_environment' if plan['enabled'] else 'native_prepared_source_design_off',
         'candidate_background_pixels_used':execution['background_reconstructed'],
         'candidate_pixels_copied':execution['background_reconstructed'],'candidate_main_person_texture_used':False,
+        # The production caller may append a freshly prepared style layer
+        # after this render.  Record whether this render already consumed an
+        # enabled registered style so it cannot be applied a second time.
+        'registered_style_applied': bool(any(record.get('applied') for record in style_records)),
         'source_render_plan':execution.get('source_render_plan'),'source_color_plan':execution.get('source_color_plan')}
 
 
@@ -143,6 +205,8 @@ def render_source_only_float(display_source: np.ndarray, run: dict, silhouette) 
     if (run.get('options') or {}).get('appearance_revision',{}).get('design_reconstruction_plan'):
         raise ValueError('Source-only editing cannot consume a prepared reference plan')
     geometry=silhouette.convert('L').resize(tuple(plan['native_size']))
+    from portrait_beauty_layer import apply_for_run as apply_beauty
+    values,beauty_receipt=apply_beauty(values,run)
     result=_detail_tiled(values,denoise=float((run.get('options') or {}).get('denoise_strength',0)),
         coverage=np.asarray(geometry,np.float32)/255)
     from source_relight import apply_source_render_plan,source_render_plan_for_run
@@ -160,6 +224,7 @@ def render_source_only_float(display_source: np.ndarray, run: dict, silhouette) 
         'working_space':'display-linear-sRGB-float32','display_transform':display_plan_for_run(run),
         'composition_policy':'current_source_only_display','source_only_plan':plan,
         'source_render_plan':light_receipt,'source_color_plan':colour_receipt,'calibration_rgb8':False,
+        'portrait_beauty':beauty_receipt,
         'candidate_pixels_copied':False,'source_display_applied_once':True}
 
 

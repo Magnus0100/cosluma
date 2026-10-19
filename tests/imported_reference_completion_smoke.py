@@ -44,9 +44,11 @@ def main():
         intent = normalize_task_intent({'schema_version': 'cosplay_task_intent.v1', 'mode': 'existing_reference',
             'brief': 'Keep this makeup and finish the imported reference.',
             'constraints': {}, 'services': {'text_vision': True}})
-        plan = {'schema_version': 'cosplay_task_plan.v1', 'plan_id': 'a'*64, 'mode': intent['mode'],
+        plan = {'schema_version': 'cosplay_task_plan.v2', 'plan_id': 'a'*64, 'mode': intent['mode'],
             'intent': intent, 'ready': True, 'image_budget': image_budget(intent),
             'inputs': {role: {'sha256': hashes[str(path)]} for role, path in (('source', source), ('reference', reference))}}
+        from cos_node_registry import compile_workflow
+        plan['layer_workflow'] = compile_workflow(intent['mode'])
         settings = {'task_intent': intent, 'task_plan': plan}
         calls = []
         def observe(board, output, prompt, **kwargs):

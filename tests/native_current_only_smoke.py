@@ -97,6 +97,10 @@ def main():
         paired=prepare_fixture(root/'paired',native=(32,24));plan=plan_for_run(paired)
         paired['options']['appearance_revision']['regions']={'subject':{'exposure':.2},'global':{'contrast':.1}}
         source_values=source_for_plan(plan);full,op=render_source_float(source_values,paired)
+        # The supplied canvas establishes output size, not a new frozen-source
+        # identity. Arbitrary same-shape RGB cannot override paired source.
+        from_zeros,_ = render_source_float(np.zeros_like(source_values), paired)
+        np.testing.assert_array_equal(from_zeros, full)
         crop,_=render_native_roi(paired,(5,4,22,19));np.testing.assert_array_equal(crop,full[4:19,5:22])
         paired_manifest=save(root,paired,full,op)
         saved=saved_native_detail(root,paired['run_id'],{'edge':128});live=live_native_detail(root,paired['run_id'],{'edge':128})

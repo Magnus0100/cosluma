@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
 from scipy.spatial import ConvexHull
+from asset_identity import sha256_file
 
 SCHEMA = 'native_receiver_preservation.v1'
 RECIPE = 'qualified_native_receiver_luminance_bands_v1'
@@ -28,8 +29,7 @@ LUMA = np.array([.2126, .7152, .0722], np.float32)
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def identity(value):

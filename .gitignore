@@ -9,9 +9,13 @@
 *.cosplayproj
 /providers/local-models.current.json
 /providers/qwen-image-2.1-models.json
-/.env
-/.env.local
-/.env.*.local
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 /.cache/
 /dist/
 /build/
@@ -19,6 +23,10 @@
 /SOURCE_MANIFEST.json
 *.zip
 *.7z
+*.tar
+*.tar.gz
+*.tgz
+*.rar
 *.onnx
 *.safetensors
 *.gguf
@@ -40,6 +48,8 @@
 # Model downloads and local runtimes. Keep only public manifests, URLs,
 # revisions, hashes and license notices in the repository.
 /models/
+/model/*
+!/model/README.md
 /weights/
 /checkpoints/
 /runtime/
@@ -53,6 +63,11 @@
 # Private execution records; public docs describe current contracts
 /docs/meetings/
 /docs/reviews/
+**/evidence/
+**/reports/
+**/artifacts/
+**/scratch/
+**/logs/
 
 # Python, editors and OS
 __pycache__/
@@ -65,3 +80,15 @@ venv/
 Thumbs.db
 *.log
 *.tmp
+*.bak
+*.orig
+*.rej
+*.sqlite
+*.sqlite3
+*.db
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

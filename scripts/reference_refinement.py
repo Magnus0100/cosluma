@@ -131,7 +131,8 @@ def _generation_evidence(provenance, source_display, parent, candidate, prompt, 
                 or actual[2].get('hard_edit_mask_enforced') is not False):
             raise ValueError('The image mask is conditioning in the actual reference canvas, not a model hard constraint')
         graph = contract['comfyui']['request']['prompt']
-        encoders = [node for node in graph.values() if node['class_type'] == 'TextEncodeQwenImage21']
+        encoders = [node for node in graph.values() if node['class_type'] in
+                    {'TextEncodeQwenImage21', 'CosplayTextEncodeQwenImage21'}]
         if len(encoders) != 1:
             raise ValueError('Actual request must have one ordered Qwen multi-image encoder')
         encoder = encoders[0]['inputs']

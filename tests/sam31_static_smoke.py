@@ -2,8 +2,14 @@
 from __future__ import annotations
 
 import json
+import io
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -34,6 +40,55 @@ def output(masks, boxes, scores):
     return {key: CpuTensor(value) for key, value in [('masks', masks), ('boxes', boxes), ('scores', scores)]}
 
 
+def service_startup_contracts(root):
+    paths = {'python': Path(sys.executable), 'worker': root/'worker.py',
+             'models': root/'models', 'profile': profiles.IMAGE_PROFILE}
+    poison = {'PYTHONPATH': str(root/'foreign-packages'), 'PYTHONHOME': 'foreign-home',
+              'PYTHONUSERBASE': 'foreign-user'}
+    with patch.dict(os.environ, poison):
+        with patch.object(scene.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            scene._run_scene_worker_once(['python', 'worker.py'], root/'fallback.log')
+        environment = run.call_args.kwargs['env']
+        assert not set(poison) & set(environment)
+        assert environment['PYTHONNOUSERSITE'] == '1'
+        assert environment['HF_HUB_OFFLINE'] == '1'
+        with patch.object(scene.subprocess, 'Popen', side_effect=OSError('cannot launch selected runtime')):
+            try:
+                scene._start_scene_service(root, paths)
+            except scene._SceneServiceUnavailable as error:
+                assert isinstance(error.__cause__, OSError)
+                assert 'cannot launch selected runtime' in str(error)
+            else:
+                raise AssertionError('Launch failure was ignored')
+
+    class StalledProcess:
+        def __init__(self):
+            self.done = threading.Event()
+            self.stdout = self
+            self.killed = False
+        def readline(self):
+            self.done.wait(5)
+            return ''
+        def poll(self): return -9 if self.killed else None
+        def kill(self):
+            self.killed = True
+            self.done.set()
+        def wait(self, timeout=None): return -9
+    child = StalledProcess()
+    started = time.monotonic()
+    with patch.object(scene.subprocess, 'Popen', return_value=child):
+        try:
+            scene._start_scene_service(root, paths, timeout_seconds=.02)
+        except scene._SceneServiceUnavailable as error:
+            assert isinstance(error.__cause__, TimeoutError)
+        else:
+            raise AssertionError('A stalled ready pipe was accepted')
+    assert child.killed and time.monotonic()-started < 2
+    assert scene._SCENE_SERVICE is None
+    ready = type('ReadyProcess', (), {'stdout': io.StringIO('{"ready": true}\n')})()
+    assert json.loads(scene._read_scene_ready(ready, 1))['ready']
+
+
 def main():
     assert profiles.specification()['hair_alpha'] is False
     assert profiles.specification()['profile'] == 'sam31_static_detector_v1'
@@ -61,6 +116,7 @@ def main():
     assert instances(output(np.zeros_like(masks), [[0,0,5,3]]*2, [.6,.8]), size=(5,3), concept='bag') == []
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+        service_startup_contracts(root)
         from current_model_registry import load_registry
         config = {key: str(root/key) for key in ('python', 'scene_python', 'semantics_checkpoint',
             'semantics_repo_dir', 'vitmatte_model_root', 'dinov3_model_root', 'scene_model_root', 'birefnet_model_path', 'lama_checkpoint', 'background_sr_checkpoint', 'face_model_path', 'face_python', 'onnx_runtime_root')}
@@ -82,6 +138,8 @@ def main():
             assert scene.scene_runtime_paths(root)['profile'] == profiles.IMAGE_PROFILE
         assert load_registry(root, registry_path=registry)['dinov3_profile'] == 'dinov3_vitl16'
     print(json.dumps({'ok': True, 'checks': 27, 'gpu_used': False, 'models_inferred': 0,
+                      'worker_environment_isolated': True, 'startup_timeout_bounded': True,
+                      'launch_error_preserved': True,
                       'scope': 'CPU profile, shape, representation and explicit routing contracts'}))
 
 

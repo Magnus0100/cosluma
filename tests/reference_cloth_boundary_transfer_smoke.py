@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import sys
+from unittest.mock import patch
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
 import reference_cloth_boundary_transfer as producer
@@ -69,6 +70,30 @@ def slanted_counterexample():
 
 
 def main():
+    # A fractional lattice's rectangle prefilter may reject only windows
+    # with fewer than 32 possible domain samples; weights/robust median still
+    # make the final qualification. Include clipped frame edges and holes.
+    rng=np.random.default_rng(377)
+    domain=rng.random((67,83))>.75
+    xs=np.linspace(0,82,11);ys=np.linspace(0,66,9);radius=6.3
+    possible=producer._window_sample_candidates(domain,xs,ys,radius)
+    for j,yy in enumerate(ys):
+        for i,xx in enumerate(xs):
+            left,top=max(0,int(np.floor(xx-radius))),max(0,int(np.floor(yy-radius)))
+            right,bottom=min(83,int(np.ceil(xx+radius))+1),min(67,int(np.ceil(yy+radius))+1)
+            assert possible[j,i] == (np.count_nonzero(domain[top:bottom,left:right])>=32)
+    size=512
+    yy,xx=np.indices((size,size),dtype=np.float32)
+    own=np.zeros((size,size),bool);own[32:-32,32:-32]=True
+    depth=distance_transform_edt(own);edge=own&(depth<=24);core=own&(depth>=24)
+    affinity=(.8+.1*np.cos(xx/71)*np.cos(yy/83))*own
+    paired=rng.uniform(-.03,.03,(size,size,3)).astype(np.float32)
+    paired[(xx>size-65)&own]+=[.12,.05,.015]
+    serial=producer._field(paired,affinity,edge,core,1.,workers=1)
+    parallel=producer._field(paired,affinity,edge,core,1.,workers=2)
+    for a,b in zip(serial[:5],parallel[:5]):
+        assert np.array_equal(a.view(np.uint32),b.view(np.uint32))
+    assert serial[-1] == parallel[-1]
     src, a, ref, labels, maps, x, y = fixture(); checks = []
     def run(p=src, alpha=a, reference=ref, ra=a, sl=labels, rl=labels,
             source_rgb=src, registration=maps, **kw):
@@ -142,7 +167,25 @@ def main():
     nvalid = expand(maps['valid'])
     nmaps = {'ref_x': (nx+.5)/factor-.5, 'ref_y': (ny+.5)/factor-.5,
              'valid': nvalid, 'confidence': nvalid.astype(np.float32)}
-    native = run(p=ns, alpha=na, sl=nl, source_rgb=ns, registration=nmaps)
+    empty_bands = []
+    empty_gate = producer._empty_coefficient_band
+    def record_empty(response, confidence):
+        empty = empty_gate(response, confidence)
+        empty_bands.append(bool(empty))
+        return empty
+    with patch.object(producer, '_empty_coefficient_band', side_effect=record_empty):
+        native = run(p=ns, alpha=na, sl=nl, source_rgb=ns, registration=nmaps)
+    with patch.object(producer, '_empty_coefficient_band', return_value=False):
+        unskipped = run(p=ns, alpha=na, sl=nl, source_rgb=ns, registration=nmaps)
+    assert any(empty_bands) and not all(empty_bands)
+    for key in ('delta_p', 'after_p', 'alpha'):
+        assert np.array_equal(native[key].view(np.uint32), unskipped[key].view(np.uint32))
+    assert np.array_equal(native['support'], unskipped['support'])
+    assert native['receipt'] == unskipped['receipt']
+    assert not empty_gate(np.full((2, 3, 3), np.nan), np.zeros((2, 3)))
+    assert not empty_gate(np.zeros((2, 3, 3)), np.full((2, 3), np.nan))
+    checks.append('exact_empty_bands_skip_native_work_without_changing_float_bits_or_receipt')
+    checks.append('empty_multiplier_does_not_hide_nonfinite_coefficients')
     assert native['support'].any() and np.array_equal(native['alpha'], na)
     assert native['receipt']['changed_pixels'] == int(np.any(native['delta_p'] != 0, -1).sum())
     assert max(native['receipt']['components'][0]['analysis_size']) < max(na.shape)

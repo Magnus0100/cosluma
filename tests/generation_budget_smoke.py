@@ -30,7 +30,8 @@ def main():
                 else:
                     raise AssertionError('failure should be reported')
                 assert transport.call_count == 1
-                assert len(events) == 1 and events[0]['retrying'] is False
+                attempts = [event for event in events if event.get('event') == 'provider_attempt']
+                assert len(attempts) == 1 and attempts[0]['retrying'] is False
 
         calls = []
         def provider(_root, run, args):
@@ -66,6 +67,17 @@ def main():
         saved = json.loads((root / run['manifest']).read_text(encoding='utf-8'))
         assert saved['generation_budget'] == budget
 
+        # The adapter's typed pre-submit rejection is known to cost zero calls.
+        # A timeout remains outcome-unknown and must retain its occupied budget.
+        args.run_id = 'known-not-submitted'
+        with patch('single_source_workflow.generate_candidate',
+                   side_effect=reference_provider.QwenInputQualityError('unreadable input')):
+            rejected = workflow.create_run(args)
+        assert rejected['status'] == 'blocked'
+        assert rejected['generation_budget']['image_submissions'] == 0
+        assert rejected['generation_budget']['submissions'][0]['status'] == 'rejected_before_submission'
+        assert rejected['generation_budget']['submissions'][0]['request_submitted'] is False
+
         args = workflow.parse_args(['--root', str(root), '--source', str(source), '--local-only', '--run-id', 'local-fixture'])
         with patch('single_source_workflow.render_local_source', return_value=draft), \
              patch('single_source_workflow.diagnose_cosplay_post', return_value=None), \
@@ -73,11 +85,15 @@ def main():
              patch('character_profile.analyze_character', side_effect=AssertionError('local-only must not recognize')):
             local = workflow.create_run(args)
         assert local['delivery_status'] == 'local_source_draft' and 'generation_budget' not in local
-        body = {'source': str(source), 'local_only': True, 'generate': False, 'async': False}
+        body = {'source': str(source), 'local_only': True, 'generate': False, 'sync': True,
+                'creative_task': {'schema_version': 'cosplay_task_intent.v1',
+                                  'mode': 'local_portrait',
+                                  'services': {'text_vision': False, 'visual_review': False}}}
         backend = Backend(root, embedded=True)
         with patch('single_source_workflow.render_local_source', side_effect=RuntimeError('models not installed')), \
              patch('single_source_workflow.generate_candidate', side_effect=AssertionError('must not pay')):
-            failed_local = backend.one_click(body)['run']
+            checked = backend.task_plan(body)
+            failed_local = backend.start_task({**body, 'plan_id': checked['plan']['plan_id']})['run']
         assert failed_local['status'] == 'blocked' and failed_local['next_action'] == 'retry_local_processing'
         assert 'fallback' not in failed_local and 'generation_budget' not in failed_local
         assert '--local-only' in backend._one_click_args(body, str(source))

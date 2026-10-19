@@ -4,7 +4,7 @@ import copy
 
 FLAT_REVISION_KEYS = ('design_reconstruction_plan','source_render_plan','source_render_plan_origin',
     'source_color_plan','source_color_plan_origin',
-    'params','regions','display_transform','receiver_intent','receiver_shadow_plan')
+    'params','regions','display_transform','receiver_intent','receiver_shadow_plan','portrait_beauty','workflow_graph')
 
 
 def appearance_revision_patch(body):

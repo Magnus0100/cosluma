@@ -1,0 +1,23 @@
+{
+  "schema": "beautygrpo_models.v1",
+  "ready": false,
+  "python": "",
+  "base_model_root": "",
+  "lora_path": "",
+  "base_manifest": "",
+  "base_manifest_sha256": "",
+  "regions_python": "",
+  "regions_model_root": "",
+  "face_registry": "",
+  "offload": "sequential_cpu_offload",
+  "gpu_id": 0,
+  "torch_cpu_threads": 8,
+  "recipe": {
+    "prompt": "Beautify this person's face while maintaining a natural and realistic appearance.",
+    "size": 1024,
+    "steps": 28,
+    "guidance": 2.5,
+    "seed": 42,
+    "lora_scale": 1.0
+  }
+}

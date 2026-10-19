@@ -36,7 +36,7 @@ def main():
             assert not qwen.ensure_running(endpoint='https://service.invalid')['managed']
         with tempfile.TemporaryDirectory(prefix='cosplay-public-start-') as folder:
             profile = Path(folder).resolve()
-            with patch.object(sys, 'frozen', True, create=True), patch.dict(os.environ, {'LOCALAPPDATA': str(profile)}):
+            with patch.object(sys, 'frozen', True, create=True), patch.object(Path, 'home', return_value=profile), patch.dict(os.environ, {'LOCALAPPDATA': str(profile)}):
                 assert qt_workbench._default_repo_root() == profile/'CosplayWorkbench/workspace'
             chosen = profile/'chosen workspace'
             with patch.dict(os.environ, {'COSPLAY_WORKSPACE': str(chosen)}):

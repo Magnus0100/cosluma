@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from backend_server import Backend
-from job_store import JobStore
+from job_store import DuplicateActiveJobError, JobStore
 
 
 def main() -> int:
@@ -23,11 +23,27 @@ def main() -> int:
         assert cancelled["status"] == "cancelling" and store.is_cancel_requested("job-smoke")
         assert (root / "outputs" / "jobs" / "job-smoke" / "job.json").is_file()
         assert (root / "outputs" / "jobs" / "job-smoke" / "events.jsonl").is_file()
+        active = store.create({'kind': 'one_click', 'execution_binding': 'binding:one'}, job_id='active-binding')
+        try:
+            store.create({'kind': 'one_click', 'execution_binding': 'binding:one'}, job_id='duplicate-binding')
+        except DuplicateActiveJobError as error:
+            assert error.job['job_id'] == active['job_id']
+        else:
+            raise AssertionError('active execution binding was duplicated')
+        store.update(active['job_id'], status='succeeded')
+        replacement = store.create({'kind': 'one_click', 'execution_binding': 'binding:one'}, job_id='replacement-binding')
+        assert replacement['status'] == 'queued'
 
         backend = Backend(root)
         created = backend.create_job({"source": "one.jpg", "sample": "ONE"})
         jid = created["job_id"]
         assert backend.job(jid)["job"]["status"] == "queued"
+        try:
+            backend.create_job({"source": "one.jpg", "sample": "ONE"})
+        except DuplicateActiveJobError as error:
+            assert error.job['job_id'] == jid
+        else:
+            raise AssertionError('backend accepted duplicate active binding')
         assert backend.job_events(jid)["events"]
         backend.cancel_job(jid)
         assert backend.job(jid)["job"]["status"] == "cancelling"

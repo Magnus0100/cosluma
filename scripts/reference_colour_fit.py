@@ -7,6 +7,9 @@ This module deliberately has no matting, image generation, or scene relighting.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from functools import lru_cache
+import hashlib
 import numpy as np
 from scipy.ndimage import binary_erosion, gaussian_filter
 from scipy.optimize import least_squares, minimize
@@ -30,6 +33,127 @@ SETTINGS = {'patch_size': 24, 'minimum_patch_fraction': .70,
             'protection_chroma_strength': .15,
             'distribution_minimum_samples': 48, 'distribution_minimum_cells': 6,
             'distribution_maximum_exposure_ev': .5}
+_LAB_OBSERVATION_PROOF = object()
+SOURCE_HAIR_POLICY = {'id': 'preserve_source_hair_no_dedicated_TBS.v1'}
+SOURCE_APPEARANCE_POLICY_SCHEMA = 'source_appearance_policy.v1'
+
+
+def source_appearance_policy_for_run(run):
+    """Compile the generic source-preserving ownership policy for one task.
+
+    The policy is driven by the checked task contract and explicit user
+    permissions.  It never inspects a particular photograph's coordinates,
+    colours, filename or subject identity.
+    """
+    plan = run.get('task_plan') or run.get('options', {}).get('task_plan') or {}
+    contract = plan.get('reference_contract') or {}
+    source_conditioned = (plan.get('ready') is True
+        and contract.get('role') == 'source_conditioned_design'
+        and (run.get('task_intent') or plan.get('intent') or {}).get('constraints', {}).get('reference_role')
+            == 'source_conditioned_design')
+    if not source_conditioned:
+        return {'schema': SOURCE_APPEARANCE_POLICY_SCHEMA,
+                'id': 'task_default.v1', 'source_conditioned': False,
+                'preserve_source_hair': False,
+                'colour_owner': 'task_declared_operators',
+                'local_material_owner': 'task_declared_permissions'}
+    direction = plan.get('creative_direction') or {}
+    goal = direction.get('material_refinement') if isinstance(direction, dict) else None
+    rows = []
+    if isinstance(goal, dict):
+        for values in (goal.get('domains') or {}).values():
+            if isinstance(values, list):
+                rows.extend(value for value in values if isinstance(value, dict))
+    explicit_material = bool(rows) and any(
+        row.get('source') != 'bundled_product_recommendation' for row in rows)
+    return {'schema': SOURCE_APPEARANCE_POLICY_SCHEMA,
+            'id': 'source_preserving_minimal_intervention.v1',
+            'source_conditioned': True,
+            'preserve_source_hair': True,
+            'colour_owner': ('registered_reference_affine_plus_checked_material.v1'
+                             if explicit_material else 'registered_reference_affine.v1'),
+            'local_material_owner': ('explicit_user_request' if explicit_material
+                                     else 'explicit_user_request_only')}
+
+
+def preserve_source_hair_for_run(run):
+    """The default same-source route needs no separate hair recolouring."""
+    options = run.get('options') or {}
+    plan = run.get('task_plan') or options.get('task_plan') or {}
+    intent = run.get('task_intent') or options.get('task_intent') or {}
+    return (plan.get('ready') is True and plan.get('intent') == intent
+        and (plan.get('reference_contract') or {}).get('role') == 'source_conditioned_design'
+        and (intent.get('constraints') or {}).get('reference_role') == 'source_conditioned_design')
+
+
+def preserve_source_hair_parameters(parameters, run):
+    """Remove automatic hair edits at preparation, never alter frozen replay."""
+    if not preserve_source_hair_for_run(run):
+        return parameters
+    import copy
+    result = copy.deepcopy(parameters)
+    result.get('operators', {}).pop('hair', None)
+    for key in ('conditional_chroma_residual', 'local_chroma_residual'):
+        result.get(key, {}).pop('hair', None)
+    if 'authored_chroma_adjustments' in result:
+        result['authored_chroma_adjustments'] = [row for row in result['authored_chroma_adjustments']
+                                               if row.get('region') != 'hair']
+    palette = result.get('automatic_material_palette')
+    if palette and 'hair' in palette.get('regions', {}):
+        palette['regions']['hair'] = {'status': 'identity', 'reason': 'source_hair_preserved'}
+    result['source_hair_policy'] = SOURCE_HAIR_POLICY.copy()
+    return result
+
+
+
+
+@dataclass(frozen=True)
+class LabObservation:
+    """One request-local RGB/OKLab pair with an identity-bound source.
+
+    The RGB object is deliberately retained as the binding rather than a
+    cross-request cache key. Consumers reject a Lab array prepared for a
+    different object, shape, dtype, or writable backing. This keeps reuse
+    explicit while preserving the existing RGB validation at each boundary.
+    """
+
+    rgb: np.ndarray
+    lab: np.ndarray
+    _proof: object = field(repr=False, compare=False, default=None)
+    _rgb_identity: int = field(repr=False, compare=False, default=0)
+    _lab_identity: int = field(repr=False, compare=False, default=0)
+
+
+def prepare_lab_observation(rgb):
+    """Prepare an immutable request-local Lab observation for ``rgb``."""
+    values = np.asarray(rgb)
+    if (values.ndim != 3 or values.shape[-1] != 3 or values.dtype != np.dtype(np.float32)
+            or not np.isfinite(values).all()):
+        raise ValueError('Lab observation requires finite float32 RGB canvas')
+    lab = to_lab(values)
+    if lab.shape != values.shape or lab.dtype != np.dtype(np.float32) or not np.isfinite(lab).all():
+        raise ValueError('Lab observation transform returned an invalid canvas')
+    lab = np.ascontiguousarray(lab)
+    lab.setflags(write=False)
+    return LabObservation(values, lab, _LAB_OBSERVATION_PROOF, id(values), id(lab))
+
+
+def _resolve_lab_observation(values, observation, name):
+    """Validate a request-local Lab pair and return its read-only Lab plane."""
+    if observation is None:
+        return to_lab(values)
+    if (not isinstance(observation, LabObservation)
+            or observation._proof is not _LAB_OBSERVATION_PROOF):
+        raise ValueError(f'{name} must be a LabObservation prepared for this request')
+    if (id(observation.rgb) != observation._rgb_identity
+            or id(observation.lab) != observation._lab_identity
+            or observation.rgb is not values or observation.rgb.shape != values.shape
+            or observation.rgb.dtype != np.dtype(np.float32)
+            or observation.lab.shape != values.shape
+            or observation.lab.dtype != np.dtype(np.float32)
+            or observation.lab.flags.writeable):
+        raise ValueError(f'{name} does not bind the supplied RGB canvas')
+    return observation.lab
 
 
 def release_feature_colour(parameters):
@@ -87,15 +211,54 @@ def _validate_images(source, reference, source_labels, reference_labels, alpha, 
         raise ValueError('Invalid alpha or protection observation')
 
 
+def _eligible_patch_grid(mask, bounds, step, minimum_fraction):
+    """Select the same row-major cells without a Python loop over empty cells."""
+    top, bottom, left, right = bounds
+    ys = np.arange(top, min(bottom, mask.shape[0]-step+1), step)
+    xs = np.arange(left, min(right, mask.shape[1]-step+1), step)
+    if not len(ys) or not len(xs):
+        return ys[:0], xs[:0], np.empty((0, step, step), bool)
+    grid = mask[top:top+len(ys)*step, left:left+len(xs)*step]
+    grid = grid.reshape(len(ys), step, len(xs), step).transpose(0, 2, 1, 3)
+    rows, columns = np.nonzero(grid.mean(axis=(2, 3)) >= minimum_fraction)
+    return ys[rows], xs[columns], grid[rows, columns]
+
+
+def _patch_batches(lab, tops, lefts, masks, batch_size=512):
+    """Bound temporary storage while gathering the selected original cells."""
+    step = masks.shape[-1]
+    offsets = np.arange(step)
+    for start in range(0, len(tops), batch_size):
+        end = min(start+batch_size, len(tops))
+        values = lab[tops[start:end, None, None]+offsets[None, :, None],
+                     lefts[start:end, None, None]+offsets[None, None, :]]
+        yield start, values, masks[start:end]
+
+
+def _patch_medians(values, masks):
+    """Use the original compact median arithmetic, batched by sample count."""
+    flattened = values.reshape(len(values), -1, 3)
+    valid = masks.reshape(len(masks), -1)
+    counts = valid.sum(axis=1)
+    result = np.empty((len(values), 3), values.dtype)
+    for count in np.unique(counts):
+        selected = counts == count
+        samples = flattened[selected][valid[selected]].reshape(-1, int(count), 3)
+        result[selected] = np.median(samples, axis=1)
+    return result
+
+
 def collect_anchors(source, reference, source_labels, reference_labels, alpha,
-                    protection, reference_protection, validity, settings=None):
+                    protection, reference_protection, validity, settings=None, *,
+                    source_observation=None, reference_observation=None):
     """H proposes positions; homogeneous semantic patches reject poor proposals."""
     cfg = {**SETTINGS, **(settings or {})}
     _validate_images(source, reference, source_labels, reference_labels, alpha, protection)
     if any(x.shape != alpha.shape or not np.isfinite(x).all() or x.min() < 0 or x.max() > 1
            for x in (reference_protection, validity)):
         raise ValueError('Invalid reference protection or mapping validity')
-    sl, rl = to_lab(source), to_lab(reference)
+    sl = _resolve_lab_observation(source, source_observation, 'source_observation')
+    rl = _resolve_lab_observation(reference, reference_observation, 'reference_observation')
     usable_s = (alpha >= .995) & (protection < .05) & (sl[..., 0] > .08) & (source.max(-1) < .98)
     usable_r = (reference_protection < .05) & (validity > .999) & (rl[..., 0] > .08) & (reference.max(-1) < .98)
     anchors, rejected, overlaps = [], {}, {}
@@ -116,17 +279,21 @@ def collect_anchors(source, reference, source_labels, reference_labels, alpha,
         if not len(xs):
             rejected[name] = 'source_region_absent'
             continue
-        for top in range(int(ys.min()), int(ys.max()) + 1 - step, step):
-            for left in range(int(xs.min()), int(xs.max()) + 1 - step, step):
-                box = (slice(top, top+step), slice(left, left+step))
-                valid = safe_s[box] & safe_r[box]
-                if float(valid.mean()) < cfg['minimum_patch_fraction']:
-                    continue
-                sv, rv = sl[box][valid], rl[box][valid]
+        tops, lefts, masks = _eligible_patch_grid(safe_s & safe_r,
+            (int(ys.min()), int(ys.max())+1-step, int(xs.min()), int(xs.max())+1-step),
+            step, cfg['minimum_patch_fraction'])
+        reference_batches = _patch_batches(rl, tops, lefts, masks)
+        for (start, source_cells, valid_cells), (_, reference_cells, _) in zip(
+                _patch_batches(sl, tops, lefts, masks), reference_batches):
+            source_medians = _patch_medians(source_cells, valid_cells)
+            reference_medians = _patch_medians(reference_cells, valid_cells)
+            source_structure = gaussian_filter(source_cells[..., 0], (0, 1, 1))
+            reference_structure = gaussian_filter(reference_cells[..., 0], (0, 1, 1))
+            for index, valid in enumerate(valid_cells):
+                top, left = int(tops[start+index]), int(lefts[start+index])
                 # Only gross structural disagreement is rejected. Low-texture
                 # cheeks cannot be certified by a texture correlation score.
-                a, b = sl[box][..., 0], rl[box][..., 0]
-                a, b = gaussian_filter(a, 1), gaussian_filter(b, 1)
+                a, b = source_structure[index], reference_structure[index]
                 if a[valid].std() > .012 and b[valid].std() > .012:
                     correlation = float(np.corrcoef(a[valid], b[valid])[0, 1])
                     if correlation < -.1:
@@ -136,8 +303,8 @@ def collect_anchors(source, reference, source_labels, reference_labels, alpha,
                 anchors.append({'region': name, 'xy': [left+step/2, top+step/2],
                     'box': [left, top, left+step, top+step],
                     'sample_mask_bits': np.packbits(valid.ravel()).tobytes().hex(),
-                    'source': np.median(sv, axis=0).tolist(),
-                    'reference': np.median(rv, axis=0).tolist(),
+                    'source': source_medians[index].tolist(),
+                    'reference': reference_medians[index].tolist(),
                     'pixels': int(valid.sum()), 'structure_correlation': correlation})
                 count += 1
         if count < cfg['minimum_anchors']:
@@ -147,8 +314,7 @@ def collect_anchors(source, reference, source_labels, reference_labels, alpha,
                      'correspondence': 'coarse_background_H_plus_material_patch_rejection; not_dense_correspondence'}
 
 
-def _material_distribution(image, labels, protection, coverage, cfg, name, lab, skin_family=None):
-    """Summarize one material on its own canvas; no paired positions exist."""
+def _validate_material_inputs(image, labels, protection, coverage):
     image = np.asarray(image)
     if (image.ndim != 3 or image.shape[-1] != 3 or labels.shape != image.shape[:2]
             or protection.shape != labels.shape or coverage.shape != labels.shape
@@ -157,9 +323,23 @@ def _material_distribution(image, labels, protection, coverage, cfg, name, lab, 
             or min(protection.min(), coverage.min()) < 0
             or max(protection.max(), coverage.max()) > 1):
         raise ValueError('Invalid independent material observation')
+
+
+def _material_eligibility(image, lab, protection, coverage):
+    """Compute the fixed radiometric gate once per independent image."""
+    return ((coverage >= .995) & (protection < .05) & (lab[..., 0] > .15)
+            & (lab[..., 0] < .95) & (image.max(-1) < .98))
+
+
+def _material_distribution(image, labels, protection, coverage, cfg, name, lab, skin_family=None,
+                           *, _eligible=None):
+    """Summarize one material on an already validated independent canvas."""
     mask = binary_erosion(np.isin(labels, REGIONS[name]), iterations=2)
-    mask &= (coverage >= .995) & (protection < .05)
-    mask &= (lab[..., 0] > .15) & (lab[..., 0] < .95) & (image.max(-1) < .98)
+    if _eligible is None:
+        _eligible = _material_eligibility(image, lab, protection, coverage)
+    elif _eligible.shape != labels.shape or _eligible.dtype != np.dtype(bool):
+        raise ValueError('Material observation gate must be a boolean canvas plane')
+    mask &= _eligible
     material_guard = None
     if name.endswith('_hand'):
         # A hand semantic class includes black cosplay gloves. Exposed skin
@@ -178,13 +358,11 @@ def _material_distribution(image, labels, protection, coverage, cfg, name, lab, 
     rows = []
     ys, xs = np.nonzero(mask)
     if len(xs):
-        for top in range(int(ys.min()), int(ys.max())+1, step):
-            for left in range(int(xs.min()), int(xs.max())+1, step):
-                box = (slice(top, top+step), slice(left, left+step))
-                valid = mask[box]
-                if valid.size != step*step or valid.mean() < .7:
-                    continue
-                rows.append(np.median(lab[box][valid], axis=0))
+        tops, lefts, masks = _eligible_patch_grid(mask,
+            (int(ys.min()), int(ys.max())+1, int(xs.min()), int(xs.max())+1), step, .7)
+        rows = [_patch_medians(values, valid) for _, values, valid
+                in _patch_batches(lab, tops, lefts, masks)]
+    rows = np.concatenate(rows) if rows else np.empty((0, 3), lab.dtype)
     result = {'samples': count, 'cells': len(rows), 'accepted': False,
               'sampling': 'independent_eroded_same_material_cells; no_coordinate_pairs'}
     if material_guard:
@@ -205,7 +383,8 @@ def _material_distribution(image, labels, protection, coverage, cfg, name, lab, 
 
 
 def collect_material_distributions(source, reference, source_labels, reference_labels,
-                                   alpha, protection, reference_protection, *, settings=None):
+                                   alpha, protection, reference_protection, *, settings=None,
+                                   source_observation=None, reference_observation=None):
     """Independent same-material statistics, including different image sizes.
 
     Semantic interiors, source coverage and protected facial features reject
@@ -214,15 +393,23 @@ def collect_material_distributions(source, reference, source_labels, reference_l
     """
     cfg = {**SETTINGS, **(settings or {})}
     reference_coverage = np.ones(reference.shape[:2], np.float32)
-    source_lab, reference_lab = to_lab(source), to_lab(reference)
-    source_face = _material_distribution(source, source_labels, protection, alpha, cfg, 'face', source_lab)
+    _validate_material_inputs(source, source_labels, protection, alpha)
+    _validate_material_inputs(reference, reference_labels, reference_protection, reference_coverage)
+    source_lab = _resolve_lab_observation(source, source_observation, 'source_observation')
+    reference_lab = _resolve_lab_observation(reference, reference_observation, 'reference_observation')
+    source_eligible = _material_eligibility(source, source_lab, protection, alpha)
+    reference_eligible = _material_eligibility(reference, reference_lab, reference_protection, reference_coverage)
+    source_face = _material_distribution(source, source_labels, protection, alpha, cfg, 'face', source_lab,
+                                        _eligible=source_eligible)
     reference_face = _material_distribution(reference, reference_labels, reference_protection,
-                                            reference_coverage, cfg, 'face', reference_lab)
+                                            reference_coverage, cfg, 'face', reference_lab,
+                                            _eligible=reference_eligible)
     return {name: {'source': source_face if name == 'face' else _material_distribution(
-                    source, source_labels, protection, alpha, cfg, name, source_lab, source_face),
+                    source, source_labels, protection, alpha, cfg, name, source_lab, source_face,
+                    _eligible=source_eligible),
                    'reference': reference_face if name == 'face' else _material_distribution(
                     reference, reference_labels, reference_protection, reference_coverage, cfg, name,
-                    reference_lab, reference_face), 'mode': 'independent_material_distribution',
+                    reference_lab, reference_face, _eligible=reference_eligible), 'mode': 'independent_material_distribution',
                    'paired_anchor_count': 0, 'spatial_correspondence_allowed': False}
             for name in REGIONS}
 
@@ -549,11 +736,13 @@ def fit_conditional_residual(anchors, parameters, *, regions=('hair', 'left_hand
     return result
 
 
-def fit_local_residual(anchors, parameters, canvas_size, *, regions=None, strength=1.):
+def fit_local_residual(anchors, parameters, canvas_size, *, regions=None, strength=1.,
+                       source_labels, source_lab, source_alpha):
     """Fit four colour-only controls per supported material, after A.
 
     Coordinates refer to the source canvas; no reference pixels are sampled
-    during application. Missing spatial support rejects the local model.
+    during application. Production fits own the source-connected application
+    domain; the anchor hull describes evidence, never a dose boundary.
     """
     from copy import deepcopy
     result = deepcopy(parameters)
@@ -649,27 +838,108 @@ def fit_local_residual(anchors, parameters, canvas_size, *, regions=None, streng
             'heldout_error_improvement': improvement,
             'support_hull_equations': ConvexHull(xy).equations.tolist(),
             'support_margin_normalized': (np.array([48, 48])/np.asarray(canvas_size)).tolist()}
+        labels, guide, alpha = map(np.asarray, (source_labels, source_lab, source_alpha))
+        if (labels.shape != (canvas_size[1], canvas_size[0])
+                or guide.shape != (*labels.shape, 3) or alpha.shape != labels.shape
+                or labels.dtype.kind not in 'iu' or not np.isfinite(guide).all()
+                or not np.isfinite(alpha).all() or alpha.min() < 0 or alpha.max() > 1):
+            raise ValueError('Local field requires matching source material, guide and coverage')
+        domain = np.isin(labels, REGIONS[name]) & (alpha >= .995)
+        observed = np.zeros(labels.shape, np.float32)
+        for anchor in rows:
+            if anchor.get('box') and anchor.get('sample_mask_bits'):
+                left, top, right, bottom = map(int, anchor['box'])
+                if not (0 <= left < right <= labels.shape[1] and 0 <= top < bottom <= labels.shape[0]):
+                    raise ValueError('Local anchor sample box is outside its source canvas')
+                bits = np.unpackbits(np.frombuffer(bytes.fromhex(anchor['sample_mask_bits']), np.uint8))
+                selected = bits[:(right-left)*(bottom-top)].reshape(bottom-top, right-left).astype(bool)
+                observed[top:bottom, left:right] = np.maximum(observed[top:bottom, left:right], selected)
+            else:
+                x, y = map(lambda value: int(round(value)), anchor['xy'])
+                if 0 <= x < labels.shape[1] and 0 <= y < labels.shape[0]:
+                    observed[y, x] = 1
+        observed *= domain
+        if not observed.any():
+            del result['local_chroma_residual'][name]
+            continue
+        from reference_adaptive_fusion import _fine_topology
+        domain_y, domain_x = np.nonzero(domain)
+        offset_x, offset_y = int(domain_x.min()), int(domain_y.min())
+        roi = np.s_[offset_y:int(domain_y.max())+1, offset_x:int(domain_x.max())+1]
+        _, supported, components = _fine_topology(domain[roi], labels[roi], guide[roi], observed[roi])
+        yy, xx = np.nonzero(supported)
+        if not len(xx):
+            del result['local_chroma_residual'][name]
+            continue
+        left, right, top, bottom = int(xx.min()), int(xx.max())+1, int(yy.min()), int(yy.max())+1
+        packed = np.packbits(supported[top:bottom, left:right]).tobytes()
+        field = result['local_chroma_residual'][name]
+        field['application_policy'] = 'source_material_continuation.v1'
+        field['application_domain'] = {'schema': 'source_component_support.v1',
+            'canvas_size': list(canvas_size),
+            'box': [left+offset_x, top+offset_y, right+offset_x, bottom+offset_y],
+            'bits': packed.hex(), 'sha256': hashlib.sha256(packed).hexdigest(),
+            'anchor_components': len(components), 'source_pixels': int(supported.sum()),
+            'topology_before_sampling': True, 'reference_geometry_extended': False}
     return result
 
 
+@lru_cache(maxsize=32)
+def _local_domain_bits(bits, digest, width, height):
+    packed = bytes.fromhex(bits)
+    if len(packed) != (width*height+7)//8 or hashlib.sha256(packed).hexdigest() != digest:
+        raise ValueError('Local source-component support bytes differ from their receipt')
+    result = np.unpackbits(np.frombuffer(packed, np.uint8))[:width*height].reshape(height, width).astype(bool)
+    result.setflags(write=False)
+    return result
+
+
+def sample_local_domain(field, shape, origin, canvas_size):
+    """Sample physical source components identically for CPU and CUDA fields."""
+    support = field.get('application_domain') or {}
+    if support.get('schema') != 'source_component_support.v1':
+        raise ValueError('Continuous local field requires certified source-component support')
+    proxy = support.get('canvas_size') or []
+    box = support.get('box') or []
+    if (len(proxy) != 2 or len(box) != 4 or any(type(v) is not int for v in [*proxy, *box])
+            or min(proxy) <= 0 or not 0 <= box[0] < box[2] <= proxy[0]
+            or not 0 <= box[1] < box[3] <= proxy[1]):
+        raise ValueError('Invalid local source-component canvas or support box')
+    mask = _local_domain_bits(support['bits'], support['sha256'], box[2]-box[0], box[3]-box[1])
+    def positions(count, offset, source_extent, target_extent):
+        if float(offset).is_integer() and float(target_extent).is_integer():
+            return ((2*(np.arange(count, dtype=np.int64)+int(offset))+1)*source_extent)//(2*int(target_extent))
+        return np.floor((np.arange(count)+offset+.5)*source_extent/target_extent).astype(np.int64)
+    x = positions(shape[1], origin[0], proxy[0], canvas_size[0])-box[0]
+    y = positions(shape[0], origin[1], proxy[1], canvas_size[1])-box[1]
+    inside = (y[:, None] >= 0) & (y[:, None] < mask.shape[0]) & (x[None, :] >= 0) & (x[None, :] < mask.shape[1])
+    return mask[np.clip(y, 0, mask.shape[0]-1)[:, None], np.clip(x, 0, mask.shape[1]-1)[None, :]] & inside
+
+
 def _local_colour(field, shape, origin, canvas_size):
+    low, high = np.asarray(field['bounds_normalized'])
+    nodes = np.asarray(field['nodes'], np.float32)
+    margin = np.asarray(field['support_margin_normalized'])
+    hull = np.asarray(field['support_hull_equations'])
+    if (low.shape != (2,) or high.shape != (2,) or nodes.shape != (4, 2)
+            or margin.shape != (2,) or hull.ndim != 2 or hull.shape[1] != 3
+            or not all(np.isfinite(v).all() for v in (low, high, nodes, margin, hull, origin, canvas_size))
+            or np.any(high <= low) or np.any(margin <= 0) or np.any(np.asarray(canvas_size) <= 0)
+            or not np.isfinite(field['strength']) or not 0 <= field['strength'] <= 1):
+        raise ValueError('Local colour field requires finite bounds, nodes and a valid support hull')
+    if field.get('application_policy') != 'source_material_continuation.v1':
+        raise ValueError('Unsupported local field application policy')
+    from native_cuda_fields import eligible, local_colour
+    if eligible(shape):
+        return local_colour(field, shape, origin, canvas_size)
     height, width = shape
     x = (np.arange(width)+origin[0]+.5)/canvas_size[0]
     y = (np.arange(height)+origin[1]+.5)/canvas_size[1]
-    low, high = np.asarray(field['bounds_normalized'])
     u = np.clip((x-low[0])/(high[0]-low[0]), 0, 1)[None, :]
     v = np.clip((y-low[1])/(high[1]-low[1]), 0, 1)[:, None]
-    nodes = np.asarray(field['nodes'], np.float32)
     colour = ((1-u)*(1-v))[..., None]*nodes[0] + (u*(1-v))[..., None]*nodes[1]
     colour += ((1-u)*v)[..., None]*nodes[2] + (u*v)[..., None]*nodes[3]
-    margin = np.asarray(field['support_margin_normalized'])
-    sx = np.clip(1-np.maximum(low[0]-x, x-high[0])/margin[0], 0, 1)
-    sy = np.clip(1-np.maximum(low[1]-y, y-high[1])/margin[1], 0, 1)
-    support = sx[None, :]*sy[:, None]
-    for a, b, c in field['support_hull_equations']:
-        outside = a*x[None, :]+b*y[:, None]+c
-        support = np.minimum(support, np.clip(1-np.maximum(outside, 0)/min(margin), 0, 1))
-    return colour*support[..., None]*field['strength']
+    return colour*sample_local_domain(field, shape, origin, canvas_size)[..., None]*field['strength']
 
 
 def fit(anchors, *, settings=None):
@@ -771,7 +1041,8 @@ def fit(anchors, *, settings=None):
         'reference_pixels_in_output': False, 'geometry_warp': False}
 
 
-def region_weights(labels, protection, parameters, *, chroma=False, source_values=None):
+def region_weights(labels, protection, parameters, *, chroma=False, source_values=None,
+                   source_observation=None):
     """Material weights with independently chosen L or ab protection dose.
 
     Protection controls application strength, not reference anchor eligibility.
@@ -786,11 +1057,35 @@ def region_weights(labels, protection, parameters, *, chroma=False, source_value
     dose = parameters['settings']['protection_chroma_strength'] if chroma else structural
     if not np.isfinite(dose) or not 0 <= dose <= 1:
         raise ValueError('Invalid source feature protection strength')
+    application_labels, application_protection = labels, protection
+    if not chroma and parameters.get('feature_material_domains'):
+        from local_face_protection import mouth_lightness_domain
+        mouth = mouth_lightness_domain(labels.shape,
+            parameters['feature_material_domains']['source_regions'], labels)
+        # Global face exposure is illumination, not a skin pigment transfer.
+        # Actual lips and the opening receive the same smooth L field as skin;
+        # the fitted observations and separate ab weights retain their materials.
+        application_labels, application_protection = labels.copy(), protection.copy()
+        application_labels[mouth] = 3
+        application_protection[mouth] = 0
+    if source_observation is not None:
+        if not isinstance(source_observation, LabObservation):
+            raise ValueError('source_observation must be a LabObservation')
+        bound_values = source_values if source_values is not None else source_observation.rgb
+        if bound_values.shape[:2] != labels.shape:
+            raise ValueError('source_observation does not use the source mask canvas')
+        _resolve_lab_observation(bound_values, source_observation, 'source_observation')
     guarded = any(op.get('source_material_guard') for op in parameters['operators'].values())
+    if source_values is None and source_observation is not None:
+        source_values = source_observation.rgb
     if guarded and (source_values is None or source_values.shape != (*labels.shape, 3)
                     or not np.isfinite(source_values).all()):
         raise ValueError('Source material guards require explicit source RGB on the mask canvas')
-    source_lightness = to_lab(source_values)[..., 0] if guarded else None
+    if guarded:
+        source_lightness = _resolve_lab_observation(source_values, source_observation,
+                                                    'source_observation')[..., 0]
+    else:
+        source_lightness = None
     palette_regions = {}
     if chroma and parameters.get('automatic_material_palette'):
         from reference_material_palette import validate_palette
@@ -801,7 +1096,7 @@ def region_weights(labels, protection, parameters, *, chroma=False, source_value
         if (chroma and name == 'face' and feature_palette.get('mode') ==
                 'source_feature_chroma_only_face_distribution_bias'):
             ids = ids+feature_palette['source_feature_labels']
-        mask = np.isin(labels, ids).astype(np.float32)
+        mask = np.isin(application_labels, ids).astype(np.float32)
         material_dose = None
         guard = parameters['operators'].get(name, {}).get('source_material_guard')
         if guard:
@@ -810,85 +1105,159 @@ def region_weights(labels, protection, parameters, *, chroma=False, source_value
         for hand in ('left_hand', 'right_hand'):
             if (not parameters.get('distribution_policy') and name == hand.replace('_hand', '_arm')
                     and hand not in parameters['operators']):
-                mask = np.maximum(mask, np.isin(labels, REGIONS[hand]).astype(np.float32))
-        if (name not in parameters['operators']
-                and palette_regions.get(name, {}).get('status') != 'supported'):
+                mask = np.maximum(mask, np.isin(application_labels, REGIONS[hand]).astype(np.float32))
+        skip_gaussian = (name not in parameters['operators']
+                         and palette_regions.get(name, {}).get('status') != 'supported')
+        if skip_gaussian:
             mask *= 0
-        blurred = gaussian_filter(mask, 1.5)
+        # A material already forced to zero cannot acquire support from a
+        # Gaussian. Preserve the later palette-floor checks and final stack,
+        # but avoid scanning the full canvas for an all-zero plane.
+        blurred = np.zeros_like(mask) if skip_gaussian else gaussian_filter(mask, 1.5)
         palette_floor = palette_regions.get(name, {}).get('source_skin_L_floor')
         if palette_floor is not None:
-            if (source_values is None or source_values.shape != (*labels.shape, 3)
-                    or not np.isfinite(source_values).all()):
-                raise ValueError('Palette skin support requires explicit source RGB')
-            palette_L = to_lab(source_values)[..., 0]
-            blurred *= np.clip((palette_L-palette_floor)/.02, 0, 1)
+            if source_lightness is None:
+                if (source_values is None or source_values.shape != (*labels.shape, 3)
+                        or not np.isfinite(source_values).all()):
+                    raise ValueError('Palette skin support requires explicit source RGB')
+                source_lightness = _resolve_lab_observation(source_values, source_observation,
+                                                            'source_observation')[..., 0]
+            blurred *= np.clip((source_lightness-palette_floor)/.02, 0, 1)
         result.append(blurred*material_dose if material_dose is not None else blurred)
     weights = np.stack(result, axis=-1)
     weights /= np.maximum(weights.sum(-1, keepdims=True), 1)
-    weights *= (1-(1-dose)*protection[..., None])
+    weights *= (1-(1-dose)*application_protection[..., None])
     if not chroma and parameters.get('feature_palette_policy', {}).get('mode') == 'source_feature_chroma_only_face_distribution_bias':
-        # Gaussian mask feathering must not introduce face brightness into a
-        # source lip. Only the separate chroma weights inherit its palette.
-        weights[np.isin(labels, parameters['feature_palette_policy']['source_feature_labels']),
+        # A palette-only inheritance does not establish face L on unsupported
+        # lip geometry. The canonical illumination domain above is separate.
+        weights[np.isin(application_labels, parameters['feature_palette_policy']['source_feature_labels']),
                 list(REGIONS).index('face')] = 0
-    return weights.astype(np.float32)
+    return weights.astype(np.float32, copy=False)
 
 
-def apply(values, weights, parameters, *, strength=1., origin=(0, 0), canvas_size=None, chroma_weights=None):
+def apply(values, weights, parameters, *, strength=1., origin=(0, 0), canvas_size=None,
+          chroma_weights=None, _trusted=False, values_observation=None):
     """Apply native pixels with sampled parameter masks; never resize the person."""
-    if parameters.get('schema') != SCHEMA or parameters.get('working_domain') != 'display_linear_sRGB':
-        raise ValueError('Colour parameters require the explicit appearance domain')
-    if not 0 <= strength <= 1 or weights.shape != (*values.shape[:2], len(REGIONS)):
-        raise ValueError('Invalid matching strength or source-coordinate weights')
-    if values.ndim != 3 or values.shape[-1] != 3 or not np.isfinite(values).all():
-        raise ValueError('Invalid source appearance values')
-    for name, operator in parameters.get('operators', {}).items():
-        matrix = np.asarray(operator.get('matrix'), dtype=float)
-        bias = np.asarray(operator.get('bias'), dtype=float)
-        exposure = float(operator.get('exposure_ev', float('nan')))
-        if (name not in REGIONS or matrix.shape != (2, 2) or bias.shape != (2,)
-                or not np.isfinite(matrix).all() or not np.isfinite(bias).all()
-                or not np.isfinite(exposure)):
-            raise ValueError('Invalid saved material colour operator')
-    feature_palette = parameters.get('feature_palette_policy', {})
-    if feature_palette.get('mode') == 'source_feature_chroma_only_face_distribution_bias':
-        face_operator = parameters['operators'].get('face', {})
-        if (face_operator.get('evidence', {}).get('mode') != 'material_distribution'
-                or not np.array_equal(face_operator.get('matrix'), np.eye(2))
-                or 'face' in parameters.get('conditional_chroma_residual', {})
-                or 'face' in parameters.get('local_chroma_residual', {})):
-            raise ValueError('Source feature tint requires only a supported face distribution bias')
-    policy = parameters.get('protection_policy', {})
-    split = policy == 'split_lightness_chroma' or (isinstance(policy, dict)
-                                                and policy.get('mode') == 'split_lightness_chroma')
+    if not _trusted:
+        if parameters.get('schema') != SCHEMA or parameters.get('working_domain') != 'display_linear_sRGB':
+            raise ValueError('Colour parameters require the explicit appearance domain')
+        if not 0 <= strength <= 1 or weights.shape != (*values.shape[:2], len(REGIONS)):
+            raise ValueError('Invalid matching strength or source-coordinate weights')
+        if values.ndim != 3 or values.shape[-1] != 3 or not np.isfinite(values).all():
+            raise ValueError('Invalid source appearance values')
+        for name, operator in parameters.get('operators', {}).items():
+            matrix = np.asarray(operator.get('matrix'), dtype=float)
+            bias = np.asarray(operator.get('bias'), dtype=float)
+            exposure = float(operator.get('exposure_ev', float('nan')))
+            if (name not in REGIONS or matrix.shape != (2, 2) or bias.shape != (2,)
+                    or not np.isfinite(matrix).all() or not np.isfinite(bias).all()
+                    or not np.isfinite(exposure)):
+                raise ValueError('Invalid saved material colour operator')
+        feature_palette = parameters.get('feature_palette_policy', {})
+        if feature_palette.get('mode') == 'source_feature_chroma_only_face_distribution_bias':
+            face_operator = parameters['operators'].get('face', {})
+            if (face_operator.get('evidence', {}).get('mode') != 'material_distribution'
+                    or not np.array_equal(face_operator.get('matrix'), np.eye(2))
+                    or 'face' in parameters.get('conditional_chroma_residual', {})
+                    or 'face' in parameters.get('local_chroma_residual', {})):
+                raise ValueError('Source feature tint requires only a supported face distribution bias')
+        policy = parameters.get('protection_policy', {})
+        split = policy == 'split_lightness_chroma' or (isinstance(policy, dict)
+                                                    and policy.get('mode') == 'split_lightness_chroma')
+    else:
+        # Native matching has already validated the immutable parameter and
+        # sampled fields.  Repeating full-image finite/min/max reductions for
+        # every 128-row tile dominated this hot loop while adding no safety.
+        split = parameters.get('protection_policy', {}) == 'split_lightness_chroma' or (
+            isinstance(parameters.get('protection_policy', {}), dict)
+            and parameters['protection_policy'].get('mode') == 'split_lightness_chroma')
     if chroma_weights is None:
         if split:
             raise ValueError('Split protection requires explicit chroma_weights')
         chroma_weights = weights
-    for name, field in (('lightness', weights), ('chroma', chroma_weights)):
-        if (field.shape != weights.shape or not np.isfinite(field).all()
-                or field.min() < 0 or field.max() > 1+1e-6
-                or np.any(field.sum(-1) > 1+1e-6)):
-            raise ValueError(f'Invalid {name} region weights')
+    if not _trusted:
+        for name, field in (('lightness', weights), ('chroma', chroma_weights)):
+            if (field.shape != weights.shape or not np.isfinite(field).all()
+                    or field.min() < 0 or field.max() > 1+1e-6
+                    or np.any(field.sum(-1) > 1+1e-6)):
+                raise ValueError(f'Invalid {name} region weights')
+    if values_observation is not None:
+        _resolve_lab_observation(values, values_observation, 'values_observation')
     if strength == 0:
         return values.copy()
-    lab = to_lab(values)
+    # Colour conversion is pointwise. Restrict the expensive OKLab round trip
+    # to the union of pixels owned by at least one saved operator; all other
+    # pixels are copied from the source unchanged below. This keeps the
+    # accumulation order inside each material region intact.
+    operator_indices = [i for i, name in enumerate(REGIONS) if name in parameters['operators']]
+    active = np.zeros(values.shape[:2], dtype=bool)
+    for index in operator_indices:
+        active |= (weights[..., index] != 0) | (chroma_weights[..., index] != 0)
+    rows = np.flatnonzero(active.any(axis=1)); columns = np.flatnonzero(active.any(axis=0))
+    coordinate_edits = bool(parameters.get('local_chroma_residual')) or bool(parameters.get('authored_chroma_adjustments'))
+    if not len(rows) and not coordinate_edits:
+        result = values.copy()
+        if parameters.get('automatic_material_palette'):
+            from reference_material_palette import apply_palette
+            result = apply_palette(result, parameters['automatic_material_palette'], chroma_weights,
+                                   source_values=values, strength=strength, _trusted=_trusted,
+                                   source_observation=values_observation,
+                                   values_observation=None)
+        return result
+    work_top, work_bottom = (int(rows[0]), int(rows[-1])+1) if len(rows) else (0, values.shape[0])
+    work_left, work_right = (int(columns[0]), int(columns[-1])+1) if len(columns) else (0, values.shape[1])
+    work = np.s_[work_top:work_bottom, work_left:work_right]
+    work_values = values[work]
+    work_weights = weights[work]
+    work_chroma = chroma_weights[work]
+    if values_observation is not None:
+        full_lab = _resolve_lab_observation(values, values_observation, 'values_observation')
+        lab = full_lab[work]
+    else:
+        lab = to_lab(work_values)
     delta = np.zeros_like(lab)
     for index, name in enumerate(REGIONS):
         op = parameters['operators'].get(name)
         if op is None:
             continue
-        target = lab.copy()
-        target[..., 0] = _apply_tone(lab[..., 0], op)
-        target[..., 1:] = lab[..., 1:] @ np.asarray(op['matrix'], np.float32).T + op['bias']
+        support = (work_weights[..., index] != 0) | (work_chroma[..., index] != 0)
+        rows = np.flatnonzero(support.any(axis=1))
+        columns = np.flatnonzero(support.any(axis=0))
+        unused = not len(rows)
+        # Each material's pixelwise tone/colour work needs only its sampled
+        # L/ab support. Keep rectangular grids and native coordinates for the
+        # local field and authored stroke; accumulation remains region ordered.
+        if unused:
+            region = np.s_[:1, :1]
+            region_origin = origin
+        else:
+            top, left = int(rows[0]), int(columns[0])
+            right = int(columns[-1])+1
+            # A one-column crop selects a differently rounded NumPy affine
+            # matrix kernel. Retain one zero-dose neighbour when the input
+            # tile has multiple columns, preserving its ordinary tile kernel.
+            if right-left == 1 and lab.shape[1] > 1:
+                if right < lab.shape[1]:
+                    right += 1
+                else:
+                    left -= 1
+            region = np.s_[top:int(rows[-1])+1, left:right]
+            region_origin = (origin[0]+work_left+left, origin[1]+work_top+top)
+        # Keep saved field/stroke checks on one pixel when this band has no dose.
+        region_lab = lab[region]
+        # Every channel is assigned immediately below; avoid copying the
+        # source Lab tile only to overwrite all three channels.
+        target = np.empty_like(region_lab)
+        target[..., 0] = _apply_tone(region_lab[..., 0], op)
+        target[..., 1:] = region_lab[..., 1:] @ np.asarray(op['matrix'], np.float32).T + op['bias']
         shade = parameters.get('conditional_chroma_residual', {}).get(name)
         if shade:
-            target[..., 1:] += _shade_colour(shade, lab[..., shade['source_channel']])
+            target[..., 1:] += _shade_colour(shade, region_lab[..., shade['source_channel']])
         field = parameters.get('local_chroma_residual', {}).get(name)
         if field:
             if canvas_size is None:
                 raise ValueError('Local residuals require explicit source canvas coordinates')
-            target[..., 1:] += _local_colour(field, values.shape[:2], origin, canvas_size)
+            target[..., 1:] += _local_colour(field, region_lab.shape[:2], region_origin, canvas_size)
         for edit in parameters.get('authored_chroma_adjustments', []):
             if edit['region'] != name:
                 continue
@@ -901,35 +1270,46 @@ def apply(values, weights, parameters, *, strength=1., origin=(0, 0), canvas_siz
             high, low = edit['source_a_ramp']
             if not low < high < 0:
                 raise ValueError('Authored green-tail support must use an explicit source colour range')
-            gate = np.clip((high-lab[..., 1])/(high-low), 0, 1)
+            gate = np.clip((high-region_lab[..., 1])/(high-low), 0, 1)
             gate = gate*gate*(3-2*gate)
             # Protected eyes/lips and semantic boundaries cannot receive this
             # authored skin correction; only the fully supported face does.
-            gate *= np.clip((weights[..., index]-.9)/.1, 0, 1)
+            region_weights = work_weights[region][..., index]
+            gate *= np.clip((region_weights-.9)/.1, 0, 1)
             if any(not 0 <= edit['stroke'].get(key, default) <= 1 for key, default in (('opacity', 1.), ('hardness', .5))):
                 raise ValueError('Authored stroke opacity and hardness must remain in [0, 1]')
-            ox, oy = origin
-            coverage = stroke_coverage(edit['stroke'], (ox, oy, ox+values.shape[1], oy+values.shape[0]), canvas_size)
+            ox, oy = region_origin
+            coverage = stroke_coverage(edit['stroke'], (ox, oy, ox+region_lab.shape[1], oy+region_lab.shape[0]), canvas_size)
             target[..., 1:] += (coverage*gate)[..., None]*shift
-        delta[..., 0] += (target[..., 0]-lab[..., 0])*weights[..., index]
-        delta[..., 1:] += (target[..., 1:]-lab[..., 1:])*chroma_weights[..., index, None]
+        if unused:
+            continue
+        delta[region][..., 0] += (target[..., 0]-region_lab[..., 0])*work_weights[region][..., index]
+        delta[region][..., 1:] += (target[..., 1:]-region_lab[..., 1:])*work_chroma[region][..., index, None]
     target = lab + delta*strength
     rgb = from_lab(target)
     # Chroma compression preserves perceptual lightness; no photographic tone
     # shoulder is applied to an already display-referred reference or result.
+    bad = (rgb.min(-1) < 0) | (rgb.max(-1) > 1)
     for _ in range(12):
-        bad = (rgb.min(-1) < 0) | (rgb.max(-1) > 1)
         if not np.any(bad):
             break
         target[..., 1:][bad] *= .9
-        rgb[bad] = from_lab(target[bad])
-    result = np.clip(rgb, 0, 1).astype(np.float32)
-    operator_indices = [i for i, name in enumerate(REGIONS) if name in parameters['operators']]
-    inactive = ((weights[..., operator_indices].sum(-1) <= 1e-8)
-                & (chroma_weights[..., operator_indices].sum(-1) <= 1e-8))
-    result[inactive] = values[inactive]
+        # Only these pixels changed. Safe RGB cannot become out of gamut in
+        # a later iteration; retain the same packed transform and dose order
+        # while avoiding twelve reductions over every material pixel.
+        corrected = from_lab(target[bad])
+        rgb[bad] = corrected
+        bad[bad] = (corrected.min(-1) < 0) | (corrected.max(-1) > 1)
+    result = values.copy()
+    work_result = np.clip(rgb, 0, 1).astype(np.float32)
+    inactive = ((work_weights[..., operator_indices].sum(-1) <= 1e-8)
+                & (work_chroma[..., operator_indices].sum(-1) <= 1e-8))
+    work_result[inactive] = work_values[inactive]
+    result[work] = work_result
     if parameters.get('automatic_material_palette'):
         from reference_material_palette import apply_palette
         result = apply_palette(result, parameters['automatic_material_palette'], chroma_weights,
-                               source_values=values, strength=strength)
+                               source_values=values, strength=strength, _trusted=_trusted,
+                               source_observation=values_observation,
+                               values_observation=None)
     return result

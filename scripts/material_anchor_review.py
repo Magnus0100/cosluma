@@ -16,8 +16,8 @@ from PIL import Image, ImageDraw
 import cosplay_post_review as visual
 from float_appearance import srgb_to_linear
 from local_face_protection import prepare_face_protection
-import reference_material_targets as targets
-import reference_material_targets_v2 as current
+import reference_material_evidence as targets
+import reference_material_solver as current
 import vision_transport
 
 SCHEMA = 'material_target_inputs.v2'
@@ -77,7 +77,7 @@ def prepare_observation(root, role, displayed, identity_root, analysis_path, out
     # Keep thumbnail's aspect-ratio geometry, but use one Lanczos resize from
     # the canonical sRGB parent. Its default reducing_gap pre-reduces large
     # images and produces different pixels from the strictly bound parent
-    # resize checked by reference_material_targets._observation.
+    # resize checked by reference_material_evidence._observation.
     image.thumbnail((maximum_edge, maximum_edge), Image.Resampling.LANCZOS,
                     reducing_gap=None)
     # _raster has already converted the pixels to canonical sRGB. Its generated

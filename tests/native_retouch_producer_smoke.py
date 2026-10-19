@@ -189,13 +189,6 @@ def main():
             consumer = apply_clone_retouch(source.copy(), frozen['clone_retouch'], branch='foreground', subject_alpha=np.ones(labels.shape, np.float32))
             assert np.array_equal(replay, consumer)
             passed('double_approved_producer_executes_existing_heal_consumer')
-            from float_appearance import apply_native_source_retouch_float
-            bridged = apply_native_source_retouch_float(source, frozen, source_sha256=manifest['source']['sha256'],
-                working_domain='display_linear_sRGB', canvas_size=(384, 384))
-            assert np.array_equal(bridged, replay)
-            require_error(lambda: apply_native_source_retouch_float(source, frozen, source_sha256=manifest['source']['sha256'],
-                working_domain='scene_linear_sRGB'), 'cannot cross scene/display')
-            passed('production_float_entry_consumes_frozen_layer_and_rejects_wrong_working_domain')
             changed = np.any(replay != source, axis=2)
             support = np.zeros(labels.shape, bool)
             for item in frozen['patches']:

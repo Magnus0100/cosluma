@@ -6,7 +6,6 @@ import copy
 import hashlib
 import json
 from contextvars import ContextVar
-from functools import lru_cache
 from pathlib import Path
 import re
 
@@ -16,6 +15,7 @@ from effect_code_identity import current_code_identity, require_current_code
 from installed_resources import resource_path
 from PIL import Image
 from scipy.ndimage import binary_dilation
+from asset_identity import sha256_file
 
 SCHEMA = 'independent_effect_layer.v1'
 KIND = 'independent_effect'
@@ -35,15 +35,7 @@ def write(path, value):
 
 
 def digest(path):
-    path = Path(path)
-    stat = path.stat()
-    return _content_digest(str(path.resolve()), stat.st_size, stat.st_mtime_ns)
-
-
-@lru_cache(maxsize=64)
-def _content_digest(path, size, modified):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def identity(value):

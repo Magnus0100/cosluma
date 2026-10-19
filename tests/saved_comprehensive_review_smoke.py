@@ -257,16 +257,16 @@ def main():
         checked_paths = material._diagnosis(root, run, root)
         assert checked_paths == (path, prepared['source_path'], Path(run['source']['path']), Path(run['reference']['path']))
         passed.append('automatic_material_completion_production_diagnosis_accepts_v2')
-        import reference_material_targets as targets
+        import reference_material_evidence as targets
         source_binding = {'image': result['binding']['images']['source']}
         diagnosis = {'evidence': refinement._file(path), 'regions': ['face', 'left_arm', 'right_arm']}
         checked_target = targets._checked_diagnosis(diagnosis, source_binding)
         assert checked_target['reason'] == checked['checks']['skin_materials']['reference']['reason']
-        passed.append('reference_material_targets_production_diagnosis_accepts_v2')
+        passed.append('reference_material_evidence_production_diagnosis_accepts_v2')
         try:
             targets._checked_diagnosis(diagnosis, {'image': {'sha256': '0'*64}})
         except ValueError:
-            passed.append('reference_material_targets_rejects_wrong_source_owner')
+            passed.append('reference_material_evidence_rejects_wrong_source_owner')
         else:
             raise AssertionError('Material target entry accepted a different source owner')
         for name, operation in (
@@ -277,7 +277,7 @@ def main():
             try:
                 targets._checked_diagnosis(changed_diagnosis, source_binding)
             except ValueError:
-                passed.append('reference_material_targets_rejects_v2_'+name)
+                passed.append('reference_material_evidence_rejects_v2_'+name)
             else:
                 raise AssertionError('Material target entry bypassed v2 evidence validation: '+name)
             finally:

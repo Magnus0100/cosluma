@@ -7,6 +7,7 @@ import threading
 import time
 
 from PIL import Image
+from asset_identity import sha256_file
 
 _render_lock = threading.Lock()
 
@@ -32,11 +33,11 @@ def live_native_detail(root, run_id, body):
     left=max(0,min(width-cw,round(float(center[0])*width-cw/2)))
     top=max(0,min(height-ch,round(float(center[1])*height-ch/2)))
     box=(left,top,left+cw,top+ch);display=display_plan_for_run(edited)
-    identity={'run_id':run_id,'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    identity={'run_id':run_id,'manifest_sha256':sha256_file(manifest),
               'options':edited['options'],'crop_box':box,'display':display,
               'renderer':_renderer_identity(),
-              'live_renderer':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-              'roi_renderer':hashlib.sha256(code_path('native_roi_render.py').read_bytes()).hexdigest()}
+              'live_renderer':sha256_file(__file__),
+              'roi_renderer':sha256_file(code_path('native_roi_render.py'))}
     key=hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:20]
     directory=root/'outputs/cache/live-native-detail'/run_id;directory.mkdir(parents=True,exist_ok=True)
     target=directory/(key+'.png');receipt_path=directory/(key+'.json');hit=False;execution=None

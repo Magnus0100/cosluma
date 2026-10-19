@@ -24,6 +24,8 @@ def asset(path, size):
     return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'size': size}
 
 def write_run(root, run):
+    run.setdefault('execution_strategy', 'layered_reference_transfer')
+    run.setdefault('task_intent', {'mode':'existing_reference' if run.get('reference') else 'local_portrait'})
     path = root / 'outputs' / 'runs' / run['run_id'] / 'manifest.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(run), encoding='utf-8')

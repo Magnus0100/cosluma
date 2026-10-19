@@ -36,6 +36,31 @@ def _operations(run,branch):
     return operations
 
 
+def has_active_operations(run, branches=('foreground', 'composite')):
+    """Whether an appearance operation would actually change native pixels.
+
+    The persisted default appearance controls contain zero-valued dictionaries
+    for every branch.  Testing ``bool(_operations(...))`` therefore treats a
+    no-op control block as active and incorrectly blocks boundary preparation.
+    Keep the decision in one place so workers and the renderer agree.
+    """
+    for branch in branches:
+        for spec in _operations(run, branch):
+            if not isinstance(spec, dict):
+                continue
+            if float(spec.get('strength', 1.0)) == 0.0:
+                continue
+            keys = ('exposure', 'contrast', 'highlights', 'shadows',
+                    'saturation', 'temperature', 'tint', 'sharpness')
+            if any(float(spec.get(key, 0.0)) != 0.0 for key in keys):
+                return True
+            # A non-empty scoped operation with no tonal fields is still a
+            # real operation (for example a future local adjustment).
+            if any(key in spec for key in ('rect', 'scope', 'region_scope')):
+                return True
+    return False
+
+
 def _appearance(values,run,branch,box,native_size,premultiplied_alpha=None):
     from float_appearance import _float_tonal
     width,height=native_size;l,t,r,b=box
@@ -132,7 +157,7 @@ def render_native_roi(run,box):
     if color.get('enabled') and revision.get('source_color_plan_origin') in {
             'manual','model_with_user_edits','local_model_with_user_edits','local_automatic_with_user_edits','user'}:
         raise ROIUnavailable('selected-colour correction requires whole-selection current statistics')
-    admitted={'reference_appearance_stack','source_subject_detail','source_environment_response','source_boundary_light','source_cloth_boundary_light','background_design','contact_shadow','authored_receiver_shadow','rim_light','atmosphere','particles','bloom','independent_effect'}
+    admitted={'reference_appearance_stack','source_subject_detail','source_environment_response','source_boundary_light','source_cloth_boundary_light','background_design','contact_shadow','authored_receiver_shadow','rim_light','atmosphere','particles','bloom','independent_effect','registered_reference_style'}
     for layer in active:
         if layer['kind'] not in admitted:raise ROIUnavailable('nonlocal operator: '+layer['kind'])
         if 'target_look' in layer.get('assets',{}):raise ROIUnavailable('dynamic skin look needs whole-material current statistics')
@@ -158,6 +183,9 @@ def render_native_roi(run,box):
     if applicability is not None:
         fraction=np.clip(sample(applicability),0,1);retained=foreground*fraction[...,None]
         unsupported=foreground-retained;foreground=retained;automatic_alpha=np.clip(alpha*fraction,0,alpha)
+    from portrait_beauty_layer import apply_for_run as apply_beauty
+    foreground,beauty_execution=apply_beauty(foreground,run,canvas_size=native,box=hbox,
+        premultiplied_alpha=automatic_alpha)
     foreground=_detail_tiled(foreground,denoise=float(run.get('options',{}).get('denoise_strength',0)),coverage=automatic_alpha)
     if unsupported is not None:
         foreground += unsupported
@@ -261,10 +289,14 @@ def render_native_roi(run,box):
     for layer,sigma in bloom:
         highlights=np.maximum(result-float(layer['params'].get('threshold_linear',.45)),0)
         result=result+gaussian_filter(highlights,(sigma,sigma,0))*float(layer.get('strength',1))
+    from float_appearance import apply_registered_style_layers
+    result,style_records=apply_registered_style_layers(result,plan,run,box=hbox,canvas_size=native)
+    records.extend(style_records)
     return result[core].copy(),dict(schema='native_roi_execution.v1',recipe=RECIPE,enabled=plan.get('enabled'),
         source_coordinate_box=list(box),processing_box=list(hbox),halo_native_pixels=halo,
         native_pixel_spacing=[1,1],layers=records,source_geometry_changed=False,
         bounded_roi_renderer=True,full_canvas_rendered=False,nonlocal_receiver='zero support in processing box',
         source_reference='paired_native_baseline',source_binding=binding,
+        portrait_beauty=beauty_execution,
         working_domain='display_linear_sRGB',
         authored_receiver_shadow=plan.get('execution',{}).get('authored_receiver_shadow'))

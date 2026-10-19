@@ -5,7 +5,7 @@
       "id": "openai-compatible",
       "display": "OpenAI-compatible",
       "kind": "openai-compatible",
-      "model": "gpt-image-1",
+      "model": "gpt-image-2.5-sunburst",
       "endpoint_env": "COSPLAY_REFERENCE_API_BASE",
       "key_env": "COSPLAY_REFERENCE_API_KEY",
       "capabilities": [
@@ -40,7 +40,7 @@
         "b64_json",
         "url"
       ],
-      "timeout": 180,
+      "timeout": 900,
       "retry": {
         "max_attempts": 1,
         "backoff_seconds": 0,
@@ -58,7 +58,7 @@
     {
       "id": "qwen_image_2_1",
       "vision_provider": "auto",
-      "display": "Qwen Image 2.1 本地 / BF16 高画质",
+      "display": "Qwen Image 2.1 本地 / BF16 默认高画质",
       "kind": "comfyui",
       "adapter": "comfyui-http-v1",
       "protocol": "comfyui-api",

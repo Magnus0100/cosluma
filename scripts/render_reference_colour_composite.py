@@ -1,4 +1,4 @@
-"""Render a controlled native appearance-domain composite from fitted colours.
+"""Render the native T+B baseline from fitted colours and bound colour fusion.
 
 Reuses the selected background and alpha. Only the unknown source edge band
 is re-estimated in appearance RGB; this does not alter the existing project.
@@ -7,11 +7,12 @@ Run with the registered model-worker Python (PyMatting and OpenCV).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 from pathlib import Path
-from runtime_resources import code_path
+from runtime_resources import code_path, ordered_native_map
+from asset_identity import sha256_file
+import workflow_timing
 
 import cv2
 import numpy as np
@@ -19,8 +20,8 @@ from scipy.ndimage import distance_transform_edt
 
 from display_transform import display_linear
 from raw_support import open_linear, linear_preview, save_render_master
-from source_foreground import estimate_source_background
 from reference_colour_fit import apply, REGIONS
+from native_cuda_sampling import request_sampling_lease, sample_scoped_maps
 
 
 def field_owners(receipt, shape):
@@ -34,30 +35,240 @@ def field_owners(receipt, shape):
     return owners
 
 
-def sample_maps(values, box, proxy_size, native_size, *, owners=None):
+def matching_tiles(alpha, tile_rows=128):
+    """Yield full bands and covered native boxes for pixelwise matching.
+
+    Prepared proxy fields remain complete: callers sample their original
+    native coordinates and bilinear neighbours. Transparent bands retain one
+    native matching pixel for ordinary validation and zero-dose receipts;
+    callers still own the complete zero-alpha target and background bands.
+    """
+    for top in range(0, len(alpha), tile_rows):
+        end = min(len(alpha), top+tile_rows)
+        covered = alpha[top:end] > 0
+        rows = np.flatnonzero(covered.any(axis=1))
+        columns = np.flatnonzero(covered.any(axis=0))
+        if len(rows):
+            left, right = int(columns[0]), int(columns[-1])+1
+            first, last = top+int(rows[0]), top+int(rows[-1])+1
+        else:
+            left, right, first, last = 0, 1, top, top+1
+        yield top, end, (left, first, right, last), np.s_[first:last, left:right]
+
+
+def _sample_grid(box, proxy_size, native_size):
+    """Build one native tile's remap grid for all fields in that tile.
+
+    Native rendering samples several fields (weights, donors, colour, scene,
+    background and validity) with identical coordinates.  Keeping coordinate
+    construction outside ``sample_maps`` avoids allocating the same meshgrid
+    once per field while preserving the exact float32 coordinates and OpenCV
+    interpolation behaviour.
+    """
     left, top, right, bottom = box
     xs = ((np.arange(left, right)+.5)*proxy_size[0]/native_size[0]-.5).astype(np.float32)
     ys = ((np.arange(top, bottom)+.5)*proxy_size[1]/native_size[1]-.5).astype(np.float32)
-    xx, yy = np.meshgrid(xs, ys)
+    return np.meshgrid(xs, ys)
+
+
+def _sample_plan(grid, values_shape):
+    """Precompute coordinate math shared by owner-aware fields in one tile."""
+    xx, yy = grid
+    height, width = values_shape[:2]
+    clipped_xx = np.clip(xx, 0, width-1)
+    clipped_yy = np.clip(yy, 0, height-1)
+    x0 = np.floor(clipped_xx).astype(np.int32)
+    y0 = np.floor(clipped_yy).astype(np.int32)
+    x1 = np.minimum(x0+1, width-1)
+    y1 = np.minimum(y0+1, height-1)
+    dx, dy = clipped_xx-x0, clipped_yy-y0
+    owner_x = np.floor(clipped_xx+.5).astype(np.int32)
+    owner_y = np.floor(clipped_yy+.5).astype(np.int32)
+    # Every owner-aware field in a tile uses the same four neighbours and
+    # bilinear weights.  Keep those products and row-major indices beside the
+    # coordinate plan so colour, scene and donor sampling do not rebuild them
+    # once per field.  The expressions are evaluated here exactly as in the
+    # former call site, preserving float32 values and output bits.
+    i00 = y0*width + x0
+    i10 = y0*width + x1
+    i01 = y1*width + x0
+    i11 = y1*width + x1
+    owner_indices = owner_y*width + owner_x
+    w00 = (1-dx)*(1-dy)
+    w10 = dx*(1-dy)
+    w01 = (1-dx)*dy
+    w11 = dx*dy
+    return {'values_shape': (height, width), 'xx': xx, 'yy': yy, 'x0': x0, 'y0': y0,
+            'x1': x1, 'y1': y1, 'dx': dx, 'dy': dy,
+            'owner_x': owner_x, 'owner_y': owner_y,
+            'owner_indices': owner_indices, 'indices': (i00, i10, i01, i11),
+            'weights': (w00, w10, w01, w11)}
+
+
+def _sample_identity_grid(values, box, proxy_size, native_size, owners, grid, support, plan):
+    """Copy proven original proxy pixels; retain owner/visibility and +0 bits."""
+    if (owners is None or values.ndim != 3 or tuple(proxy_size) != tuple(native_size)
+            or tuple(proxy_size) != (values.shape[1], values.shape[0])):
+        return None
+    l, t, r, b = box
+    shape = b-t, r-l
+    if (any(not isinstance(x, (int, np.integer)) for x in box)
+            or not 0 <= l < r <= min(values.shape[1], 2**24)
+            or not 0 <= t < b <= min(values.shape[0], 2**24)
+            or owners.shape != values.shape[:2] or not np.issubdtype(owners.dtype, np.integer)):
+        return None
+    yy, xx = np.ogrid[t:b, l:r]
+    xx, yy = np.broadcast_to(xx, shape), np.broadcast_to(yy, shape)
+    if grid is not None and (not np.array_equal(grid[0], xx) or not np.array_equal(grid[1], yy)):
+        return None
+    if plan is not None:
+        indices = yy*values.shape[1]+xx
+        if (tuple(plan.get('values_shape', ())) != values.shape[:2]
+                or not np.array_equal(plan['xx'], xx) or not np.array_equal(plan['yy'], yy)
+                or not np.array_equal(plan.get('owner_indices'), indices)
+                or not np.array_equal(plan['indices'][0], indices)
+                or not np.all(plan['weights'][0] == 1)
+                or any(not np.all(w == 0) for w in plan['weights'][1:])):
+            return None
+        for positions in (*plan['indices'], plan['owner_indices']):
+            if (not isinstance(positions, np.ndarray) or positions.shape != shape
+                    or not np.issubdtype(positions.dtype, np.integer)
+                    or positions.min() < 0 or positions.max() >= owners.size):
+                return None
+    if (not np.isfinite(values).all() or support is not None and (values.shape[-1] not in (3, 4, 6)
+            or support.shape != shape or not np.isfinite(support).all() or support.min() < 0 or support.max() > 1)):
+        return None
+    result = np.zeros((*shape, values.shape[-1]), np.float32)
+    result += values[t:b, l:r]
+    result += np.float32(0)
+    if support is not None:
+        dose = np.where(np.isin(owners[t:b, l:r], (4, 1004)), 1-support, 1).astype(np.float32)
+        result[..., :2 if values.shape[-1] == 6 else values.shape[-1]-1] *= dose[..., None]
+    return result
+
+
+def sample_maps(values, box, proxy_size, native_size, *, owners=None, grid=None,
+                hair_face_support=None, sample_plan=None):
+    sampled = _sample_identity_grid(values, box, proxy_size, native_size, owners,
+        grid, np.asarray(hair_face_support) if hair_face_support is not None else None, sample_plan)
+    if sampled is not None:
+        return sampled
+    sampled = sample_scoped_maps(values, box, proxy_size, native_size, owners=owners,
+        grid=grid, hair_face_support=hair_face_support, sample_plan=sample_plan)
+    if sampled is not None:
+        return sampled
+    if grid is None:
+        xx, yy = _sample_grid(box, proxy_size, native_size)
+    else:
+        xx, yy = grid
     if owners is not None:
         if (owners.shape != values.shape[:2] or not np.issubdtype(owners.dtype, np.integer)
                 or tuple(proxy_size) != (values.shape[1], values.shape[0])):
             raise ValueError('Material-aware field sampling requires matching integer owners')
-        xx = np.clip(xx, 0, values.shape[1]-1); yy = np.clip(yy, 0, values.shape[0]-1)
-        x0 = np.floor(xx).astype(np.int32); y0 = np.floor(yy).astype(np.int32)
-        x1 = np.minimum(x0+1, values.shape[1]-1); y1 = np.minimum(y0+1, values.shape[0]-1)
-        domain = owners[np.floor(yy+.5).astype(np.int32), np.floor(xx+.5).astype(np.int32)]
-        dx,dy = xx-x0, yy-y0
+        width = values.shape[1]
+        if sample_plan is None:
+            xx = np.clip(xx, 0, values.shape[1]-1); yy = np.clip(yy, 0, values.shape[0]-1)
+            x0 = np.floor(xx).astype(np.int32); y0 = np.floor(yy).astype(np.int32)
+            x1 = np.minimum(x0+1, values.shape[1]-1); y1 = np.minimum(y0+1, values.shape[0]-1)
+            owner_x = np.floor(xx+.5).astype(np.int32)
+            owner_y = np.floor(yy+.5).astype(np.int32)
+            dx,dy = xx-x0, yy-y0
+        else:
+            if (sample_plan['xx'].shape != xx.shape
+                    or tuple(sample_plan.get('values_shape', ())) != (values.shape[0], values.shape[1])):
+                raise ValueError('Precomputed sample plan shape differs from target grid')
+            x0, y0 = sample_plan['x0'], sample_plan['y0']
+            x1, y1 = sample_plan['x1'], sample_plan['y1']
+            dx, dy = sample_plan['dx'], sample_plan['dy']
+            owner_x, owner_y = sample_plan['owner_x'], sample_plan['owner_y']
+        # Flattened row-major indices avoid repeating a two-array advanced
+        # indexing broadcast for every corner.  The source arrays are already
+        # C-contiguous native fields, so this preserves the exact gathered
+        # values while reducing temporary index construction in every tile.
+        values_flat = values.reshape((-1,) + values.shape[2:])
+        owners_flat = owners.reshape(-1)
+        owner_indices = sample_plan.get('owner_indices') if sample_plan is not None else owner_y*width + owner_x
+        domain = owners_flat[owner_indices]
         result = np.zeros((*xx.shape,)+values.shape[2:], np.float32)
+        # Advanced indexing (``values_flat[indices]``) allocates a fresh
+        # corner array on every one of the four neighbours.  Native matching
+        # samples the same owner-aware fields for dozens of full-resolution
+        # tiles, so keep one typed scratch buffer and gather into it.  The
+        # gather and following float32 multiply are the same operations as the
+        # former expression; only the temporary lifetime changes.
+        # Match NumPy's value*dose promotion before the in-place accumulation
+        # as well, so callers that provide a non-float32 field retain the
+        # former arithmetic contract (production fields are float32).
+        corner = np.empty((*xx.shape,)+values.shape[2:],
+                          dtype=np.result_type(values.dtype, np.float32))
         total = np.zeros_like(xx)
         channels = (None,)*(values.ndim-2)
-        for x,y,w in ((x0,y0,(1-dx)*(1-dy)),(x1,y0,dx*(1-dy)),
-                      (x0,y1,(1-dx)*dy),(x1,y1,dx*dy)):
-            dose = (w*(owners[y,x]==domain)).astype(np.float32)
-            result += values[y,x]*dose[(...,)+channels]
+        if sample_plan is not None:
+            corners = zip(sample_plan['indices'], sample_plan['weights'])
+        else:
+            corners = ((y0*width+x0,(1-dx)*(1-dy)), (y0*width+x1,dx*(1-dy)),
+                       (y1*width+x0,(1-dx)*dy), (y1*width+x1,dx*dy))
+        for indices,w in corners:
+            dose = (w*(owners_flat[indices]==domain)).astype(np.float32)
+            np.take(values_flat, indices, axis=0, out=corner)
+            corner *= dose[(...,)+channels]
+            result += corner
             total += dose
-        return result/np.maximum(total,1e-12)[(...,)+channels]
+        result = result/np.maximum(total,1e-12)[(...,)+channels]
+        if hair_face_support is not None:
+            support = np.asarray(hair_face_support)
+            if (values.ndim != 3 or values.shape[-1] not in (3,4,6) or support.shape != xx.shape
+                    or not np.isfinite(support).all() or support.min() < 0 or support.max() > 1):
+                raise ValueError('Hair field veto requires sampled visible-face support on the target grid')
+            dose = np.where(np.isin(domain, (4,1004)), 1-support, 1).astype(np.float32)
+            # Colour v2 has B ab/QA plus ambient ab/feature mask. Its QA and
+            # feature support are not amplitudes; scene fields have EV/ab/QA.
+            result[..., :2 if values.shape[-1] == 6 else values.shape[-1]-1] *= dose[...,None]
+        return result
+    if hair_face_support is not None:
+        raise ValueError('Hair field veto requires the field material owners')
     return cv2.remap(values, xx, yy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def sample_plain_stack(stacked, channel_sizes, box, proxy_size, native_size, *, grid=None):
+    """Remap a pre-concatenated owner-free field bank and split its views.
+
+    Weights, donors and optional chroma weights share coordinates and are all
+    channel-wise float32 fields.  One OpenCV remap preserves each channel's
+    interpolation bits while avoiding repeated proxy coordinate walks.  The
+    owner-aware colour/scene fields remain on ``sample_maps``.
+    """
+    stacked = np.asarray(stacked)
+    channel_sizes = tuple(int(value) for value in channel_sizes)
+    if (stacked.ndim != 3 or not channel_sizes or sum(channel_sizes) != stacked.shape[-1]
+            or not np.issubdtype(stacked.dtype, np.floating)):
+        raise ValueError('Invalid pre-concatenated plain field bank')
+    if grid is None:
+        xx, yy = _sample_grid(box, proxy_size, native_size)
+    else:
+        xx, yy = grid
+    sampled = cv2.remap(stacked, xx, yy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    result, start = [], 0
+    for channels in channel_sizes:
+        result.append(sampled[..., start:start+channels])
+        start += channels
+    return tuple(result)
+
+
+def sample_reference_field(values, box, proxy_size, canvas_size, *, owners, guard=None,
+                          grid=None, visible_face_support=None, sample_plan=None):
+    """B/S and proxy donors consume the same source visibility veto once.
+
+    ``visible_face_support`` lets native matching share the support sampled for
+    two fields at the same tile.  The array is read-only here; omitting it
+    retains the original guard-bound sampling path for independent callers.
+    """
+    support = visible_face_support
+    if guard is not None and support is None:
+        from portrait_beauty_layer import sample_visible_face_support
+        support = sample_visible_face_support(guard, box, canvas_size)
+    return sample_maps(values, box, proxy_size, canvas_size, owners=owners, grid=grid,
+                       hair_face_support=support, sample_plan=sample_plan)
 
 
 def donor_fields(source, alpha, weights, parameters, reference_blend=None, scene_balance=None, matched_baseline=None, chroma_weights=None):
@@ -80,8 +291,8 @@ def donor_fields(source, alpha, weights, parameters, reference_blend=None, scene
     else:
         matched = apply(source, weights, parameters, canvas_size=(source.shape[1], source.shape[0]), chroma_weights=chroma_weights)
         if reference_blend is not None:
-            from reference_colour_blend import apply_colour_layer
-            matched = apply_colour_layer(matched, reference_blend)
+            from reference_colour_blend import fuse_reference_colour
+            matched = fuse_reference_colour(matched, reference_blend, source_values=source)
     if scene_balance is not None:
         from reference_scene_balance import apply_scene_balance
         matched = apply_scene_balance(matched, scene_balance)
@@ -156,14 +367,137 @@ def bounded_edge_extension(fp, alpha, correction, report=None):
     return result
 
 
-def match_foreground(fp, alpha, weights, donors, edge_support, parameters, *, origin, canvas_size, reference_blend=None, scene_balance=None, chroma_weights=None, donor_gamut_report=None):
+def _match_straight(source, weights, parameters, *, origin, canvas_size,
+                    reference_blend=None, chroma_weights=None, _trusted=False):
+    matched = apply(source, weights, parameters, origin=origin, canvas_size=canvas_size,
+                    chroma_weights=chroma_weights, _trusted=_trusted)
+    if reference_blend is not None:
+        from reference_colour_blend import fuse_reference_colour
+        matched = fuse_reference_colour(matched, reference_blend, source_values=source)
+    return matched
+
+
+_PRE_SCENE_MAX_ADJACENT_BLOCKS = 2
+
+
+def _pre_scene_recompute_ranges(valid):
+    """Yield bounded adjacent miss ranges without crossing an all-valid block."""
+    from reference_pre_scene_cache import BLOCK_COLUMNS
+    width = valid.shape[1]
+    left = 0
+    while left < width:
+        right = min(left+BLOCK_COLUMNS, width)
+        if valid[:, left:right].all():
+            left = right
+            continue
+        # Two 128-column misses form at most one 128x256 native band; sampled
+        # owners and fields still use their original global pixel coordinates.
+        for _ in range(_PRE_SCENE_MAX_ADJACENT_BLOCKS-1):
+            following = min(right+BLOCK_COLUMNS, width)
+            if right == width or valid[:, right:following].all():
+                break
+            right = following
+        # Preserve the ordinary multi-column matrix kernel for a thin tail.
+        first = left-1 if right-left == 1 and width > 1 else left
+        yield first, right
+        left = right
+
+
+def sample_pre_scene_reference_field(values, box, proxy_size, canvas_size, *,
+                                     pre_scene_valid, owners, guard=None,
+                                     grid=None, visible_face_support=None, sample_plan=None):
+    """Sample B only where the verified native T+B cache needs recomputation.
+
+    Scene balance remains a full-band field. The original matcher consumes
+    these same bounded miss ranges; unused B locations have no effect on its
+    cached target. Slice the complete coordinate plan and visibility support
+    so neighbours, owners and the one-column tail retain their original bits.
+    """
+    if pre_scene_valid is None:
+        return sample_reference_field(values, box, proxy_size, canvas_size,
+            owners=owners, guard=guard, grid=grid, sample_plan=sample_plan,
+            visible_face_support=visible_face_support)
+    shape = (box[3]-box[1], box[2]-box[0])
+    if (not isinstance(pre_scene_valid, np.ndarray) or pre_scene_valid.dtype != np.dtype(bool)
+            or pre_scene_valid.shape != shape or values.ndim != 3):
+        raise ValueError('Pre-scene B sampling requires the native boolean cache mask')
+    if owners is not None and (owners.shape != values.shape[:2]
+            or not np.issubdtype(owners.dtype, np.integer)
+            or tuple(proxy_size) != (values.shape[1], values.shape[0])):
+        raise ValueError('Material-aware field sampling requires matching integer owners')
+    grid = _sample_grid(box, proxy_size, canvas_size) if grid is None else grid
+    if any(value.shape != shape for value in grid):
+        raise ValueError('Pre-scene B sampling grid differs from the native cache mask')
+    if sample_plan is not None and (sample_plan['xx'].shape != shape
+            or tuple(sample_plan.get('values_shape', ())) != values.shape[:2]):
+        raise ValueError('Precomputed sample plan shape differs from target grid')
+    support = visible_face_support
+    if guard is not None and support is None:
+        from portrait_beauty_layer import sample_visible_face_support
+        support = sample_visible_face_support(guard, box, canvas_size)
+    if support is not None:
+        support = np.asarray(support)
+        if owners is None:
+            raise ValueError('Hair field veto requires the field material owners')
+        if (values.shape[-1] not in (3, 4, 6) or support.shape != shape
+                or not np.isfinite(support).all() or support.min() < 0 or support.max() > 1):
+            raise ValueError('Hair field veto requires sampled visible-face support on the target grid')
+    result = np.zeros((*shape, values.shape[-1]), np.float32 if owners is not None else values.dtype)
+    for first, right in _pre_scene_recompute_ranges(pre_scene_valid):
+        region = np.s_[:, first:right]
+        part_plan = ({name: (value[region] if isinstance(value, np.ndarray)
+            else tuple(part[region] for part in value) if name in ('indices', 'weights')
+            else value) for name, value in sample_plan.items()} if sample_plan is not None else None)
+        result[region] = sample_reference_field(values,
+            (box[0]+first, box[1], box[0]+right, box[3]), proxy_size, canvas_size,
+            owners=owners, guard=guard, grid=tuple(value[region] for value in grid),
+            sample_plan=part_plan, visible_face_support=support[region] if support is not None else None)
+    return result
+
+
+def _reuse_pre_scene(source, weights, parameters, *, origin, canvas_size,
+                     reference_blend, chroma_weights, prepared, valid, _trusted):
+    matched = prepared.copy()
+    for first, right in _pre_scene_recompute_ranges(valid):
+        region = np.s_[:, first:right]
+        target = _match_straight(source[region], weights[region], parameters,
+            origin=(origin[0]+first, origin[1]), canvas_size=canvas_size,
+            reference_blend=reference_blend[region] if reference_blend is not None else None,
+            chroma_weights=chroma_weights[region] if chroma_weights is not None else None,
+            _trusted=_trusted)
+        invalid = ~valid[region]
+        matched[region][invalid] = target[invalid]
+    return matched
+
+
+def match_foreground(fp, alpha, weights, donors, edge_support, parameters, *, origin, canvas_size,
+                     reference_blend=None, scene_balance=None, chroma_weights=None,
+                     donor_gamut_report=None, _trusted=False, pre_scene_target=None,
+                     pre_scene_valid=None, pre_scene_sink=None):
     # At high coverage unpremultiplication is stable; below .95 it is never used.
     safe = alpha >= .95
     source = np.divide(fp, alpha[..., None], out=np.zeros_like(fp), where=safe[..., None])
-    matched = apply(source, weights, parameters, origin=origin, canvas_size=canvas_size, chroma_weights=chroma_weights)
-    if reference_blend is not None:
-        from reference_colour_blend import apply_colour_layer
-        matched = apply_colour_layer(matched, reference_blend)
+    if not np.isfinite(source).all():
+        raise ValueError('Unpremultiplied foreground contains nonfinite values')
+    # A fractional matte can divide a valid premultiplied foreground slightly
+    # above the display endpoint. This is an edge-estimation artifact, so
+    # normalize the straight foreground before any colour or scene operator.
+    source = np.clip(source, 0, 1)
+    if pre_scene_target is None:
+        matched = _match_straight(source, weights, parameters, origin=origin,
+            canvas_size=canvas_size, reference_blend=reference_blend,
+            chroma_weights=chroma_weights, _trusted=_trusted)
+    else:
+        if (pre_scene_target.shape != source.shape or pre_scene_target.dtype != np.float32
+                or pre_scene_valid is None or pre_scene_valid.shape != alpha.shape
+                or np.any(pre_scene_valid & (alpha != 1))):
+            raise ValueError('Pre-scene reuse requires exact opaque float32 source coverage')
+        matched = _reuse_pre_scene(source, weights, parameters, origin=origin,
+            canvas_size=canvas_size, reference_blend=reference_blend,
+            chroma_weights=chroma_weights, prepared=pre_scene_target,
+            valid=pre_scene_valid, _trusted=_trusted)
+    if pre_scene_sink is not None:
+        pre_scene_sink(matched)
     if scene_balance is not None:
         from reference_scene_balance import apply_scene_balance
         matched = apply_scene_balance(matched, scene_balance)
@@ -180,158 +514,209 @@ def match_foreground(fp, alpha, weights, donors, edge_support, parameters, *, or
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--run', type=Path, required=True)
-    parser.add_argument('--match-dir', type=Path, default=Path('outputs/inspection/reference-match-v2'))
-    parser.add_argument('--reference-blend', type=Path, help='Bound selected low-frequency reference colour layer')
-    parser.add_argument('--scene-balance', type=Path, help='Bound residual lightness and environment-colour balance layer')
-    args = parser.parse_args()
-    started = time.perf_counter()
-    run = json.loads(args.run.read_text(encoding='utf8'))
-    plan = run['options']['appearance_revision']['design_reconstruction_plan']
-    directory = args.match_dir.resolve()
-    parameters = json.loads((directory/'parameters.json').read_text(encoding='utf8'))
-    if parameters['binding']['source'] != run['source']['sha256'] or parameters['binding']['reference'] != run['reference']['sha256']:
-        raise ValueError('Match belongs to a different original/reference pair')
-    if parameters['binding']['algorithm_sha256'] != hashlib.sha256(code_path('reference_colour_fit.py').read_bytes()).hexdigest():
-        raise ValueError('Re-evaluate matching after an algorithm change')
-    if parameters['binding']['alpha'] != plan['source_baseline']['assets']['foreground_alpha']['sha256']:
-        raise ValueError('Match belongs to a different baseline alpha')
-    if parameters.get('region_order') != list(REGIONS):
-        raise ValueError('Re-evaluate matching after a region contract change')
-    authored = parameters['binding'].get('authored_colour_edit')
-    if authored and hashlib.sha256(Path(authored['path']).read_bytes()).hexdigest() != authored['sha256']:
-        raise ValueError('Authored colour stroke changed after evaluation')
-    if authored and hashlib.sha256(code_path('local_colour_brush.py').read_bytes()).hexdigest() != authored['stroke_algorithm_sha256']:
-        raise ValueError('Authored stroke algorithm changed after evaluation')
-    objects = parameters['binding'].get('object_masks')
-    if objects:
-        object_path = Path(objects['receipt_path'])
-        if hashlib.sha256(object_path.read_bytes()).hexdigest() != objects['receipt_sha256']:
-            raise ValueError('Accessory mask review changed after fitting')
-        receipt = json.loads(object_path.read_text(encoding='utf8'))
-        for role in ('source', 'reference'):
-            asset = receipt['roles'][role]
-            if hashlib.sha256(Path(asset['mask_path']).read_bytes()).hexdigest() != objects['masks'][role]:
-                raise ValueError('Accessory mask changed after fitting')
-    size, native = tuple(plan['canvas']['source_proxy_size']), tuple(plan['canvas']['source_oriented_size'])
-    blend_field, blend_receipt = None, None
-    if args.reference_blend:
-        from reference_colour_blend import validate_layer
-        blend_field, blend_receipt = validate_layer(args.reference_blend, parameters, native, size)
-    blend_owners = field_owners(blend_receipt, blend_field.shape[:2]) if blend_field is not None else None
-    scene_field, scene_receipt, donor_baseline = None, None, None
-    if args.scene_balance:
-        if not args.reference_blend:
-            raise ValueError('Scene balance must follow its bound reference colour layer')
-        from reference_scene_balance import validate_scene_layer
-        scene_field, scene_receipt = validate_scene_layer(args.scene_balance, parameters,
-            args.reference_blend, plan, native, size)
-        with np.load(scene_receipt['asset']['path'], allow_pickle=False) as resource:
-            donor_baseline = resource['baseline_rgb']
-        if donor_baseline.shape != (*scene_field.shape[:2], 3) or not np.isfinite(donor_baseline).all():
-            raise ValueError('Scene balance requires its native-matched proxy donor baseline')
-    scene_owners = field_owners(scene_receipt, scene_field.shape[:2]) if scene_field is not None else None
-    weights_hash = hashlib.sha256((directory/'source-weights.npz').read_bytes()).hexdigest()
-    if parameters['binding'].get('source_weights_sha256') != weights_hash:
-        raise ValueError('Re-evaluate matching after source weights change')
-    with np.load(directory/'source-weights.npz', allow_pickle=False) as resource:
-        weights = resource['values']
-        chroma_weights = resource['chroma_values'] if 'chroma_values' in resource else None
-    with np.load(plan['source_baseline']['assets']['foreground_alpha']['path'], allow_pickle=False) as resource:
-        alpha = resource['values']
-    print('Decoding native original into fixed appearance RGB', flush=True)
-    from native_source_baseline import source_for_reference_prepare
-    source, _, _ = source_for_reference_prepare(run, binding=parameters['binding'])
-    proxy = cv2.resize(source, size, interpolation=cv2.INTER_LINEAR)
-    donors = donor_fields(proxy, cv2.resize(alpha, size, interpolation=cv2.INTER_LINEAR), weights, parameters,
-        blend_field, scene_field, donor_baseline, chroma_weights)
-    # Alpha is reused. No ViTMatte, inpainting, reference generation or SR rerun.
-    trimap = np.full(alpha.shape, 128, np.uint8)
-    trimap[alpha == 0] = 0; trimap[alpha == 1] = 255
-    print('Re-estimating only unknown appearance-domain edges', int(np.count_nonzero(trimap == 128)), flush=True)
-    old_bg, foreground, edge_support, tiles, _, _ = estimate_source_background(source, alpha, trimap)
-    maximum_reconstruction_error = 0.
-    opaque_unchanged = True
-    for top in range(0, len(source), 128):
-        end = min(len(source), top+128)
-        restored = foreground[top:end]+(1-alpha[top:end, ..., None])*old_bg[top:end]
-        maximum_reconstruction_error = max(maximum_reconstruction_error, float(np.max(np.abs(restored-source[top:end]))))
-        known = alpha[top:end] == 1
-        opaque_unchanged &= bool(np.array_equal(foreground[top:end][known], source[top:end][known]))
-    del source, trimap
-    bg_layer = next(x for x in plan['layers'] if x['kind'] == 'background_design')
-    with np.load(bg_layer['assets']['background']['path'], allow_pickle=False) as resource:
-        background = resource['values']
-    with np.load(bg_layer['assets']['validity']['path'], allow_pickle=False) as resource:
-        validity_proxy = resource['values']
-    associated = bg_layer['assets']['background'].get('validity_associated', False) or bg_layer['assets']['background'].get('representation') == 'sampling_validity_associated_RGB'
-    # The selected plate is inverse-sRGB reference appearance, not RAW scene
-    # radiance. Do not subject it to a second photographic display transform.
-    print('Matching native Fp, selected reference colour fusion, and compositing once', flush=True)
-    clipping, opaque_pixels, low_alpha_pixels = 0, 0, 0
-    for top in range(0, len(foreground), 128):
-        end = min(len(foreground), top+128); box = (0, top, native[0], end)
-        w = sample_maps(weights, box, size, native)
-        cw = sample_maps(chroma_weights, box, size, native) if chroma_weights is not None else None
-        d = sample_maps(donors, box, size, native)
-        colour = sample_maps(blend_field, box, size, native, owners=blend_owners) if blend_field is not None else None
-        scene = sample_maps(scene_field, box, size, native, owners=scene_owners) if scene_field is not None else None
-        foreground[top:end] = match_foreground(foreground[top:end], alpha[top:end], w, d, edge_support[top:end], parameters,
-            origin=(0, top), canvas_size=native, reference_blend=colour, scene_balance=scene, chroma_weights=cw)
+@request_sampling_lease(('blend_field', 'blend_owners'))
+def _matching_native_bands(foreground, alpha, edge_support, old_bg, background,
+                           validity_proxy, parameters, blend_field, blend_owners,
+                           hair_guard, size, native, plain_proxy, plain_channels,
+                           *, associated, has_chroma, capture_pre_scene, workers=2):
+    """Calculate independent original-coordinate bands; consumers own writes."""
+    def compute(tile):
+        top, end, match_box, region = tile
+        grid = _sample_grid(match_box, size, native)
+        sample_plan = _sample_plan(grid, blend_field.shape[:2])
+        sampled_plain = sample_plain_stack(plain_proxy, plain_channels,
+                                           match_box, size, native, grid=grid)
+        w, d = sampled_plain[:2]
+        cw = sampled_plain[2] if has_chroma else None
+        colour = sample_reference_field(blend_field, match_box, size, native, owners=blend_owners,
+            guard=hair_guard, grid=grid, sample_plan=sample_plan)
+        # This local sink captures the unchanged T+B target, without writing
+        # the shared pre-scene cache or changing its statistics in a worker.
+        pre_scene = []
+        matched = match_foreground(foreground[region], alpha[region], w, d, edge_support[region], parameters,
+            origin=match_box[:2], canvas_size=native, reference_blend=colour, chroma_weights=cw,
+            pre_scene_sink=pre_scene.append if capture_pre_scene else None, _trusted=True)
+        values = np.zeros((end-top, native[0], 3), np.float32)
+        left, first, right, last = match_box
+        values[first-top:last-top, left:right] = matched
+        # Composition still covers every native pixel once in the same band.
+        box = (0, top, native[0], end)
         if (background.shape[1], background.shape[0]) == native:
             target = background[top:end]
         else:
             target = sample_maps(background, box, (background.shape[1], background.shape[0]), native)
-        validity = sample_maps(validity_proxy, box, (validity_proxy.shape[1], validity_proxy.shape[0]), native)
+        validity_size = (validity_proxy.shape[1], validity_proxy.shape[0])
+        validity_grid = (grid if match_box == box else _sample_grid(box, size, native)) if validity_size == tuple(size) else None
+        validity = sample_maps(validity_proxy, box, validity_size, native, grid=validity_grid)
         bg = target+(1-validity[..., None])*old_bg[top:end] if associated else validity[..., None]*target+(1-validity[..., None])*old_bg[top:end]
-        foreground[top:end] += (1-alpha[top:end, ..., None])*bg
-        clipping += int(np.count_nonzero((foreground[top:end] < 0) | (foreground[top:end] > 1)))
-        opaque_pixels += int(np.count_nonzero(alpha[top:end] == 1))
-        low_alpha_pixels += int(np.count_nonzero((alpha[top:end] > 0) & (alpha[top:end] < .95)))
-    del old_bg, background
-    np.clip(foreground, 0, 1, out=foreground)
-    master = directory/'appearance-composite.tif'
-    save_render_master(foreground, master)
-    linear_preview(cv2.resize(foreground, size, interpolation=cv2.INTER_AREA)).save(directory/'pure-composite.jpg', quality=97)
-    previous = json.loads((directory/'validation.json').read_text(encoding='utf8'))
-    for name, box in previous['native_crop_boxes'].items():
-        left, top, right, bottom = box
-        linear_preview(foreground[top:bottom, left:right]).save(directory/f'composite-native-{name}.png')
-    report = {'schema': 'reference_colour_composite.appearance.v2', 'source_run_id': run['run_id'],
-        'working_domain': 'display_linear_sRGB', 'output': str(master), 'size': list(native),
-        'source_reference_binding': parameters['binding'], 'source_weights_sha256': weights_hash,
-        'protection_policy': parameters['protection_policy'],
-        'parameters_sha256': hashlib.sha256((directory/'parameters.json').read_bytes()).hexdigest(),
-        'validation_sha256': hashlib.sha256((directory/'validation.json').read_bytes()).hexdigest(),
-        'renderer_sha256': hashlib.sha256(code_path('render_reference_colour_composite.py').read_bytes()).hexdigest(),
-        'output_sha256': hashlib.sha256(master.read_bytes()).hexdigest(),
-        'alpha_reused': True, 'appearance_edge_tiles': tiles, 'original_reconstruction_max_error': maximum_reconstruction_error,
-        'edge_donors': 'same_semantic_region; untyped_very_near_edges_support_at_most_0.15',
-        'opaque_original_unchanged_before_matching': opaque_unchanged,
-        'opaque_source_pixels': opaque_pixels, 'low_alpha_division_avoided_pixels': low_alpha_pixels,
-        'final_out_of_gamut_channels_before_clipping': clipping,
-        'composition_count': 1, 'photographic_display_transform_after_reference': False,
-        'extra_contact_rim_fog_bloom': False, 'existing_project_brushes_applied': False,
-        'authored_colour_edit': authored, 'existing_reference_shadows_reflections_resolved': False,
-        'reference_spatial_colour_used': blend_receipt is not None,
-        'reference_high_frequency_texture_used': False,
-        'reference_spatial_lightness_used': scene_receipt is not None,
-        'scene_balance': {'receipt_path': str(args.scene_balance.resolve()),
-            'receipt_sha256': hashlib.sha256(args.scene_balance.read_bytes()).hexdigest(),
-            'asset_sha256': scene_receipt['asset']['sha256'],
-            'donor_baseline': 'native_T_plus_colour_blend_reduced_to_proxy; opaque_donors_only',
-            'joint_donor_exposure_limit_ev': parameters['settings']['maximum_exposure_ev']+float(np.max(np.abs(scene_field[..., 0]))),
-            'background_curve': 'identity', 'physical_lighting_reconstructed': False,
-            'regions': scene_receipt['regions']} if scene_receipt else None,
-        'reference_colour_layer': {'receipt_path': str(args.reference_blend.resolve()),
-            'receipt_sha256': hashlib.sha256(args.reference_blend.read_bytes()).hexdigest(),
-            'asset_sha256': blend_receipt['asset']['sha256'], 'regions': blend_receipt['regions']} if blend_receipt else None,
-        'geometry_or_texture_from_reference_person': False, 'project_pointer_modified': False,
-        'visual_acceptance': False, 'elapsed_seconds': round(time.perf_counter()-started, 2)}
-    (directory/'composite-receipt.json').write_text(json.dumps(report, indent=2, ensure_ascii=False)+'\n', encoding='utf8')
-    print(json.dumps(report, ensure_ascii=False), flush=True)
+        values += (1-alpha[top:end, ..., None])*bg
+        counts = (int(np.count_nonzero((values < 0) | (values > 1))),
+                  int(np.count_nonzero(alpha[top:end] == 1)),
+                  int(np.count_nonzero((alpha[top:end] > 0) & (alpha[top:end] < .95))))
+        return top, end, match_box, values, pre_scene[0] if pre_scene else None, counts
+
+    yield from ordered_native_map(compute, matching_tiles(alpha), workers=workers)
+
+
+def validate_material_inputs(parameters):
+    """Shared source-bound material inputs for baseline rendering and freeze."""
+    from asset_identity import sha256_file
+    if parameters.get('region_order') != list(REGIONS):
+        raise ValueError('Re-evaluate matching after a region contract change')
+    authored = parameters['binding'].get('authored_colour_edit')
+    if authored and sha256_file(authored['path']) != authored['sha256']:
+        raise ValueError('Authored colour stroke changed after evaluation')
+    if authored and sha256_file(code_path('local_colour_brush.py')) != authored['stroke_algorithm_sha256']:
+        raise ValueError('Authored stroke algorithm changed after evaluation')
+    objects = parameters['binding'].get('object_masks')
+    if objects:
+        object_path = Path(objects['receipt_path'])
+        if sha256_file(object_path) != objects['receipt_sha256']:
+            raise ValueError('Accessory mask review changed after fitting')
+        receipt = json.loads(object_path.read_text(encoding='utf8'))
+        for role in ('source', 'reference'):
+            if sha256_file(receipt['roles'][role]['mask_path']) != objects['masks'][role]:
+                raise ValueError('Accessory mask changed after fitting')
+    return authored
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--run', type=Path, required=True)
+    parser.add_argument('--match-dir', type=Path, default=Path('outputs/inspection/reference-match-v2'))
+    parser.add_argument('--reference-blend', type=Path, required=True, help='Bound selected low-frequency reference colour layer')
+    args = parser.parse_args()
+    started = time.perf_counter()
+    directory = args.match_dir.resolve()
+    with workflow_timing.request(directory, 'reference_native_baseline') as ledger:
+        with workflow_timing.span('load', model_request=False, http_request=False):
+            run = json.loads(args.run.read_text(encoding='utf8'))
+            plan = run['options']['appearance_revision']['design_reconstruction_plan']
+            parameters = json.loads((directory/'parameters.json').read_text(encoding='utf8'))
+            if parameters['binding']['source'] != run['source']['sha256'] or parameters['binding']['reference'] != run['reference']['sha256']:
+                raise ValueError('Match belongs to a different original/reference pair')
+            if parameters['binding']['algorithm_sha256'] != sha256_file(code_path('reference_colour_fit.py')):
+                raise ValueError('Re-evaluate matching after an algorithm change')
+            if parameters['binding']['alpha'] != plan['source_baseline']['assets']['foreground_alpha']['sha256']:
+                raise ValueError('Match belongs to a different baseline alpha')
+            authored = validate_material_inputs(parameters)
+            if parameters.get('automatic_material_palette'):
+                from reference_material_palette import validate_palette
+                validate_palette(parameters['automatic_material_palette'])
+            size, native = tuple(plan['canvas']['source_proxy_size']), tuple(plan['canvas']['source_oriented_size'])
+            from portrait_beauty_layer import hair_correction_guard_for_run
+            hair_guard = hair_correction_guard_for_run(run)
+            guard_binding = hair_guard['binding'] if hair_guard else None
+            from reference_colour_blend import validate_layer
+            blend_field, blend_receipt = validate_layer(args.reference_blend, parameters, native, size)
+            if blend_receipt.get('hair_correction_guard') != guard_binding:
+                raise ValueError('Reference colour field visible-face guard differs from the current source')
+            blend_owners = field_owners(blend_receipt, blend_field.shape[:2])
+            # Register large artifact identities in the cross-process cache so
+            # freeze/resume validation does not read the same weights again.
+            weights_hash = sha256_file(directory/'source-weights.npz')
+            if parameters['binding'].get('source_weights_sha256') != weights_hash:
+                raise ValueError('Re-evaluate matching after source weights change')
+            with np.load(directory/'source-weights.npz', allow_pickle=False) as resource:
+                weights = resource['values']
+                chroma_weights = resource['chroma_values'] if 'chroma_values' in resource else None
+            with np.load(plan['source_baseline']['assets']['foreground_alpha']['path'], allow_pickle=False) as resource:
+                alpha = resource['values']
+            print('Decoding native original into fixed appearance RGB', flush=True)
+            from native_source_baseline import source_for_reference_prepare, background_for_reference_prepare
+            source, source_precision, source_display = source_for_reference_prepare(
+                run, binding=parameters['binding'], apply_beauty=True, writable=False)
+        with workflow_timing.span('matching_donors', model_request=False, http_request=False):
+            proxy = cv2.resize(source, size, interpolation=cv2.INTER_LINEAR)
+            proxy_box = (0,0,size[0],size[1])
+            donor_colour = sample_reference_field(blend_field,proxy_box,size,size,owners=blend_owners,
+                guard=hair_guard)
+            donors = donor_fields(proxy, cv2.resize(alpha, size, interpolation=cv2.INTER_LINEAR), weights, parameters,
+                reference_blend=donor_colour, chroma_weights=chroma_weights)
+        with workflow_timing.span('foreground_background', model_request=False, http_request=False):
+            # Alpha is reused. No ViTMatte, inpainting, reference generation or SR rerun.
+            old_bg, foreground, edge_support, tiles, appearance_pair = background_for_reference_prepare(
+                source, alpha, run, binding=parameters['binding'], precision=source_precision,
+                transform=source_display, apply_beauty=True)
+            maximum_reconstruction_error = 0.
+            opaque_unchanged = True
+            for top in range(0, len(source), 128):
+                end = min(len(source), top+128)
+                restored = foreground[top:end]+(1-alpha[top:end, ..., None])*old_bg[top:end]
+                maximum_reconstruction_error = max(maximum_reconstruction_error, float(np.max(np.abs(restored-source[top:end]))))
+                known = alpha[top:end] == 1
+                opaque_unchanged &= bool(np.array_equal(foreground[top:end][known], source[top:end][known]))
+            del source
+        with workflow_timing.span('load_selected_background', model_request=False, http_request=False):
+            bg_layer = next(x for x in plan['layers'] if x['kind'] == 'background_design')
+            with np.load(bg_layer['assets']['background']['path'], allow_pickle=False) as resource:
+                background = resource['values']
+            with np.load(bg_layer['assets']['validity']['path'], allow_pickle=False) as resource:
+                validity_proxy = resource['values']
+            associated = bg_layer['assets']['background'].get('validity_associated', False) or bg_layer['assets']['background'].get('representation') == 'sampling_validity_associated_RGB'
+            # The selected plate is inverse-sRGB reference appearance, not RAW scene
+            # radiance. Do not subject it to a second photographic display transform.
+        with workflow_timing.span('matching_native', model_request=False, http_request=False):
+            print('Matching native Fp, selected reference colour fusion, and compositing once', flush=True)
+            from reference_pre_scene_cache import open_writer
+            pre_scene_writer = open_writer(parameters, blend_receipt, native, size)
+            clipping, opaque_pixels, low_alpha_pixels = 0, 0, 0
+            plain_proxy = np.concatenate([weights, donors] +
+                                         ([chroma_weights] if chroma_weights is not None else []), axis=-1)
+            plain_channels = (weights.shape[-1], donors.shape[-1]) + ((chroma_weights.shape[-1],)
+                                                                        if chroma_weights is not None else ())
+            bands = _matching_native_bands(foreground, alpha, edge_support, old_bg, background,
+                validity_proxy, parameters, blend_field, blend_owners, hair_guard, size, native,
+                plain_proxy, plain_channels, associated=associated,
+                has_chroma=chroma_weights is not None, capture_pre_scene=pre_scene_writer is not None)
+            try:
+                for top, end, match_box, values, pre_scene, counts in bands:
+                    if pre_scene_writer is not None:
+                        pre_scene_writer.write(match_box, pre_scene)
+                    foreground[top:end] = values
+                    clipping += counts[0]
+                    opaque_pixels += counts[1]
+                    low_alpha_pixels += counts[2]
+            finally:
+                bands.close()
+            del old_bg, background
+            np.clip(foreground, 0, 1, out=foreground)
+        with workflow_timing.span('pre_scene_cache_publish', model_request=False, http_request=False):
+            pre_scene_cache = pre_scene_writer.finish() if pre_scene_writer is not None else {'written': False}
+        with workflow_timing.span('master_encoding', model_request=False, http_request=False):
+            master = directory/'appearance-composite.tif'
+            save_render_master(foreground, master)
+        with workflow_timing.span('receipt_hashing', model_request=False, http_request=False):
+            report = {'schema': 'reference_colour_composite.appearance.v2', 'source_run_id': run['run_id'],
+                'working_domain': 'display_linear_sRGB', 'output': str(master), 'size': list(native),
+                'source_reference_binding': parameters['binding'], 'source_weights_sha256': weights_hash,
+                'protection_policy': parameters['protection_policy'],
+                'parameters_sha256': sha256_file(directory/'parameters.json'),
+                'validation_sha256': sha256_file(directory/'validation.json'),
+                'renderer_sha256': sha256_file(code_path('render_reference_colour_composite.py')),
+                'output_sha256': sha256_file(master),
+                'alpha_reused': True, 'appearance_edge_tiles': tiles, 'appearance_pair_cache': appearance_pair,
+                'pre_scene_acceleration_cache': pre_scene_cache,
+                'original_reconstruction_max_error': maximum_reconstruction_error,
+                'edge_donors': 'same_semantic_region; untyped_very_near_edges_support_at_most_0.15',
+                'opaque_original_unchanged_before_matching': opaque_unchanged,
+                'opaque_source_pixels': opaque_pixels, 'low_alpha_division_avoided_pixels': low_alpha_pixels,
+                'final_out_of_gamut_channels_before_clipping': clipping,
+                'composition_count': 1, 'photographic_display_transform_after_reference': False,
+                'extra_contact_rim_fog_bloom': False, 'existing_project_brushes_applied': False,
+                'authored_colour_edit': authored, 'existing_reference_shadows_reflections_resolved': False,
+                'reference_spatial_colour_used': True,
+                'reference_high_frequency_texture_used': False,
+                'reference_spatial_lightness_used': False, 'scene_balance': None,
+                'reference_colour_layer': {'receipt_path': str(args.reference_blend.resolve()),
+                    'receipt_sha256': sha256_file(args.reference_blend),
+                    'asset_sha256': blend_receipt['asset']['sha256'], 'regions': blend_receipt['regions']},
+                'geometry_or_texture_from_reference_person': False, 'project_pointer_modified': False,
+                'visual_acceptance': False, 'elapsed_seconds': round(time.perf_counter()-started, 2),
+                'workflow_timing': {'schema': workflow_timing.SCHEMA, 'path': str(ledger.path),
+                    'scope': 'native_baseline_worker_body_after_cli_parse', 'clock': 'time.perf_counter'}}
+        (directory/'composite-receipt.json').write_text(json.dumps(report, indent=2, ensure_ascii=False)+'\n', encoding='utf8')
+        print(json.dumps(report, ensure_ascii=False), flush=True)
 
 
 if __name__ == '__main__':

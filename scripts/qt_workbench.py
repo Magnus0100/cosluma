@@ -6,9 +6,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Iterable
 from urllib.parse import urlparse
+from runtime_resources import configure_cpu_runtime
+
+configure_cpu_runtime()
 
 FROZEN_QT_DIAGNOSTIC = {}
 CRASH_TRACE_FILE = None
+
+
+def post_completion_message(run):
+    if run.get('status') in {'failed', 'blocked', 'cancelled', 'render_failed', 'needs_rerender'}:
+        return '制作未完成，输入和可用结果已保留；请查看任务详情后继续。'
+    completion = run.get('system_post_completion') or {}
+    if (completion.get('status') == 'completed_with_findings' or completion.get('failed_checks')
+            or completion.get('unknown_checks') or completion.get('unfulfilled_independent_effects')):
+        return '后期处理已结束，仍有未通过或待确认的审片项；请在审片页查看。'
+    effects = next((row for row in completion.get('stages', []) if row.get('id') == 'independent_effects'), {})
+    if effects.get('status') == 'skipped':
+        return '后期处理已结束；本次未新增独立特效，请审片确认参考中的效果。'
+    return '后期处理已结束；请在审片页核对已保存版本并批准或继续调整。'
 
 
 def _enable_crash_trace():
@@ -79,13 +95,10 @@ except ImportError as exc:
 
 def _default_repo_root() -> Path:
     """Choose a usable project root for source and frozen launches."""
-    configured = os.environ.get("COSPLAY_WORKSPACE") or os.environ.get("COSPLAY_PROJECT_ROOT")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    if getattr(sys, "frozen", False):
-        local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local/share")
-        return (local / "CosplayWorkbench/workspace").resolve()
-    return Path(__file__).resolve().parents[1]
+    from workspace_location import resolve_workspace
+    fallback = (Path.home() / "CosplayWorkbench/workspace" if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parents[1])
+    return resolve_workspace(fallback, argv=sys.argv[1:])
 
 
 REPO_ROOT = _default_repo_root()
@@ -108,9 +121,45 @@ VISUAL_CHECK_LABELS = {
 
 CREATIVE_TASK_MODES = {
     'local_portrait': '自然原片后期',
-    'existing_reference': '已有参考并完成后期',
+    'existing_reference': '已有参考并完成后期（默认零生图）',
     'create_reference': '创作参考并完成后期',
 }
+
+# New workspaces prefer the full-precision local quality workflow. A saved
+# or explicit user choice still wins; an unavailable model is reported.
+PREFERRED_LOCAL_GENERATION_PROVIDER = 'qwen_image_2_1'
+
+
+def beauty_startup_outcome(result):
+    """Only a completed warm receipt proves that the Beauty pipeline loaded."""
+    warm = (isinstance(result, dict) and result.get('ok') is not False
+            and result.get('state') in {'pipeline_warm', 'pipeline_already_warm'})
+    if warm:
+        return 'ready', '人像美化模型预热完成；其他能力在开始前按本次计划检查。'
+    if isinstance(result, dict) and result.get('state') == 'busy_service_untouched':
+        return 'degraded', '人像服务正在处理其他请求；尚未确认预热，开始前将检查本次计划。'
+    return 'degraded', '人像美化预热未确认；开始前将检查本次计划及所需配置。'
+
+
+def generation_readiness_text(row):
+    """Keep configuration evidence separate from service and model readiness."""
+    configuration = '配置已检查' if row.get('ready') else {
+        'missing_models': '模型文件未齐', 'missing_workflow': '需配置工作流',
+        'missing_endpoint': '需配置地址', 'missing_key': '需配置凭据',
+        'disabled': '已停用'}.get(row.get('status'), '待配置')
+    if str(row.get('id') or row.get('registry_id') or '').startswith('qwen_image_') or str(row.get('model_env') or '').startswith('COSPLAY_QWEN_'):
+        service = ('服务可连接' if row.get('service_ready') is True else '服务未连接') if row.get('network_checked') is True else '服务未检测'
+        return configuration + ' · ' + service + ' · 模型加载未验证'
+    return configuration
+
+
+def image_submission_budget_text(budget):
+    """Count every image-model stage, including a local regional continuation."""
+    names = (('initial_reference', '全局参考'), ('reference_correction', '参考纠错'),
+             ('independent_effect', '独立效果'), ('regional_refinement', '局部精修'))
+    total = sum(int(budget.get(key) or 0) for key, _ in names)
+    return ('新增图像模型提交总上限：' + str(total) + '；' + ' / '.join(
+        label + ' ' + str(budget.get(key) or 0) for key, label in names))
 
 
 def creative_task_plan_text(plan: dict) -> str:
@@ -118,14 +167,41 @@ def creative_task_plan_text(plan: dict) -> str:
     lines = [str(plan.get('label') or CREATIVE_TASK_MODES.get(plan.get('mode'), '制作计划')),
              '计划检查通过；开始时会重新核验输入与配置。' if plan.get('ready') is True else '尚不能开始；请处理以下缺口。']
     lines += ['缺口：' + str(reason) for reason in plan.get('blocking_reasons', [])]
+    direction = plan.get('creative_direction') or {}
+    role=(((plan.get('intent') or {}).get('constraints') or {}).get('reference_role')
+          or (plan.get('reference_contract') or {}).get('role'))
+    if role == 'same_photo_finish':
+        lines += ['参考用途：已冻结同照精修匹配意图；尚未实际配准，执行时验证同照关系与有效范围。',
+                  '原片拥有几何和原生纹理；参考仅为光色与修饰标尺，不直接复制参考 RGB。新增生图 0 次。']
+    elif role == 'source_conditioned_design':
+        lines += ['参考用途：原图单独创作设计参考；不需要人工精修图作为输入。' if plan.get('mode')=='create_reference'
+                  else '参考用途：复用已核验同源生成的设计参考，不重新生图。',
+                  '原片拥有几何和原生细节；执行时核验生成来源与配准，再将设计光色映射到原尺寸。']
+    if direction:
+        lines += ['冻结角色：' + str((direction.get('character') or {}).get('name') or '未指定'),
+                  '场景：' + str(direction.get('scene') or ''),
+                  '主效：' + str((direction.get('main_effect') or {}).get('description') or '未指定'),
+                  ('依据：内置推荐与原始请求分别冻结；没有自动研究或批准。' if direction.get('recommendation')
+                   else '依据：用户要求离线编译；没有自动研究或批准。')]
+    recommendation = direction.get('recommendation') or {}
+    if recommendation:
+        lines += ['产品推荐目标：原景精修 v' + str(recommendation.get('version'))
+                  + ' · 内容 ' + str(recommendation.get('profile_sha256') or '')[:12],
+                  '推荐来自内置产品目标，用户原始作品要求保持独立；暖光、保留彩灯、无特效及分域禁止优先。',
+                  '肤色随本人和所选照明，不统一漂白；实际完成域与质量须看保存结果，不等于已批准。']
+        if plan.get('refinement_inheritance'):
+            lines.append('推荐继承自已保存的 checked 目标；同原片、参考与版本证明已冻结，新增参考图 0 次。')
     inputs = plan.get('inputs') or {}
     for key, label in (('source', '原片'), ('reference', '参考')):
         node = inputs.get(key) or {}
         if node.get('path'):
             lines.append(label + '：' + Path(str(node['path'])).name + ' · ' + str(node.get('sha256') or '')[:12])
     budget = plan.get('image_budget') or {}
-    names = {'initial_reference': '参考候选', 'reference_correction': '参考纠错', 'independent_effect': '独立效果'}
-    lines.append('新增图像提交上限：' + '；'.join(label + ' ' + str(budget.get(key, 0)) for key, label in names.items()))
+    lines.append(image_submission_budget_text(budget))
+    if budget.get('regional_refinement'):
+        lines.append('局部精修为本地 GPU 图像模型推理，占用本机计算时间；不是外部付费图像请求。人物安全范围仍由后台核验。')
+    if plan.get('regional_candidate_reuse_authorization'):
+        lines.append('复用已返回局部候选，仅本地光度对齐与合成；新增生图 0 次。原模型画布与本次 CPU 区域分别冻结。')
     stages = [str(row.get('label') or row.get('id') or '') for row in plan.get('stages', []) if isinstance(row, dict)]
     capabilities = plan.get('capabilities') or {}
     missing = [str(row.get('label') or row.get('key')) for row in capabilities.get('models', [])
@@ -145,6 +221,8 @@ def creative_task_plan_text(plan: dict) -> str:
         lines.append('费用：' + str(services.get('price') or '价格未知'))
     else:
         lines.append('文本/视觉服务：不使用；不向该服务发送图片或创作要求。')
+    lines.append('自动审片与诊断修复：' + ('已启用，会额外发送成片与局部审片窗口。'
+        if services.get('visual_review') else '未启用，保存后由人工审片。'))
     seconds = plan.get('estimated_seconds')
     lines.append('耗时：' + (str(seconds) + ' 秒' if seconds is not None else '未知；' + str(plan.get('estimate_basis') or '尚无当前硬件统计')))
     lines.append('观察边界：整图与匹配原尺寸窗口分别审查；局部通过不认证全图原生细节，人工批准另行记录。')
@@ -161,8 +239,21 @@ def api_call(base: str, method: str, path: str, body: Optional[dict] = None) -> 
     # Preparation includes vision, cited web research and a second image plan.
     # It runs in ApiTask, so its network budget does not block the GUI thread.
     timeout = 600 if path == "/api/generation/prepare" or path.endswith(("/plan-light", "/plan-color", "/auto-color", "/reconstruct-design", "/native-detail-preview")) else 120
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        value = json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            value = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        detail = str(error)
+        try:
+            failure = json.loads(error.read(65536).decode('utf8'))
+            reported = failure.get('error') if isinstance(failure, dict) else None
+            if isinstance(reported, dict): reported = reported.get('message')
+            if isinstance(reported, str) and reported.strip(): detail = reported[:1500]
+        except (OSError, UnicodeError, ValueError):
+            pass
+        finally:
+            error.close()
+        raise RuntimeError(f'HTTP {error.code}: {detail}') from error
     return value if isinstance(value, dict) else {"value": value}
 
 def api_stream(base: str, path: str, on_event) -> None:
@@ -233,13 +324,7 @@ def native_runtime_smoke(root: Path) -> dict:
 
 
 def capability_declaration() -> dict[str, Any]:
-    """Declare the one production contract and a separate archive boundary.
-
-    ``native`` is the only capability contract exposed to product actions.
-    Historical manifests are evidence-only: their old layer names are kept
-    under ``historical_read_only`` so they cannot be mistaken for a renderer
-    or for a compatibility mode available to new runs.
-    """
+    """Declare the current production contract exposed to product actions."""
     native = {
         "render_mode": "native_source_design",
         "read_only_compatibility": False,
@@ -296,6 +381,8 @@ def capability_declaration() -> dict[str, Any]:
     return {
         "workflow_mode": "single_source",
         "default_render_mode": "native_source_design",
+        "project_cleanup_supported": True,
+        "project_cleanup_scope": "unreferenced_stopped_workspace_records",
         "native": native,
     }
 
@@ -322,9 +409,13 @@ if QT_AVAILABLE:
         def run(self):
             try:
                 from cache_store import ContentCache
-                from raw_support import open_rgb, dimensions, RGB_DECODE_VERSION
+                from raw_support import open_rgb, storage_info, RGB_DECODE_VERSION
                 cache = ContentCache(self.root); proxy = cache.find_latest_proxy(self.source, params={"max_edge": 2048, "decode_version": RGB_DECODE_VERSION})
-                width, height = dimensions(self.source)
+                # Use the stat-bound metadata memo for both raster and RAW
+                # inputs.  A proxy hit must not reopen a camera container via
+                # LibRaw merely to rediscover its oriented dimensions.
+                facts = storage_info(self.source)
+                width, height = facts['oriented_size']
                 if not proxy:
                     image = open_rgb(self.source); image.thumbnail((2048, 2048))
                     proxy = Path(cache.put_proxy(self.source, image, params={"max_edge": 2048, "decode_version": RGB_DECODE_VERSION}, dimensions=[width, height])["path"])
@@ -358,13 +449,16 @@ if QT_AVAILABLE:
                     (self.label not in {"job-status", "job-events", "job-run-loaded", "job-stream"} or self.observation == self.owner.job_observation))
         @Slot(object)
         def result(self, value):
-            if self.current(): self.owner.result(self.label, value)
+            if self.current():
+                self.owner.result(self.label, value)
+                self.owner.refresh_cos_workspace()
         @Slot(str)
         def error(self, error):
             if not self.current(): return
             if self.current():
                 if self.stream: self.owner.job_stream_error(error)
                 else: self.owner.error(error, self.label)
+                self.owner.refresh_cos_workspace()
         @Slot()
         def finished(self):
             if self.stream and self.current(): self.owner.job_stream_finished()
@@ -851,6 +945,8 @@ if QT_AVAILABLE:
 
     class Workbench(QMainWindow):
         backendLog = Signal(str)
+        startupStatus = Signal(str)
+        startupReadinessChanged = Signal(str)
         def __init__(self, root: Path, url: str, embedded_backend: bool = False):
             super().__init__()
             # A frozen one-folder build cannot spawn ``scripts/backend_server.py``
@@ -862,15 +958,40 @@ if QT_AVAILABLE:
             self.root_path, self.url = root.resolve(), url; self.embedded_backend = embedded_backend; self.pool = QThreadPool.globalInstance()
             self.backend_generation = 0; self.model_setup_status = {}; self.model_setup_dialog = None
             self.model_setup_submission = None
+            self.model_auto_discovery_attempted = False
             self.model_setup_observation = 0
             self.process = None; self.embedded_server = None; self.rows = {}; self.previews = {}; self.source_run_id = ""; self.source_sample = ""; self.source_revision = 0; self.source_status = ""; self.render_pending = False; self.active_job_id = ""; self.job_stream_active = False; self.risk_crop_paths = {}; self.job_rows = {}; self.provider_rows = {}; self.provider_settings = {}; self.appearance_controls = []; self.appearance_extra_controls = []; self.job_observation = 0
-            self.provider_settings_loaded = False; self.pending_tasks = {}; self.source_run_source = ""
+            self.provider_settings_loaded = False; self.provider_default = None; self.pending_tasks = {}; self.source_run_source = ""; self.source_run_reference = ""
+            self.generation_model_user_selected = False
+            self.generation_model_save_error = False
+            self.generation_model_save_pending = None; self.generation_model_save_active = None
+            self.generation_model_save_timer = QTimer(self); self.generation_model_save_timer.setSingleShot(True)
+            self.generation_model_save_timer.setInterval(250)
+            self.generation_model_save_timer.timeout.connect(self.persist_generation_model)
+            self.job_poll_terminal_observation = None
+            self.job_poll_timer = QTimer(self); self.job_poll_timer.setSingleShot(True)
+            self.job_poll_timer.timeout.connect(self.poll_active_job)
             self.product_result_panels = []; self.product_stage_report = {}; self.product_run = {}
+            self._startup_result_requested = False; self._startup_result_context = None
+            self.workflow_graph = None; self._workflow_cache_state = None; self.professional_mode = False
+            self.simple_creation = None; self.simple_comparing = False; self._workflow_signature = None
+            self.startup_readiness = 'ready'
+            self._quick_progress_key = None; self._quick_progress_value = 0.0
+            self.simple_cancel_submissions = set()
             self.creative_task_plan = None; self.creative_task_plan_request = None
+            self.active_checked_task = None
+            # The bundled source-refinement profile is an explicit option. A
+            # fresh task starts from the user's brief so ordinary users do not
+            # inherit extra skin/material operators they did not request.
+            self.refinement_profile_choice = None
             self.creative_task_revision = 0; self.creative_task_start_pending = False
             self.creative_task_execution_label = None
             self.creative_task_retry_batch_id = None
-            self.creative_task_policies = {mode: {'text_vision': mode != 'local_portrait',
+            self.regional_enabled = False; self.regional_core_box = None
+            self.same_photo_finish_enabled = False
+            self.source_conditioned_reference = False
+            self.creative_task_policies = {mode: {'text_vision': False, 'visual_review': False,
+                'background_mode': 'preserve' if mode == 'local_portrait' else 'enhance_source',
                 'preserve_background': mode == 'local_portrait', 'no_effects': mode == 'local_portrait'}
                 for mode in CREATIVE_TASK_MODES}
             self._session_binding = None; self._session_baseline = None; self._session_written = None
@@ -886,6 +1007,8 @@ if QT_AVAILABLE:
             self.design_reconstruction_prepared = False
             self.native_reconstruction_job_id = ''; self.native_reconstruction_result_seen = ''
             self.native_reconstruction_preparation_kind = 'reference_appearance'
+            self.portrait_beauty = None; self.portrait_beauty_faces = []; self.portrait_beauty_loading = False
+            self.portrait_beauty_request = None; self.portrait_beauty_job_id = ''; self.portrait_beauty_result_seen = ''
             from scene_receiver_intent import normalize_receiver_intent
             self.receiver_intent = normalize_receiver_intent(); self.receiver_intent_loading = False
             self.receiver_source_canvas_size = None
@@ -906,6 +1029,8 @@ if QT_AVAILABLE:
             self.prepared_design = None; self.prepared_design_context = None; self.prepared_character_profile = None; self.design_request_context = None
             self.backendLog.connect(self.log_text)
             self.setWindowTitle("Cosplay 二次元后期工作台"); self.resize(1260, 820); self.build()
+            self.startupStatus.connect(self.set_startup_status)
+            self.startupReadinessChanged.connect(self.set_startup_readiness)
             if not self.embedded_backend: self.refresh()
             self.session_timer = QTimer(self); self.session_timer.setInterval(1000)
             self.session_timer.timeout.connect(self._checkpoint_session); self.session_timer.start()
@@ -919,9 +1044,14 @@ if QT_AVAILABLE:
             brand = QLabel("COSPLAY STUDIO"); brand.setObjectName("brandName"); bar.addWidget(brand)
             self.project_label = QLabel(self.root_path.name); self.project_label.setObjectName("projectLabel"); bar.addWidget(self.project_label); bar.addStretch()
             self.operation_state = QLabel("就绪"); self.operation_state.setObjectName("statusPill"); self.operation_state.setMaximumWidth(420); self.operation_state.setWordWrap(True); bar.addWidget(self.operation_state)
+            self.mode_button = QPushButton('专业模式'); self.mode_button.setCheckable(True)
+            self.mode_button.hide()
+            self.mode_button.toggled.connect(self.set_professional_mode); bar.addWidget(self.mode_button)
             self.start = QPushButton("启动后台"); self.refresh_btn = QPushButton("刷新")
             bar.addWidget(self.refresh_btn)
-            settings_button = QPushButton("连接设置"); settings_button.setObjectName("secondaryButton"); bar.addWidget(settings_button); outer.addWidget(header)
+            settings_button = QPushButton("设置"); settings_button.setObjectName("secondaryButton"); bar.addWidget(settings_button); outer.addWidget(header)
+            self.models_button = QPushButton('模型管理'); self.models_button.clicked.connect(self.open_model_setup)
+            bar.insertWidget(bar.count()-1, self.models_button)
             connection = QWidget(); connection_form = QFormLayout(connection); connection_form.setContentsMargins(22, 10, 22, 10)
             self.root_edit = QLineEdit(str(self.root_path)); self.url_edit = QLineEdit(self.url)
             self.root_edit.setReadOnly(self.embedded_backend); self.url_edit.setReadOnly(self.embedded_backend)
@@ -931,7 +1061,7 @@ if QT_AVAILABLE:
             connection_form.addRow("项目目录", self.root_edit); connection_form.addRow("本地后台地址", self.url_edit); connection_form.addRow(self.start)
             self.model_setup_summary = QLabel('分析模型尚未检查'); self.model_setup_summary.setWordWrap(True)
             model_buttons = QWidget(); model_layout = QHBoxLayout(model_buttons); model_layout.setContentsMargins(0, 0, 0, 0)
-            self.model_configure_button = QPushButton('配置分析模型'); self.model_inspect_button = QPushButton('检查安装路径')
+            self.model_configure_button = QPushButton('模型管理'); self.model_inspect_button = QPushButton('检查安装路径')
             self.model_configure_button.clicked.connect(self.open_model_setup)
             self.model_inspect_button.clicked.connect(lambda: self.task('GET', '/api/model-setup', None, 'model-setup'))
             model_layout.addWidget(self.model_configure_button); model_layout.addWidget(self.model_inspect_button)
@@ -939,12 +1069,37 @@ if QT_AVAILABLE:
             connection.setVisible(False); settings_button.setCheckable(True); settings_button.toggled.connect(connection.setVisible); outer.addWidget(connection)
             body = QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
             self.navigation = QListWidget(); self.navigation.setObjectName("navRail"); self.navigation.setFixedWidth(168)
-            self.navigation.addItems(["工作区", "候选版本", "精修与审片", "导出交付", "任务中心"]); body.addWidget(self.navigation)
+            self.navigation.addItems(["工作区", "候选版本", "精修与审片", "导出交付", "任务中心", "工作流画布", "快速制作"]); body.addWidget(self.navigation)
             self.tabs = QTabWidget(); self.tabs.tabBar().hide(); self.tabs.setDocumentMode(True)
             self.tabs.addTab(self.project_page(), "项目"); self.tabs.addTab(self.scrollable_page(self.candidate_page()), "候选")
             self.tabs.addTab(self.scrollable_page(self.review_page()), "审片"); self.tabs.addTab(self.scrollable_page(self.delivery_page()), "交付")
-            self.tabs.addTab(self.scrollable_page(self.jobs_page()), "任务"); body.addWidget(self.tabs, 1); outer.addLayout(body, 1)
-            self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex); self.tabs.currentChanged.connect(self.navigation.setCurrentRow); self.navigation.setCurrentRow(0)
+            self.tabs.addTab(self.scrollable_page(self.jobs_page()), "任务")
+            from cos_workflow_canvas import CosWorkflowCanvas
+            from simple_cos_workspace import SimpleCosWorkspace
+            self.workflow_canvas = CosWorkflowCanvas(); self.workflow_index = self.tabs.addTab(self.workflow_canvas, '工作流画布')
+            self.simple_workspace = SimpleCosWorkspace(); self.simple_index = self.tabs.addTab(self.simple_workspace, '快速制作')
+            self.workflow_canvas.actionRequested.connect(self.workflow_node_action)
+            self.workflow_canvas.templateChanged.connect(self.workflow_template_changed)
+            self.simple_workspace.sourceChosen.connect(self.choose_source)
+            self.simple_workspace.sourcePathChanged.connect(self.set_simple_source)
+            self.simple_workspace.strengthChanged.connect(self.portrait_beauty_strength.setValue)
+            self.simple_workspace.briefChanged.connect(self.creative_task_brief.setPlainText)
+            self.simple_workspace.actionRequested.connect(self.simple_action)
+            self.simple_workspace.generationModelChanged.connect(self.select_generation_model)
+            self.simple_workspace.characterChanged.connect(self.character_name.setText)
+            self.simple_workspace.characterNotesChanged.connect(self.character_notes.setText)
+            self.simple_workspace.backgroundModeChanged.connect(self.set_background_mode)
+            self.simple_workspace.noEffectsChanged.connect(self.creative_no_effects.setChecked)
+            self.simple_workspace.regionalEnabledChanged.connect(self.set_regional_enabled)
+            self.simple_workspace.samePhotoFinishChanged.connect(self.set_same_photo_finish)
+            self.simple_workspace.regionalBoxChanged.connect(self.set_regional_box)
+            self.simple_workspace.normalizedRegionSelected.connect(self.set_normalized_regional_box)
+            self.simple_workspace.nativeDetailRequested.connect(self.request_native_detail)
+            self.simple_workspace.taskModeChanged.connect(lambda mode: self.creative_task_mode.setCurrentIndex(self.creative_task_mode.findData(mode)))
+            self.model.textChanged.connect(self.refresh_generation_models)
+            body.addWidget(self.tabs, 1); outer.addLayout(body, 1)
+            self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex); self.tabs.currentChanged.connect(self.navigation.setCurrentRow)
+            self.navigation.setCurrentRow(self.simple_index); self.navigation.hide()
             self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(150)
             log_panel, self.log_toggle = self.accordion("运行日志", self.log, False); outer.addWidget(log_panel)
             self.start.clicked.connect(self.start_backend); self.refresh_btn.clicked.connect(self.refresh)
@@ -959,7 +1114,454 @@ if QT_AVAILABLE:
             self.root_edit.textChanged.connect(self.invalidate_creative_task_plan)
             self.url_edit.textChanged.connect(self.invalidate_creative_task_plan)
             self.creative_task_brief.textChanged.connect(self.invalidate_prepared_design)
+            self.character_name.textChanged.connect(self.refresh_cos_workspace)
+            self.character_notes.textChanged.connect(self.refresh_cos_workspace)
+            self.source_edit.textChanged.connect(self.refresh_cos_workspace)
             self.update_creative_service_actions()
+            self.refresh_cos_workspace()
+
+        def set_professional_mode(self, enabled):
+            self.professional_mode = bool(enabled)
+            self.mode_button.blockSignals(True); self.mode_button.setChecked(self.professional_mode); self.mode_button.blockSignals(False)
+            self.mode_button.setText('返回快速制作' if enabled else '专业模式')
+            self.navigation.setVisible(self.professional_mode)
+            self.mode_button.setVisible(self.professional_mode)
+            self.tabs.setCurrentIndex(self.workflow_index if enabled else self.simple_index)
+            self.refresh_cos_workspace()
+
+        def set_simple_source(self, path):
+            if self.render_pending: return
+            self.simple_creation = None; self.simple_comparing = False; self._reset_quick_progress()
+            self.regional_enabled = False; self.regional_core_box = None
+            self.same_photo_finish_enabled = False
+            self.source_conditioned_reference = False
+            self.refinement_profile_choice = ({'id': 'source_refinement', 'version': 1}
+                if self.preset.currentData() == 'source_refinement' else None)
+            self.source_edit.setText(path); self.project_view_selector.setCurrentIndex(0)
+            self.request_source_preview(path); self.refresh_cos_workspace()
+
+        def _cos_draft_run(self):
+            run = copy.deepcopy(self.product_run)
+            options = run.setdefault('options', {})
+            revision = options.setdefault('appearance_revision', {})
+            self.add_local_plans_to_revision(revision)
+            return run
+
+        def _reset_quick_progress(self):
+            """Start a new quick-route observation at its first milestone."""
+            self._quick_progress_key = None
+            self._quick_route_key = None
+            self._quick_progress_value = 0.0
+            self._quick_local_progress_value = None
+            self._quick_timing_cursor = None
+
+        def refresh_cos_workspace(self, *_args):
+            if not hasattr(self, 'simple_workspace'): return
+            source = self.source_edit.text().strip()
+            if source != getattr(self, '_regional_source_path', source):
+                self.regional_enabled = False; self.regional_core_box = None
+                self.same_photo_finish_enabled = False
+                self.source_conditioned_reference = False
+            self._regional_source_path = source
+            same = bool(self.source_run_id and source and self.source_run_source
+                        and Path(source).resolve() == Path(self.source_run_source).resolve())
+            awaiting_variant = bool(self.simple_creation and self.simple_creation.get('stage') == 'awaiting_variant')
+            busy = bool(self.render_pending or self.creative_task_start_pending or (self.simple_creation and not awaiting_variant))
+            proxy = self.project_proxies.get('source')
+            original = proxy or self.project_images.get('source')
+            result = (getattr(self, 'source_light_preview_path', None) or self.source_light_draft_path) if same else None
+            if self.simple_comparing and same: result = original
+            progress_active = bool(busy or awaiting_variant)
+            self.simple_workspace.set_state(source, same, busy, bool(result), same and self.portrait_beauty is not None,
+                progress_active=progress_active, readiness=self.startup_readiness)
+            for control, value in ((self.simple_workspace.character_name, self.character_name.text()),
+                                   (self.simple_workspace.character_notes, self.character_notes.text())):
+                control.blockSignals(True); control.setText(value); control.blockSignals(False)
+            background = self.creative_background_mode.currentData()
+            self.simple_workspace.task_mode.blockSignals(True)
+            self.simple_workspace.task_mode.setCurrentIndex(self.simple_workspace.task_mode.findData(self.creative_task_mode.currentData()))
+            self.simple_workspace.task_mode.blockSignals(False)
+            self.simple_workspace.background_mode.blockSignals(True)
+            self.simple_workspace.background_mode.setCurrentIndex(self.simple_workspace.background_mode.findData(background))
+            self.simple_workspace.background_mode.blockSignals(False)
+            self.simple_workspace.no_effects.blockSignals(True)
+            self.simple_workspace.no_effects.setChecked(self.creative_no_effects.isChecked())
+            self.simple_workspace.no_effects.blockSignals(False)
+            active_checked = self.active_checked_task or {}
+            active_intent = (active_checked.get('request') or {}).get('creative_task') or {}
+            same_photo = (((active_intent.get('constraints') or {}).get('reference_role') == 'same_photo_finish')
+                          if active_checked else self.same_photo_finish_enabled)
+            same_photo_available = self.same_photo_finish_available() and not busy and not active_checked
+            for control in (self.creative_same_photo_finish, self.simple_workspace.same_photo_finish):
+                control.blockSignals(True); control.setChecked(same_photo); control.blockSignals(False)
+                control.setEnabled(same_photo_available)
+            active_regional = active_intent.get('regional_refinement') or {}
+            active_maximum = int(active_regional.get('maximum_submissions') or 0)
+            active_regions = active_regional.get('regions') or []
+            displayed_box = (active_regions[0].get('core_box') if active_regions else None) if active_checked else self.regional_core_box
+            displayed_enabled = active_maximum > 0 if active_checked else self.regional_enabled
+            regional_available = self.creative_task_mode.currentData() in {'create_reference','existing_reference'} and background == 'enhance_source' and not busy and not active_checked and not same_photo
+            cpu_reuse = regional_available and any(action.get('regional_candidate_reuse')
+                for action in (self.product_stage_report.get('whole_work') or {}).get('recovery_actions', []))
+            size = self.source_native_size()
+            self.regional_controls.sync(size, displayed_enabled, displayed_box, available=regional_available, cpu_reuse=cpu_reuse)
+            self.simple_workspace.regional.sync(size, displayed_enabled, displayed_box, available=regional_available, cpu_reuse=cpu_reuse)
+            if active_checked:
+                note = (image_submission_budget_text(active_checked.get('image_budget') or {})
+                    + '；已冻结，处理中不能修改。'
+                    + (' 局部精修使用本地 GPU 推理，不是外部付费请求。' if active_maximum else ''))
+                for controls in (self.regional_controls, self.simple_workspace.regional): controls.note.setText(note)
+            self.simple_workspace.select_region.setEnabled(regional_available and (self.regional_enabled or cpu_reuse) and bool(size))
+            self.simple_workspace.source_image.selection = ([self.regional_core_box[0]/size[0], self.regional_core_box[1]/size[1],
+                self.regional_core_box[2]/size[0], self.regional_core_box[3]/size[1]] if size and self.regional_core_box else None)
+            saved_direction = self.product_run.get('creative_direction') or (self.product_run.get('options') or {}).get('creative_direction') or {}
+            direction = active_checked.get('creative_direction') or ((self.creative_task_plan or {}).get('plan') or {}).get('creative_direction') or saved_direction
+            self.simple_workspace.direction_summary.setText((('本次制作已冻结方向' if active_checked else '已冻结方向') + ' · 角色：' + str((direction.get('character') or {}).get('name') or '未指定')
+                + ' · ' + str(direction.get('scene') or '') + '\n主效：' + str((direction.get('main_effect') or {}).get('description') or '未指定'))
+                if direction else '本次方向尚未冻结；旧版本不会补写角色或场景权限。请检查新任务计划。')
+            if same_photo:
+                self.simple_workspace.direction_summary.setText(self.simple_workspace.direction_summary.text()
+                    + '\n同照精修：' + ('匹配意图已冻结；执行时实际核验配准。' if active_checked or self.creative_task_plan
+                                          else '尚未实际配准；请先检查计划。')
+                    + ' 原片保有几何与原生纹理；新增生图 0 次。')
+            if direction.get('recommendation'):
+                self.simple_workspace.direction_summary.setText(self.simple_workspace.direction_summary.text()
+                    + '\n产品推荐：原景精修；用户作品要求、暖光和彩灯保留项优先。实际完成范围仍须看保存结果。')
+            status_label = {'needs_visual_review': '已保存 · 待用户审片', 'delivered': '已有批准记录', 'accepted': '已有批准记录'}.get(self.source_status, self.source_status or '尚未保存')
+            dimensions = ' × '.join(map(str, size)) if same and size else '尺寸尚未载入'
+            self.simple_workspace.version_summary.setText((f'r{self.source_revision} · {dimensions} · {status_label} · {self.source_run_id}'
+                + (' · 当前修改未保存' if self._session_dirty else '')) if same else '尚未打开此原片的保存版本')
+            self.simple_workspace.native_review_button.setEnabled(same and self.native_detail_button.isEnabled() and not busy)
+            self.simple_workspace.start_plan_button.setEnabled(not busy and bool(self.creative_task_plan)
+                and self.creative_task_plan['plan'].get('ready') is True)
+            if self.startup_readiness == 'degraded' and not busy and not same:
+                self.simple_workspace.set_message('启动预热未确认；选择制作方式后会检查本次所需能力。')
+            self.refresh_generation_models(locked=busy or awaiting_variant or self._session_loading)
+            run_variants = self.product_run.get('variants') if isinstance(self.product_run, dict) else None
+            pending_variants = run_variants if (isinstance(run_variants, list)
+                and same and self.source_status == 'awaiting_reference') else []
+            self.simple_workspace.set_candidate_pending(bool(pending_variants), len(pending_variants))
+            self.simple_workspace.set_images(original, result)
+            self.simple_workspace.set_strength(round(float((self.portrait_beauty or {}).get('strength', 1.))*100))
+            can_continue_post = bool(same and self.source_run_has_reference and self.design_reconstruction_plan
+                                    and self.source_status == 'needs_visual_review'
+                                    and not self.render_pending)
+            self.simple_workspace.set_post_continuation(can_continue_post, dirty=self._session_dirty)
+            self.simple_workspace.set_preparation_state(self.preparation_version_review.text() if same else '')
+            self.simple_workspace.set_compare(self.simple_comparing and same)
+            if busy or same:
+                message = self.operation_state.text()
+                if self._session_dirty and not busy:
+                    message = '当前效果尚未保存，确认后点击“保存高清版本”。'
+                self.simple_workspace.set_message(message)
+            if busy or awaiting_variant:
+                job = self.job_rows.get(self.active_job_id, {}) if self.active_job_id else {}
+                checked_job = (self.active_checked_task or {}).get('job_id')
+                if self.active_checked_task and (not checked_job or checked_job != self.active_job_id):
+                    job = {}  # An older selected job is not this pending task.
+                if self.creative_task_plan_request or (self.creative_task_start_pending and not job):
+                    progress, stage, local_progress, stage_index = None, '检查制作计划' if self.creative_task_plan_request else '等待任务提交', None, None
+                    message = '正在检查输入与配置；尚未启动制作。' if self.creative_task_plan_request else '开始请求已发送，等待本次任务编号。'
+                else:
+                    progress, stage, message, local_progress, stage_index = self._quick_progress(job.get('progress'),
+                        job.get('stage', ''), job.get('kind', ''),
+                        timing=job.get('timing') or (job.get('data') or {}).get('timing'))
+                self.simple_workspace.set_progress_stages(self._quick_progress_stages())
+                self.simple_workspace.set_job_progress(progress, stage, job.get('message') or message,
+                    local_progress, stage_index)
+            else:
+                self.simple_workspace.set_progress_stages(self._quick_progress_stages())
+            self.simple_workspace.export_button.setEnabled(same and bool(result) and not busy and not self._session_dirty)
+            self.simple_workspace.brief.blockSignals(True)
+            self.simple_workspace.brief.setText(self.creative_task_brief.toPlainText())
+            self.simple_workspace.brief.blockSignals(False)
+            intent = self.simple_creation or {}
+            self.simple_workspace.cancel_button.setEnabled(bool(self.simple_creation or (self.render_pending and self.active_job_id
+                and self.active_job_id != intent.get('initial_job'))))
+            run = self._cos_draft_run()
+            signature = json.dumps([run.get('run_id'), run.get('options'), self.product_stage_report], sort_keys=True, ensure_ascii=False)
+            if signature != self._workflow_signature:
+                self._workflow_signature = signature
+                self.workflow_canvas.set_run(run, self.product_stage_report, template=self.workflow_graph)
+            self.workflow_canvas.set_busy(busy)
+
+        def _quick_progress_stages(self):
+            """The checked route is display data, never an execution authority."""
+            active = getattr(self, 'active_checked_task', None) or {}
+            context = getattr(self, 'creative_task_plan', None) or {}
+            intent = self.simple_creation or {}
+            stages = (active.get('progress_stages') or (context.get('plan') or {}).get('stages')
+                      or intent.get('progress_stages'))
+            if stages:
+                return stages
+            if getattr(self, 'creative_task_plan_request', None):
+                return []
+            # Only the old explicitly sequenced editing route has these coarse
+            # UI phases. Never infer local source-first order from a model name.
+            if intent.get('mode') == 'beauty':
+                return ['原片准备', '人像美化', '高清保存']
+            if intent.get('mode') in {'create_cos', 'existing_reference'} and intent.get('stage') != 'production':
+                return [('复用参考' if intent['mode'] == 'existing_reference' else '候选设计与选择'),
+                        '人像美化', '仿色与边界融合', '高清保存与审片']
+            return []
+
+        def _show_quick_job_progress(self, job):
+            """Polling, SSE and preparation callbacks share one presentation."""
+            kind = job.get('kind') or self.job_rows.get(self.active_job_id, {}).get('kind', '')
+            progress, stage, message, local, index = self._quick_progress(job.get('progress'),
+                job.get('stage', ''), kind,
+                timing=job.get('timing') or (job.get('data') or {}).get('timing'))
+            self.simple_workspace.set_progress_stages(self._quick_progress_stages())
+            self.simple_workspace.set_job_progress(progress, stage, job.get('message') or message, local, index)
+
+        def _quick_progress(self, progress=None, stage='', kind='', *, timing=None):
+            """Map each worker's local fraction onto the quick route.
+
+            Worker progress is deliberately local to its preparation contract.
+            The quick UI presents one monotonic route so starting BeautyGRPO or
+            the reconstruction worker never makes the bar jump back to zero.
+            Values are coarse milestones, not time estimates.
+            """
+            intent = self.simple_creation or {}
+            mode = intent.get('mode')
+            current = intent.get('stage')
+            expected_kind = {'base': 'one_click', 'selecting_variant': 'select_reference_variant',
+                'production': 'one_click',
+                'beauty': 'prepare_portrait_beauty', 'colour': 'native_design_reconstruction',
+                'boundary': 'native_design_reconstruction',
+                'post': 'one_click'}.get(current)
+            if kind and expected_kind and kind != expected_kind:
+                progress = None
+                timing = None
+            observed_label = str((timing or {}).get('module_label') or '') if isinstance(timing, dict) else ''
+            if observed_label:
+                try: elapsed = float(timing.get('elapsed_seconds'))
+                except (TypeError, ValueError): elapsed = None
+                if elapsed is not None and 0 <= elapsed < float('inf'):
+                    timing_key = (str(intent.get('source') or ''), str(intent.get('mode') or ''),
+                        str(getattr(self, 'active_job_id', '') or ''), str(timing.get('request_id') or ''))
+                    previous = getattr(self, '_quick_timing_cursor', None)
+                    if previous and previous[0] == timing_key and elapsed < previous[1]:
+                        observed_label = previous[2]
+                    else:
+                        self._quick_timing_cursor = (timing_key, elapsed, observed_label)
+            try:
+                local = None if progress is None else min(1., max(0., float(progress)))
+            except (TypeError, ValueError):
+                local = None
+            if not intent:
+                return local, observed_label or stage, '', None, None
+            if current == 'awaiting_variant':
+                return .40, 'awaiting_reference', '候选设计已生成；请选择一张后继续。', None, None
+            if mode == 'create_cos':
+                spans = {
+                    'base': (.05, .35, '正在生成角色风格候选。'),
+                    'selecting_variant': (.40, .02, '正在准备所选候选的高清原片结果。'),
+                    'beauty': (.42, .13, '正在准备 BeautyGRPO 人像美化。'),
+                    'colour': (.55, .14, '正在准备仿色、材质与背景融合。'),
+                    'boundary': (.69, .10, '正在自动补充人物边界受光。'),
+                    'post_save_wait': (.79, .04, '正在保存高清融合版本，随后进入特效与完整后期。'),
+                    'post': (.83, .16, '正在完成已授权的成片处理与审片。'),
+                }
+            else:
+                spans = {
+                    'base': (.05, .30, '正在准备原片。'),
+                    'beauty': (.35, .35, '正在准备 BeautyGRPO 人像美化。'),
+                    'colour': (.70, .10, '正在准备本地融合。'),
+                    'boundary': (.80, .08, '正在自动补充人物边界受光。'),
+                    'post_save_wait': (.88, .03, '正在保存高清版本，随后进入后期。'),
+                    'post': (.91, .08, '正在完成后期审片。'),
+                }
+            spans['production'] = (.05, .94, '正在按已检查计划制作；当前模块以实际任务事件为准。')
+            start, width, fallback = spans.get(current, (.05, .90, '正在处理当前阶段。'))
+            shown = start if local is None else start + width * local
+            # Worker events can arrive through both SSE and polling.  Keep a
+            # single route monotonic when an older event arrives after a newer
+            # one, while allowing a new stage to advance from its own start.
+            key = (str(intent.get('source') or ''), str(intent.get('mode') or ''), str(current or ''),
+                   str(getattr(self, 'active_job_id', '') or ''))
+            if key != getattr(self, '_quick_progress_key', None):
+                self._quick_progress_key = key
+                route_key = (str(intent.get('source') or ''), str(intent.get('mode') or ''))
+                if route_key != getattr(self, '_quick_route_key', None):
+                    self._quick_progress_value = 0.0
+                    self._quick_route_key = route_key
+                self._quick_local_progress_value = None
+            previous_local = getattr(self, '_quick_local_progress_value', None)
+            if previous_local is not None:
+                local = previous_local if local is None else max(previous_local, local)
+            self._quick_local_progress_value = local
+            shown = max(float(getattr(self, '_quick_progress_value', 0.0)), float(shown))
+            self._quick_progress_value = min(.99, shown)
+            stage_index = {'base': 0, 'selecting_variant': 0, 'beauty': 1, 'colour': 2,
+                           'boundary': 2, 'post_save_wait': 3, 'post': 3}.get(current, 0)
+            checked_job = current == 'production' or bool(getattr(self, 'active_checked_task', None))
+            label = observed_label or ('完整制作' if current == 'production' else stage if checked_job and stage else current)
+            # Source-job fractions describe whole-job milestones. A module's
+            # elapsed time does not make that fraction a local phase percent.
+            return self._quick_progress_value, label, fallback, None if checked_job else local, None if checked_job else stage_index
+
+        def workflow_template_changed(self, template):
+            from cos_workflow_graph import revision_for_template, validate_template, compile_template, route_for_run
+            from cos_workflow_cache import compare as compare_workflow_cache
+            previous_template = self.workflow_graph
+            comparison_run = self._cos_draft_run()
+            previous_compiled = (compile_template(previous_template, route_for_run(comparison_run))
+                                 if previous_template else None)
+            self.workflow_graph = validate_template(template)
+            current_compiled = compile_template(self.workflow_graph, route_for_run(comparison_run))
+            self._workflow_cache_state = compare_workflow_cache(previous_compiled, current_compiled)
+            patch = revision_for_template(self._cos_draft_run(), self.workflow_graph)
+            pixels_changed = (('portrait_beauty' in patch and patch['portrait_beauty'] != self.portrait_beauty)
+                or ('design_reconstruction_plan' in patch and patch['design_reconstruction_plan'] != self.design_reconstruction_plan))
+            # Do not rebuild a scene while a node is being dragged or adjusted.
+            if patch.get('portrait_beauty') is not None:
+                self.load_portrait_beauty(patch['portrait_beauty'], self.portrait_beauty_faces)
+            if patch.get('design_reconstruction_plan') is not None:
+                self.load_design_reconstruction(patch['design_reconstruction_plan'])
+            draft = self._cos_draft_run()
+            self._workflow_signature = json.dumps([draft.get('run_id'), draft.get('options'), self.product_stage_report], sort_keys=True, ensure_ascii=False)
+            if pixels_changed:
+                self.source_light_version += 1; self.simple_comparing = False
+                invalidated = self._workflow_cache_state.get('invalidated', [])
+                if invalidated:
+                    self.source_light_state.setText('工作流变更，将重算：' + ' → '.join(invalidated) + '。正在准备成片预览…')
+            self._checkpoint_session()
+            if pixels_changed and self.source_run_id and not self.render_pending: self.source_light_timer.start()
+            self.refresh_cos_workspace()
+
+        def workflow_node_action(self, node):
+            if node == 'source': self.choose_source(); return
+            if node == 'beauty': self.prepare_portrait_beauty(); return
+            if node == 'boundary': self.prepare_boundary_light_coordination(); return
+            if node == 'composite': self.save_source_lights(); return
+            if node == 'export': self.export_source_run(); return
+            self.set_professional_mode(True)
+            if node == 'reference': self.tabs.setCurrentIndex(0); self.use_existing_design_reference(); return
+            self.tabs.setCurrentIndex(2)
+            if node == 'matte': self.local_editor_tabs.setCurrentIndex(7)
+            elif node in {'colour', 'background', 'effects'}: self.local_editor_tabs.setCurrentIndex(2)
+
+        def simple_action(self, action):
+            if action == 'native_review': self.request_native_detail([.5,.5]); return
+            if action == 'check_plan': self.check_creative_task_plan(); return
+            if action == 'start_plan': self.start_planned_creative_task(); return
+            if action == 'professional': self.set_professional_mode(True); return
+            if action == 'generation_settings':
+                self.set_professional_mode(True); self.tabs.setCurrentIndex(1)
+                self.provider_panel_toggle.setChecked(True); self.provider.setFocus(); return
+            if action == 'select_candidate':
+                self.set_professional_mode(True)
+                self.tabs.setCurrentIndex(1)  # 候选页：先选设计，再开始后续图层流程
+                self.operation_state.setText('请比较角色风格候选，采用一张后才进入仿色、融合和后期。')
+                return
+            if action == 'continue_post':
+                if not self.source_run_id or not self.source_run_has_reference or not self.design_reconstruction_plan:
+                    self.operation_state.setText('请先选择候选并完成仿色融合准备。'); return
+                if self.render_pending: return
+                self._checkpoint_session()
+                if self._session_checkpoint_failed:
+                    self.operation_state.setText(self.session_draft_state.text()); return
+                intent = self.simple_creation or {'source': str(Path(self.source_run_source).resolve()), 'mode': 'create_cos'}
+                intent['stage'] = 'post_save_wait' if self._session_dirty else 'post'
+                self.simple_creation = intent
+                if self._session_dirty:
+                    self.operation_state.setText('正在保存当前仿色与融合版本；保存完成后自动进入特效与完整后期。')
+                    self.save_source_lights()
+                else:
+                    self.complete_current_post()
+                self.refresh_cos_workspace()
+                return
+            if action == 'compare':
+                self.simple_comparing = not self.simple_comparing; self.refresh_cos_workspace(); return
+            if action == 'cancel':
+                # Stop the automatic chain immediately, including a success/cancel race.
+                intent = self.simple_creation or {}
+                if self.creative_task_start_pending and self.creative_task_execution_label:
+                    self.simple_cancel_submissions.add(self.creative_task_execution_label)
+                if self.portrait_beauty_request == 'submitting': self.simple_cancel_submissions.add('portrait-beauty-job')
+                if self.design_reconstruction_request == 'submitting': self.simple_cancel_submissions.add('design-reconstruct-job')
+                self.simple_creation = None; self._reset_quick_progress()
+                self.invalidate_creative_task_plan()
+                if self.render_pending and self.active_job_id and self.active_job_id != intent.get('initial_job'):
+                    self.task('POST', f'/api/jobs/{self.active_job_id}/cancel', {}, 'job-cancel')
+                self.refresh_cos_workspace()
+                return
+            if action == 'save': self.save_source_lights(); return
+            if action == 'export': self.export_source_run(); return
+            if action not in {'beauty', 'create_cos', 'existing_reference'} or self.render_pending or self.simple_creation: return
+            source = self.source_edit.text().strip()
+            if not source: self.choose_source(); return
+            if self.embedded_backend and self.embedded_server is None: self.start_backend()
+            self.simple_creation = {'source': str(Path(source).resolve()), 'mode': action, 'stage': 'base', 'initial_job': self.active_job_id}
+            self._reset_quick_progress()
+            if action == 'beauty' and self.source_run_id and Path(source).resolve() == Path(self.source_run_source).resolve():
+                # Reusing an open revision must pass the same capability plan;
+                # startup's degraded/ready flag is never execution authority.
+                self.request_creative_task_plan('local_portrait', source=source,
+                    parent_run_id=self.source_run_id, prepare_existing_beauty=True)
+                if self.creative_task_plan_request is None: self.simple_creation = None
+                else: self.simple_creation['plan_label'] = self.creative_task_plan_request['label']
+            else:
+                if action == 'existing_reference':
+                    reference, _filter = QFileDialog.getOpenFileName(self, '选择已有参考图', str(Path(source).parent), 'Images (*.png *.jpg *.jpeg *.tif *.tiff)')
+                    if not reference:
+                        self.simple_creation = None; self.refresh_cos_workspace(); return
+                    mode = 'existing_reference'
+                else:
+                    reference = None; mode = 'local_portrait' if action == 'beauty' else 'create_reference'
+                parent = (self.source_run_id if self.source_run_id and self.source_run_source
+                    and Path(source).resolve() == Path(self.source_run_source).resolve()
+                    and not self._session_dirty and self.source_status in {'needs_visual_review','accepted','delivered'} else None)
+                self.request_creative_task_plan(mode, source=source, reference=reference, parent_run_id=parent)
+                if self.creative_task_plan_request is None: self.simple_creation = None
+                elif self.simple_creation is not None:
+                    self.simple_creation['plan_label'] = self.creative_task_plan_request['label']
+            self.refresh_cos_workspace()
+
+        def _advance_simple_creation(self, stage):
+            intent = self.simple_creation
+            if not intent: return
+            # Explicit multi-candidate requests pause for selection. Once the
+            # user adopts one, continue its local editing chain. Single-image
+            # production is completed by the backend and has no second chain.
+            if stage == 'base' and intent.get('stage') in {'awaiting_variant', 'selecting_variant'} and self.source_run_has_reference:
+                intent['stage'] = 'beauty'
+                self.prepare_portrait_beauty()
+                if self.portrait_beauty_request is None: self.simple_creation = None
+                self.refresh_cos_workspace()
+                return
+            if intent['stage'] != stage: return
+            if (not self.source_run_id or intent['source'] != str(Path(self.source_run_source).resolve())
+                    or self.source_status in {'failed', 'blocked', 'cancelled', 'render_failed', 'needs_rerender'}):
+                self.simple_creation = None; return
+            if stage == 'base':
+                if intent['mode'] == 'create_cos' and self.source_status == 'awaiting_reference':
+                    if self.product_run.get('variants'):
+                        intent['stage'] = 'awaiting_variant'
+                        self.operation_state.setText('候选设计已生成；请选择一张后继续 Cos 后期。')
+                        self.refresh_cos_workspace()
+                    else:
+                        self.operation_state.setText('候选生成未返回图片；请检查任务详情后重试。')
+                        self.simple_creation = None
+                    return
+                from cos_workflow_graph import preset
+                self.workflow_template_changed(preset('portrait' if intent['mode'] == 'beauty' else 'cos_scene'))
+                intent['stage'] = 'beauty'; self.prepare_portrait_beauty()
+                if self.portrait_beauty_request is None: self.simple_creation = None
+            elif stage == 'beauty' and intent['mode'] in {'create_cos', 'existing_reference'} and self.source_run_has_reference:
+                intent['stage'] = 'colour'; self.reconstruct_design()
+                if self.design_reconstruction_request is None: self.simple_creation = None
+            else:
+                self.simple_creation = None
+            self.refresh_cos_workspace()
+        def _apply_workflow_intent(self):
+            if not self.workflow_graph: return
+            from cos_workflow_graph import revision_for_template
+            patch = revision_for_template(self._cos_draft_run(), self.workflow_graph)
+            if 'portrait_beauty' in patch: self.load_portrait_beauty(patch['portrait_beauty'], self.portrait_beauty_faces)
+            if 'design_reconstruction_plan' in patch: self.load_design_reconstruction(patch['design_reconstruction_plan'])
+
         def accordion(self, title, content, expanded=False):
             panel = QWidget(); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(5)
             toggle = QToolButton(); toggle.setObjectName("accordion"); toggle.setText(title); toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); toggle.setCheckable(True); toggle.setChecked(expanded)
@@ -972,7 +1574,7 @@ if QT_AVAILABLE:
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             return scroll
         def project_page(self):
-            from generation_prompt import DEFAULT_PROMPT
+            from generation_prompt import DEFAULT_PROMPT, compose_generation_prompt
             from preset_store import list_presets
             page = QWidget(); layout = QHBoxLayout(page); layout.setContentsMargins(14, 14, 14, 10)
             split = QSplitter(Qt.Horizontal); layout.addWidget(split)
@@ -981,7 +1583,7 @@ if QT_AVAILABLE:
             self.project_view_selector = QComboBox(); self.project_view_selector.addItem("原片", "source"); self.project_view_selector.addItem("GPT 候选", "reference"); self.project_view_selector.addItem("高清草稿", "final"); canvas_bar.addWidget(self.project_view_selector)
             self.choose_source_button = QPushButton("导入原图"); self.choose_source_button.setObjectName("secondaryButton"); self.choose_source_button.clicked.connect(self.choose_source); canvas_bar.addWidget(self.choose_source_button); canvas_layout.addLayout(canvas_bar)
             self.project_preview = Preview("原片"); self.project_preview.path_label.hide(); self.project_preview.scroll.setObjectName("canvas"); self.project_preview.image.setObjectName("canvas"); self.project_preview.image.setText("导入 JPG / RAW 原图\n在这里预览你的作品"); self.project_preview.image.adjustSize(); canvas_layout.addWidget(self.project_preview, 1)
-            self.project_image_info = QLabel("原片构图与人物细节始终保留"); self.project_image_info.setObjectName("caption"); canvas_layout.addWidget(self.project_image_info)
+            self.project_image_info = QLabel("导入原图，选择成片效果"); self.project_image_info.setObjectName("caption"); canvas_layout.addWidget(self.project_image_info)
             self.project_view_selector.currentIndexChanged.connect(self.update_project_canvas); split.addWidget(canvas)
             inspector = QWidget(); inspector.setObjectName("inspector"); form = QVBoxLayout(inspector); form.setContentsMargins(18, 18, 18, 18); form.setSpacing(12)
             heading = QLabel("创作设置"); heading.setObjectName("sectionTitle"); form.addWidget(heading)
@@ -992,10 +1594,20 @@ if QT_AVAILABLE:
             self.creative_task_brief = QPlainTextEdit(); self.creative_task_brief.setPlaceholderText('简明要求：角色、氛围、重点，以及需要保留的妆造/纹样/道具。批次会共享这些要求。')
             self.creative_task_brief.setMinimumHeight(65); self.creative_task_brief.setMaximumHeight(95); form.addWidget(self.creative_task_brief)
             self.creative_task_reference = QLineEdit(); self.creative_task_reference.setPlaceholderText('已有参考路径（PNG / JPG / TIFF）'); self.creative_task_reference.hide(); form.addWidget(self.creative_task_reference)
+            self.creative_background_mode = QComboBox(); self.creative_background_mode.setAccessibleName('专业场景调整范围')
+            for label, value in (('原景增强', 'enhance_source'), ('严格保留原背景', 'preserve'), ('允许换景', 'replace')):
+                self.creative_background_mode.addItem(label, value)
+            form.addWidget(QLabel('场景调整范围')); form.addWidget(self.creative_background_mode)
+            from simple_cos_workspace import same_photo_finish_checkbox
+            self.creative_same_photo_finish = same_photo_finish_checkbox()
+            self.creative_same_photo_finish.toggled.connect(self.set_same_photo_finish)
+            form.addWidget(self.creative_same_photo_finish)
             constraints = QHBoxLayout(); self.creative_preserve_background = QCheckBox('保留原背景'); self.creative_no_effects = QCheckBox('不加特效')
+            self.creative_preserve_background.hide()
             self.creative_preserve_background.setChecked(True); self.creative_no_effects.setChecked(True)
             constraints.addWidget(self.creative_preserve_background); constraints.addWidget(self.creative_no_effects); form.addLayout(constraints)
-            self.creative_text_vision = QCheckBox('允许文本/视觉服务规划与审片（会发送图片）'); self.creative_text_vision.setEnabled(False); form.addWidget(self.creative_text_vision)
+            self.creative_text_vision = QCheckBox('额外角色识别、联网研究与视觉规划（可选，增加耗时）'); self.creative_text_vision.setEnabled(False); form.addWidget(self.creative_text_vision)
+            self.creative_visual_review = QCheckBox('自动审片与诊断修复（额外耗时，会发送成片）'); self.creative_visual_review.setEnabled(False); form.addWidget(self.creative_visual_review)
             plan_actions = QHBoxLayout(); self.creative_plan_button = QPushButton('检查制作计划'); self.creative_plan_button.clicked.connect(self.check_creative_task_plan)
             self.creative_start_button = QPushButton('开始制作'); self.creative_start_button.setObjectName('primaryButton'); self.creative_start_button.setEnabled(False); self.creative_start_button.clicked.connect(self.start_planned_creative_task)
             plan_actions.addWidget(self.creative_plan_button); plan_actions.addWidget(self.creative_start_button); form.addLayout(plan_actions)
@@ -1003,11 +1615,12 @@ if QT_AVAILABLE:
             self.creative_plan_summary.setMinimumHeight(150); self.creative_plan_summary.setMaximumHeight(260)
             plan_panel, self.creative_plan_toggle = self.accordion('本次执行计划与范围', self.creative_plan_summary); form.addWidget(plan_panel)
             self.creative_task_mode.currentIndexChanged.connect(self.creative_task_mode_changed)
+            self.creative_background_mode.currentIndexChanged.connect(self.background_mode_changed)
             self.creative_task_brief.textChanged.connect(self.invalidate_creative_task_plan)
             self.creative_task_reference.textChanged.connect(self.invalidate_creative_task_plan)
-            for control in (self.creative_preserve_background, self.creative_no_effects, self.creative_text_vision): control.toggled.connect(self.creative_task_policy_changed)
+            for control in (self.creative_preserve_background, self.creative_no_effects, self.creative_text_vision, self.creative_visual_review): control.toggled.connect(self.creative_task_policy_changed)
             self.existing_design_button = QPushButton("选择已有参考并检查后期计划"); self.existing_design_button.setObjectName("secondaryButton")
-            self.existing_design_button.setToolTip("选择参考并检查完整后期的依赖与服务范围；新增图像预算为零。开始制作另行提交。")
+            self.existing_design_button.setToolTip("复用参考并检查完整后期；默认零生图。主动授权局部精修时，以本次检查计划预算为准。")
             self.existing_design_button.clicked.connect(self.use_existing_design_reference); form.addWidget(self.existing_design_button)
             self.existing_design_state = QLabel("已有参考与原片成对规划；缺失或不支持的步骤会列入计划。"); self.existing_design_state.setWordWrap(True); self.existing_design_state.setObjectName("caption"); form.addWidget(self.existing_design_state)
             self.local_source_button = QPushButton("检查自然原片后期计划"); self.local_source_button.setObjectName("secondaryButton"); self.local_source_button.setToolTip("检查原片本地处理；不调用外部文本、视觉或生图服务。"); self.local_source_button.clicked.connect(self.run_local_source); form.addWidget(self.local_source_button)
@@ -1019,25 +1632,38 @@ if QT_AVAILABLE:
             form.addWidget(self.product_result_panel())
             self.pipeline_summary = QPlainTextEdit("打开已保存工程后显示全流程进度与下一步。"); self.pipeline_summary.setReadOnly(True); self.pipeline_summary.setMinimumHeight(150); self.pipeline_summary.setMaximumHeight(210); self.pipeline_summary.setToolTip("以当前已保存版本的资产和处理记录为准；未保存编辑需先保存。")
             pipeline_panel, _toggle = self.accordion('流程明细与来源', self.pipeline_summary); form.addWidget(pipeline_panel)
-            self.complete_post_button = QPushButton('完成当前作品后期')
-            self.complete_post_button.setToolTip('使用当前原片、设计和所选分析方案，检查并完成精修、肤色、融合与所需效果，保存为独立新版本。')
+            self.preparation_version_workspace = QLabel('打开已保存版本后显示处理版本。'); self.preparation_version_workspace.setWordWrap(True); form.addWidget(self.preparation_version_workspace)
+            self.complete_post_button = QPushButton('按当前算法重新制作')
+            self.complete_post_button.setToolTip('复用原片、参考和美化，按当前算法重新准备完整后期并保存新版本；不新增生图。')
             self.complete_post_button.setEnabled(False)
             self.complete_post_button.clicked.connect(self.complete_current_post)
             form.addWidget(self.complete_post_button)
-            self.character_name = QLineEdit(); self.character_name.setPlaceholderText("角色名 · 留空自动识别")
+            self.character_name = QLineEdit(); self.character_name.setPlaceholderText("角色名 · 由你确认，可留空")
+            self.character_name.setAccessibleName('专业角色名')
             self.character_notes = QLineEdit(); self.character_notes.setPlaceholderText("作品、版本或你希望的氛围（可选）")
+            self.character_notes.setAccessibleName('专业角色作品版本说明')
             form.addWidget(self.character_name); form.addWidget(self.character_notes)
+            from simple_cos_workspace import RegionalRefinementControls
+            self.regional_controls = RegionalRefinementControls(); form.addWidget(self.regional_controls)
+            self.regional_controls.setAccessibleName('专业模式局部精修设置')
+            self.regional_controls.enabledChanged.connect(self.set_regional_enabled)
+            self.regional_controls.boxChanged.connect(self.set_regional_box)
             self.character_recognize = QPushButton("识别角色并推荐风格"); self.character_recognize.setObjectName("secondaryButton"); self.character_recognize.clicked.connect(self.recognize_character)
-            self.character_result = QLabel("留空时会自动识别；不能确定时依照可见造型设计。"); self.character_result.setWordWrap(True)
+            self.character_result = QLabel("默认按你填写的角色与要求制作；额外识别与研究须启用服务。"); self.character_result.setWordWrap(True)
             self.recommended_styles = QComboBox(); self.recommended_styles.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); self.recommended_styles.setMinimumContentsLength(12); self.recommended_styles.addItem("识别后显示推荐", None)
             self.character_apply_style = QPushButton("使用推荐风格"); self.character_apply_style.clicked.connect(self.apply_recommended_style)
             character_details = QWidget(); character_layout = QVBoxLayout(character_details); character_layout.setContentsMargins(0, 0, 0, 0); character_layout.addWidget(self.character_recognize); character_layout.addWidget(self.character_result); character_layout.addWidget(self.recommended_styles); character_layout.addWidget(self.character_apply_style)
             character_panel, self.character_details_toggle = self.accordion("角色识别与初步建议", character_details); form.addWidget(character_panel)
             self.preset = QComboBox(); self.preset.addItem("按角色与本图自动设计", ""); self.preset_rows = {row["id"]: row for row in list_presets()}
             for identifier, row in self.preset_rows.items(): self.preset.addItem(row["name"], identifier)
+            # Keep the first-run route generic. The source-refinement profile
+            # remains available in the selector, but it must be chosen by the
+            # user instead of becoming an invisible task constraint.
+            self.preset.setCurrentIndex(0)
             self.preset.currentIndexChanged.connect(self.select_preset)
+            self.preset.activated.connect(self.preset_activated)
             style_label = QLabel("艺术风格"); style_label.setObjectName("caption"); form.addWidget(style_label); form.addWidget(self.preset)
-            self.generation_style = QLabel("依据角色、服装和场景设计合适的灯光与氛围。"); self.generation_style.setWordWrap(True); self.generation_style.setObjectName("caption"); form.addWidget(self.generation_style)
+            self.generation_style = QLabel(self.preset_rows.get(self.preset.currentData(), {}).get('description') or '依据角色、服装和场景设计合适的灯光与氛围。'); self.generation_style.setWordWrap(True); self.generation_style.setObjectName("caption"); form.addWidget(self.generation_style)
             quantity = QHBoxLayout(); quantity.addWidget(QLabel("候选数量")); self.variant_count = QSpinBox(); self.variant_count.setRange(1, 8); self.variant_count.setValue(1); quantity.addWidget(self.variant_count); quantity.addStretch()
             self.batch_button = QPushButton("检查批量创作计划"); self.batch_button.setObjectName("secondaryButton"); self.batch_button.clicked.connect(self.run_batch); quantity.addWidget(self.batch_button); form.addLayout(quantity)
             self.prepare_design_button = QPushButton("研究角色并准备提示词"); self.prepare_design_button.setObjectName("secondaryButton"); self.prepare_design_button.clicked.connect(self.prepare_generation_design); form.addWidget(self.prepare_design_button)
@@ -1047,7 +1673,8 @@ if QT_AVAILABLE:
             self.final_prompt = QTextEdit(); self.final_prompt.setPlaceholderText("可先研究，查看并编辑这张照片的完整英文设计。"); self.final_prompt.setMinimumHeight(130); self.final_prompt.setMaximumHeight(185)
             final_panel, self.final_prompt_toggle = self.accordion("英文提示词（可编辑）", self.final_prompt); form.addWidget(final_panel)
             self.final_prompt_toggle.toggled.connect(lambda opened: self.final_prompt.verticalScrollBar().setValue(0) if opened else None)
-            self.prompt = QTextEdit(); self.prompt.setPlainText(DEFAULT_PROMPT); self.prompt.setMinimumHeight(150); self.prompt.setMaximumHeight(220)
+            self.prompt = QTextEdit(); self.prompt.setPlainText(compose_generation_prompt(DEFAULT_PROMPT,
+                self.preset_rows.get(self.preset.currentData(), {}).get('prompt'))); self.prompt.setMinimumHeight(150); self.prompt.setMaximumHeight(220)
             self.prompt_tabs = QTabWidget(); input_tab = QWidget(); input_layout = QVBoxLayout(input_tab); input_layout.addWidget(QLabel("摄影要求与自由艺术方向")); input_layout.addWidget(self.prompt)
             prompt_row = QHBoxLayout(); self.restore_prompt = QPushButton("恢复默认英文提示词"); self.apply_style_prompt = QPushButton("应用所选风格提示词"); self.restore_prompt.clicked.connect(self.restore_generation_prompt); self.apply_style_prompt.clicked.connect(self.apply_selected_style_prompt)
             prompt_row.addWidget(self.restore_prompt); prompt_row.addWidget(self.apply_style_prompt); input_layout.addLayout(prompt_row); self.prompt_tabs.addTab(input_tab, "自由方向")
@@ -1078,7 +1705,7 @@ if QT_AVAILABLE:
             self.local_batch_retry_button = QPushButton('重试选中失败项'); self.local_batch_retry_button.clicked.connect(self.retry_local_batch_item); self.local_batch_retry_button.setEnabled(False)
             self.local_batch_retry_button.setToolTip('按本项保存的策略重试，保留其他成功项；生成结果未知时不会自动再次生成。'); files_layout.addWidget(self.local_batch_retry_button)
             self.local_batch_restore_button = QPushButton('恢复最近制作批次'); self.local_batch_restore_button.clicked.connect(lambda: self.task('GET', '/api/batch', None, 'local-batch-restore')); files_layout.addWidget(self.local_batch_restore_button)
-            cleanup_preview = QPushButton("查看可清理空间"); cleanup_apply = QPushButton("清理可重建文件"); cleanup_available = not getattr(sys, "frozen", False); cleanup_preview.setEnabled(cleanup_available); cleanup_apply.setEnabled(cleanup_available); cleanup_preview.setToolTip("仅源码归档工具可用" if not cleanup_available else ""); cleanup_apply.setToolTip("仅源码归档工具可用" if not cleanup_available else ""); cleanup_preview.clicked.connect(lambda: self.task("GET", "/api/cleanup", None, "cleanup-preview")); cleanup_apply.clicked.connect(self.apply_cleanup); files_layout.addWidget(cleanup_preview); files_layout.addWidget(cleanup_apply)
+            cleanup_preview = QPushButton("查看可清理历史"); cleanup_apply = QPushButton("清理过时失败记录"); cleanup_preview.clicked.connect(lambda: self.task("GET", "/api/cleanup", None, "cleanup-preview")); cleanup_apply.clicked.connect(self.apply_cleanup); files_layout.addWidget(cleanup_preview); files_layout.addWidget(cleanup_apply)
             files_panel, _toggle = self.accordion("文件与存储", files); form.addWidget(files_panel); form.addStretch()
             self.inspector_scroll = QScrollArea(); self.inspector_scroll.setWidgetResizable(True); self.inspector_scroll.setWidget(inspector); self.inspector_scroll.setMinimumWidth(350); self.inspector_scroll.setMaximumWidth(480); self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             split.addWidget(self.inspector_scroll); split.setStretchFactor(0, 1); split.setStretchFactor(1, 0); split.setSizes([900, 400]); return page
@@ -1101,6 +1728,7 @@ if QT_AVAILABLE:
         def show_product_result(self, report, run):
             self.product_stage_report = copy.deepcopy(report); self.product_run = copy.deepcopy(run)
             self.refresh_product_result_actions()
+            self.refresh_cos_workspace()
 
         def refresh_product_result_actions(self):
             work = self.product_stage_report.get('whole_work') or {}
@@ -1132,11 +1760,19 @@ if QT_AVAILABLE:
                 selector.setCurrentIndex(index); selector.blockSignals(False)
             self.update_product_action_buttons()
 
+        def _active_production_job(self):
+            kinds = {'one_click', 'native_design_reconstruction', 'prepare_portrait_beauty', 'select_reference_variant'}
+            return next((job for job in self.job_rows.values()
+                         if job.get('kind') in kinds and job.get('status') in {'queued', 'running', 'cancelling'}), None)
+
+        def _production_mutation_busy(self):
+            return bool(self.render_pending or self.creative_task_start_pending or self._active_production_job())
+
         def update_product_action_buttons(self):
             for panel in self.product_result_panels:
                 action=panel['selector'].currentData() or {}; action_id=action.get('action_id')
                 read_only=action_id in {'inspect_native_evidence','inspect_scene_producer','review_and_accept'}
-                ready=bool(action.get('supported') and self.source_run_id and (read_only or not self.render_pending))
+                ready=bool(action.get('supported') and self.source_run_id and (read_only or not self._production_mutation_busy()))
                 if action_id=='save_native_revision': ready=ready and bool(getattr(self,'source_light_save',None) and self.source_light_save.isEnabled())
                 if self._session_dirty and action_id in {'retry_local_processing','prepare_reconstruction','repair_final_locally','review_and_accept'}: ready=False
                 panel['button'].setEnabled(ready); panel['button'].setToolTip(str(action.get('reason') or ''))
@@ -1148,12 +1784,16 @@ if QT_AVAILABLE:
             action_id=action.get('action_id')
             if action_id in {'inspect_native_evidence','inspect_scene_producer'}:
                 self.open_product_evidence(native=action_id=='inspect_native_evidence'); return
-            if self.render_pending: return
+            if self._production_mutation_busy():
+                self.operation_state.setText('当前任务仍在处理；先等待或取消，再重试或准备。'); return
             if self._session_dirty and action_id!='save_native_revision':
                 self.operation_state.setText('请先保存当前修改，再继续本地恢复或批准。'); return
             if action_id=='retry_local_processing':
+                recovery={'generate':False,'async':True}
+                if action.get('regional_candidate_reuse') and self.regional_core_box:
+                    recovery['regional_reuse_core_box']=list(self.regional_core_box)
                 self.task('POST',f'/api/source-runs/{self.source_run_id}/retry',
-                    {'generate':False,'async':True},'local-retry')
+                    recovery,'local-retry')
             elif action_id=='prepare_reconstruction': self.reconstruct_design()
             elif action_id=='save_native_revision': self.save_source_lights()
             elif action_id=='repair_final_locally':
@@ -1235,7 +1875,7 @@ if QT_AVAILABLE:
             else:
                 self.project_preview.image.setText("导入原图开始创作" if name == "source" else "生成后可以在这里查看" )
                 self.project_preview.image.adjustSize()
-                self.project_image_info.setText("原片构图与人物细节始终保留" if name == "source" else "生成后显示图像信息")
+                self.project_image_info.setText("导入原图，选择成片效果" if name == "source" else "生成后显示图像信息")
         def _appearance_scope_options(self):
             """Serialize the regional controls without inventing image logic."""
             extra = self.appearance_extra_controls[0] if self.appearance_extra_controls else {}
@@ -1254,6 +1894,8 @@ if QT_AVAILABLE:
 
         def select_preset(self, _index):
             row = self.preset_rows.get(self.preset.currentData(), {})
+            self.refinement_profile_choice = ({'id': 'source_refinement', 'version': 1}
+                if self.preset.currentData() == 'source_refinement' else None)
             self.apply_selected_style_prompt()
             if row.get("appearance"):
                 self.appearance.setPlainText(json.dumps({"params": row.get("appearance", {})}, ensure_ascii=False, indent=2))
@@ -1262,6 +1904,12 @@ if QT_AVAILABLE:
                     self.appearance_value_labels[key].setText(str(slider.value()))
             if row.get("manual_layers"):
                 self.manual_layers.setPlainText(json.dumps({"schema_version": "manual_layers.v1", "layers": row.get("manual_layers", {})}, ensure_ascii=False, indent=2)); self.sync_manual_controls()
+        def preset_activated(self, _index):
+            # activated also fires when the user chooses the already selected
+            # empty item; currentIndexChanged cannot express that opt-out.
+            self.refinement_profile_choice = ({'id': 'source_refinement', 'version': 1}
+                if self.preset.currentData() == 'source_refinement' else None)
+            self.invalidate_creative_task_plan()
         def restore_generation_prompt(self):
             from generation_prompt import DEFAULT_PROMPT
             self.prompt.setPlainText(DEFAULT_PROMPT)
@@ -1384,7 +2032,7 @@ if QT_AVAILABLE:
             return settings
         def candidate_page(self):
             page = QWidget(); lay = QVBoxLayout(page); form = QFormLayout()
-            self.provider = QComboBox(); self.provider.addItems(["ccswitch_sub2api", "openai-compatible", "qwen_image_2_1", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast", "manual_import", "comfyui", "local"])
+            self.provider = QComboBox(); self.provider.addItems(["qwen_image_2_1", "ccswitch_sub2api", "openai-compatible", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast", "manual_import", "comfyui", "local"])
             self.model = QLineEdit("gpt-image-2.5-sunburst")
             self.provider.currentTextChanged.connect(self.select_provider)
             self.provider_state = QLabel("Provider 配置尚未读取")
@@ -1393,7 +2041,7 @@ if QT_AVAILABLE:
             self.analysis_models.addItem('当前 DINOv3 + SAM3.1', 'current')
             self.analysis_models.setToolTip('当前唯一模型配置：DINOv3 ViT-L/16、SAM3.1 静态实例分割、Sapiens2 与 ViTMatte。')
             form.addRow('本地分析方案', self.analysis_models)
-            provider_content = QWidget(); provider_content.setLayout(form); provider_panel, _toggle = self.accordion("生成服务与模型", provider_content); lay.addWidget(provider_panel)
+            provider_content = QWidget(); provider_content.setLayout(form); provider_panel, self.provider_panel_toggle = self.accordion("生成服务与模型", provider_content); lay.addWidget(provider_panel)
             prompt_note = QLabel("英文提示词与生成风格在项目页编辑；下方重新生成使用当前单图的原图和编辑参数。"); prompt_note.setWordWrap(True); lay.addWidget(prompt_note)
             variants_box = QGroupBox("多版候选浏览与选择"); variants_lay = QVBoxLayout(variants_box)
             self.variant_list = QListWidget(); self.variant_list.setViewMode(QListWidget.ViewMode.IconMode); self.variant_list.setResizeMode(QListWidget.ResizeMode.Adjust); self.variant_list.setIconSize(QSize(100, 140)); self.variant_list.setGridSize(QSize(170, 200)); self.variant_list.setWordWrap(True)
@@ -1452,9 +2100,14 @@ if QT_AVAILABLE:
             item = self.variant_list.currentItem()
             row = item.data(Qt.UserRole) if item else None
             if not isinstance(row, dict) or not self.source_run_id or self.render_pending: return
+            if self.simple_creation and self.simple_creation.get('stage') == 'awaiting_variant':
+                self.simple_creation['stage'] = 'selecting_variant'
             self.task("POST", f"/api/source-runs/{self.source_run_id}/select-variant", {"variant_id": row["variant_id"]}, "source-select-variant")
         def review_page(self):
             page = QWidget(); lay = QVBoxLayout(page); self.review_title = QLabel("请选择样例"); self.review_state = QLabel("review 状态：未知"); lay.addWidget(self.review_title); lay.addWidget(self.review_state)
+            self.preparation_version_review = QLabel(''); self.preparation_version_review.setWordWrap(True); lay.addWidget(self.preparation_version_review)
+            self.reprepare_current_button = QPushButton('按当前算法重新制作'); self.reprepare_current_button.setEnabled(False)
+            self.reprepare_current_button.clicked.connect(self.complete_current_post); lay.addWidget(self.reprepare_current_button)
             lay.addWidget(self.product_result_panel())
             review_action = QPushButton("打开审片证据"); lay.addWidget(review_action)
             review_action.clicked.connect(self.open_product_evidence)
@@ -1559,6 +2212,8 @@ if QT_AVAILABLE:
             light_layout.addWidget(self.source_light_form, 1)
             for content, label in ((light_tab, "柔光"), (self.source_color_panel(), "局部纠偏"), (self.design_reconstruction_panel(), "设计图层"), (self.clone_panel(), "仿制修复"), (self.tone_curve_panel(), "曲线"), (self.hsl_panel(), "颜色 HSL"), (self.local_colour_brush_panel(), "颜色笔刷"), (self.native_matte_panel(), "人物边缘")):
                 scroll = self.scrollable_page(content); scroll.setMinimumHeight(150); self.local_editor_tabs.addTab(scroll, label)
+            self.portrait_beauty_page = self.scrollable_page(self.portrait_beauty_panel())
+            self.local_editor_tabs.addTab(self.portrait_beauty_page, '人像美化')
             outer.addWidget(self.local_editor_tabs, 1)
             self.local_editor_tabs.currentChanged.connect(self.local_editor_changed)
             actions = QHBoxLayout(); self.source_light_preview = QPushButton("预览"); self.source_light_save = QPushButton("保存高清版本"); self.source_light_save.setObjectName("primaryButton")
@@ -1569,6 +2224,8 @@ if QT_AVAILABLE:
             self.source_light_list.currentRowChanged.connect(self.select_source_light); self.source_light_enabled.toggled.connect(self.toggle_source_lights)
             self.source_light_label.textEdited.connect(self.edit_source_light); self.source_light_field_enabled.toggled.connect(self.edit_source_light); self.source_light_scope.currentIndexChanged.connect(self.edit_source_light)
             self.source_light_overlay.toggled.connect(self.update_source_light_overlay); self.source_light_compare.toggled.connect(self.compare_source_lights)
+            self.portrait_beauty_compare.toggled.connect(self.source_light_compare.setChecked)
+            self.source_light_compare.toggled.connect(self.portrait_beauty_compare.setChecked)
             self.source_light_preview.clicked.connect(self.preview_source_lights); self.source_light_save.clicked.connect(self.save_source_lights)
             self.source_light_form.setEnabled(False); self.update_source_light_actions(); return panel
 
@@ -1578,7 +2235,7 @@ if QT_AVAILABLE:
             self.source_light_add.setEnabled(available); self.source_light_enabled.setEnabled(available and self.source_light_plan is not None)
             has_selection = self.source_light_list.currentRow() >= 0
             self.source_light_remove.setEnabled(available and has_selection); self.source_light_form.setEnabled(available and has_selection)
-            has_plan = self.source_light_plan is not None or self.source_color_plan is not None or self.design_reconstruction_plan is not None or (hasattr(self,'manual_layers') and bool(self._manual_data()['layers'].get('clone_retouch',{}).get('strokes') or self._manual_data()['layers'].get('tone_curves') or self._manual_data()['layers'].get('hsl_adjust') or self._manual_data()['layers'].get('local_colour_brush',{}).get('strokes')))
+            has_plan = self.portrait_beauty is not None or self.source_light_plan is not None or self.source_color_plan is not None or self.design_reconstruction_plan is not None or (hasattr(self,'manual_layers') and bool(self._manual_data()['layers'].get('clone_retouch',{}).get('strokes') or self._manual_data()['layers'].get('tone_curves') or self._manual_data()['layers'].get('hsl_adjust') or self._manual_data()['layers'].get('local_colour_brush',{}).get('strokes')))
             current = not self._paired_subject_state()['reconstruction_required']
             self.source_light_preview.setEnabled(available and has_plan and current); self.source_light_save.setEnabled(available and has_plan and current)
             self.update_source_color_actions()
@@ -1589,6 +2246,7 @@ if QT_AVAILABLE:
             self.update_local_brush_overlay()
             self.update_native_matte_overlay()
             self.update_live_native_detail_actions()
+            self.update_portrait_beauty_actions()
 
         def _paired_subject_state(self, plan=None):
             from pipeline_stage_report import paired_subject_observation_state
@@ -1739,6 +2397,166 @@ if QT_AVAILABLE:
             manual = json.loads(self.manual_layers.toPlainText())
             return {'appearance_revision':self._appearance_revision_payload(appearance),
                     'manual_layers':manual.get('layers',manual)}
+
+        def portrait_beauty_panel(self):
+            panel = QWidget(); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 6, 0, 0); layout.setSpacing(8)
+            self.portrait_beauty_prepare = QPushButton('一键准备人像美化 · BeautyGRPO')
+            self.portrait_beauty_prepare.setObjectName('primaryButton')
+            self.portrait_beauty_prepare.setToolTip('本地准备模型原始美化效果，无需参考图。任务中心可查看进度或取消；完成后预览并保存高清版本。')
+            self.portrait_beauty_prepare.clicked.connect(self.prepare_portrait_beauty); layout.addWidget(self.portrait_beauty_prepare)
+            self.portrait_beauty_state = QLabel('打开原片版本后可准备人像美化，无需参考图。')
+            self.portrait_beauty_state.setWordWrap(True); layout.addWidget(self.portrait_beauty_state)
+            row = QHBoxLayout(); row.addWidget(QLabel('美化强度'))
+            self.portrait_beauty_strength = QSlider(Qt.Horizontal); self.portrait_beauty_strength.setRange(0, 100)
+            self.portrait_beauty_strength.setValue(100); row.addWidget(self.portrait_beauty_strength, 1)
+            self.portrait_beauty_strength_value = QLabel('100%'); row.addWidget(self.portrait_beauty_strength_value)
+            self.portrait_beauty_strength.valueChanged.connect(self.edit_portrait_beauty_strength); layout.addLayout(row)
+            self.portrait_beauty_compare = QCheckBox('查看调整前的保存画面')
+            self.portrait_beauty_compare.setToolTip('沿用同一预览的缩放和位置；取消勾选查看当前美化预览。')
+            layout.addWidget(self.portrait_beauty_compare)
+            restoration = QGroupBox('局部恢复原片 · 按人脸'); restore_layout = QVBoxLayout(restoration)
+            self.portrait_beauty_face = QComboBox(); self.portrait_beauty_face.currentIndexChanged.connect(self.update_portrait_beauty_actions)
+            restore_layout.addWidget(self.portrait_beauty_face)
+            self.portrait_beauty_restore_face = QCheckBox('恢复所选人脸的原片外观')
+            self.portrait_beauty_restore_face.setToolTip('关闭这张人脸的美化，恢复该人脸范围；其它人脸保留美化。此入口按人脸操作，不是画笔。')
+            self.portrait_beauty_restore_face.toggled.connect(self.toggle_portrait_beauty_face); restore_layout.addWidget(self.portrait_beauty_restore_face)
+            self.portrait_beauty_scope = QLabel('准备完成后选择人脸。恢复范围为该人脸的美化区域。')
+            self.portrait_beauty_scope.setWordWrap(True); restore_layout.addWidget(self.portrait_beauty_scope); layout.addWidget(restoration)
+            note = QLabel('默认 100% 保留模型生成的肤质、清晰度和色调；按接缝及遮挡融合。可降低强度或按人脸恢复原片，调整后预览并保存。')
+            note.setWordWrap(True); note.setObjectName('mutedLabel'); layout.addWidget(note); layout.addStretch()
+            return panel
+
+        def update_portrait_beauty_actions(self, *_args):
+            if not hasattr(self, 'portrait_beauty_prepare'): return
+            available = bool(self.source_run_id) and not self.render_pending
+            ready = self.portrait_beauty is not None
+            self.portrait_beauty_prepare.setEnabled(available and self.portrait_beauty_request is None)
+            self.portrait_beauty_prepare.setText('重新准备人像美化 · BeautyGRPO' if ready else '一键准备人像美化 · BeautyGRPO')
+            self.portrait_beauty_strength.setEnabled(available and ready)
+            self.portrait_beauty_compare.setEnabled(available and ready)
+            self.portrait_beauty_face.setEnabled(available and ready and bool(self.portrait_beauty_faces))
+            identifier = self.portrait_beauty_face.currentData()
+            face = next((row for row in self.portrait_beauty_faces if row['id'] == identifier), None)
+            self.portrait_beauty_restore_face.setEnabled(available and ready and face is not None)
+            self.portrait_beauty_restore_face.blockSignals(True)
+            self.portrait_beauty_restore_face.setChecked(bool(ready and identifier in self.portrait_beauty.get('disabled_faces', [])))
+            self.portrait_beauty_restore_face.blockSignals(False)
+            box = face.get('native_box') if face else None
+            self.portrait_beauty_scope.setText(('所选人脸美化区域：原片坐标 ' + ', '.join(str(value) for value in box) + '；整张人脸恢复，不是画笔。')
+                if isinstance(box, list) and len(box) == 4 else '准备完成后选择人脸。恢复范围为该人脸的美化区域。')
+
+        def load_portrait_beauty(self, config, faces=None):
+            self.portrait_beauty_loading = True
+            self.portrait_beauty = copy.deepcopy(config) if isinstance(config, dict) and config.get('result') else None
+            self.portrait_beauty_faces = []
+            if self.portrait_beauty is not None:
+                if faces is None:
+                    try:
+                        document = json.loads(Path(self.portrait_beauty['result']).read_text(encoding='utf-8'))
+                        faces = document.get('faces', [])
+                    except (OSError, TypeError, ValueError):
+                        faces = []
+                self.portrait_beauty_faces = [copy.deepcopy(row) for row in faces or []
+                    if isinstance(row, dict) and isinstance(row.get('id'), str)]
+            self.portrait_beauty_face.blockSignals(True); self.portrait_beauty_face.clear()
+            for index, face in enumerate(self.portrait_beauty_faces):
+                self.portrait_beauty_face.addItem('人脸 ' + str(index + 1) + ' · ' + face['id'], face['id'])
+            self.portrait_beauty_face.blockSignals(False)
+            strength = float(self.portrait_beauty.get('strength', 1)) if self.portrait_beauty else 1.
+            self.portrait_beauty_strength.blockSignals(True); self.portrait_beauty_strength.setValue(round(strength * 100)); self.portrait_beauty_strength.blockSignals(False)
+            self.portrait_beauty_strength_value.setText(str(self.portrait_beauty_strength.value()) + '%')
+            self.portrait_beauty_compare.blockSignals(True); self.portrait_beauty_compare.setChecked(False); self.portrait_beauty_compare.blockSignals(False)
+            self.portrait_beauty_state.setText('BeautyGRPO 原始生成外观已载入；可调强度或按人脸恢复原片。' if self.portrait_beauty else '打开原片版本后可准备人像美化，无需参考图。')
+            self.portrait_beauty_loading = False; self.update_portrait_beauty_actions()
+
+        def portrait_beauty_changed(self):
+            if self.workflow_graph:
+                self.workflow_graph['nodes']['beauty'] = {'enabled': True, 'strength': float(self.portrait_beauty.get('strength', 1.))}
+            self.simple_comparing = False
+            self.source_light_version += 1
+            self.source_light_compare.setChecked(False)
+            self._checkpoint_session(); self.update_source_light_actions(); self.source_light_timer.start()
+
+        def edit_portrait_beauty_strength(self, value):
+            self.portrait_beauty_strength_value.setText(str(value) + '%')
+            if self.portrait_beauty_loading or self.portrait_beauty is None: return
+            self.portrait_beauty['strength'] = value / 100.
+            self.portrait_beauty_changed()
+
+        def toggle_portrait_beauty_face(self, restored):
+            if self.portrait_beauty_loading or self.portrait_beauty is None: return
+            identifier = self.portrait_beauty_face.currentData()
+            if identifier is None: return
+            disabled = set(self.portrait_beauty.get('disabled_faces', []))
+            if restored: disabled.add(identifier)
+            else: disabled.discard(identifier)
+            self.portrait_beauty['disabled_faces'] = sorted(disabled); self.portrait_beauty_changed()
+
+        def prepare_portrait_beauty(self, _checked=False):
+            if not self.source_run_id or self.render_pending or self.portrait_beauty_request is not None: return
+            self._checkpoint_session()
+            if self._session_checkpoint_failed: return
+            try: payload = self._source_edit_payload()
+            except (TypeError, ValueError) as error:
+                self.portrait_beauty_state.setText('当前参数无法读取，尚未提交美化准备：' + str(error)); return
+            self.source_light_timer.stop(); self.native_matte_timer.stop()
+            self.portrait_beauty_request = 'submitting'
+            self.portrait_beauty_state.setText('正在本地准备 BeautyGRPO 原始效果；任务中心可等待或取消。')
+            self.local_editor_tabs.setCurrentWidget(self.portrait_beauty_page); self.layer_tabs.setCurrentWidget(self.previews['final'])
+            self.task('POST', f'/api/source-runs/{self.source_run_id}/prepare-portrait-beauty', payload, 'portrait-beauty-job')
+
+        def handle_portrait_beauty_job(self, value):
+            from session_draft import digest
+            job = value.get('job') or {}
+            if job.get('kind') != 'prepare_portrait_beauty': return False
+            if job.get('job_id') != self.active_job_id: return True
+            job_id = job['job_id']; status = job.get('status'); self.portrait_beauty_job_id = job_id
+            self.job_details.setPlainText(json.dumps(job, ensure_ascii=False, indent=2))
+            if hasattr(self, 'simple_workspace'):
+                self._show_quick_job_progress(job)
+            if status in {'queued', 'running', 'cancelling'}:
+                self.render_pending = True; self.portrait_beauty_request = job_id
+                self.operation_state.setText(str(job.get('message') or '正在准备人像美化；任务中心可取消。'))
+                self.portrait_beauty_state.setText(self.operation_state.text()); self.update_accept_enabled()
+                self._schedule_job_poll(750)
+                return True
+            self.render_pending = False; self.portrait_beauty_request = None; self.update_accept_enabled()
+            if self.portrait_beauty_result_seen == job_id: return True
+            if status != 'succeeded':
+                self.simple_creation = None
+                self.operation_state.setText('人像美化准备已取消；当前编辑保留。' if status == 'cancelled' else '人像美化准备未完成；当前编辑保留，可重试。')
+                self.portrait_beauty_state.setText(self.operation_state.text())
+                if job.get('error'): self.log_text('[portrait beauty] ' + str(job['error']))
+                return True
+            receipt = value.get('portrait_beauty_result') or {}
+            if receipt.get('run_id') != self.source_run_id or receipt.get('source_sha256') != self.source_run_source_sha256:
+                self.simple_creation = None
+                self.operation_state.setText('美化结果已保留；请打开任务对应原片版本后再载入。'); return True
+            try: current_sha = digest(self._source_edit_payload())
+            except (TypeError, ValueError): current_sha = None
+            if receipt.get('input_sha256') != current_sha:
+                self.simple_creation = None
+                self.operation_state.setText('美化结果已保留；当前精修已有变化，请按当前参数重试准备。'); return True
+            if receipt.get('no_change') is True:
+                self.simple_creation = None
+                self.portrait_beauty_result_seen = job_id
+                self.operation_state.setText('未找到可美化的可见人脸；当前编辑与原片保留。')
+                self.portrait_beauty_state.setText(self.operation_state.text()); return True
+            config = (receipt.get('appearance_revision') or {}).get('portrait_beauty')
+            if (receipt.get('preparation_contract') != 'portrait_beauty_layer.v1' or not isinstance(config, dict)
+                    or not config.get('result') or not Path(config['result']).is_absolute()):
+                self.simple_creation = None
+                self.operation_state.setText('美化任务缺少有效冻结结果；当前编辑保留，请重试。'); return True
+            self.portrait_beauty_result_seen = job_id
+            self.load_portrait_beauty(config, receipt.get('faces'))
+            self._apply_workflow_intent()
+            self.local_editor_tabs.setCurrentWidget(self.portrait_beauty_page); self.layer_tabs.setCurrentWidget(self.previews['final'])
+            self.source_light_version += 1; self.source_light_compare.setChecked(False)
+            self._checkpoint_session(); self.update_source_light_actions()
+            self.operation_state.setText('BeautyGRPO 原始美化效果已准备；预览后保存高清新版本。')
+            self.portrait_beauty_state.setText(self.operation_state.text()); self.preview_source_lights()
+            self._advance_simple_creation('beauty')
+            return True
 
         def design_reconstruction_panel(self):
             panel = QWidget(); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 6, 0, 0); layout.setSpacing(8)
@@ -2104,6 +2922,12 @@ if QT_AVAILABLE:
             self.design_reconstruction_loading = False; self.update_design_reconstruction_actions()
 
         def design_reconstruction_changed(self):
+            if self.workflow_graph:
+                from cos_workflow_graph import build_graph
+                draft = self._cos_draft_run(); draft['options']['appearance_revision'].pop('workflow_graph', None)
+                for node in build_graph(draft)['nodes']:
+                    if node['prepared'] and node['id'] != 'beauty' and node['editable']:
+                        self.workflow_graph['nodes'][node['id']] = node['parameters']
             self.source_light_version += 1; self.source_light_compare.setChecked(False)
             self.source_light_state.setText("设计图层已修改，正在准备成片预览…"); self.update_source_light_actions(); self.source_light_timer.start()
 
@@ -2215,17 +3039,19 @@ if QT_AVAILABLE:
             name = self._reconstruction_name()
             self.native_reconstruction_job_id = job_id
             self.job_details.setPlainText(json.dumps(job, ensure_ascii=False, indent=2))
+            if hasattr(self, 'simple_workspace'):
+                self._show_quick_job_progress(job)
             if status in {'queued', 'running', 'cancelling'}:
                 self.render_pending = True; self.design_reconstruction_request = job_id
                 self.operation_state.setText(str(job.get('message') or f'正在准备{name}；任务中心可取消。'))
                 self.update_accept_enabled()
-                observation = self.job_observation
-                QTimer.singleShot(750, lambda: self.poll_active_job() if observation == self.job_observation else None)
+                self._schedule_job_poll(750)
                 return True
             self.render_pending = False; self.design_reconstruction_request = None
             self.update_accept_enabled()
             if self.native_reconstruction_result_seen == job_id: return True
             if status != 'succeeded':
+                self.simple_creation = None
                 message = (f'{name}准备已取消；当前编辑与已保存画面保留。' if status == 'cancelled'
                     else f'{name}准备未完成；当前编辑保留，可重新提交本地准备。')
                 self.operation_state.setText(message); self.source_light_state.setText(message)
@@ -2235,15 +3061,18 @@ if QT_AVAILABLE:
             if (receipt.get('run_id') != self.source_run_id
                     or receipt.get('source_sha256') != self.source_run_source_sha256
                     or receipt.get('candidate_sha256') != self.source_run_candidate_sha256):
+                self.simple_creation = None
                 self.operation_state.setText('本地准备结果已保留；先打开任务对应版本，再在任务中心选择此任务。')
                 return True
             try: current_sha = digest(self._source_edit_payload())
             except (TypeError, ValueError): current_sha = None
             if receipt.get('input_sha256') != current_sha:
+                self.simple_creation = None
                 self.operation_state.setText(f'准备结果已保留；当前精修已有变化，请按当前参数重试{name}准备。')
                 return True
             plan = receipt.get('design_reconstruction_plan')
             if not isinstance(plan, dict):
+                self.simple_creation = None
                 self.operation_state.setText(f'本地任务缺少准备结果，请重试{name}准备。'); return True
             self.native_reconstruction_result_seen = job_id
             if job.get('preparation_kind') in ('hair_boundary_light', 'cloth_boundary_light', 'boundary_light_coordination') and receipt.get('no_change') is True:
@@ -2251,12 +3080,49 @@ if QT_AVAILABLE:
                     if job.get('preparation_kind') == 'boundary_light_coordination' else
                     f'{name}依据不足，未改变画面；当前编辑与已保存原图保留。')
                 self.operation_state.setText(message); self.source_light_state.setText(message)
+                # In the default Cos route, insufficient evidence for one
+                # boundary segment is a local finding, not a reason to drop
+                # the already prepared Beauty/fusion result. Save that result
+                # and continue to the post stage with the missing segment
+                # recorded by the job receipt.
+                if (self.simple_creation and self.simple_creation.get('stage') == 'boundary'
+                        and job.get('preparation_kind') == 'boundary_light_coordination'):
+                    self.simple_creation['stage'] = 'post_save_wait'
+                    self.operation_state.setText(message + '正在保存当前融合版本并继续后期。')
+                    QTimer.singleShot(0, self.save_source_lights)
                 return True
             self.load_design_reconstruction(plan); self.design_reconstruction_prepared = True
+            self._apply_workflow_intent()
             self.local_editor_tabs.setCurrentIndex(2); self.layer_tabs.setCurrentWidget(self.previews['final'])
             self.source_light_version += 1; self._checkpoint_session()
             self.operation_state.setText(f'{name}已准备，待审片且尚未保存；预览后保存高清新版本。')
-            self.update_source_light_actions(); self.preview_source_lights()
+            automatic_handoff = bool(self.simple_creation and (
+                (job.get('preparation_kind') == 'reference_appearance'
+                 and self.simple_creation.get('stage') == 'colour') or
+                (job.get('preparation_kind') == 'boundary_light_coordination'
+                 and self.simple_creation.get('stage') == 'boundary')))
+            self.update_source_light_actions()
+            # The automatic route immediately submits the next local worker;
+            # avoid starting a competing preview render for the same snapshot.
+            # The final high-resolution save is the first preview of this
+            # combined edit. Manual professional edits retain live preview.
+            if not automatic_handoff:
+                self.preview_source_lights()
+            # The quick Cos route owns the next hand-off.  A selected
+            # reference first prepares ordinary appearance fusion, then the
+            # same edit snapshot is sent through coordinated boundary light,
+            # and only then is the high-resolution revision saved. Professional
+            # manual reconstruction keeps its previous behaviour.
+            if (self.simple_creation and job.get('preparation_kind') == 'reference_appearance'
+                    and self.simple_creation.get('stage') == 'colour'):
+                self.simple_creation['stage'] = 'boundary'
+                QTimer.singleShot(0, lambda: self.reconstruct_design(preparation_kind='boundary_light_coordination'))
+            elif (self.simple_creation and job.get('preparation_kind') == 'boundary_light_coordination'
+                    and self.simple_creation.get('stage') == 'boundary'):
+                self.simple_creation['stage'] = 'post_save_wait'
+                QTimer.singleShot(0, self.save_source_lights)
+            else:
+                self._advance_simple_creation('colour')
             return True
 
         def source_color_panel(self):
@@ -2903,6 +3769,10 @@ if QT_AVAILABLE:
             self.task("POST", f"/api/source-runs/{self.source_run_id}/auto-color", {}, "source-color-auto:" + token)
 
         def add_local_plans_to_revision(self, revision):
+            if self.workflow_graph is not None: revision['workflow_graph'] = copy.deepcopy(self.workflow_graph)
+            else: revision.pop('workflow_graph', None)
+            if self.portrait_beauty is not None: revision['portrait_beauty'] = copy.deepcopy(self.portrait_beauty)
+            else: revision.pop('portrait_beauty', None)
             for prefix, plan, origin, design in (("source_render_plan", self.source_light_plan, self.source_light_origin, self.source_light_design), ("source_color_plan", self.source_color_plan, self.source_color_origin, self.source_color_design)):
                 if plan is not None:
                     revision[prefix] = json.loads(json.dumps(plan)); revision[prefix + "_origin"] = origin
@@ -3030,6 +3900,8 @@ if QT_AVAILABLE:
         def jobs_page(self):
             page = QWidget(); lay = QVBoxLayout(page)
             lay.addWidget(QLabel("任务保存在项目目录中；选择任务恢复进度或载入对应草稿。"))
+            self.job_timing = QLabel('阶段耗时将在任务开始后显示；样本不足时显示估算中。')
+            self.job_timing.setWordWrap(True); lay.addWidget(self.job_timing)
             row = QHBoxLayout(); refresh = QPushButton("刷新任务列表"); cancel = QPushButton("取消选中任务")
             refresh.clicked.connect(self.refresh_jobs); cancel.clicked.connect(self.cancel_selected_job)
             row.addWidget(refresh); row.addWidget(cancel); row.addStretch(); lay.addLayout(row)
@@ -3052,6 +3924,7 @@ if QT_AVAILABLE:
                 if job_id == self.active_job_id: self.jobs_tree.setCurrentItem(item)
             self.jobs_tree.blockSignals(False)
         def observe_job(self, job_id):
+            self.job_poll_timer.stop(); self.job_poll_terminal_observation = None
             self.job_observation += 1
             self.active_job_id = str(job_id); self.job_stream_active = False
             self.start_job_stream(); self.poll_active_job()
@@ -3065,7 +3938,9 @@ if QT_AVAILABLE:
             if job_id != self.active_job_id:
                 if job.get("status") in {"queued", "running", "cancelling"}: self.observe_job(job_id)
                 else:
+                    self.job_poll_timer.stop()
                     self.job_observation += 1; self.active_job_id = job_id; self.job_stream_active = False
+                    self.job_poll_terminal_observation = self.job_observation
             if job.get('kind') == 'native_design_reconstruction':
                 self.native_reconstruction_job_id = job_id
                 self.task('GET', f'/api/jobs/{job_id}', None, 'job-status')
@@ -3075,18 +3950,89 @@ if QT_AVAILABLE:
             item = self.jobs_tree.currentItem()
             if item is not None:
                 self.task("POST", f"/api/jobs/{item.data(0, Qt.UserRole)}/cancel", {}, "job-cancel")
+        def _select_preferred_local_provider(self):
+            """Choose the qualified local default only when it is ready.
+
+            Persisted settings and an explicit selector action take precedence;
+            this helper is used solely when no default has ever been saved.
+            """
+            if self.generation_model_user_selected or self.provider_default:
+                return False
+            row = self.provider_rows.get(PREFERRED_LOCAL_GENERATION_PROVIDER) or {}
+            if not row.get('ready'):
+                return False
+            if self.provider.currentText() == PREFERRED_LOCAL_GENERATION_PROVIDER:
+                return True
+            self.provider.blockSignals(True)
+            self.provider.setCurrentText(PREFERRED_LOCAL_GENERATION_PROVIDER)
+            self.provider.blockSignals(False)
+            self.select_provider(PREFERRED_LOCAL_GENERATION_PROVIDER)
+            return True
+
         def select_provider(self, provider):
             row = self.provider_rows.get(provider, {})
             configured = self.provider_settings.get(provider, {})
-            self.model.setText(str(configured.get("model") or row.get("model") or ("" if provider in {"comfyui", "local", "manual_import", "qwen_image_2_1", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast"} else "gpt-image-2.5-sunburst")))
-            self.provider_state.setText(f"{row.get('status', '未配置')} / {row.get('endpoint') or '无 endpoint'}")
+            model = configured.get("model") or row.get("model") or ("" if provider in {"comfyui", "local", "manual_import", "qwen_image_2_1", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast"} else "gpt-image-2.5-sunburst")
+            self.model.setText(str(model))
+            display = row.get('display') or provider
+            status = row.get('status', '未配置')
+            readiness = generation_readiness_text({**row, 'id': provider})
+            self.provider_state.setText(f"{display} · {readiness} / {status} · {row.get('endpoint') or '未配置地址'}")
+            self.model.setToolTip('当前生图模型或 ComfyUI 工作流：' + (str(model) if model else '请填写模型/工作流路径'))
             self.provider_endpoint.setText(str(configured.get("endpoint") or row.get("endpoint") or ""))
             self.provider_secret_env.setText(str(configured.get("secret_env") or ""))
             self.provider_credential.setCurrentText(str(configured.get("credential_source") or "auto"))
+            self.refresh_generation_models()
+
+        def refresh_generation_models(self, *_args, locked=None):
+            if not hasattr(self, 'simple_workspace'): return
+            selected = self.provider.currentText()
+            choices = []
+            for provider, row in self.provider_rows.items():
+                if not row.get('generation_supported'): continue
+                model = self.model.text().strip() if provider == selected else str(row.get('model') or '')
+                display = str(row.get('display') or provider)
+                if row.get('kind') == 'comfyui':
+                    label = display if str(row.get('model_env') or '').startswith('COSPLAY_QWEN_') else display + (' · ' + Path(model).stem if model else '')
+                    route = 'ComfyUI 生成'
+                else:
+                    label = (model + ' · ' if model else '') + display
+                    route = 'API 生成'
+                state = generation_readiness_text({**row, 'id': provider})
+                if provider == selected and self.generation_model_save_error: state += ' / 默认未保存'
+                choices.append({'id':provider, 'label':label, 'detail':route + ' · ' + state})
+            if locked is None:
+                locked = bool(self.render_pending or self.creative_task_start_pending or self.simple_creation or self._session_loading)
+            self.simple_workspace.set_generation_models(choices, selected, locked=locked)
+            if (self.generation_model_save_pending and not self.generation_model_save_active
+                    and not self.generation_model_save_timer.isActive()
+                    and not self._session_loading and (not self.embedded_backend or self.embedded_server is not None)):
+                self.generation_model_save_timer.start()
+
+        def select_generation_model(self, provider):
+            if not self.simple_workspace.generation_model.isEnabled() or provider not in self.provider_rows: return
+            self.generation_model_user_selected = True
+            self.generation_model_save_error = False
+            self.provider.setCurrentText(provider)
+            self.generation_model_save_pending = {**(self.generation_model_save_pending or {}), 'default_provider':provider}
+            self.generation_model_save_timer.start()
+
+        def persist_generation_model(self):
+            if self.generation_model_save_active or not self.generation_model_save_pending: return
+            if self._session_loading or (self.embedded_backend and self.embedded_server is None): return
+            self.generation_model_save_active = self.generation_model_save_pending
+            self.generation_model_save_pending = None
+            payload = self.generation_model_save_active
+            label = 'provider-settings-saved' if 'providers' in payload else 'generation-model-selected'
+            self.task('POST', '/api/provider-settings', payload, label)
+
         def save_provider_settings(self):
             provider = self.provider.currentText()
             settings = {"endpoint": self.provider_endpoint.text().strip(), "model": self.model.text().strip(), "secret_env": self.provider_secret_env.text().strip(), "credential_source": self.provider_credential.currentText()}
-            self.task("POST", "/api/provider-settings", {"default_provider": provider, "providers": {provider: settings}}, "provider-settings-saved")
+            pending = self.generation_model_save_pending or {}
+            self.generation_model_save_pending = {'default_provider':provider,
+                'providers':{**pending.get('providers', {}), provider:settings}}
+            self.generation_model_save_timer.stop(); self.persist_generation_model()
         def choose_export_directory(self):
             directory = QFileDialog.getExistingDirectory(self, "选择导出目录", self.export_directory.text().strip() or str(self.root_path))
             if directory: self.export_directory.setText(directory)
@@ -3121,6 +4067,9 @@ if QT_AVAILABLE:
         def log_text(self, text): self.log.appendPlainText(str(text).rstrip())
         def sample(self): return self.source_sample
         def task(self, method, path, body, label):
+            if label in {'job-status', 'job-events'} and any(
+                    relay.label == label and relay.current() for relay in self.pending_tasks):
+                return
             if self.embedded_backend and self.embedded_server is None:
                 self.operation_state.setText('请先启动当前工程的后台。'); return
             if label == 'model-setup' and self.model_setup_submission is not None: return
@@ -3131,13 +4080,15 @@ if QT_AVAILABLE:
                     self.operation_state.setText('当前任务仍在处理；先等待或取消，再切换版本。'); return
                 self._checkpoint_session()
                 if self._session_checkpoint_failed: return
-            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "local-only", "existing-design", "source-select-variant", "design-reconstruct-job"}:
-                if self.render_pending:
+            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "complete-post", "local-only", "existing-design", "source-select-variant", "design-reconstruct-job", "portrait-beauty-job"}:
+                if self.render_pending or self._active_production_job():
                     self.log_text("[render] 请求进行中，请等待草稿完成"); return
                 self._checkpoint_session()
                 if self._session_checkpoint_failed:
                     if label == 'design-reconstruct-job':
                         self.design_reconstruction_request = None; self.update_source_light_actions()
+                    if label == 'portrait-beauty-job':
+                        self.portrait_beauty_request = None; self.update_source_light_actions()
                     return
                 if label == "source-adjust" and self._session_binding:
                     from session_draft import SessionDraftStore
@@ -3148,7 +4099,7 @@ if QT_AVAILABLE:
                     except (OSError, TypeError, ValueError) as error:
                         self.session_draft_state.setText("会话保留失败，高清保存未提交：" + str(error)); return
                 self.render_pending = True; self.update_accept_enabled()
-                self.operation_state.setText(f'正在提交{self._reconstruction_name()}准备任务；准备阶段不更新已保存版本。' if label == 'design-reconstruct-job' else "正在高清处理，完成后打开新版本" if label == "source-adjust" else "正在按已检查计划本地处理原片。" if label == "local-only" else "正在按已有参考计划完成支持的后期；新增图像预算为零。" if label == "existing-design" else f"操作状态：{label} pending / run={self.source_run_id} / r{self.source_revision}")
+                self.operation_state.setText(f'正在提交{self._reconstruction_name()}准备任务；准备阶段不更新已保存版本。' if label == 'design-reconstruct-job' else "正在高清处理，完成后打开新版本" if label == "source-adjust" else "正在按已检查计划本地处理原片。" if label == "local-only" else "正在复用参考执行已检查计划；新增图像模型调用以本次冻结预算为准。" if label == "existing-design" else f"操作状态：{label} pending / run={self.source_run_id} / r{self.source_revision}")
             self.log_text(f"[{label}] {method} {path}"); task = ApiTask(self.backend_url(), method, path, body, label)
             relay = TaskRelay(self, label, self.job_observation)
             self.pending_tasks[relay] = task
@@ -3163,7 +4114,7 @@ if QT_AVAILABLE:
                           min(1.,max(0.,point.y()/max(1,view.image.height())))]
             self.native_detail_token = self.source_run_id+":"+uuid.uuid4().hex[:8]
             self.task("POST",f"/api/source-runs/{self.source_run_id}/native-detail",
-                      {'center':center,'edge':768,'request_id':self.native_detail_token},
+                      {'center':center,'edge':768,'include_source':True,'request_id':self.native_detail_token},
                       "native-detail:"+self.native_detail_token)
 
         def request_live_native_detail(self,center=None):
@@ -3201,18 +4152,67 @@ if QT_AVAILABLE:
             box = value['crop_box']
             layout.addWidget(QLabel(f"已保存版本 · {value['native_size'][0]} × {value['native_size'][1]}\n"
                 f"原生像素区域 {box[0]}, {box[1]} → {box[2]}, {box[3]}；未缩放。尚未保存的修改不在此视图中。"))
-            image = QLabel(); image.setPixmap(QPixmap(value['preview_path'])); image.adjustSize()
-            scroll = QScrollArea(); scroll.setWidget(image); scroll.setAlignment(Qt.AlignCenter); layout.addWidget(scroll,1)
+            pair = QHBoxLayout(); scrolls = []
+            source = value.get('source_preview_path')
+            if not source:
+                layout.addWidget(QLabel('原片基线对照不可用：' + str((value.get('source_comparison') or {}).get('unavailable_reason') or '未提供同坐标原片基线；未使用代理图代替。')))
+            for title, path in ([('原片基线（美化前）', source)] if source else []) + [('已保存成片', value['preview_path'])]:
+                column = QVBoxLayout(); column.addWidget(QLabel(title))
+                image = QLabel(); image.setPixmap(QPixmap(path)); image.adjustSize()
+                scroll = QScrollArea(); scroll.setWidget(image); scroll.setAlignment(Qt.AlignCenter); column.addWidget(scroll,1)
+                pair.addLayout(column); scrolls.append(scroll)
+            if len(scrolls) == 2:
+                for first, second in ((scrolls[0],scrolls[1]), (scrolls[1],scrolls[0])):
+                    first.horizontalScrollBar().valueChanged.connect(second.horizontalScrollBar().setValue)
+                    first.verticalScrollBar().valueChanged.connect(second.verticalScrollBar().setValue)
+                dialog.resize(1460,900)
+            layout.addLayout(pair,1)
             self.native_detail_dialog = dialog
             dialog.show()
 
         def result(self, label, value):
+            active = self.active_checked_task
+            if active and isinstance(value, dict):
+                if label == active['callback']:
+                    if value.get('async') and value.get('job_id'):
+                        active['job_id'] = str(value['job_id'])
+                    else:
+                        self.active_checked_task = None
+                elif label in {'job-status', 'job-stream'}:
+                    observed = value.get('job' if label == 'job-status' else 'data') or {}
+                    identifier = str(observed.get('job_id') or self.active_job_id)
+                    if (identifier == active.get('job_id') and observed.get('status') in
+                            {'succeeded', 'failed', 'blocked', 'cancelled'}):
+                        self.active_checked_task = None
+            # Polling/SSE carry fresher progress than the occasional jobs list.
+            # Keep that observation available to ordinary UI refreshes too.
+            if label in {'job-status', 'job-stream'} and isinstance(value, dict):
+                observed = value.get('job' if label == 'job-status' else 'data') or {}
+                if isinstance(observed, dict) and self.active_job_id:
+                    identifier = str(observed.get('job_id') or self.active_job_id)
+                    if identifier == self.active_job_id:
+                        self.job_rows[identifier] = {**self.job_rows.get(identifier, {}), **observed}
+                        timing = observed.get('timing') or (observed.get('data') or {}).get('timing')
+                        if isinstance(timing, dict):
+                            from workflow_timing import progress_text
+                            self.job_timing.setText(progress_text(timing))
             if label.startswith('creative-task-plan:'):
                 self.receive_creative_task_plan(label, value); return
             if self.creative_task_start_pending and label == self.creative_task_execution_label:
                 self.creative_task_start_pending = False; self.creative_task_execution_label = None
                 self.creative_task_retry_batch_id = None
                 self.update_creative_task_actions()
+            if label in self.simple_cancel_submissions:
+                self.simple_cancel_submissions.discard(label)
+                if value.get('async') and value.get('job_id'):
+                    identifier = value['job_id']
+                    if label == 'portrait-beauty-job':
+                        self.portrait_beauty_job_id = identifier; self.portrait_beauty_request = identifier
+                    elif label == 'design-reconstruct-job':
+                        self.native_reconstruction_job_id = identifier; self.design_reconstruction_request = identifier
+                    self.observe_job(identifier)
+                    self.task('POST', f'/api/jobs/{identifier}/cancel', {}, 'job-cancel')
+                    self.refresh_jobs(); return
             if label in {'model-setup', 'model-setup-saved'}:
                 if label == 'model-setup-saved' and self.model_setup_dialog is not None:
                     for key, edit in self.model_path_edits.items():
@@ -3228,6 +4228,14 @@ if QT_AVAILABLE:
                     self.observe_job(value['job_id']); self.refresh_jobs()
                     self.operation_state.setText(f'{self._reconstruction_name()}准备任务已提交；任务中心可等待或取消，未保存新版本。')
                 else: self.error('本地准备任务未创建，当前编辑保留。', label)
+                return
+            if label == 'portrait-beauty-job':
+                if value.get('async') and value.get('job_id'):
+                    self.portrait_beauty_job_id = value['job_id']; self.portrait_beauty_request = value['job_id']
+                    self.observe_job(value['job_id']); self.refresh_jobs()
+                    self.operation_state.setText('人像美化任务已提交；任务中心可等待或取消，完成后预览并保存。')
+                    self.portrait_beauty_state.setText(self.operation_state.text())
+                else: self.error('人像美化任务未创建，当前编辑保留。', label)
                 return
             if label.startswith('native-live-detail:'):
                 context=self.native_live_detail_context
@@ -3296,6 +4304,7 @@ if QT_AVAILABLE:
                     self.source_light_state.setText(f"预览已更新（{size_text}），尚未保存。")
                     self.load_receiver_shadow_result(value.get('authored_receiver_shadow_execution'),
                         snapshot=receipt['snapshot'], matte_version=receipt['matte_version'], origin='本次预览', matte_strokes=receipt['matte_strokes'])
+                    self.refresh_cos_workspace()
                 return
             if label == "source-preview":
                 source = Path(str(value.get("source") or ""))
@@ -3304,11 +4313,17 @@ if QT_AVAILABLE:
                     self.project_dimensions["source"] = [value["width"], value["height"]]
                     if self.project_view_selector.currentData() == "source": self.update_project_canvas()
                     if self.previews.get("source") and self.previews["source"].path == source: self.previews["source"].set_path(source, self.project_proxies["source"])
+                    self.refresh_cos_workspace()
                 return
-            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "local-only", "existing-design", "source-select-variant"} and not value.get("async"):
+            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "complete-post", "local-only", "existing-design", "source-select-variant"} and not value.get("async"):
                 self.render_pending = False; self.update_accept_enabled()
-            self.log_text(json.dumps(value, ensure_ascii=False, indent=2))
-            if isinstance(value, dict) and label not in {"source-delivery-history", "source-run-history"}:
+            if label == 'job-status':
+                job = value.get('job') or {}
+                self.log_text(json.dumps({key: job.get(key) for key in
+                    ('job_id', 'status', 'stage', 'progress', 'message')}, ensure_ascii=False))
+            elif label != 'jobs-list':
+                self.log_text(json.dumps(value, ensure_ascii=False, indent=2))
+            if isinstance(value, dict) and label not in {"source-delivery-history", "source-run-history", "job-events", "jobs-list", "job-status", "job-stream", "job-run-loaded"}:
                 status = value.get("status") or value.get("review_status")
                 if value.get("needs_rerender"):
                     self.operation_state.setText(f"操作状态：{label} 完成，需重新渲染")
@@ -3316,9 +4331,16 @@ if QT_AVAILABLE:
                     self.operation_state.setText(f"操作状态：{label} → {status}")
                 else:
                     self.operation_state.setText(f"操作状态：{label} 完成")
-            if label in {"one-click", "local-only", "existing-design", "source-retry", "local-retry", "repair-final", "source-select-variant"}:
+            if label in {"one-click", "complete-post", "local-only", "existing-design", "source-retry", "local-retry", "repair-final", "source-select-variant"}:
                 run = (value.get("run") or value.get("child_run")) if isinstance(value, dict) else None
-                if isinstance(run, dict): self.load_source_run(run)
+                if isinstance(run, dict):
+                    was_post = bool(label in {'one-click', 'complete-post', 'existing-design'} and self.simple_creation
+                                    and self.simple_creation.get('stage') in {'post', 'production'})
+                    self.load_source_run(run)
+                    if was_post and self.simple_creation:
+                        self.simple_creation = None; self._reset_quick_progress()
+                        self.operation_state.setText(post_completion_message(run))
+                        self.refresh_cos_workspace()
                 elif isinstance(value, dict) and value.get("async") and value.get("job_id"):
                     self.observe_job(value["job_id"])
                     self.operation_state.setText(f"操作状态：后台任务 {self.active_job_id} 已启动")
@@ -3331,6 +4353,10 @@ if QT_AVAILABLE:
                         if self.source_run_id == run.get("run_id"):
                             self.operation_state.setText("高清版本已保存")
                             if self.source_light_plan is not None or self.source_color_plan is not None or self.design_reconstruction_plan is not None: self.source_light_state.setText("高清版本已保存；可继续调整设计图层与局部光色。")
+                            if label == "source-adjust" and self.simple_creation and self.simple_creation.get('stage') == 'post_save_wait':
+                                self.simple_creation['stage'] = 'post'
+                                self.operation_state.setText('仿色与融合版本已保存；正在进入特效与完整后期。')
+                                QTimer.singleShot(0, self.complete_current_post)
                         else:
                             self.operation_state.setText("高清子版本已保存；当前新增修改仍未保存")
                 elif label == "source-adjust" and value.get("async") and value.get("job_id"):
@@ -3353,15 +4379,28 @@ if QT_AVAILABLE:
                     self.research_summary.setText("原图或艺术方向已改变；直接生成时将自动研究并重新准备当前设计。")
                 self.design_request_context = None
                 self.update_creative_service_actions()
+            elif label == 'generation-model-selected':
+                self.generation_model_save_active = None
+                self.generation_model_save_error = False
+                self.provider_settings = value.get('providers') or {}
+                self.refresh_generation_models()
             elif label in {"provider-settings", "provider-settings-saved"}:
                 self.provider_settings = value.get("providers") or {}
+                self.provider_default = value.get("default_provider")
                 if label == "provider-settings-saved":
+                    self.generation_model_save_active = None
+                    self.generation_model_save_error = False
                     self.select_provider(self.provider.currentText()); self.task("GET", "/api/providers", None, "providers")
                 elif not self.provider_settings_loaded:
                     default = value.get("default_provider")
-                    if default and self.provider.findText(default) >= 0: self.provider.setCurrentText(default)
-                    self.select_provider(self.provider.currentText())
+                    if not self.generation_model_user_selected:
+                        if default and self.provider.findText(default) >= 0: self.provider.setCurrentText(default)
+                        self.select_provider(self.provider.currentText())
+                        self._select_preferred_local_provider()
                 self.provider_settings_loaded = True
+                if label == "provider-settings" and not self.generation_model_user_selected:
+                    self._select_preferred_local_provider()
+                self.refresh_generation_models()
             elif label == "provider-discovery":
                 discovery = value.get("discovery") or value.get("provider") or {}
                 if discovery.get("available"):
@@ -3388,16 +4427,35 @@ if QT_AVAILABLE:
                     self.operation_state.setText("操作状态：参数模板已保存")
             elif label == "recent":
                 rows = value.get("recent", []) if isinstance(value, dict) else []
+                current = self.recent_projects.currentData()
+                selected_id = (current or {}).get('run_id') if isinstance(current, dict) else None
+                selection = value.get('selection') or {}
+                if selected_id is None:
+                    selected_id = selection.get('selected_saved_run_id') if selection.get('selection_explicit') else selection.get('latest_saved_run_id')
+                self.recent_projects.blockSignals(True)
                 self.recent_projects.clear()
                 for row in rows:
                     if isinstance(row, dict): self.recent_projects.addItem(f"{row.get('sample', '?')} / {row.get('run_id', '?')}", row)
+                for index in range(self.recent_projects.count()):
+                    if (self.recent_projects.itemData(index) or {}).get('run_id') == selected_id:
+                        self.recent_projects.setCurrentIndex(index); break
+                self.recent_projects.blockSignals(False)
                 if hasattr(self, "recent_projects_label"):
                     entries = [f"{row.get('sample', '?')} / {row.get('run_id', '?')}" for row in rows[:8] if isinstance(row, dict)]
                     self.recent_projects_label.setText("最近项目：" + ("；".join(entries) if entries else "暂无记录"))
+                if (not self._startup_result_requested and not self.source_run_id and not self.render_pending
+                        and not self._session_dirty and not self.simple_creation):
+                    self._startup_result_requested = True
+                    restore_id = selection.get('selected_saved_run_id') if selection.get('selection_explicit') else selection.get('latest_saved_run_id')
+                    if restore_id:
+                        self._startup_result_context = {'source_input': self.source_edit.text(),
+                            'explicit': bool(selection.get('selection_explicit')), 'run_id': restore_id}
+                        self.task('GET', f'/api/source-runs/{restore_id}', None, 'startup-result-loaded')
             elif label == "cleanup-preview":
-                self.operation_state.setText(f"可清理：{value.get('file_count', 0)} 个文件 / {value.get('bytes', 0)} bytes（仅 staging/cache/inspection）")
+                self.operation_state.setText(str(value.get('reason')) if value.get('blocked') else f"可清理历史：{value.get('run_count', 0)} 个运行 / {value.get('job_count', 0)} 个任务 / {value.get('bytes', 0)} bytes" if value.get('ok') else '清理检查未通过：'+str(value.get('errors') or '请查看日志'))
             elif label == "cleanup-apply":
-                self.operation_state.setText(f"已清理可重建文件：{value.get('file_count', 0)} 个")
+                self.operation_state.setText(str(value.get('reason')) if value.get('blocked') else f"已直接删除过时记录：{value.get('removed_runs', 0)} 个运行 / {value.get('removed_jobs', 0)} 个任务 / {value.get('deleted_bytes', 0)} bytes" if value.get('ok') else '清理未完成：'+str(value.get('errors') or '请查看日志'))
+                if value.get('ok'): self.refresh()
             elif label == 'local-batch-restore':
                 batches = [batch for batch in (value.get('batches') or []) if self.is_creative_task_batch(batch)]
                 if batches:
@@ -3414,7 +4472,7 @@ if QT_AVAILABLE:
                 batch = value.get("batch", {}) if isinstance(value, dict) else {}
                 status = batch.get("status", "?")
                 message = {"queued": "排队中", "running": "处理中", "cancelling": "正在取消",
-                           "awaiting_reference": "原图已导入，未生成候选；请提供候选或启动生成",
+                           "awaiting_reference": "候选已生成时请选择一张；没有候选时再提供已有参考或重新生成",
                            "cancelled": "已取消；取消的任务未完成出片", "failed": "存在失败或丢失任务，请查看任务详情",
                            "succeeded": "批量执行结束，作品仍需逐图检查缺项与批准"}.get(status, status)
                 self.batch_state.setText(f"批量任务：{batch.get('batch_id', '?')} / {message} / {batch.get('summary', {})}")
@@ -3440,27 +4498,38 @@ if QT_AVAILABLE:
                     self.provider.setItemData(index, row.get("display") or row["id"], Qt.ToolTipRole)
                 if selected in self.provider_rows: self.provider.setCurrentText(selected)
                 self.provider.blockSignals(False); self.select_provider(self.provider.currentText())
+                self._select_preferred_local_provider()
                 if already_loaded and selected == self.provider.currentText():
                     self.model.setText(current_model); self.provider_endpoint.setText(current_connection[0]); self.provider_secret_env.setText(current_connection[1]); self.provider_credential.setCurrentText(current_connection[2])
+                self.refresh_generation_models()
             elif label == "job-status":
+                observed_job = value.get('job') or {}
+                if observed_job.get('status') in {'succeeded', 'failed', 'blocked', 'cancelled'}:
+                    self.job_poll_timer.stop()
+                    self.job_poll_terminal_observation = self.job_observation
+                if self.handle_portrait_beauty_job(value): return
                 if self.handle_reconstruction_job(value): return
                 job = value.get("job") if isinstance(value, dict) else {}
                 if isinstance(job, dict):
                     status = str(job.get("status") or "unknown")
-                    self.operation_state.setText(f"操作状态：job {job.get('job_id', self.active_job_id)} / {status} / {job.get('progress')}")
+                    self.operation_state.setText(str(job.get('message') or f"任务 {status} · {job.get('stage') or '处理中'}"))
                     if status=='succeeded': self.operation_state.setText('本次处理执行结束；正在读取作品缺项、证据与批准状态。')
-                    if status in {"failed", "blocked", "cancelled"}: self.operation_state.setText(self.operation_state.text() + "；任务已停止，不会自动重试或重新生图。")
+                    if status in {"failed", "blocked", "cancelled"}:
+                        detail = (job.get('error') or {}).get('message') if isinstance(job.get('error'), dict) else job.get('error')
+                        self.operation_state.setText(str(detail or self.operation_state.text()) + '；任务已停止，可查看任务详情。')
                     self.job_details.setPlainText(json.dumps(job, ensure_ascii=False, indent=2))
+                    if hasattr(self, 'simple_workspace'):
+                        self._show_quick_job_progress(job)
                     if status in {"queued", "running", "cancelling"} and self.active_job_id:
-                        observation = self.job_observation
-                        QTimer.singleShot(750, lambda: self.poll_active_job() if observation == self.job_observation else None)
+                        self._schedule_job_poll(750)
                     elif status in {"succeeded", "failed", "blocked", "cancelled"}:
+                        if status != 'succeeded': self.simple_creation = None
                         run_id = job.get("run_id")
                         self._session_commit_child_id = run_id if status == "succeeded" and self._session_submission else None
-                        if not run_id:
+                        if status != 'succeeded' or not run_id:
                             self.render_pending = False; self.update_accept_enabled()
                         self.refresh_jobs()
-                        if run_id:
+                        if status == 'succeeded' and run_id:
                             self.task("GET", f"/api/source-runs/{run_id}", None, "job-run-loaded")
             elif label == "job-events":
                 events = value.get("events") if isinstance(value, dict) else []
@@ -3468,6 +4537,15 @@ if QT_AVAILABLE:
             elif label == "job-stream":
                 event = value if isinstance(value, dict) else {}
                 data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if self.active_job_id == self.portrait_beauty_job_id:
+                    self.operation_state.setText(str(data.get('message') or '正在观察人像美化准备任务。'))
+                    self.portrait_beauty_state.setText(self.operation_state.text())
+                    if data.get('status') in {'succeeded', 'failed', 'blocked', 'cancelled'}:
+                        self.job_stream_active = False
+                        self.task('GET', f'/api/jobs/{self.active_job_id}', None, 'job-status'); self.refresh_jobs()
+                    return
+                if hasattr(self, 'simple_workspace') and data:
+                    self._show_quick_job_progress(data)
                 if self.active_job_id == self.native_reconstruction_job_id:
                     self.operation_state.setText(str(data.get('message') or f'正在观察{self._reconstruction_name()}准备任务。'))
                     if data.get('status') in {'succeeded', 'failed', 'blocked', 'cancelled'}:
@@ -3476,24 +4554,46 @@ if QT_AVAILABLE:
                     return
                 if data:
                     status = str(data.get("status") or "unknown")
-                    self.operation_state.setText(f"操作状态：job {self.active_job_id} / {status} / {data.get('progress')}")
+                    self.operation_state.setText(str(data.get('message') or f"任务 {status} · {data.get('stage') or '处理中'}"))
                     if status=='succeeded': self.operation_state.setText('本次处理执行结束；正在读取作品缺项、证据与批准状态。')
                     if status in {"failed", "blocked", "cancelled"}: self.operation_state.setText(self.operation_state.text() + "；任务已停止，不会自动重试或重新生图。")
                     self.log_text("[job-stream] " + json.dumps(data, ensure_ascii=False))
                     if status in {"succeeded", "failed", "blocked", "cancelled"}:
+                        if status != 'succeeded': self.simple_creation = None
                         self.job_stream_active = False
                         self.refresh_jobs()
                         run_id = data.get("run_id") or (data.get("data") or {}).get("run_id")
                         self._session_commit_child_id = run_id if status == "succeeded" and self._session_submission else None
-                        if run_id: self.task("GET", f"/api/source-runs/{run_id}", None, "job-run-loaded")
+                        if status == 'succeeded' and run_id: self.task("GET", f"/api/source-runs/{run_id}", None, "job-run-loaded")
                         else:
                             self.render_pending = False; self.update_accept_enabled()
+            elif label == 'startup-result-loaded':
+                context = self._startup_result_context
+                self._startup_result_context = None
+                run = value.get('run') if isinstance(value, dict) else None
+                if (context and isinstance(run, dict) and run.get('run_id') == context['run_id']
+                        and not self.source_run_id and not self.render_pending and not self._session_dirty
+                        and not self.simple_creation and self.source_edit.text() == context['source_input']):
+                    self.load_source_run(run, value.get('stage_report'), selection_explicit=context['explicit'])
             elif label in {"source-run-loaded", "job-run-loaded"}:
                 run = value.get("run") if isinstance(value, dict) else None
-                if isinstance(run, dict): self.load_source_run(run, value.get("stage_report"), saved_submission=label == "job-run-loaded" and run.get("run_id") == self._session_commit_child_id)
+                if isinstance(run, dict):
+                    terminal_saved_post = label == 'job-run-loaded' and not self.simple_creation
+                    was_async_post = bool(label == 'job-run-loaded' and self.simple_creation
+                                          and self.simple_creation.get('stage') in {'post', 'production'})
+                    self.load_source_run(run, value.get("stage_report"), saved_submission=label == "job-run-loaded" and run.get("run_id") == self._session_commit_child_id)
+                    if terminal_saved_post and self.source_run_id == run.get('run_id') and not self._session_dirty:
+                        self.operation_state.setText(post_completion_message(run))
+                    # Complete production and explicit post completion share
+                    # this saved asynchronous callback. End the UI intent
+                    # without starting another preparation chain.
+                    if was_async_post and self.simple_creation and not self._active_production_job():
+                        self.simple_creation = None; self._reset_quick_progress()
+                        self.operation_state.setText(post_completion_message(run))
+                        self.refresh_cos_workspace()
             elif label == "history-run-selected":
                 run = value.get("run") if isinstance(value, dict) else None
-                if isinstance(run, dict): self.load_source_run(run, value.get("stage_report"))
+                if isinstance(run, dict): self.load_source_run(run, value.get("stage_report"), selection_explicit=True)
             elif label == "status": self.load(value)
             elif label == "source-delivery-history":
                 self.delivery_history.setPlainText(json.dumps(value, ensure_ascii=False, indent=2))
@@ -3514,6 +4614,16 @@ if QT_AVAILABLE:
                 self.load_delivery_history()
             elif label in {"generate-reference","one-click","existing-design","source-accept","source-adjust","source-retry","source-rollback"}: QTimer.singleShot(500, self.refresh)
         def error(self, error, label=None):
+            if self.active_checked_task and label == self.active_checked_task['callback']:
+                self.active_checked_task = None
+            if label in {'generation-model-selected', 'provider-settings-saved'}:
+                self.generation_model_save_active = None
+                self.generation_model_save_error = True
+                self.operation_state.setText('当前生成模型已选择，但默认选择未保存；可在配置模型中重试保存。')
+                self.log_text('[generation model settings] ' + str(error)); self.refresh_generation_models(); return
+            self.simple_cancel_submissions.discard(label)
+            if (str(label or '').startswith('creative-task-plan:') or label in {'local-only', 'one-click', 'complete-post', 'portrait-beauty-job', 'design-reconstruct-job'}):
+                self.simple_creation = None
             if str(label or '').startswith('creative-task-plan:'):
                 context = self.creative_task_plan_request
                 if context and context['label'] == label:
@@ -3534,9 +4644,20 @@ if QT_AVAILABLE:
                 self.log_text('[model setup] ' + str(error)); return
             if label == 'job-status' and self.active_job_id == self.native_reconstruction_job_id:
                 self.operation_state.setText('本地任务状态连接中断；当前编辑保留，正在重新查询进度。')
-                observation = self.job_observation
-                QTimer.singleShot(1500, lambda: self.poll_active_job() if observation == self.job_observation else None)
+                self._schedule_job_poll(1500)
                 self.log_text('[native reconstruction status] ' + str(error)); return
+            if label == 'job-status' and self.active_job_id == self.portrait_beauty_job_id:
+                self.operation_state.setText('美化任务连接中断；当前编辑保留，正在重新查询进度。')
+                self._schedule_job_poll(1500)
+                self.log_text('[portrait beauty status] ' + str(error)); return
+            if label == 'job-status':
+                self._schedule_job_poll(1500)
+                self.operation_state.setText('任务状态连接中断；正在重新查询进度。')
+                self.log_text('[job status] ' + str(error)); return
+            if label == 'portrait-beauty-job':
+                self.render_pending = False; self.portrait_beauty_request = None; self.update_accept_enabled()
+                self.operation_state.setText('人像美化任务未提交；当前编辑保留，可重试本地准备。')
+                self.portrait_beauty_state.setText(self.operation_state.text()); self.log_text('[portrait beauty] ' + str(error)); return
             if label == 'design-reconstruct-job':
                 self.render_pending = False; self.design_reconstruction_request = None
                 self.update_accept_enabled()
@@ -3569,11 +4690,16 @@ if QT_AVAILABLE:
             if label == "generation-prepared":
                 self.design_request_context = None; self.update_creative_service_actions()
                 self.research_summary.setText("本图设计准备失败：" + error + "；可重新准备或直接生成。")
-            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "local-only", "existing-design", "job-run-loaded", "source-select-variant"}:
+            if label in {"source-adjust", "source-retry", "local-retry", "repair-final", "source-copy", "one-click", "complete-post", "local-only", "existing-design", "job-run-loaded", "source-select-variant"}:
                 self.render_pending = False; self.update_accept_enabled()
+                if label == 'source-adjust' and self.simple_creation and self.simple_creation.get('stage') == 'post_save_wait':
+                    self.simple_creation = None
             if label in {'repair-final','local-retry'}:
                 self.operation_state.setText('本地恢复未完成，已保留当前作品；不会自动重试或新增生图。')
                 self.log_text('[ERROR] '+error); return
+            if label == 'complete-post':
+                self.operation_state.setText('本地重新制作未完成：' + str(error) + '；已保存版本保留。')
+                self.log_text('[ERROR] ' + str(error)); self.refresh_cos_workspace(); return
             self.operation_state.setText("已有参考的后期请求未完成，请查看任务中心或日志；不会自动生图。" if label == "existing-design" else "本地处理请求未完成，请查看任务中心或日志；未触发生图。" if label == "local-only" else "生成请求未完成，请查看任务中心；不会自动重试生成。点击重新生图才会新增候选。" if label in {"one-click", "source-retry", "generate-reference"} else "操作状态：失败，请查看日志"); self.log_text("[ERROR] " + error)
         def job_stream_error(self, error):
             # A proxy, older backend, or a closed desktop connection can make
@@ -3581,14 +4707,18 @@ if QT_AVAILABLE:
             # compatibility path and will continue from the durable journal.
             self.job_stream_active = False
             self.log_text("[job-stream] unavailable; fallback to polling: " + error)
-            if self.active_job_id: QTimer.singleShot(100, self.poll_active_job)
+            self._schedule_job_poll(100)
         def job_stream_finished(self):
             # A bounded stream can end without an exception (for example
             # after its 60s server timeout).  Release the flag so the durable
             # polling fallback keeps observing the job.
             if self.job_stream_active:
                 self.job_stream_active = False
-                if self.active_job_id: QTimer.singleShot(100, self.poll_active_job)
+                self._schedule_job_poll(100)
+        def _schedule_job_poll(self, delay):
+            if not self.active_job_id or self.job_poll_terminal_observation == self.job_observation: return
+            if self.job_poll_timer.isActive() and self.job_poll_timer.remainingTime() <= delay: return
+            self.job_poll_timer.start(delay)
         def start_job_stream(self):
             if not self.active_job_id or self.job_stream_active: return
             self.job_stream_active = True
@@ -3598,7 +4728,8 @@ if QT_AVAILABLE:
             task.signals.result.connect(relay.result); task.signals.error.connect(relay.error); task.signals.finished.connect(relay.finished)
             self.pool.start(task)
         def poll_active_job(self):
-            if not self.active_job_id: return
+            if not self.active_job_id or self.job_poll_terminal_observation == self.job_observation: return
+            self.job_poll_timer.stop()
             self.task("GET", f"/api/jobs/{self.active_job_id}", None, "job-status")
             if not self.job_stream_active:
                 self.task("GET", f"/api/jobs/{self.active_job_id}/events", None, "job-events")
@@ -3613,15 +4744,54 @@ if QT_AVAILABLE:
             self.task("GET", "/api/recent", None, "recent")
             self.task('GET', '/api/model-setup', None, 'model-setup')
 
+        def prewarm_startup(self):
+            """Warm the local backend and owned Beauty service after launch."""
+            if self.embedded_backend and self.embedded_server is None:
+                return
+            self.refresh()
+            if getattr(self, '_startup_prewarm_started', False):
+                return
+            self._startup_prewarm_started = True
+            self.set_startup_status('后台已启动；正在预热人像美化模型，其他能力尚未验证。')
+            root = self.root_path
+            def warm():
+                try:
+                    import beautygrpo_prepare
+                    result = beautygrpo_prepare.prewarm_for_workbench(root)
+                    state, message = beauty_startup_outcome(result)
+                    self.backendLog.emit('[startup] Beauty prewarm: ' + str(result))
+                    self.startupReadinessChanged.emit(state)
+                    self.startupStatus.emit(message)
+                except Exception as error:
+                    # Missing optional Beauty installation must not prevent the
+                    # workbench or local source workflow from opening.
+                    self.backendLog.emit('[startup] Beauty prewarm skipped: ' + str(error))
+                    self.startupReadinessChanged.emit('degraded')
+                    self.startupStatus.emit('后台可用；人像美化预热失败，开始前将检查本次所需配置。')
+            threading.Thread(target=warm, name='cosplay-startup-prewarm', daemon=True).start()
+
+        def set_startup_readiness(self, state):
+            self.startup_readiness = str(state)
+            self.refresh_cos_workspace()
+
+        def set_startup_status(self, message):
+            # A late prewarm receipt must not overwrite an active task's status.
+            self.models_button.setToolTip(str(message))
+            if not (self.render_pending or self.creative_task_start_pending or self.simple_creation):
+                self.operation_state.setText(str(message))
+
         def backend_url(self):
             return self.url if self.embedded_backend else self.url_edit.text().strip()
 
         def show_model_setup_status(self, setup):
-            if setup != self.model_setup_status: self.invalidate_creative_task_plan()
+            identity = lambda value: (value.get('config'), value.get('registry_path'), value.get('beauty'))
+            if identity(setup) != identity(self.model_setup_status): self.invalidate_creative_task_plan()
             self.model_setup_status = setup
             missing = [row['label'] for row in setup.get('paths', []) if not row.get('available')]
             if setup.get('paths_available'):
-                message = '安装路径检查通过；处理时仍会核对模型身份和运行能力。'
+                message = '分析模型路径已就绪'
+                if 'beauty' in setup:
+                    message += '；人像美化已就绪。' if setup['beauty']['available'] else '；人像美化待配置。'
             elif missing:
                 message = '待配置或缺失：' + '、'.join(missing)
             else:
@@ -3630,22 +4800,60 @@ if QT_AVAILABLE:
             self.model_setup_summary.setToolTip(str(setup.get('registry_path') or '') + '\n' + str(setup.get('error') or ''))
             if self.model_setup_dialog is not None:
                 self.model_dialog_status.setText(message)
+                if setup.get('model_directory'):
+                    self.model_directory_label.setText('模型目录：'+setup['model_directory'])
+                for index, group in enumerate(setup.get('groups') or []):
+                    if index < len(self.model_group_states):
+                        self.model_group_states[index].setText('已找到' if group['available'] else '待配置：'+'、'.join(group['missing']))
+                beauty = setup.get('beauty') or {}
+                self.beauty_model_state.setText('已找到 · BeautyGRPO + FLUX + SegFace' if beauty.get('available') else '待配置 · 点击自动查找或选择安装配置')
+                self.beauty_model_state.setToolTip(str(beauty.get('config_path') or '')+'\n'+str(beauty.get('error') or ''))
                 for row in setup.get('paths', []):
                     edit = self.model_path_edits[row['key']]
                     if not edit.isModified(): edit.setText(row.get('path') or '')
                     edit.setToolTip('路径可用' if row.get('available') else '待配置或文件缺失')
                     self.model_path_states[row['key']].setText('未保存' if edit.isModified() else '可用' if row.get('available') else '缺失')
+                for row in (setup.get('discovery') or {}).get('paths', []):
+                    edit = self.model_path_edits[row['key']]
+                    if row['available'] and not edit.isModified():
+                        edit.setText(row['path']); edit.setModified(True)
+                        self.model_path_states[row['key']].setText('已找到 · 待保存')
+            if ('beauty' in setup and not self.model_auto_discovery_attempted
+                    and not (setup.get('paths_available') and setup['beauty'].get('available'))
+                    and not self.render_pending and not self.simple_creation):
+                self.model_auto_discovery_attempted = True
+                self.discover_models()
 
         def open_model_setup(self):
             if self.model_setup_dialog is not None:
                 self.model_setup_dialog.show(); self.model_setup_dialog.raise_(); return
             from current_model_registry import PATH_KEYS, PATH_LABELS
-            dialog = QDialog(self); dialog.setWindowTitle('配置分析模型'); dialog.resize(790, 650)
+            dialog = QDialog(self); dialog.setWindowTitle('模型管理'); dialog.resize(890, 740)
             layout = QVBoxLayout(dialog)
-            intro = QLabel('选择已安装的模型与独立 Python 环境，或导入已有配置。配置保存在用户目录，重新打开软件会继续使用。安装路径检查不执行推理。')
+            intro = QLabel('自动查找已有安装；如果模型放在其他位置，选择一次模型文件夹即可。配置会保存，重启和更新软件后继续使用。')
             intro.setWordWrap(True); layout.addWidget(intro)
+            from current_model_registry import model_directory
+            self.model_directory_label = QLabel('模型目录：'+str(model_directory()))
+            self.model_directory_label.setWordWrap(True); self.model_directory_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(self.model_directory_label)
             self.model_dialog_status = QLabel(); self.model_dialog_status.setWordWrap(True); layout.addWidget(self.model_dialog_status)
-            select_existing = QPushButton('导入已有模型配置 JSON'); layout.addWidget(select_existing)
+            discovery = QHBoxLayout(); auto = QPushButton('自动查找已有模型'); folder = QPushButton('选择模型文件夹')
+            discovery.addWidget(auto); discovery.addWidget(folder); discovery.addStretch(); layout.addLayout(discovery)
+            auto.clicked.connect(lambda: self.discover_models()); folder.clicked.connect(self.choose_model_directory)
+            body = QWidget(); body_layout = QVBoxLayout(body)
+            from model_setup import GROUPS
+            self.model_group_states = []
+            for name, purpose, _keys in GROUPS:
+                card = QGroupBox(name); card_layout = QHBoxLayout(card)
+                description = QLabel(purpose); card_layout.addWidget(description)
+                state = QLabel('尚未检查'); state.setWordWrap(True); card_layout.addWidget(state, 1)
+                self.model_group_states.append(state); body_layout.addWidget(card)
+            beauty_card = QGroupBox('人像美化'); beauty_layout = QVBoxLayout(beauty_card)
+            self.beauty_model_state = QLabel('尚未检查'); self.beauty_model_state.setWordWrap(True)
+            beauty_select = QPushButton('选择 BeautyGRPO 安装配置'); beauty_select.clicked.connect(self.select_beauty_config)
+            beauty_layout.addWidget(self.beauty_model_state); beauty_layout.addWidget(beauty_select); body_layout.insertWidget(0, beauty_card)
+            advanced = QWidget(); advanced_layout = QVBoxLayout(advanced)
+            select_existing = QPushButton('导入分析模型配置 JSON'); advanced_layout.addWidget(select_existing)
             fields = QWidget(); form = QFormLayout(fields); self.model_path_edits = {}; self.model_path_states = {}
             for key in PATH_KEYS:
                 field = QWidget(); row = QHBoxLayout(field); row.setContentsMargins(0, 0, 0, 0)
@@ -3654,7 +4862,10 @@ if QT_AVAILABLE:
                 browse = QPushButton('选择'); row.addWidget(edit, 1); row.addWidget(state); row.addWidget(browse)
                 browse.clicked.connect(lambda _checked=False, key=key: self.choose_model_path(key))
                 form.addRow(PATH_LABELS[key], field)
-            layout.addWidget(self.scrollable_page(fields), 1)
+            advanced_layout.addWidget(fields)
+            advanced_panel, _toggle = self.accordion('高级：逐项路径与配置 JSON', advanced, expanded=False)
+            body_layout.addWidget(advanced_panel)
+            layout.addWidget(self.scrollable_page(body), 1)
             controls = QHBoxLayout(); save = QPushButton('保存并使用'); check = QPushButton('重新检查'); close = QPushButton('关闭')
             controls.addWidget(save); controls.addWidget(check); controls.addStretch(); controls.addWidget(close); layout.addLayout(controls)
             save.clicked.connect(self.save_model_paths); check.clicked.connect(lambda: self.task('GET', '/api/model-setup', None, 'model-setup'))
@@ -3663,6 +4874,29 @@ if QT_AVAILABLE:
             self.show_model_setup_status(self.model_setup_status)
             dialog.finished.connect(lambda _result: setattr(self, 'model_setup_dialog', None))
             dialog.show(); self.task('GET', '/api/model-setup', None, 'model-setup')
+
+        def discover_models(self, directory=None):
+            if self.model_setup_submission is not None or self.render_pending or self.simple_creation: return
+            if self.embedded_backend and self.embedded_server is None: return
+            self.model_auto_discovery_attempted = True
+            self.model_setup_submission = {key: edit.text() for key, edit in self.model_path_edits.items()} if self.model_setup_dialog else {}
+            body = {'action': 'discover'}
+            if directory: body['directory'] = directory
+            self.model_setup_summary.setText('正在查找本机已有模型…')
+            if self.model_setup_dialog: self.model_dialog_status.setText('正在查找本机已有模型…')
+            self.task('POST', '/api/model-setup', body, 'model-setup-saved')
+
+        def choose_model_directory(self):
+            from current_model_registry import model_directory
+            directory = QFileDialog.getExistingDirectory(self.model_setup_dialog, '选择模型总目录或原源码项目目录', str(model_directory()))
+            if directory: self.discover_models(directory)
+
+        def select_beauty_config(self):
+            if self.model_setup_submission is not None: return
+            path, _filter = QFileDialog.getOpenFileName(self.model_setup_dialog, '选择 BeautyGRPO installation.json', str(Path.home()), 'JSON (*.json)')
+            if path:
+                self.model_setup_submission = {key: edit.text() for key, edit in self.model_path_edits.items()}
+                self.task('POST', '/api/model-setup', {'beauty_config_path': path}, 'model-setup-saved')
 
         def choose_model_path(self, key):
             from current_model_registry import DIRECTORY_KEYS, PATH_LABELS
@@ -3699,15 +4933,93 @@ if QT_AVAILABLE:
 
         def creative_task_payload(self, mode=None):
             mode = mode or self.creative_task_mode.currentData()
-            return {'schema_version': 'cosplay_task_intent.v1', 'mode': mode,
+            background = self.creative_background_mode.currentData() if mode != 'local_portrait' else 'preserve'
+            constraints = {'preserve_background': background == 'preserve',
+                           'no_effects': self.creative_no_effects.isChecked()}
+            if background == 'enhance_source': constraints['background_mode'] = background
+            if self.same_photo_finish_enabled and mode == 'existing_reference' and background == 'enhance_source':
+                constraints['reference_role'] = 'same_photo_finish'
+            elif (background == 'enhance_source' and not self.regional_enabled and
+                    (mode == 'create_reference' and self.provider.currentText().startswith('qwen_image_2_1')
+                     or mode == 'existing_reference' and self.source_conditioned_reference)):
+                constraints['reference_role'] = 'source_conditioned_design'
+            if (mode in {'create_reference', 'existing_reference'}
+                    and constraints.get('reference_role') == 'source_conditioned_design'
+                    and self.preset.currentData() == 'source_refinement' and self.refinement_profile_choice):
+                constraints['refinement_profile'] = copy.deepcopy(self.refinement_profile_choice)
+            payload = {'schema_version': 'cosplay_task_intent.v1', 'mode': mode,
                 'brief': self.creative_task_brief.toPlainText().strip(),
-                'constraints': {'preserve_background': self.creative_preserve_background.isChecked(),
-                                'no_effects': self.creative_no_effects.isChecked()},
-                'services': {'text_vision': self.creative_text_vision.isChecked() if mode != 'local_portrait' else False}}
+                'constraints': constraints,
+                'services': {'text_vision': self.creative_text_vision.isChecked() if mode != 'local_portrait' and background != 'enhance_source' else False,
+                             'visual_review': (mode != 'local_portrait' and self.creative_text_vision.isChecked()
+                                               and background != 'enhance_source' and self.creative_visual_review.isChecked())}}
+            if mode in {'create_reference','existing_reference'} and background == 'enhance_source' and self.regional_enabled and not self.same_photo_finish_enabled:
+                payload['regional_refinement'] = {'maximum_submissions': 1, 'coordinate_space': 'source_canvas',
+                    'regions': [{'id': 'bg-1', 'core_box': list(self.regional_core_box)}] if self.regional_core_box else []}
+            return payload
+
+        def set_background_mode(self, value):
+            index = self.creative_background_mode.findData(value)
+            if index >= 0: self.creative_background_mode.setCurrentIndex(index)
+
+        def background_mode_changed(self, *_args):
+            if not self.same_photo_finish_available(): self.same_photo_finish_enabled = False
+            self.creative_preserve_background.blockSignals(True)
+            self.creative_preserve_background.setChecked(self.creative_background_mode.currentData() == 'preserve')
+            self.creative_preserve_background.blockSignals(False)
+            self.creative_task_policy_changed()
+
+        def set_regional_enabled(self, enabled):
+            if self.same_photo_finish_enabled: return
+            self.regional_enabled = bool(enabled)
+            self.invalidate_creative_task_plan()
+
+        def same_photo_finish_available(self):
+            return (self.creative_task_mode.currentData() == 'existing_reference'
+                    and self.creative_background_mode.currentData() == 'enhance_source')
+
+        def set_same_photo_finish(self, enabled):
+            self.same_photo_finish_enabled = bool(enabled) and self.same_photo_finish_available()
+            if self.same_photo_finish_enabled:
+                self.source_conditioned_reference = False
+                self.regional_enabled = False; self.regional_core_box = None
+                self.simple_workspace.select_region.setChecked(False)
+            self.invalidate_creative_task_plan()
+
+        def source_native_size(self):
+            size = self.project_dimensions.get('source')
+            return list(map(int, size)) if isinstance(size, (list, tuple)) and len(size) == 2 and min(size) > 0 else None
+
+        def set_regional_box(self, box):
+            size = self.source_native_size()
+            if not size or not isinstance(box, list) or len(box) != 4: return
+            left, top, right, bottom = map(int, box)
+            if not (0 <= left < right <= size[0] and 0 <= top < bottom <= size[1]) or right-left > 768 or bottom-top > 768:
+                self.operation_state.setText('请选择原片范围内、不超过 768 × 768 像素的背景区域。'); return
+            self.regional_core_box = [left, top, right, bottom]
+            self.invalidate_creative_task_plan()
+
+        def set_normalized_regional_box(self, box):
+            size = self.source_native_size()
+            if not size: return
+            left, top = max(0, round(box[0]*size[0])), max(0, round(box[1]*size[1]))
+            right = min(size[0], left+768, max(left+1, round(box[2]*size[0])))
+            bottom = min(size[1], top+768, max(top+1, round(box[3]*size[1])))
+            self.set_regional_box([left, top, right, bottom])
 
         def update_creative_service_actions(self):
+            local_direction = self.creative_background_mode.currentData() == 'enhance_source'
+            if local_direction:
+                for control in (self.creative_text_vision, self.creative_visual_review):
+                    control.blockSignals(True); control.setChecked(False); control.blockSignals(False)
+            self.creative_text_vision.setEnabled(self.creative_task_mode.currentData() != 'local_portrait' and not local_direction)
+            self.creative_text_vision.setToolTip('原景增强使用本地检查设计；当前路线不外发规划。' if local_direction else '可选择额外外部角色研究与视觉规划。')
             allowed = self.creative_task_payload()['services']['text_vision']
-            reason = '会向已配置的文本/视觉服务发送原片与创作要求。' if allowed else '当前任务未允许外部文本/视觉服务；选择允许服务的路线并启用该服务后才能识别或研究。'
+            if not allowed:
+                self.creative_visual_review.blockSignals(True); self.creative_visual_review.setChecked(False); self.creative_visual_review.blockSignals(False)
+            self.creative_visual_review.setEnabled(allowed)
+            reason = ('原景增强使用本地检查设计；当前路线不外发规划。' if local_direction else
+                      '会向已配置的文本/视觉服务发送原片与创作要求。' if allowed else '当前任务未允许外部文本/视觉服务；选择允许服务的路线并启用该服务后才能识别或研究。')
             for control in (self.character_recognize, self.prepare_design_button): control.setToolTip(reason)
             self.character_recognize.setEnabled(allowed)
             self.prepare_design_button.setEnabled(allowed and self.design_request_context is None)
@@ -3719,9 +5031,20 @@ if QT_AVAILABLE:
 
         def creative_task_mode_changed(self, *_args):
             mode = self.creative_task_mode.currentData(); policy = self.creative_task_policies[mode]
+            if mode != getattr(self, '_regional_task_mode', mode):
+                self.regional_enabled = False
+                self.same_photo_finish_enabled = False
+                self.source_conditioned_reference = False
+            self._regional_task_mode = mode
             for control, key in ((self.creative_preserve_background, 'preserve_background'),
-                                 (self.creative_no_effects, 'no_effects'), (self.creative_text_vision, 'text_vision')):
+                                 (self.creative_no_effects, 'no_effects'), (self.creative_text_vision, 'text_vision'),
+                                 (self.creative_visual_review, 'visual_review')):
                 control.blockSignals(True); control.setChecked(policy[key]); control.blockSignals(False)
+            self.creative_background_mode.blockSignals(True)
+            background = policy.get('background_mode', 'preserve' if policy['preserve_background'] else 'replace')
+            self.creative_background_mode.setCurrentIndex(self.creative_background_mode.findData(background))
+            self.creative_background_mode.blockSignals(False)
+            if not self.same_photo_finish_available(): self.same_photo_finish_enabled = False
             self.creative_text_vision.setEnabled(mode != 'local_portrait')
             self.creative_task_reference.setVisible(mode == 'existing_reference')
             self.invalidate_prepared_design()
@@ -3731,8 +5054,10 @@ if QT_AVAILABLE:
         def creative_task_policy_changed(self, *_args):
             mode = self.creative_task_mode.currentData()
             self.creative_task_policies[mode] = {'preserve_background': self.creative_preserve_background.isChecked(),
+                'background_mode': self.creative_background_mode.currentData(),
                 'no_effects': self.creative_no_effects.isChecked(),
-                'text_vision': self.creative_text_vision.isChecked() if mode != 'local_portrait' else False}
+                'text_vision': self.creative_text_vision.isChecked() if mode != 'local_portrait' else False,
+                'visual_review': self.creative_task_payload()['services']['visual_review']}
             self.invalidate_prepared_design()
             self.invalidate_creative_task_plan()
             self.update_creative_service_actions()
@@ -3743,13 +5068,24 @@ if QT_AVAILABLE:
             if mode not in CREATIVE_TASK_MODES: return
             local = mode == 'local_portrait'
             constraints = value.get('constraints') or {}; services = value.get('services') or {}
+            selected_profile = constraints.get('refinement_profile')
+            self.refinement_profile_choice = ({key: copy.deepcopy(selected_profile[key]) for key in ('id', 'version')}
+                if isinstance(selected_profile, dict) and all(key in selected_profile for key in ('id', 'version')) else None)
             self.creative_task_policies[mode] = {'preserve_background': bool(constraints.get('preserve_background', local)),
-                'no_effects': bool(constraints.get('no_effects', local)), 'text_vision': bool(services.get('text_vision', not local)) and not local}
+                'background_mode': constraints.get('background_mode') or ('preserve' if constraints.get('preserve_background', local) else 'replace'),
+                'no_effects': bool(constraints.get('no_effects', local)), 'text_vision': bool(services.get('text_vision', False)) and not local,
+                'visual_review': bool(services.get('visual_review', False)) and bool(services.get('text_vision', False)) and not local}
+            self.regional_enabled = False; self.regional_core_box = None
             self.creative_task_mode.setCurrentIndex(self.creative_task_mode.findData(mode))
             self.creative_task_mode_changed(); self.creative_task_brief.setPlainText(str(value.get('brief') or ''))
+            self.same_photo_finish_enabled = self.same_photo_finish_available() and constraints.get('reference_role') == 'same_photo_finish'
+            self.source_conditioned_reference = constraints.get('reference_role') == 'source_conditioned_design'
+            self.invalidate_creative_task_plan()
 
         def invalidate_creative_task_plan(self, *_args):
             had_plan = self.creative_task_plan is not None or self.creative_task_plan_request is not None
+            if had_plan and self.simple_creation and self.simple_creation.get('plan_label'):
+                self.simple_creation = None
             self.creative_task_revision += 1; self.creative_task_plan = None; self.creative_task_plan_request = None
             if had_plan: self.creative_plan_summary.setPlainText('输入、要求或配置已改变；请重新检查当前制作计划。')
             self.update_creative_task_actions()
@@ -3759,16 +5095,37 @@ if QT_AVAILABLE:
             self.creative_plan_button.setEnabled(not busy and self.creative_task_plan_request is None)
             self.creative_start_button.setEnabled(not busy and bool(self.creative_task_plan)
                 and self.creative_task_plan['plan'].get('ready') is True)
+            self.refresh_cos_workspace()
 
         def creative_task_request_options(self, mode, *, source=None, batch=False):
             # Shared artistic options contain no source-coordinate editing assets.
             settings = self.generation_request_options(source, reuse_design=not batch) if mode == 'create_reference' else self._template_payload()
-            keys = ('preset', 'provider', 'model', 'vision_model', 'variant_count', 'model_registry',
+            keys = ('preset', 'provider', 'model', 'vision_model', 'variant_count', 'variant_styles', 'model_registry',
                     'character_name', 'character_notes', 'algorithm_profile', 'material_finish_profile')
             request = {key: copy.deepcopy(settings[key]) for key in keys if key in settings}
             request.update(prompt=self.generation_input_prompt(), input_prompt=self.generation_input_prompt(),
                            creative_task=self.creative_task_payload(mode))
-            if mode == 'create_reference' and not batch:
+            if batch:
+                request['creative_task'].pop('regional_refinement', None)
+            if request['creative_task']['constraints'].get('background_mode') == 'enhance_source':
+                request['variant_count'] = 1
+                request.pop('variant_styles', None)
+                request.pop('defer_reference_selection', None)
+            if mode == 'create_reference':
+                count = int(request.get('variant_count') or 1)
+                if request['creative_task']['constraints'].get('background_mode') == 'enhance_source':
+                    count = 1
+                    request.pop('variant_styles', None)
+                request['variant_count'] = count
+                request['defer_reference_selection'] = count > 1
+                if count > 1:
+                    styles = list(request.get('variant_styles') or [])
+                    recommended = ['anime_light_color', 'cinematic_backlight', 'stage_light', 'night_scene']
+                    selected = self.preset.currentData() if hasattr(self, 'preset') else None
+                    if selected:
+                        recommended = [selected] + [item for item in recommended if item != selected]
+                    request['variant_styles'] = (styles or recommended)[:count]
+            if mode == 'create_reference' and not batch and request['creative_task']['constraints'].get('background_mode') != 'enhance_source':
                 request.update({key: copy.deepcopy(settings[key]) for key in ('generation_design', 'character_profile', 'effective_prompt') if key in settings})
             return request
 
@@ -3776,15 +5133,23 @@ if QT_AVAILABLE:
             mode = self.creative_task_mode.currentData()
             if mode == 'existing_reference' and not self.creative_task_reference.text().strip():
                 self.use_existing_design_reference(); return
-            self.request_creative_task_plan(mode)
+            source = self.source_edit.text().strip()
+            parent = (self.source_run_id if self.source_run_id and self.source_run_source and source
+                and Path(source).resolve() == Path(self.source_run_source).resolve()
+                and not self._session_dirty and self.source_status in {'needs_visual_review','accepted','delivered'} else None)
+            self.request_creative_task_plan(mode, parent_run_id=parent)
 
-        def request_creative_task_plan(self, mode, *, source=None, reference=None, batch=False, parent_run_id=None):
+        def request_creative_task_plan(self, mode, *, source=None, reference=None, batch=False,
+                                       parent_run_id=None, auto_start=False, prepare_existing_beauty=False):
             if self.render_pending or self.creative_task_start_pending: return
             if self.embedded_backend and self.embedded_server is None:
                 self.operation_state.setText('请先启动当前工程的后台。'); return
             self.creative_task_mode.setCurrentIndex(self.creative_task_mode.findData(mode))
             if self.creative_task_plan_request is not None: return
             request = self.creative_task_request_options(mode, source=source, batch=batch)
+            if (request['creative_task'].get('regional_refinement') or {}).get('maximum_submissions'):
+                if not self.regional_core_box:
+                    self.operation_state.setText('已开启一次局部精修；请先在原片框选背景区域或设置位置尺寸。'); return
             if batch:
                 if mode == 'existing_reference': request['items'] = copy.deepcopy(self.local_batch_pairs)
                 else: request['sources'] = list(self.batch_sources)
@@ -3799,7 +5164,8 @@ if QT_AVAILABLE:
                 'local_portrait': 'local-only', 'existing_reference': 'existing-design', 'create_reference': 'one-click'}[mode]
             self.creative_task_plan = None
             self.creative_task_plan_request = {'label': label, 'revision': self.creative_task_revision,
-                'request': request, 'batch': batch, 'callback': callback}
+                'request': request, 'batch': batch, 'callback': callback,
+                'auto_start': bool(auto_start), 'prepare_existing_beauty': bool(prepare_existing_beauty)}
             self.creative_plan_summary.setPlainText('正在读取输入与配置，检查制作计划；不上传、不推理、不开始制作。')
             self.creative_plan_toggle.setChecked(True); self.update_creative_task_actions()
             self.task('POST', '/api/tasks/batch/plan' if batch else '/api/tasks/plan', request, label)
@@ -3811,6 +5177,7 @@ if QT_AVAILABLE:
             plan = value.get('batch_plan' if context['batch'] else 'plan') or {}
             request = value.get('request')
             if value.get('ok') is not True or not plan.get('plan_id') or not isinstance(request, dict):
+                self.simple_creation = None
                 self.creative_task_plan = None; self.creative_plan_summary.setPlainText('计划未返回有效身份或规范请求；未开始制作。')
                 self.update_creative_task_actions(); return
             self.creative_task_plan = {**context, 'plan': copy.deepcopy(plan), 'request': copy.deepcopy(request)}
@@ -3826,6 +5193,25 @@ if QT_AVAILABLE:
             else: self.creative_plan_summary.setPlainText(creative_task_plan_text(plan))
             self.operation_state.setText('计划检查完成；查看范围后可开始制作。' if plan.get('ready') is True else '制作计划有缺口；未创建处理任务。')
             self.update_creative_task_actions()
+            if (self.simple_creation and self.simple_creation['stage'] == 'base'
+                    and self.simple_creation.get('plan_label') == context['label']
+                    and not context['batch'] and context['request'].get('source')
+                    and str(Path(context['request']['source']).resolve()) == self.simple_creation['source']):
+                if plan.get('ready') is True:
+                    if context.get('prepare_existing_beauty'):
+                        self.creative_task_plan = None
+                        self.simple_creation['stage'] = 'beauty'
+                        self.prepare_portrait_beauty()
+                        if self.portrait_beauty_request is None: self.simple_creation = None
+                    else:
+                        self.start_planned_creative_task()
+                        if not self.creative_task_start_pending: self.simple_creation = None
+                else:
+                    self.simple_creation = None
+                    self.operation_state.setText('请先完成配置：' + '；'.join(plan.get('blocking_reasons') or []))
+                    self.refresh_cos_workspace()
+            elif context.get('auto_start') and plan.get('ready') is True:
+                self.start_planned_creative_task()
 
         def start_planned_creative_task(self):
             context = self.creative_task_plan
@@ -3838,6 +5224,21 @@ if QT_AVAILABLE:
             self._checkpoint_session()
             if self._session_checkpoint_failed: return
             body = copy.deepcopy(context['request']); body['plan_id'] = context['plan']['plan_id']
+            if not context['batch']:
+                body['async'] = True
+                self.active_checked_task = {'callback': context['callback'], 'job_id': None,
+                    'request': copy.deepcopy(context['request']),
+                    'progress_stages': copy.deepcopy(context['plan'].get('stages') or []),
+                    'image_budget': copy.deepcopy(context['plan'].get('image_budget') or {}),
+                    'creative_direction': copy.deepcopy(context['plan'].get('creative_direction') or context['request'].get('creative_direction'))}
+                if self.simple_creation:
+                    self.simple_creation['progress_stages'] = copy.deepcopy(context['plan'].get('stages') or [])
+            if (self.simple_creation and self.simple_creation.get('stage') == 'base'
+                    and context['plan'].get('mode') in {'create_reference', 'existing_reference'}
+                    and not body.get('defer_reference_selection')):
+                # This checked backend task already owns every production
+                # stage. Its saved result must not launch Beauty/TBS again.
+                self.simple_creation['stage'] = 'production'
             self.creative_task_plan = None; self.creative_task_start_pending = True
             self.creative_task_execution_label = context['callback']; self.update_creative_task_actions()
             self.task('POST', '/api/tasks/batch' if context['batch'] else '/api/tasks/start', body, context['callback'])
@@ -3873,7 +5274,7 @@ if QT_AVAILABLE:
             self.task("POST", "/api/templates", {"name": name, "template": self._template_payload()}, "template-saved")
 
         def apply_cleanup(self):
-            answer = QMessageBox.question(self, "清理可重建文件", "删除构建缓存、Python 字节码和过期临时文件；保留照片、工程输出、模型和运行环境。继续？")
+            answer = QMessageBox.question(self, "清理过时失败记录", "直接删除未被当前任务、版本、缓存或交付引用的失败、阻塞和取消记录；保留原片、待审版本与已批准交付。继续？")
             if answer == QMessageBox.StandardButton.Yes:
                 self.task("POST", "/api/cleanup", {"apply": True}, "cleanup-apply")
 
@@ -3951,7 +5352,7 @@ if QT_AVAILABLE:
         def choose_source(self):
             path, _ = QFileDialog.getOpenFileName(self, "选择原图", str(self.root_path), "Images (*.jpg *.jpeg *.png *.tif *.tiff *.arw *.cr2 *.nef *.dng)")
             if path:
-                self.source_edit.setText(path); self.project_view_selector.setCurrentIndex(0); self.request_source_preview(path)
+                self.set_simple_source(path)
 
         def choose_batch_sources(self):
             paths, _ = QFileDialog.getOpenFileNames(self, "选择多张原图", str(self.root_path), "Images (*.jpg *.jpeg *.png *.tif *.tiff *.arw *.cr2 *.nef *.dng)")
@@ -4032,11 +5433,15 @@ if QT_AVAILABLE:
             if not reference: return
             reference = str(Path(reference).expanduser().resolve())
             self.creative_task_reference.setText(reference)
-            self.existing_design_state.setText(f"已选参考：{Path(reference).name}。正在检查成对后期计划；新增图像预算为零。")
+            self.existing_design_state.setText(f"已选参考：{Path(reference).name}。正在检查成对后期计划；默认零生图，局部精修须明确授权。")
             self.request_creative_task_plan('existing_reference', source=source, reference=reference)
         def complete_current_post(self):
             if not self.source_run_id or self.render_pending:
                 return
+            self._checkpoint_session()
+            if self._session_checkpoint_failed:
+                self.simple_creation = None
+                self.operation_state.setText(self.session_draft_state.text()); self.refresh_cos_workspace(); return
             if self._session_dirty:
                 QMessageBox.information(self, '请先保存微调', '保存当前编辑后再完成后期，处理会从这个已保存版本开始。')
                 return
@@ -4044,7 +5449,7 @@ if QT_AVAILABLE:
             if model_options is None:
                 self.model_setup_summary.setText('请先检查或配置当前后台的分析模型。'); self.open_model_setup(); return
             self.task('POST', f'/api/source-runs/{self.source_run_id}/complete-post',
-                model_options, 'one-click')
+                model_options, 'complete-post')
         def _session_snapshot(self):
             from session_draft import editable_payload
             from source_relight import normalize_source_render_plan
@@ -4060,6 +5465,8 @@ if QT_AVAILABLE:
                 "source_color_plan": normalize_source_color_plan(self.source_color_plan) if self.source_color_plan is not None else None,
                 "receiver_intent": revision["receiver_intent"],
                 "receiver_shadow_plan": revision["receiver_shadow_plan"],
+                "portrait_beauty": revision.get('portrait_beauty'),
+                "workflow_graph": revision.get('workflow_graph'),
                 "design_overrides": {"enabled": bool(plan.get("enabled", True)),
                     "prepared_plan": json.loads(json.dumps(plan)) if self.design_reconstruction_prepared else None,
                     "layers": [{"id": layer["id"], "enabled": bool(layer.get("enabled", True)), "strength": float(layer.get("strength", 1)),
@@ -4078,7 +5485,14 @@ if QT_AVAILABLE:
 
         def _checkpoint_session(self, retain=False):
             self._session_checkpoint_failed = False
-            if self._session_loading or not self._session_binding: return None
+            if self._session_loading: return None
+            if not self._session_binding:
+                if self._session_baseline is not None and self.source_run_id:
+                    from session_draft import digest
+                    if digest(self._session_snapshot()) != self._session_baseline:
+                        self._session_checkpoint_failed = True
+                        self._set_session_dirty(True, '当前精修无法保留；请检查工程与绑定资产，保存完成前不能继续后期或导出。')
+                return None
             from session_draft import SessionDraftStore, digest
             try:
                 snapshot = self._session_snapshot(); sha = digest(snapshot)
@@ -4107,8 +5521,10 @@ if QT_AVAILABLE:
             return False
 
         def _restore_session_payload(self, payload):
+            self.workflow_graph = copy.deepcopy(payload.get('workflow_graph'))
             appearance = json.loads(self.appearance.toPlainText())
             appearance.update(params=payload["params"], regions=payload.get("regions", {}))
+            self.load_portrait_beauty(payload.get('portrait_beauty'))
             self.load_receiver_intent(payload.get("receiver_intent"))
             appearance["receiver_intent"] = json.loads(json.dumps(self.receiver_intent))
             self.load_receiver_shadow_plan(payload.get('receiver_shadow_plan'))
@@ -4153,7 +5569,7 @@ if QT_AVAILABLE:
                 self.native_matte_state.setText(str(len(self.native_matte_strokes)) + " 笔 · 已恢复未保存边缘精修；可预览或保存高清版本。")
             self.update_native_matte_overlay()
 
-        def load_source_run(self, run, stage_report=None, saved_submission=False):
+        def load_source_run(self, run, stage_report=None, saved_submission=False, selection_explicit=False):
             from session_draft import SessionDraftStore, binding_for_run, digest
             self._checkpoint_session()
             if self._session_checkpoint_failed: return False
@@ -4175,23 +5591,46 @@ if QT_AVAILABLE:
             self.source_light_requests.clear(); self.native_detail_token = ""
             try:
                 self._load_source_run_state(run, stage_report)
+                self._session_baseline = digest(self._session_snapshot())
                 try:
                     self._session_binding = binding_for_run(self.root_path, run)
-                    self._session_baseline = digest(self._session_snapshot())
                 except (OSError, KeyError, TypeError, ValueError) as error:
-                    self.session_draft_state.setText("当前版本不支持会话精修保留：" + str(error))
-                    return
-                record, reason = store.restore(self._session_binding)
-                if record:
-                    self._restore_session_payload(record["payload"])
-                    self._session_written = record["payload_sha256"]
-                    self._session_submission = record.get("submission")
-                    self._set_session_dirty(True, "已恢复未保存精修，保存高清后才能更新导出。")
-                elif reason:
-                    self.session_draft_state.setText("未恢复会话草稿，原草稿已保留：" + reason)
+                    self._session_binding = None
+                    self.session_draft_state.setText("候选选择后再准备可编辑图层。" if run.get('reference_role') == 'candidate_pending_selection'
+                        else "当前版本不支持会话精修保留：" + str(error))
+                else:
+                    record, reason = store.restore(self._session_binding)
+                    if record:
+                        self._restore_session_payload(record["payload"])
+                        self._session_written = record["payload_sha256"]
+                        self._session_submission = record.get("submission")
+                        self._set_session_dirty(True, "已恢复未保存精修，保存高清后才能更新导出。")
+                    elif reason:
+                        self.session_draft_state.setText("未恢复会话草稿，原草稿已保留：" + reason)
             finally:
                 self.native_matte_timer.stop(); self.source_light_timer.stop(); self._session_loading = False
                 self.update_accept_enabled()
+                self._advance_simple_creation('base')
+            if run.get('auto_draft'):
+                try:
+                    from workbench_store import select_saved_result
+                    select_saved_result(self.root_path, str(run.get('run_id') or ''), explicit=selection_explicit)
+                except (OSError, ValueError, TimeoutError) as error:
+                    self.log_text('[saved result selection] ' + str(error))
+
+        def show_preparation_version(self, run):
+            from preparation_currentness import preparation_currentness
+            report = preparation_currentness(self.root_path, run)
+            self.preparation_currentness = report
+            state = report.get('state')
+            text = (('此保存版本已使用当前算法。' if report.get('scope') == 'saved_local_production'
+                     else '此保存版本的仿色融合已使用当前算法。') if state == 'current' else
+                    '此保存版本使用旧算法；可以原样查看，重新制作会保存使用当前算法的新版本。' if state == 'stale' else
+                    '无法核验此保存版本的处理来源；重新制作会建立当前算法的新版本。' if state == 'unavailable' else '')
+            for name in ('preparation_version_workspace', 'preparation_version_review'):
+                label = getattr(self, name, None)
+                if label is not None:
+                    label.setText(text); label.setVisible(bool(text))
 
         def _load_source_run_state(self, run, stage_report=None):
             self.analysis_models.setCurrentIndex(0)
@@ -4208,6 +5647,7 @@ if QT_AVAILABLE:
             self.design_reconstruction_request = None
             self.design_reconstruction_prepared = False
             self.native_reconstruction_job_id = ''; self.native_reconstruction_result_seen = ''
+            self.portrait_beauty_request = None; self.portrait_beauty_job_id = ''; self.portrait_beauty_result_seen = ''
             for name in ("source", "final"): self.previews[name]._color_stroke = None
             self.source_light_preview_path = None
             self.source_run_id = str(run.get("run_id") or "")
@@ -4219,7 +5659,9 @@ if QT_AVAILABLE:
             if self.source_run_source: self.source_edit.setText(self.source_run_source)
             self.source_revision = int(run.get("revision") or 1)
             self.source_status = str(run.get("status") or "unknown")
-            self.render_pending = False
+            # Opening an in-flight checkpoint from the task centre is a read.
+            # Keep the owning task busy until its terminal observation arrives.
+            self.render_pending = bool(self._active_production_job())
             self.export_project_button.setEnabled(True)
             # Historical layers remain in saved manifests for provenance, but
             # the workbench only exposes native source-bound views and actions.
@@ -4231,6 +5673,7 @@ if QT_AVAILABLE:
             self.alpha_canvas.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self.alpha_canvas.setToolTip("Source matte 仅供查看；人物几何与 alpha 不在 Qt 中手动改写。")
             self.review_title.setText(f"单图：{self.source_run_id} / revision {self.source_revision}")
+            self.show_preparation_version(run)
             self.source_sample = str(run.get("sample") or (run.get("source") or {}).get("sample") or Path(str((run.get("source") or {}).get("path") or "source")).stem)
             artifacts = run.get("artifacts") if isinstance(run.get("artifacts"), dict) else {}
             paths = {"source": Path(str((run.get("source") or {}).get("path"))) if (run.get("source") or {}).get("path") else None,
@@ -4239,7 +5682,8 @@ if QT_AVAILABLE:
                      "alpha": Path(str(artifacts.get("alpha") or "")) if artifacts.get("alpha") else None,
                      "risk": Path(str(artifacts.get("structure_mismatch") or "")) if artifacts.get("structure_mismatch") else None,
                      "silhouette": Path(str(artifacts.get("silhouette") or "")) if artifacts.get("silhouette") else None}
-            self.existing_design_state.setText(f"当前设计参考：{paths['reference'].name}；可复用仿色融合准备。" if paths.get("reference") else "可用已有参考准备仿色融合，不新增生图。")
+            self.source_run_reference = str(paths['reference'] or "")
+            self.existing_design_state.setText(f"当前设计参考：{paths['reference'].name}；可复用仿色融合准备。" if paths.get("reference") else "可使用已有参考，默认零生图；局部精修须在新计划中明确授权。")
             self.risk_crop_paths = {}
             risk_dir = Path(str(artifacts.get("risk_crops") or "")) if artifacts.get("risk_crops") else None
             if risk_dir and risk_dir.is_dir():
@@ -4281,7 +5725,7 @@ if QT_AVAILABLE:
             self.alpha_canvas.set_path(paths["alpha"], paths["risk"])
             options = run.get("options") or {}
             self.apply_creative_task_options(run.get('task_intent') or options.get('task_intent') or options.get('creative_task'))
-            self.creative_task_reference.setText(str((run.get('reference') or {}).get('path') or ''))
+            self.creative_task_reference.setText(self.source_run_reference)
             self.character_name.setText(str(options.get("character_name") or "")); self.character_notes.setText(str(options.get("character_notes") or "")); self.variant_count.setValue(int(options.get("variant_count") or len(run.get("variants") or []) or 1))
             self.show_character_profile(run.get("character_profile") or options.get("character_profile") or {})
             self.populate_variants(run)
@@ -4291,12 +5735,17 @@ if QT_AVAILABLE:
             self.update_generation_style_description()
             saved_design = run.get("generation_design") or options.get("generation_design") or {}
             saved_prompt = saved_design.get("input_prompt") or (saved_design.get("inputs") or {}).get("base_prompt") or options.get("input_prompt") or options.get("prompt") or options.get("effective_prompt") or (run.get("reference") or {}).get("prompt")
-            from generation_prompt import compose_generation_prompt
-            self.prompt.setPlainText(str(saved_prompt or compose_generation_prompt(style_prompt=self.preset_rows.get(selected_preset, {}).get("prompt"))))
-            if options.get("provider"): self.provider.setCurrentText(str(options["provider"]))
-            if options.get("model"): self.model.setText(str(options["model"]))
+            from generation_prompt import prompt_for_new_task
+            saved_prompt_version = saved_design.get('prompt_template_version') or options.get('prompt_template_version')
+            self.prompt.setPlainText(prompt_for_new_task(saved_prompt, saved_version=saved_prompt_version,
+                style_prompt=self.preset_rows.get(selected_preset, {}).get('prompt')))
+            # A saved image owns its provenance, not the model selection for
+            # the next task. Keep the current user/default generation choice.
             self.alpha.setPlainText(json.dumps({"schema_version": "alpha_revision_draft.v1", "run_id": self.source_run_id, "sample": self.source_sample, "revision": run.get("revision", 1), "base_alpha": str(paths["alpha"]) if paths["alpha"] else None, "base_alpha_sha256": hashlib.sha256(paths["alpha"].read_bytes()).hexdigest() if paths["alpha"] and paths["alpha"].is_file() else None, "edits": []}, ensure_ascii=False, indent=2))
             appearance = options.get("appearance_revision") or {}
+            self.workflow_graph = copy.deepcopy(appearance.get('workflow_graph'))
+            self.simple_comparing = False
+            self.load_portrait_beauty(appearance.get('portrait_beauty'))
             parameters = appearance.get("params", {})
             slider_parameters = parameters.get("global", parameters) if isinstance(parameters, dict) else {}
             self.appearance.setPlainText(json.dumps({**appearance, "schema_version": "appearance_revision_draft.v1", "revision": run.get("revision", 1), "params": parameters}, ensure_ascii=False, indent=2))
@@ -4313,6 +5762,7 @@ if QT_AVAILABLE:
             self.source_color_provenance = appearance.get("source_color_plan_provenance")
             self.load_source_colors(source_color_plan_for_run(run) if has_color_plan else None); self.update_source_light_actions()
             self.load_design_reconstruction(appearance.get("design_reconstruction_plan")); self.update_source_light_actions()
+            self.local_editor_tabs.setEnabled(True)
             self.receiver_source_canvas_size = (run.get("source") or {}).get("oriented_size") or (self.design_reconstruction_plan or {}).get("canvas", {}).get("source_oriented_size")
             self.load_receiver_intent(appearance.get("receiver_intent"))
             self.load_receiver_shadow_plan(appearance.get('receiver_shadow_plan'))
@@ -4356,7 +5806,7 @@ if QT_AVAILABLE:
             self.export_state.setText(f"当前保存版本：{self.source_run_id} / {self.source_status}；导出回执显示母版的实际尺寸、位深和 ICC 信息。")
             self.export_artifact.setCurrentIndex(1 if self.source_status in {"accepted", "delivered"} else 0)
             if saved_design: self.show_generation_design(saved_design, run.get("character_profile") or options.get("character_profile") or {}, self.generation_design_context(self.source_run_source))
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(2 if self.professional_mode else self.simple_index)
             self.load_delivery_history()
         def select_risk_crop(self, index):
             key = self.risk_crop.itemData(index) if hasattr(self, "risk_crop") else ""
@@ -4389,6 +5839,9 @@ if QT_AVAILABLE:
             self.existing_design_button.setEnabled(not self.render_pending)
             if hasattr(self, 'complete_post_button'):
                 self.complete_post_button.setEnabled(bool(getattr(self, 'complete_post_available', False))
+                    and not self.render_pending and not self._session_dirty)
+            if hasattr(self, 'reprepare_current_button'):
+                self.reprepare_current_button.setEnabled(bool(getattr(self, 'complete_post_available', False))
                     and not self.render_pending and not self._session_dirty)
             if hasattr(self, "variant_use"):
                 item = self.variant_list.currentItem(); row = item.data(Qt.UserRole) if item else None
@@ -4575,7 +6028,7 @@ if QT_AVAILABLE:
             if self._session_checkpoint_failed:
                 self.session_draft_state.setText("会话保留失败，窗口保持打开；可重试保存或关闭。")
                 event.ignore(); return
-            self.session_timer.stop(); self.source_light_timer.stop(); self.native_matte_timer.stop()
+            self.session_timer.stop(); self.source_light_timer.stop(); self.native_matte_timer.stop(); self.job_poll_timer.stop()
             self.backend_generation += 1
             if self.process and self.process.poll() is None: self.process.terminate()
             if self.embedded_server is not None:
@@ -4583,7 +6036,7 @@ if QT_AVAILABLE:
             event.accept()
 
 def parse_args(argv: Optional[Iterable[str]] = None):
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--root", type=Path, default=REPO_ROOT); parser.add_argument("--backend-url", default="http://127.0.0.1:8787"); parser.add_argument("--auto-start-backend", action="store_true", help="start backend immediately after opening the workbench"); parser.add_argument("--embedded-backend", action="store_true", help="serve the backend in the workbench process"); parser.add_argument("--smoke", action="store_true"); return parser.parse_args(argv)
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--root", type=Path, default=REPO_ROOT); parser.add_argument("--backend-url", default="http://127.0.0.1:8787"); parser.add_argument("--auto-start-backend", action="store_true", help="start backend immediately after opening the workbench"); parser.add_argument("--embedded-backend", action="store_true", help="serve the backend in the workbench process"); parser.add_argument("--prewarm", action="store_true", help="warm the backend and owned Beauty service during startup"); parser.add_argument("--smoke", action="store_true"); return parser.parse_args(argv)
 
 def main(argv: Optional[Iterable[str]] = None):
     args = parse_args(argv)
@@ -4610,6 +6063,11 @@ def main(argv: Optional[Iterable[str]] = None):
                 "job_event_stream_supported": True,
                 "preset_selection_supported": True,
                 "modern_workspace_layout_supported": True,
+                "default_workspace": "simple_cos",
+                "professional_workflow_canvas_supported": True,
+                "workflow_arbitrary_connections_supported": False,
+                "shared_workspace_draft_supported": True,
+                "portrait_beauty_supported": True,
                 "source_preview_worker_supported": True,
                 "collapsed_advanced_configuration_supported": True,
                 "generation_prepare_supported": True,
@@ -4627,8 +6085,8 @@ def main(argv: Optional[Iterable[str]] = None):
                 "portable_project_export_saved_revision_only": True,
                 "recent_projects_supported": True,
                 "local_feather_supported": True,
-                "project_cleanup_supported": False,
-                "project_cleanup_scope": "archive_only_source_checkout",
+                "project_cleanup_supported": capabilities["project_cleanup_supported"],
+                "project_cleanup_scope": capabilities["project_cleanup_scope"],
                 "batch_queue_supported": True,
                 "creative_task_modes": list(CREATIVE_TASK_MODES),
                 "creative_task_plan_before_start": True,
@@ -4638,7 +6096,7 @@ def main(argv: Optional[Iterable[str]] = None):
                 "render_master_supported": True,
                 "smoke_scope": "runtime_import_and_capability_declaration",
                 "endpoints": ["/api/source-runs/<id>/complete-post",
-                    "/api/status", "/api/recovery", "/api/providers", "/api/provider-settings",
+                    "/api/status", "/api/recovery", "/api/cleanup", "/api/providers", "/api/provider-settings",
                     "/api/provider-settings/discover", "/api/templates", "/api/recent", "/api/batch",
                     "/api/batch/<id>",
                     "/api/source-runs/export-batch", "/api/providers/health", "/api/providers/dry-run", "/api/presets",
@@ -4661,9 +6119,18 @@ def main(argv: Optional[Iterable[str]] = None):
     if not QT_AVAILABLE:
         print("PySide6 is not installed; install the bundled/runtime PySide6 package before starting the Qt workbench.", file=sys.stderr); return 2
     frozen = bool(getattr(sys, 'frozen', False))
-    app = QApplication(sys.argv); window = Workbench(args.root.expanduser().resolve(), args.backend_url, args.embedded_backend or frozen); window.show()
-    if args.auto_start_backend or frozen:
-        QTimer.singleShot(0, window.start_backend)
+    if frozen:
+        os.environ.setdefault('COSPLAY_CONFIG_ROOT', str(Path.home()/'CosplayWorkbench/config'))
+    app = QApplication(sys.argv); window = Workbench(args.root.expanduser().resolve(), args.backend_url, args.embedded_backend or frozen)
+    startup = args.auto_start_backend or frozen
+    if startup:
+        # Bind the embedded backend before showing the window. The first paint
+        # therefore lands on a live local project instead of a cold connection.
+        window.set_startup_readiness('initializing')
+        window.start_backend()
+    window.show()
+    if args.prewarm or startup:
+        QTimer.singleShot(0, window.prewarm_startup)
     return app.exec()
 
 if __name__ == "__main__":

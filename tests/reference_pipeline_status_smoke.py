@@ -11,7 +11,7 @@ from float_appearance import render_source_float
 from native_source_baseline import source_for_plan
 from pipeline_stage_report import VISUAL_CHECK_KEYS,build_stage_report,read_stage_report
 from raw_support import linear_preview,save_render_master,save_scene_master
-from source_appearance_responsibility import prepare,validate_plan
+from source_appearance_responsibility import prepare
 
 
 def main():
@@ -37,7 +37,6 @@ def main():
         assert report['draft_state']=='usable_draft' and not report['visual_approved']
         assert not report['assets_rehashed'] and not report['whole_work']['complete_automatic_pipeline_claim']
         descriptor=prepare(run,plan);plan['source_appearance_responsibility']=descriptor
-        assert validate_plan(run,plan)['valid']
         checks.append('actual_v2_render_consumption_and_metadata_status')
         for label,mutation in (
             ('missing_render',lambda r:r.pop('render')),

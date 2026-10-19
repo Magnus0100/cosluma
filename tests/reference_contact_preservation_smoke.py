@@ -133,7 +133,12 @@ def main():
         assert preserve_contact_layers(absent, run)[0] == []
         historical = copy.deepcopy(plan)
         historical['layers'][-1]['provenance']['contract_schema'] = 'contact_receiver_contract.v3'
-        assert preserve_contact_layers(historical, run)[0] == []
+        try:
+            preserve_contact_layers(historical, run)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Unsupported contact contract was silently dropped')
         overlap = contact['params']['receiver_qualification']['native_box']
         assert preserve_contact_layers(plan, run, changed_receiver_box=overlap)[0] == []
         assert len(preserve_contact_layers(plan, run, changed_receiver_box=(0, 70, 5, 75))[0]) == 1

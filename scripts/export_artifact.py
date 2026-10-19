@@ -10,11 +10,11 @@ from uuid import uuid4
 import numpy as np
 import tifffile
 from PIL import Image, ImageCms
+from asset_identity import sha256_file
 
 
 def _hash(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream,"sha256").hexdigest()
+    return sha256_file(path)
 
 
 def _master_header(path, *, floating, size):
@@ -47,6 +47,7 @@ def export_source_run(root: Path, run_id: str, *, directory: str, format: str="P
     from design_reconstruction import render_mode_for_run,plan_for_run,validate_current_native_plan
     from display_transform import plan_for_run as display_plan_for_run
     root=Path(root).resolve();manifest_path,run=workflow.load_run(root,run_id)
+    saved_run = run
     continuation=run.get('continuation_edit')
     if isinstance(continuation,dict) and continuation.get('render_state')!='saved':
         raise RuntimeError("Save continuation edits before exporting")
@@ -97,22 +98,46 @@ def export_source_run(root: Path, run_id: str, *, directory: str, format: str="P
         profile=ImageCms.ImageCmsProfile(io.BytesIO(preview.info['icc_profile']))
         if 'srgb' not in ImageCms.getProfileDescription(profile).casefold():
             raise ValueError('Current saved preview must use the current sRGB colour space')
+        preview_format=preview.format
+        if format=='PNG' and preview_format=='PNG':
+            preview.verify()
     label='approved' if approved else 'draft';destination.mkdir(parents=True,exist_ok=True)
     stamp=datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
     target=destination/f"{run['sample']}-r{run.get('revision',1)}-{label}-{stamp}-{uuid4().hex[:8]}{extensions[format]}"
     floating=format=='TIFF32_LINEAR';high_bit=format in {'TIFF16','TIFF32_LINEAR'}
+    copied_bytes = False
     if high_bit:
-        render_path=scene_path if floating else master_path;shutil.copy2(render_path,target)
+        render_path=scene_path if floating else master_path
+        render_sha256 = _hash(render_path)
+        shutil.copy2(render_path,target)
+        if target.stat().st_size != render_path.stat().st_size:
+            raise IOError('Exact master copy did not preserve byte size')
+        export_sha256 = _hash(target)
+        if export_sha256 != render_sha256:
+            raise IOError('Exact master copy did not preserve content')
+        copied_bytes = True
         header=scene_header if floating else master_header
         precision_origin='stored_display_linear_float32_master' if floating else 'stored_uint16_srgb_master'
         mode='RGB_float32' if floating else 'RGB_uint16'
     else:
         render_path=image_path
-        with Image.open(image_path) as original:
-            kwargs={'icc_profile':original.info['icc_profile']}
-            if format=='JPEG':kwargs.update(quality=95,subsampling=0)
-            elif format=='TIFF':kwargs.update(compression='tiff_lzw')
-            original.save(target,format=format,**kwargs)
+        if format=='PNG' and preview_format=='PNG':
+            # The saved native preview already has the validated ICC/profile.
+            # Copy its exact bytes rather than decoding and compressing again.
+            render_sha256 = _hash(image_path)
+            shutil.copy2(image_path,target)
+            if target.stat().st_size != image_path.stat().st_size:
+                raise IOError('Exact preview copy did not preserve byte size')
+            export_sha256 = _hash(target)
+            if export_sha256 != render_sha256:
+                raise IOError('Exact preview copy did not preserve content')
+            copied_bytes = True
+        else:
+            with Image.open(image_path) as original:
+                kwargs={'icc_profile':original.info['icc_profile']}
+                if format=='JPEG':kwargs.update(quality=95,subsampling=0)
+                elif format=='TIFF':kwargs.update(compression='tiff_lzw')
+                original.save(target,format=format,**kwargs)
         header={'actual_bit_depth':8,'icc_profile_embedded':True};mode='RGB'
         precision_origin='rgb8_preview_from_current_master'
     metadata={
@@ -122,8 +147,9 @@ def export_source_run(root: Path, run_id: str, *, directory: str, format: str="P
         'color_space':'linear RGB (sRGB primaries)' if floating else 'sRGB',
         'transfer_function':'linear' if floating else 'sRGB',
         'icc_profile_origin':None if floating else 'stored current sRGB master or derived preview',
-        'source_sha256':run['source']['sha256'],'render_path':str(render_path),'render_sha256':_hash(render_path),
-        'export_path':str(target),'export_sha256':_hash(target),'review_path':str(review_path),
+        'source_sha256':run['source']['sha256'],'render_path':str(render_path),
+        'render_sha256':render_sha256 if copied_bytes else _hash(render_path),
+        'export_path':str(target),'export_sha256':export_sha256 if copied_bytes else _hash(target),'review_path':str(review_path),
         'review_sha256':_hash(review_path) if review_path.is_file() else None,
         'review_basis':('stored_working_master_with_display_transform' if floating else 'stored_float_master_and_derived_preview') if approved else None,
         'display_transform':display,'software_version':run.get('software_version'),'camera_raw_master':False,
@@ -131,4 +157,26 @@ def export_source_run(root: Path, run_id: str, *, directory: str, format: str="P
         'working_domain':'display_linear_sRGB','working_linear_master':floating,'scene_linear_master':False,
         'appearance_precision':'display_linear_float32','export_rerendered':False}
     sidecar=target.with_suffix(target.suffix+'.json');sidecar.write_text(json.dumps(metadata,ensure_ascii=False,indent=2)+'\n','utf8')
+    from artifact_receipts import file_stamp, write_receipt
+    render_artifact = 'render_scene_master' if floating else 'render_master' if high_bit else 'auto_draft'
+    saved_value = (saved_run.get('artifacts') or {}).get(render_artifact)
+    saved_path = resolve(saved_value) if saved_value else None
+    saved_binding = {}
+    if saved_path is not None and saved_path.is_file():
+        saved_hash = metadata['render_sha256'] if saved_path.resolve() == render_path.resolve() else _hash(saved_path)
+        saved_binding = {'path': str(saved_path.resolve()), 'sha256': saved_hash, 'stamp': file_stamp(saved_path)}
+    receipt = {
+        'schema_version': 'source_export_receipt.v2',
+        'status': 'succeeded',
+        'artifact': artifact,
+        'format': format,
+        'render_artifact': render_artifact,
+        'saved_render': saved_binding,
+        'export': {'path': str(target), 'sha256': metadata['export_sha256'], 'stamp': file_stamp(target)},
+        'sidecar': {'path': str(sidecar), 'sha256': _hash(sidecar), 'stamp': file_stamp(sidecar)},
+        'actual_bit_depth': metadata['actual_bit_depth'],
+        'color_space': metadata['color_space'],
+        'created_at': metadata['created_at'],
+    }
+    write_receipt(root, saved_run, receipt)
     return {'ok':True,'path':str(target),'metadata_path':str(sidecar),'metadata':metadata}

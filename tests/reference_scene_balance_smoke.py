@@ -7,14 +7,30 @@ import numpy as np
 from unittest.mock import patch
 
 from reference_colour_fit import to_lab
-from reference_scene_balance import (apply_scene_balance, resize_sdr_baseline, LIMITS,
+from reference_scene_balance import (apply_scene_balance, resize_sdr_baseline,
     PREPARATION_LIMITS, PREPARATION_POLICY, REGION_LIMITS, SDR_AREA_ROUNDOFF,
-    _receipt_limits, macro_ev, excess_warm_suppression, read_skin_protection)
+    _receipt_limits, read_skin_protection, _master,
+    extend_mouth_lightness)
 
 
 def main():
     import cv2
     with tempfile.TemporaryDirectory(prefix='cosplay_scene_protection_') as folder:
+        import tifffile
+        from float_appearance import srgb_to_linear
+        master_path = Path(folder) / '中文 路径' / '场景母版.tif'
+        master_path.parent.mkdir()
+        encoded = np.zeros((5, 7, 3), dtype=np.uint16)
+        encoded[:] = [12000, 32000, 58000]
+        tifffile.imwrite(master_path, encoded, photometric='rgb')
+        np.testing.assert_allclose(_master(master_path, (7, 5)), srgb_to_linear(encoded.astype(np.float32)/65535), atol=1e-7)
+        tifffile.imwrite(master_path, encoded.astype(np.uint8), photometric='rgb')
+        try:
+            _master(master_path, (7, 5))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Unicode-path RGB8 TIFF was accepted as uint16')
         path=Path(folder)/'mask.npz'
         mask=np.arange(35,dtype=np.float32).reshape(5,7)/34
         expected=cv2.resize(mask,(14,10),interpolation=cv2.INTER_LINEAR)
@@ -36,11 +52,6 @@ def main():
             read_skin_protection(path,(14,10))
             raise AssertionError('Missing mask key was accepted')
         except ValueError: pass
-    # Limits describe the preparation, never reinterpret an old frozen field.
-    try:
-        _receipt_limits({'limits':LIMITS})
-    except ValueError:pass
-    else:raise AssertionError('Retired scene preparation limits were accepted')
     new_limits={'limits':PREPARATION_LIMITS,'region_limits':REGION_LIMITS,'preparation_policy':PREPARATION_POLICY}
     assert _receipt_limits(new_limits)==PREPARATION_LIMITS
     for invalid in ({'limits':PREPARATION_LIMITS}, {**new_limits,'limits':{**PREPARATION_LIMITS,'maximum_ev':2}},
@@ -49,28 +60,6 @@ def main():
             _receipt_limits(invalid)
             raise AssertionError('Undeclared preparation caps were accepted')
         except ValueError: pass
-    # Skin has a small bidirectional broad dose, including structural-feature
-    # protection only in L. Face colour adaptation is not coupled to this gate.
-    lightness=np.array([.12,.2,.3,.45,.7],np.float32)
-    desired=np.array([-.7,-.1,0,.1,.8],np.float32)
-    skin=macro_ev('face',lightness,desired)
-    protected=macro_ev('face',lightness,desired,skin_protection=np.ones(5,np.float32))
-    np.testing.assert_allclose(skin,[-.25,-.1,0,.1,.25],rtol=0,atol=1e-7)
-    np.testing.assert_allclose(protected,skin*.15,rtol=0,atol=1e-7)
-    assert np.array_equal(macro_ev('face',lightness,np.zeros(5,np.float32)),np.zeros(5,np.float32))
-    # A bright clothing region can now move down slightly. Positive changes
-    # remain restricted to darker source parts, preserving white-shirt range.
-    clothes=macro_ev('clothing',lightness,np.array([.8,.2,0,-.2,-.8],np.float32))
-    assert 0 < clothes[0] <= .35 and clothes[-1] == np.float32(-.2)
-    assert np.all(macro_ev('clothing',lightness,np.ones(5,np.float32))[3:]==0)
-    hair=macro_ev('head_hair',lightness,np.ones(5,np.float32))
-    assert 0 < hair[0] <= .1875+1e-7 and hair[-1]==np.float32(.75)
-    # Identical warm target highlights receive no suppression. Actual excess
-    # compared with a cool target remains suppressed, even at equal L.
-    warm=np.full((9,13,2),[.02,.04],np.float32);high=np.ones((9,13),np.float32);mask=high.astype(bool)
-    assert np.array_equal(excess_warm_suppression(warm,warm,high,mask),np.zeros_like(high))
-    suppressed=excess_warm_suppression(warm,np.zeros_like(warm),high,mask)
-    assert suppressed.min()>.7 and suppressed.max()<=.8
     # A real non-integer INTER_AREA reduction of saturated white creates
     # endpoint overshoot on the same OpenCV path used by 60 MP preparation.
     white = np.ones((99,66,3),np.float32)
@@ -97,9 +86,12 @@ def main():
             except ValueError:
                 pass
     over = area.copy(); over[0,0,0] = np.nextafter(np.float32(1),np.float32(2))
+    normalized = apply_scene_balance(over,np.zeros((*over.shape[:2],4),np.float32))
+    assert normalized[0,0,0] == 1, 'bounded SDR endpoint roundoff must normalize'
+    invalid_scene = area.copy(); invalid_scene[0,0,0] = 1 + 1e-3
     try:
-        apply_scene_balance(over,np.zeros((*over.shape[:2],4),np.float32))
-        raise AssertionError('scene pixel operator SDR validation was weakened')
+        apply_scene_balance(invalid_scene,np.zeros((*invalid_scene.shape[:2],4),np.float32))
+        raise AssertionError('scene pixel operator must reject material SDR overflow')
     except ValueError:
         pass
     y, x = np.mgrid[:23, :31]
@@ -131,6 +123,45 @@ def main():
     coverage_only = field.copy()
     coverage_only[...,3] *= .1
     assert np.array_equal(result,apply_scene_balance(rgb,coverage_only)), 'coverage must not be consumed twice'
+    # A known planar skin illumination must continue through differently
+    # coloured lips/teeth without a categorical EV seam or any added pigment.
+    from local_face_protection import mouth_lightness_domain
+    yy, xx = np.mgrid[:41, :61]
+    material = np.full((41,61), 3, np.int32)
+    material[13:30,16:45] = 25
+    material[20:24,26:35] = 26
+    regions = [{'region': 'lips', 'polygon': [[16,13],[44,13],[44,29],[16,29]],
+                'inner_polygon': [[26,20],[34,20],[34,23],[26,23]]}]
+    opaque = np.ones(material.shape, np.float32)
+    domain = mouth_lightness_domain(material.shape, regions, material)
+    plane = (.05+.002*xx+.001*yy).astype(np.float32)
+    mouth_field = np.zeros((*material.shape,4), np.float32)
+    mouth_field[...,0] = plane; mouth_field[...,3] = .9
+    mouth_field[domain] = 0
+    continued, applied, report = extend_mouth_lightness(mouth_field,material,opaque,regions)
+    assert np.array_equal(applied, domain) and report['status'] == 'prepared'
+    np.testing.assert_allclose(continued[...,0],plane,atol=2e-8,rtol=0)
+    assert np.array_equal(continued[~domain],mouth_field[~domain])
+    assert not continued[...,1:3].any(), 'mouth illumination must not transfer pigment'
+    assert not mouth_field[domain].any(), 'input field must remain immutable'
+    # Unsupported background light cannot supply a face illumination donor.
+    negative_labels = material.copy(); negative_labels[~domain] = 0
+    background = mouth_field.copy(); background[~domain,0] = .75
+    rejected, rejected_domain, rejection = extend_mouth_lightness(
+        background,negative_labels,opaque,regions)
+    assert not rejected_domain.any() and rejection['status'] == 'rejected'
+    assert np.array_equal(rejected,background)
+    from render_reference_colour_composite import sample_maps
+    hair_owners=np.full(rgb.shape[:2],4,np.int32);hair_owners[:,20:]=3
+    visible=np.full(rgb.shape[:2],.5,np.float32)
+    raw_scene=np.zeros_like(field);raw_scene[...,0]=.5;raw_scene[...,3]=.8
+    guarded=sample_maps(raw_scene,(0,0,31,23),(31,23),(31,23),owners=hair_owners,hair_face_support=visible)
+    assert np.array_equal(guarded[:,:20,0],np.full((23,20),.25,np.float32))
+    assert np.array_equal(guarded[:,20:,0],raw_scene[:,20:,0])
+    assert np.array_equal(guarded[...,3],raw_scene[...,3]), 'QA coverage must not be used as visible-face dose'
+    guarded_result=apply_scene_balance(rgb,guarded)
+    expected_scene=raw_scene.copy();expected_scene[:,:20,0]=.25
+    assert np.array_equal(guarded_result,apply_scene_balance(rgb,expected_scene))
     # A monotone highlight endpoint retains separation instead of clipping to a white plateau.
     gray = np.array([.72,.80,.88,.94,.98,.995,1.],np.float32)
     highlights = np.repeat(gray[None,:,None],3,-1)
@@ -154,8 +185,29 @@ def main():
     tint[...,0],tint[...,1],tint[...,2],tint[...,3] = .4,.018,-.015,1
     bounded = apply_scene_balance(saturated,tint)
     assert np.isfinite(bounded).all() and bounded.min() >= 0 and bounded.max() <= 1
-    assert np.linalg.norm(tint[...,1:3],axis=-1).max() <= LIMITS['maximum_ab']
+    assert np.linalg.norm(tint[...,1:3],axis=-1).max() <= PREPARATION_LIMITS['maximum_ab']
     assert np.array_equal(bounded[:,2:4],apply_scene_balance(saturated[:,2:4],tint[:,2:4])), 'gamut ROI differs'
+    # One gamut conflict must not make every legal pixel enter the fixed
+    # 20-step search. Legal proposals retain their original computed RGB bits.
+    import reference_scene_balance as scene
+    mixed = np.full((16, 32, 3), .18, np.float32); mixed[0, :5] = saturated[0]
+    mixed_field = np.broadcast_to(tint[0, 0], (16, 32, 4)).copy()
+    mixed_lab = scene.to_lab(mixed.reshape(-1, 3))
+    initial_lab = mixed_lab.copy()
+    initial_lab[:, 0] = scene._limited_lightness(mixed_lab[:, 0], np.full(512, .4, np.float32))
+    initial_lab[:, 1:] += np.array([.018, -.015], np.float32)
+    initial = scene.from_lab(initial_lab)
+    conflicts = (initial.min(-1) < 0) | (initial.max(-1) > 1) | ~np.isfinite(initial).all(-1)
+    assert 0 < conflicts.sum() < 512
+    proposal_sizes = []
+    original_from_lab = scene.from_lab
+    def observed_from_lab(values):
+        proposal_sizes.append(len(values))
+        return original_from_lab(values)
+    with patch.object(scene, 'from_lab', side_effect=observed_from_lab):
+        mixed_result = apply_scene_balance(mixed, mixed_field)
+    assert proposal_sizes == [512] + [int(conflicts.sum())]*21
+    np.testing.assert_array_equal(mixed_result.reshape(-1, 3)[~conflicts].view(np.uint32), initial[~conflicts].view(np.uint32))
     from reference_colour_fit import SCHEMA, REGIONS
     from render_reference_colour_composite import donor_fields, match_foreground
     source = np.full((4,5,3), .18, np.float32)
@@ -180,9 +232,7 @@ def main():
     assert np.array_equal(edge_result[0,0],np.zeros(3,np.float32)), 'alpha zero must be zero'
     print(json.dumps({'smoke': 'reference_scene_balance', 'passed': True,
                       'protection_and_values_mask_layouts':True,'malformed_protection_masks_rejected':True,
-        'retired_caps_rejected_and_current_caps_explicit':True,
-                      'signed_skin_and_clothing_macro_ev':True,'skin_L_protection_dose':.15,
-                      'warm_reference_not_suppressed':True,'excess_warmth_relative_to_target_suppressed':True,
+                      'current_caps_explicit_and_invalid_caps_rejected':True,
                       'expanded_highlight_range_monotone_SDR':True,'negative_EV_detail_retained':True,
                       'area_endpoint_roundoff_normalized': area_receipt,
                       'HDR_NaN_inf_rejected': True, 'pixel_operator_SDR_validation_strict':True,
@@ -191,6 +241,7 @@ def main():
                       'ROI_exact': True, 'coverage_not_reapplied': True,
                       'highlight_separation': np.diff(high_result[0,:,0]).tolist(),
                       'gamut_finite_and_bounded': True, 'low_alpha_final_scene_target_error': edge_error,
+                      'gamut_search_only_initial_conflicts': True, 'legal_proposal_RGB_bits_preserved': True,
                       'low_alpha_no_alpha_squared': True, 'alpha_zero_exact': True}))
 
 

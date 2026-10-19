@@ -5,7 +5,7 @@ import numpy as np
 
 import source_color
 from source_color import (apply_source_color_plan, diagnose_source_colors,
-                          encode_binary_mask, selection_mask, source_color_plan_for_run)
+                          selection_mask, source_color_plan_for_run)
 
 
 def main():
@@ -56,14 +56,15 @@ def main():
     assert mask.getpixel((160, 130)) == 0, "Brush radius uses the short side"
     binary = np.zeros((40, 60), dtype=np.uint8)
     binary[10:30, 15:45] = 1
-    encoded = encode_binary_mask(binary)
+    encoded = {'size': [60, 40], 'counts': [615, *([30, 30]*19), 30, 615]}
     automatic = {"base": "mask", "mask": encoded, "feather": 0, "strokes": []}
     restored = selection_mask((60, 40), automatic)
     assert np.array_equal(np.asarray(restored) > 0, binary > 0)
     enlarged = selection_mask((120, 80), {**automatic, "strokes": [
         {"mode": "erase", "radius": .08, "points": [[.5, .5]]}]})
     assert enlarged.getpixel((60, 40)) == 0 and enlarged.getpixel((35, 25)) == 255
-    assert encode_binary_mask(np.ones((2, 3), dtype=bool))["counts"] == [0, 6]
+    all_selected = selection_mask((3, 2), {'base': 'mask', 'mask': {'size': [3, 2], 'counts': [0, 6]}, 'feather': 0})
+    assert np.asarray(all_selected).min() == 255
     empty, summary = apply_source_color_plan(source, source, {"regions": [{**region, "selection": {"base": "empty"}}]})
     assert empty is source and not summary["applied"]
     diagnosis = diagnose_source_colors(source, regions=[region])

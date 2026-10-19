@@ -33,6 +33,8 @@ def fixture(root,name):
         'source':{'path':str(source),'sha256':workflow.sha256(source)},
         'reference':{'path':str(reference),'sha256':workflow.sha256(reference)},
         'generation_design':{'schema_version':DESIGN_VERSION,'status':'ready'},
+        'task_intent':{'schema_version':'cosplay_task_intent.v1','mode':'create_reference',
+            'services':{'text_vision':True,'visual_review':True}},
         'options':{},'artifacts':artifacts,'auto_draft':{'outputs':copy.deepcopy(artifacts)},
         'generation_budget':{'image_submissions':2,'total_image_submissions':2,'correction_image_submissions':0}}
     workflow.write_json(directory/'manifest.json',run)

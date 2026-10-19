@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -50,6 +51,20 @@ def main():
                 with Image.open(result['path']) as actual:
                     assert actual.size==(61,47) and actual.mode=='RGB' and actual.info.get('icc_profile')
             checks.append(format)
+        normal_copy = shutil.copy2
+        def corrupt_same_size(source, target):
+            normal_copy(source, target)
+            with Path(target).open('r+b') as stream:
+                stream.seek(-1, 2)
+                byte = stream.read(1)
+                stream.seek(-1, 2)
+                stream.write(bytes([byte[0] ^ 1]))
+        for format in ('PNG', 'TIFF16', 'TIFF32_LINEAR'):
+            with patch('export_artifact.shutil.copy2', side_effect=corrupt_same_size):
+                try: export(format)
+                except IOError: pass
+                else: raise AssertionError('Same-size export corruption was not rejected')
+        checks.append('copied_target_content_verified')
         with patch.object(workflow,'_delivery_record',return_value=(delivery,{'reviewer':'fixture'})):
             master.write_bytes(b'changed mutable master')
             result=export('TIFF16','delivery')

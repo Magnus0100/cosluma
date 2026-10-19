@@ -16,6 +16,8 @@ import numpy as np
 from PIL import Image
 
 from runtime_resources import code_path
+from asset_identity import sha256_file
+from cache_roots import cache_dir
 
 SCHEMA = 'reference_local_correspondence.v1'
 DINO3_L_PROFILE = 'dinov3_vitl16'
@@ -67,8 +69,7 @@ def algorithm_profile_for_run(run):
 
 
 def file_sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def canonical_sha(value):
@@ -150,7 +151,7 @@ def _cached_rgb(root, record):
     root = Path(root)
     candidates = []
     observations = []
-    for path in sorted((root/'outputs/cache/local-analysis'/record['sha256'][:16]).glob('*/analysis.json')):
+    for path in sorted((cache_dir(root, 'local-analysis')/record['sha256'][:16]).glob('*/analysis.json')):
         data = json.loads(path.read_text(encoding='utf8'))
         image_path = path.parent/'source-srgb.png'
         decode = data.get('analysis_identity') or {}

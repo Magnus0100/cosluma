@@ -6,14 +6,15 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
 from reference_appearance_controls import (CONTROL_RECIPE, blend_delta, corner_targets,
-    coupling_measurements, from_lab, to_lab, prepare_owned_controls)
+    coupling_measurements, from_lab, to_lab, prepare_owned_controls, _corner_bands)
 from reference_appearance_stack import (KIND, PREPARED_STAGES, SCHEMA,
-    WORKING_DOMAIN, apply_stack, validate_layer)
+    WORKING_DOMAIN, apply_stack, validate_controls, validate_layer)
 
 
 def main():
@@ -44,6 +45,38 @@ def main():
         else:
             np.testing.assert_allclose(current[:, 1:], to_lab(saturated_source)[:, 1:], rtol=0, atol=2e-8)
 
+    # Zero coverage and unsupported endpoints select the original RGB bits
+    # without any nonlinear conversion. Supported equal boundary endpoints
+    # still retain their existing round-trip gamut dose in the QA receipt.
+    empty_alpha = np.zeros((17, 31), np.float32)
+    empty_source = np.full((*empty_alpha.shape, 3), np.float32(-0.0))
+    empty_source[4, 8] = [.2, .1, .3]
+    with patch('reference_appearance_controls.to_lab', side_effect=AssertionError('unsupported Lab conversion')):
+        empty_corners, empty_doses, empty_support = corner_targets(empty_source, empty_source, empty_alpha)
+    assert not empty_support.any()
+    for role in empty_corners:
+        np.testing.assert_array_equal(empty_corners[role].view(np.uint32), empty_source.view(np.uint32))
+        assert not empty_doses[role].any()
+    sparse_source = np.zeros((17, 31, 3), np.float32)
+    sparse_target, sparse_alpha = sparse_source.copy(), empty_alpha.copy()
+    sparse_source[8, 10:13] = saturated_source
+    sparse_target[8, 10:13] = saturated_target
+    sparse_alpha[8, 10:14] = 1
+    sparse_source[8, 13] = sparse_target[8, 13] = 1
+    conversions = []
+    def observed_lab(values):
+        conversions.append(values.shape)
+        return to_lab(values)
+    with patch('reference_appearance_controls.to_lab', side_effect=observed_lab):
+        sparse_corners, sparse_doses, sparse_support = corner_targets(sparse_source, sparse_target, sparse_alpha)
+    assert conversions == [(4, 3), (4, 3)]
+    assert sparse_support.sum() == 4
+    for role in corners:
+        np.testing.assert_array_equal(sparse_corners[role][8, 10:13].view(np.uint32), corners[role].view(np.uint32))
+        np.testing.assert_array_equal(sparse_doses[role][8, 10:13].view(np.uint64), doses[role].view(np.uint64))
+        np.testing.assert_array_equal(sparse_corners[role][8, 13], sparse_source[8, 13])
+        assert sparse_doses[role][8, 13] == 0  # exact equal white round-trip is above its boundary
+
     native = (83, 269); width, height = native
     alpha = rng.uniform(.05, 1, (height, width)).astype(np.float32)
     alpha[:24] = 1.; alpha[24:28] = 0.; alpha[28:32] = 1e-12
@@ -55,6 +88,17 @@ def main():
     target[40, 30] = np.array([1.6, .2, .2])*alpha[40, 30]
     delta = target-fp
     original_target = fp+delta
+    # Parallel preparation retains the same 128-row arithmetic, tail shape,
+    # ordered publication and dose bits as the serial producer.
+    serial_bands = list(_corner_bands(fp, alpha, delta, workers=1))
+    parallel_bands = list(_corner_bands(fp, alpha, delta, workers=2))
+    assert [band[0] for band in parallel_bands] == [0, 128, 256]
+    for serial, parallel in zip(serial_bands, parallel_bands):
+        for index in (1, 2, 3, 6):
+            np.testing.assert_array_equal(serial[index].tobytes(), parallel[index].tobytes())
+        for index in (4, 5):
+            for role in serial[index]:
+                assert serial[index][role].tobytes() == parallel[index][role].tobytes()
     old = rng.uniform(.10, .25, (height, width, 3)).astype(np.float32)
     background = rng.uniform(.15, .3, (height, width, 3)).astype(np.float32)
     with tempfile.TemporaryDirectory(prefix='cosplay_reference_controls_') as folder:
@@ -100,6 +144,63 @@ def main():
         before = json.dumps(plan, sort_keys=True)
         input_hashes = {item['path']:hashlib.sha256(Path(item['path']).read_bytes()).hexdigest() for item in (fa,aa,oa,layer['assets']['automatic_delta'])}
         upgraded = prepare_owned_controls(plan, root/'controls', run=run)
+        # A retry after a worker interruption must attach the atomically
+        # published control bank without rereading native arrays or replaying
+        # Beauty.  This is the production cache path for the expensive corner
+        # derivation; fixture assets remain tiny so the test is deterministic.
+        with (patch('reference_appearance_controls._read_native', side_effect=AssertionError('cached control reread')),
+              patch('portrait_beauty_layer.apply_for_run', side_effect=AssertionError('cached Beauty replay'))):
+            cached_plan = prepare_owned_controls(plan, root/'controls', run=run)
+        assert cached_plan['provenance']['appearance_controls']['cache_hit'] is True
+        for role in ('colour_delta', 'lightness_delta', 'control_receipt'):
+            assert cached_plan['layers'][0]['assets'][role] == upgraded['layers'][0]['assets'][role]
+        # A fresh freeze supplies these exact in-memory endpoints. Neither
+        # loading them again nor invoking another Beauty replay is necessary.
+        native_inputs = {'working_foreground': fp, 'alpha': alpha, 'automatic_delta': delta,
+                         'beauty_execution': {'enabled': False, 'applied': False}}
+        memory_before = [values.tobytes() for values in (fp, alpha, delta)]
+        from reference_appearance_stack import _validate_delta
+        with (patch('reference_appearance_controls._read_native', side_effect=AssertionError('duplicate native read')),
+              patch('portrait_beauty_layer.apply_for_run', side_effect=AssertionError('duplicate Beauty replay')),
+              patch('reference_appearance_stack._validate_delta', side_effect=AssertionError('duplicate saved delta unpack')),
+              patch('reference_appearance_stack._validate_mask', side_effect=AssertionError('duplicate saved alpha unpack'))):
+            memory_plan = prepare_owned_controls(plan, root/'memory-controls', run=run, native_inputs=native_inputs)
+        assert memory_before == [values.tobytes() for values in (fp, alpha, delta)]
+        native_controls = {}
+        for role in ('colour_delta', 'lightness_delta'):
+            with (np.load(upgraded['layers'][0]['assets'][role]['path']) as disk,
+                  np.load(memory_plan['layers'][0]['assets'][role]['path']) as memory):
+                np.testing.assert_array_equal(disk['values'].view(np.uint32), memory['values'].view(np.uint32))
+                native_controls[role] = memory['values']
+        # Default reopen still reads the actual saved bank. A producer handoff
+        # cannot bypass file binding or the native shape/float/finite contract.
+        _validate_delta.cache_clear()
+        with patch('reference_appearance_stack._validate_delta', wraps=_validate_delta) as reopened:
+            validate_controls(memory_plan['layers'][0], memory_plan, run)
+        assert all(any(role.replace('_', '-') in Path(call.args[0]).name for call in reopened.call_args_list)
+                   for role in native_controls)
+        nonfinite = native_controls['colour_delta'].copy(); nonfinite[0, 0, 0] = np.nan
+        for invalid in ({'colour_delta': native_controls['colour_delta']},
+                        {**native_controls, 'colour_delta': native_controls['colour_delta'][:-1]},
+                        {**native_controls, 'colour_delta': native_controls['colour_delta'].astype(np.float64)},
+                        {**native_controls, 'colour_delta': nonfinite}):
+            try:validate_controls(memory_plan['layers'][0], memory_plan, run, native_controls=invalid)
+            except ValueError:pass
+            else:raise AssertionError('Invalid live control bank accepted')
+        broken_live = copy.deepcopy(memory_plan)
+        broken_live['layers'][0]['assets']['colour_delta']['sha256'] = '0'*64
+        try:validate_controls(broken_live['layers'][0], broken_live, run, native_controls=native_controls)
+        except ValueError:pass
+        else:raise AssertionError('Changed saved bank accepted through live arrays')
+        for bad_inputs in ({**native_inputs, 'automatic_delta': fp},
+                           {**native_inputs, 'beauty_execution': {'enabled': True, 'applied': True}},
+                           {**native_inputs, 'alpha': alpha.astype(np.float64)},
+                           {**native_inputs, 'alpha': np.full_like(alpha, np.nan)},
+                           {**native_inputs, 'alpha': np.full_like(alpha, 1.1)},
+                           {**native_inputs, 'automatic_delta': np.full_like(delta, np.nan)}):
+            try:prepare_owned_controls(plan, root/'bad-memory-controls', run=run, native_inputs=bad_inputs)
+            except ValueError:pass
+            else:raise AssertionError('Aliased or wrong-Beauty native control input accepted')
         assert json.dumps(plan,sort_keys=True) == before
         assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path,digest in input_hashes.items())
         v2 = upgraded['layers'][0]
@@ -192,7 +293,18 @@ def main():
         try:prepare_owned_controls(plan,root/'cancelled',run=run,cancel=lambda:True)
         except InterruptedError:pass
         else:raise AssertionError('Cancelled control preparation proceeded')
-    print('OK: premultiplied Lab homogeneity/tiny alpha; native gamut reduction; current exact 00/11; no refit/parent mutation; measured interpolation coupling; native full/ROI; reduced native bank; retained coverage; portable v2 closure; dose/stale/cancel rejection')
+        cancel_calls = 0
+        def cancel_after_first_block():
+            nonlocal cancel_calls
+            cancel_calls += 1
+            return cancel_calls >= 3
+        try:prepare_owned_controls(plan,root/'cancelled-block',run=run,cancel=cancel_after_first_block)
+        except InterruptedError:pass
+        else:raise AssertionError('Control row-stream ignored cancellation after its first block')
+        assert not list((root/'cancelled-block').rglob('*.npz')), 'Cancelled controls published a partial bank'
+        assert not list(root.rglob('*.tmp.npy')), 'Control preparation left scratch arrays behind'
+        assert not list(root.rglob('*.tmp.npz')), 'Control preparation left partial row archives behind'
+    print('OK: premultiplied Lab homogeneity/tiny alpha; unsupported native pixels skip Lab with exact RGB bits; sparse/dense corners and doses bitwise equal; equal boundary dose preserved; native gamut reduction; current exact 00/11; live native inputs bitwise equal without reads/replay/mutation; freshly saved controls not unpacked again; default reopen checks saved bank; live shape/dtype/nonfinite/file-binding rejection; alias/wrong-Beauty rejection; no refit/parent mutation; measured interpolation coupling; native full/ROI; reduced native bank; retained coverage; portable v2 closure; dose/stale/cancel rejection')
 
 
 if __name__=='__main__':

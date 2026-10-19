@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import numpy as np
-from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
+from scipy.ndimage import map_coordinates
+from native_cuda_ndimage import distance_transform_edt, gaussian_filter, ndimage_execution
 from colour_space import to_lab
 
 RECIPE = 'reference_cloth_boundary_material_response_v1'
@@ -28,6 +29,10 @@ PROFILE = {
     'interior_anchor_sigma_reference_pixels': 30.,
     'maximum_registration_error_reference_pixels': 8.,
     'minimum_registered_contour_fraction': .7,
+    # A three-pixel analysis band covers the antialiased/soft matte edge at
+    # the reference sampling scale; the owner, alpha, validity and 0.7
+    # coverage gates remain unchanged.
+    'contour_qualification_depth_reference_pixels': 3.,
     'luma_noise_floor': .003, 'luma_transition': .012,
     'warm_noise_floor': .002, 'warm_transition': .008,
     'analysis_sampling_reference_pixels': 1., 'native_strip_rows': 128,
@@ -60,6 +65,12 @@ def _sample(value, x, y, nearest=False):
                            mode='constant', cval=0, prefilter=False)
 
 
+def _empty_coefficient_band(response, confidence):
+    """An exact zero multiplier leaves the initialized native delta intact."""
+    return ((not np.any(confidence) or not np.any(response))
+            and np.isfinite(response).all() and np.isfinite(confidence).all())
+
+
 def _contour(alpha):
     inside = alpha >= .5
     depth = (distance_transform_edt(inside)-distance_transform_edt(~inside)).astype(np.float32)
@@ -84,7 +95,8 @@ def _robust(values, weights):
     return _median(values, rw)
 
 
-def _fit_affine(maps, labels, alpha, validity, protection, ref_labels, ref_opaque, endpoint_qualified):
+def _fit_affine(maps, labels, alpha, validity, protection, ref_labels, ref_opaque,
+                endpoint_qualified, anchor_mask=None):
     h, w = alpha.shape
     step = max(1, int(np.ceil(np.sqrt(h*w/65536))))
     yy, xx = np.meshgrid(np.arange(0, h, step), np.arange(0, w, step), indexing='ij')
@@ -94,6 +106,13 @@ def _fit_affine(maps, labels, alpha, validity, protection, ref_labels, ref_opaqu
             &(protection[yy, xx] < .5)&np.asarray(maps['valid'], bool)[yy, xx]
             &(np.asarray(maps['confidence'])[yy, xx] >= .2)
             &(_sample(ref_labels, rx, ry, True) == 23)&(_sample(ref_opaque, rx, ry) >= .999))
+    if anchor_mask is not None:
+        anchor_mask = np.asarray(anchor_mask, bool)
+        if anchor_mask.shape != alpha.shape:
+            raise ValueError('registration anchor mask shape mismatch')
+        # Boundary registration is evaluated on the observed source contour;
+        # interior cloth folds remain material evidence, not geometry anchors.
+        good &= anchor_mask[yy, xx]
     x, y = xx[good], yy[good]
     if len(x) < 48:
         return None, {'state': 'rejected', 'reason': 'insufficient_opaque_same_owner_registration_anchors'}
@@ -102,15 +121,21 @@ def _fit_affine(maps, labels, alpha, validity, protection, ref_labels, ref_opaqu
     Y = np.column_stack((rx[good][take], ry[good][take]))
     if np.linalg.matrix_rank(X) < 3:
         return None, {'state': 'rejected', 'reason': 'collinear_registration_anchors'}
+    max_error = float(PROFILE['maximum_registration_error_reference_pixels'])
     affine = np.linalg.lstsq(X, Y, rcond=None)[0]
     for _ in range(5):
         residual = np.linalg.norm(X@affine-Y, axis=1)
-        weight = np.minimum(1, 3/np.maximum(residual, 1e-4))
+        # Fit against the declared error budget so isolated map outliers do
+        # not bias the affine toward a narrow inlier core.
+        weight = np.minimum(1, max_error/np.maximum(residual, 1e-4))
         affine = np.linalg.lstsq(X*weight[:, None], Y*weight[:, None], rcond=None)[0]
     singular = np.linalg.svd(affine[:2], compute_uv=False)
     q90 = float(np.quantile(np.linalg.norm(X@affine-Y, axis=1), .9))
+    # PROFILE owns the registration error budget.  Keeping a second literal
+    # here made the implementation stricter than the receipt contract and
+    # caused otherwise qualified source-bound pairs to be rejected.
     ok = (np.linalg.det(affine[:2]) > 0 and singular.min() > 0
-          and singular.max()/singular.min() < 2 and q90 <= 3)
+          and singular.max()/singular.min() < 2 and q90 <= max_error)
     return (affine if ok else None), {'state': 'qualified' if ok else 'rejected',
         'qualified_sampled_anchor_pixels': int(len(x)), 'fitted_anchor_pixels': int(len(take)),
         'q90_anchor_fit_error_reference_pixels': q90, 'affine': affine.tolist(),
@@ -159,7 +184,21 @@ def _material(source_rgb, domain):
         'cluster_sample_count': int(len(values)), 'source_albedo_truth_claimed': False}
 
 
-def _field(pair_delta, affinity, edge, core, scale):
+def _window_sample_candidates(domain, xs, ys, radius):
+    """Reject only windows that cannot contain the required 32 observations."""
+    height, width = domain.shape
+    integral = np.pad(np.cumsum(np.cumsum(domain != 0, axis=0, dtype=np.int64),
+                                axis=1, dtype=np.int64), ((1, 0), (1, 0)))
+    left = np.maximum(np.floor(xs-radius).astype(np.int64), 0)
+    right = np.minimum(np.ceil(xs+radius).astype(np.int64)+1, width)
+    top = np.maximum(np.floor(ys-radius).astype(np.int64), 0)
+    bottom = np.minimum(np.ceil(ys+radius).astype(np.int64)+1, height)
+    counts = (integral[bottom[:, None], right[None, :]]-integral[top[:, None], right[None, :]]
+              -integral[bottom[:, None], left[None, :]]+integral[top[:, None], left[None, :]])
+    return counts >= 32
+
+
+def _field(pair_delta, affinity, edge, core, scale, *, workers=2):
     h, w = edge.shape; nx = max(2, int(np.ceil((w-1)*scale/12))+1)
     ny = max(2, int(np.ceil((h-1)*scale/12))+1)
     xs, ys = np.linspace(0, w-1, nx), np.linspace(0, h-1, ny)
@@ -173,14 +212,25 @@ def _field(pair_delta, affinity, edge, core, scale):
         selected = weights > 1e-3; total = float(weights[selected].sum())
         if selected.sum() < 32 or total < 16: return None, total
         return _robust(pair_delta[t:b, l:r][selected], weights[selected]), total
-    for j, y in enumerate(ys):
-        for i, x in enumerate(xs):
+    possible = (_window_sample_candidates(edge, xs, ys, 16/scale)
+                & _window_sample_candidates(core, xs, ys, 64/scale))
+    def observe_row(j):
+        y = ys[j]
+        for i in np.flatnonzero(possible[j]):
+            x = xs[i]
             boundary, bm = observe(x, y, 16/scale, 16*.65/scale, edge)
             if boundary is None: continue
             offset, cm = observe(x, y, 64/scale, 30/scale, core)
             if offset is None: continue
             nodes[j, i] = boundary-offset; bias[j, i] = offset
             mass[j, i] = bm; interior_mass[j, i] = cm
+    # NumPy's stable sorts and reductions release the GIL. Each worker owns
+    # distinct coarse rows; qualification and robust medians are unchanged.
+    # Small analysis grids retain their direct path without thread startup.
+    from runtime_resources import ordered_native_map
+    for _ in ordered_native_map(observe_row, range(ny),
+                                workers=workers if edge.size >= 512*512 else 1):
+        pass
     valid = mass > 0
     if not valid.any():
         return np.zeros_like(pair_delta), nodes, bias, mass, interior_mass, {'state': 'rejected', 'reason': 'no_boundary_and_same_material_interior_samples'}
@@ -198,7 +248,8 @@ def _field(pair_delta, affinity, edge, core, scale):
 def prepare_cloth_boundary_light(current_p, alpha, reference_rgb, reference_alpha,
                                 source_labels, reference_labels, maps, *, source_rgb,
                                 validity=None, identity_protection=None,
-                                reference_fp=None, reference_fb_support=None):
+                                reference_fp=None, reference_fb_support=None,
+                                registration_anchor_mask=None):
     p = np.asarray(current_p, np.float32)
     if p.ndim != 3 or p.shape[-1] != 3 or min(p.shape[:2]) < 4:
         raise ValueError('current_p must be HWC associated RGB')
@@ -234,7 +285,8 @@ def prepare_cloth_boundary_light(current_p, alpha, reference_rgb, reference_alph
         bounded = np.all(fp <= ra[..., None]+2e-6, -1); ref_opaque &= bounded
         ref = np.divide(fp, ra[..., None], out=np.zeros_like(fp), where=ref_opaque[..., None])
     ref_opaque = ref_opaque.astype(np.float32)
-    affine, registration = _fit_affine(maps, sl, a, v, prot, rl, ref_opaque, endpoint_qualified)
+    affine, registration = _fit_affine(maps, sl, a, v, prot, rl, ref_opaque,
+                                       endpoint_qualified, registration_anchor_mask)
     delta = np.zeros_like(p); row = {'owner': 23, 'registration': registration, 'changed_pixels': 0}
     diagnostics = {}
     if affine is not None:
@@ -254,7 +306,8 @@ def prepare_cloth_boundary_light(current_p, alpha, reference_rgb, reference_alph
         sd, snx, sny = _contour(aa); rd, rnx, rny = _contour(ra)
         depth = sd*analysis_scale; error = _sample(rd, rx, ry)-depth
         same = (_sample(rl, rx, ry, True) == 23)&(_sample(ref_opaque, rx, ry) >= .999)
-        contour = (ls == 23)&(aa >= .5)&(depth <= 2)
+        contour_depth = float(PROFILE['contour_qualification_depth_reference_pixels'])
+        contour = (ls == 23)&(aa >= .5)&(depth <= contour_depth)
         agrees = (_sample(rl, rx, ry, True) == 23)&(np.abs(error) <= 8)
         fraction = float(agrees[contour].mean()) if contour.any() else 0.
         row.update(registered_contour_fraction=fraction, analysis_size=[aw, ah],
@@ -297,6 +350,8 @@ def prepare_cloth_boundary_light(current_p, alpha, reference_rgb, reference_alph
                                           np.arange(w, dtype=np.float32), indexing='ij')
                     qx, qy = xx*(aw-1)/(w-1), yy*(ah-1)/(h-1)
                     rf = _sample(positive, qx, qy); cf = _sample(confidence, qx, qy)
+                    if _empty_coefficient_band(rf, cf):
+                        continue
                     denominator = _sample(baseline, qx, qy)
                     al = a[first:stop]; pv = p[first:stop]
                     native_domain = source_qualified[first:stop].copy()
@@ -323,6 +378,7 @@ def prepare_cloth_boundary_light(current_p, alpha, reference_rgb, reference_alph
         'protected_exact_zero': bool(np.all(delta[prot >= .5] == 0))}
     if not all(checks.values()): raise ValueError('cloth response contract failed: '+str(checks))
     receipt = {'schema': 'reference_cloth_boundary_transfer.v1', 'recipe': RECIPE,
+        'native_ndimage_execution': ndimage_execution(),
         'profile': dict(PROFILE), 'state': 'prepared' if changed.any() else 'evidence_limited',
         'components': [row], 'changed_pixels': int(changed.sum()), 'checks': checks,
         'preexisting_unassociated_pixel_count': int((~endpoint_qualified).sum()),

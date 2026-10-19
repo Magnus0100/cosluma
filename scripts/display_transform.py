@@ -113,6 +113,19 @@ def display_linear(values, plan=None):
     return np.clip(mapped+(rgb-mapped)*amount, 0, 1).astype(np.float32)
 
 
+def prepare_source_display_inplace(source, transform):
+    """Apply the bound pixel transform once in independent native row bands."""
+    from runtime_resources import ordered_native_map
+    def prepare_band(top):
+        source[top:top+128] = display_linear(source[top:top+128], transform)
+    tops = range(0, len(source), 128)
+    if len(source) <= 1024:
+        for top in tops:prepare_band(top)
+    else:
+        for _ in ordered_native_map(prepare_band, tops, workers=2):
+            pass
+
+
 def encode_display(values, plan=None):
     rgb = display_linear(values, plan)
     return np.where(rgb <= .0031308, rgb*12.92,

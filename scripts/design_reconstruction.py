@@ -5,12 +5,15 @@ import copy
 import hashlib
 import json
 import os
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 import shutil
+import threading
 
 import numpy as np
 from PIL import Image
+from asset_identity import sha256_file
 
 _LUMA = np.asarray([.2126, .7152, .0722], dtype=np.float32)
 
@@ -18,6 +21,7 @@ SUPPORTED_NATIVE_LAYER_KINDS = frozenset({
     'reference_appearance_stack', 'source_subject_detail', 'source_environment_response', 'source_boundary_light',
     'source_cloth_boundary_light', 'background_design', 'contact_shadow',
     'authored_receiver_shadow', 'rim_light', 'atmosphere', 'particles', 'bloom', 'independent_effect',
+    'registered_reference_style',
 })
 
 
@@ -27,6 +31,11 @@ def reference_stack_execution_weights(layer):
     if (layer.get('params') or {}).get('schema') != 'reference_appearance_stack.v2':
         raise ValueError('Only the current reference appearance stack v2 is supported')
     colour, lightness = float(layer.get('colour_strength', 1)), float(layer.get('lightness_strength', 1))
+    # Source-conditioned hair preservation removes the original full affine
+    # style layer; a prepared T/B/S stack remains the sole colour consumer.
+    if layer.get('params', {}).get('source_hair_policy'):
+        return {'automatic_delta':0.,'colour_delta':0.,'lightness_delta':0.,
+            'sampled_asset_roles':[],'source_hair_policy':layer['params']['source_hair_policy']}
     weights = {'automatic_delta': strength * colour * lightness,
         'colour_delta': strength * colour * (1-lightness),
         'lightness_delta': strength * (1-colour) * lightness}
@@ -36,7 +45,7 @@ def reference_stack_execution_weights(layer):
 
 
 def validate_native_plan_layers(plan):
-    """Current operators only; historical research plans are read-only."""
+    """Reject every operator outside the current rendering contract."""
     unsupported = sorted({str(layer.get('kind')) for layer in (plan or {}).get('layers', [])
                           if layer.get('kind') not in SUPPORTED_NATIVE_LAYER_KINDS})
     if unsupported:
@@ -81,30 +90,121 @@ def geometry_for_plan(plan, size):
     validate_current_native_plan(plan)
     path = Path(plan['mask_roles']['foreground_alpha']['path'])
     if path.suffix == '.npz':
-        with np.load(path) as resource:
-            alpha = Image.fromarray(resource['values'].astype(np.float32)).resize(size, Image.Resampling.BILINEAR)
-        return Image.fromarray(np.uint8(np.clip(np.asarray(alpha), 0, 1)*255+.5))
+        plane = _planes(str(path), path.stat().st_mtime_ns)['values'][0]
+        alpha = plane._array if plane.size == tuple(size) else np.asarray(
+            plane.resize(size, Image.Resampling.BILINEAR), dtype=np.float32)
+        return Image.fromarray(np.uint8(np.clip(alpha, 0, 1)*255+.5))
     with Image.open(path) as image:
         return image.convert('L').resize(size, Image.Resampling.BILINEAR)
 
 
+def _native_integer_box(box, size):
+    left, top, right, bottom = box
+    return (all(isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+                for value in box)
+            and 0 <= left < right <= size[0] and 0 <= top < bottom <= size[1])
+
+
+class _ArrayPlane:
+    """A read-only channel view; create Pillow images only for Pillow operations."""
+    __slots__ = ('_values', '_channel')
+
+    def __init__(self, values, channel=None):
+        self._values = values
+        self._channel = channel
+
+    @property
+    def _array(self):
+        return self._values if self._channel is None else self._values[..., self._channel]
+
+    @property
+    def size(self):
+        return self._values.shape[1], self._values.shape[0]
+
+    def __array__(self, dtype=None, copy=None):
+        values = self._array
+        if dtype is not None and np.dtype(dtype) != values.dtype:
+            if copy is False:
+                raise ValueError('A dtype conversion requires a copy')
+            return values.astype(dtype)
+        # A view keeps the immutable cached owner behind the returned array.
+        return values.copy() if copy else values.view()
+
+    def crop(self, box=None):
+        if box is not None and _native_integer_box(box, self.size):
+            left, top, right, bottom = box
+            return Image.fromarray(self._array[top:bottom, left:right])
+        return Image.fromarray(self._array).crop(box)
+
+    def resize(self, size, resample=None, box=None, reducing_gap=None):
+        return Image.fromarray(self._array).resize(size, resample, box=box, reducing_gap=reducing_gap)
+
+
+@dataclass(frozen=True)
+class _PlaneFile:
+    # The locator is used only on a miss. Hardlinks of the same current file
+    # share a key; replacing any locator changes its inode and key even when
+    # its size and timestamp are retained. No canonical-path registry can
+    # redirect a remaining hardlink to a now replaced file.
+    identity: tuple
+    path: Path = field(compare=False, hash=False)
+
+
+_PLANE_LOCK = threading.RLock()
+
+
+def _plane_file(path):
+    target = Path(path).resolve()
+    stat = target.stat()
+    inode, device = int(stat.st_ino), int(stat.st_dev)
+    file_id = (device, inode) if inode else str(target)
+    return _PlaneFile((file_id, int(stat.st_size), int(stat.st_mtime_ns),
+                       int(stat.st_ctime_ns)), target)
+
+
 @lru_cache(maxsize=12)
-def _planes(path, modified):
-    path = Path(path)
+def _planes_uncached(key, modified):
+    path = key.path
     if path.suffix.lower() == '.npz':
         with np.load(path) as data:
             arrays = {key: np.asarray(data[key], dtype=np.float32) for key in data.files}
     else:
         with Image.open(path) as image:
             arrays = {'values': np.asarray(image.convert('L'), dtype=np.float32) / 255}
-    return {key: (tuple(Image.fromarray(values[..., channel]) for channel in range(values.shape[-1]))
-                 if values.ndim == 3 else (Image.fromarray(values),)) for key, values in arrays.items()}
+    if _plane_file(path) != key:
+        raise ValueError('Native asset changed during loading')
+    result = {}
+    for key, values in arrays.items():
+        values.setflags(write=False)
+        result[key] = (tuple(_ArrayPlane(values, channel) for channel in range(values.shape[-1]))
+                       if values.ndim == 3 else (_ArrayPlane(values),) if values.ndim == 2
+                       else (Image.fromarray(values),))
+    return result
+
+
+def _planes(path, modified):
+    with _PLANE_LOCK:
+        return _planes_uncached(_plane_file(path), modified)
+
+
+_planes.cache_clear = _planes_uncached.cache_clear
+_planes.cache_info = _planes_uncached.cache_info
 
 
 def _sample_channels(channels, box, size, sampling='bilinear'):
     left, top, right, bottom = box
     width, height = size
     fw, fh = channels[0].size
+    if (tuple(size) == (fw, fh) and _native_integer_box(box, (fw, fh))
+            and all(isinstance(channel, _ArrayPlane) and channel.size == (fw, fh) for channel in channels)):
+        first = channels[0]
+        if len(channels) == 1:
+            return first._array[top:bottom, left:right].copy()
+        if (first._values.ndim == 3 and len(channels) == first._values.shape[-1]
+                and all(channel._values is first._values and channel._channel == index
+                        for index, channel in enumerate(channels))):
+            return first._values[top:bottom, left:right].copy()
+        return np.stack([channel._array[top:bottom, left:right] for channel in channels], axis=-1)
     sample_box = (left * fw / width, top * fh / height, right * fw / width, bottom * fh / height)
     method = Image.Resampling.NEAREST if sampling == 'nearest' else Image.Resampling.BILINEAR
     planes = [np.array(channel.resize((right-left, bottom-top), method,
@@ -283,7 +383,7 @@ def materialize_plan(root, run, plan):
                             persist_json(nested,target)
                         else:
                             persist(child, target)
-                        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                        digest = sha256_file(target)
                         dependencies[f'{prefix}.{key}'] = {'path': str(target.resolve()), 'sha256': digest}
                         result[key] = str(target.resolve())
                         continue
@@ -295,7 +395,7 @@ def materialize_plan(root, run, plan):
             if isinstance(rewritten,str) and rewritten!=value.get('path') and value.get('sha256'):
                 path=Path(rewritten)
                 if path.is_file():
-                    result['sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
+                    result['sha256']=sha256_file(path)
                     if 'bytes' in result:result['bytes']=path.stat().st_size
             return result
         if isinstance(value, list):
@@ -323,7 +423,7 @@ def materialize_plan(root, run, plan):
                 if 'manifest_path' in manifest:
                     manifest['manifest_path'] = str(target.resolve())
                 persist_json(manifest,target)
-                asset['sha256'] = hashlib.sha256(target.read_bytes()).hexdigest()
+                asset['sha256'] = sha256_file(target)
                 if 'bytes' in asset:asset['bytes']=target.stat().st_size
             else:
                 persist(source,target)
@@ -337,11 +437,11 @@ def materialize_plan(root, run, plan):
         for asset in layer.get('assets', {}).values():
             if Path(asset['path']).suffix.lower() != '.json':
                 continue
-            asset['sha256'] = hashlib.sha256(Path(asset['path']).read_bytes()).hexdigest()
+            asset['sha256'] = sha256_file(Path(asset['path']))
             if 'bytes' in asset:asset['bytes']=Path(asset['path']).stat().st_size
             for record in (asset.get('dependencies') or {}).values():
                 target=Path(record['path'])
-                record['sha256']=hashlib.sha256(target.read_bytes()).hexdigest()
+                record['sha256']=sha256_file(target)
                 if 'bytes' in record:record['bytes']=target.stat().st_size
     for name, asset in plan.get('mask_roles', {}).items():
         source = Path(asset['path'])
@@ -442,6 +542,7 @@ def _apply_native_plan(source_linear,plan,geometry,run,include_optics):
     alpha = sample_asset(foreground_asset,'values',full_box,size)
     foreground = sample_asset(assets['foreground_premultiplied'],'values',full_box,size)
     background = sample_asset(assets['old_environment'],'values',full_box,size)
+    background_validity = sample_asset(assets['validity'],'values',full_box,size)
     from native_source_baseline import enabled as frozen_source_enabled, source_for_plan, background_for_view
     if frozen_source_enabled(plan):
         source_linear = source_for_plan(plan,size)
@@ -472,6 +573,9 @@ def _apply_native_plan(source_linear,plan,geometry,run,include_optics):
     # The retained paired contribution receives the prepared automatic
     # response; newly added coverage bypasses it in source radiance.
     foreground,automatic_alpha,unsupported_foreground=_edited_light_parts(plan,foreground,alpha,size)
+    from portrait_beauty_layer import apply_for_run as apply_beauty
+    foreground,beauty_execution=apply_beauty(foreground,run,canvas_size=size,
+        premultiplied_alpha=automatic_alpha)
     foreground = _detail_tiled(foreground,denoise=float((run.get('options') or {}).get('denoise_strength',0)),coverage=automatic_alpha)
     if unsupported_foreground is not None:
         foreground += unsupported_foreground
@@ -580,6 +684,52 @@ def _apply_native_plan(source_linear,plan,geometry,run,include_optics):
             background[top:bottom,left:right], plan, run, 'behind', box, size)
         for receipt in effect_records:
             next(row for row in records if row['id'] == receipt['id']).update(receipt)
+    # The generated/background plate is allowed to illuminate the original
+    # foreground through a bounded low-frequency response. This is the bridge
+    # between visible background beams/candles and source-owned skin, cloth
+    # and props; it never copies candidate subject RGB or changes alpha.
+    from source_environment_light import estimate as estimate_environment_light, apply as apply_environment_light
+    execution_contract = plan.get('execution') or {}
+    use_environment_light = execution_contract.get('source_environment_light') is True
+    candidate_subject_light_execution = {
+        'schema': 'candidate_subject_light.v1', 'applied': False,
+        'candidate_texture_imported': False, 'candidate_geometry_imported': False,
+        'alpha_modified': False, 'visual_acceptance': False,
+        'bypass_reason': 'candidate_light_evidence_not_requested'}
+    if use_environment_light:
+        # The generated candidate is not only a background donor.  Before its
+        # subject is discarded by matting, its low-frequency subject response
+        # is retained as lighting evidence and applied to the source-owned
+        # foreground.  The candidate RGB never enters the final composition.
+        reference_path = (run or {}).get('reference', {}).get('path')
+        candidate_mask = plan.get('mask_roles', {}).get('candidate_occupancy')
+        mapping = (plan.get('canvas', {}).get('candidate_mapping') or {}).get(
+            'candidate_processing_proxy_to_final_proxy')
+        if reference_path and candidate_mask:
+            try:
+                from candidate_subject_light import estimate_from_reference, apply as apply_candidate_light
+                candidate_gain, candidate_subject_light_execution = estimate_from_reference(
+                    reference_path, candidate_mask, foreground, alpha, mapping=mapping,
+                    source_proxy_size=plan.get('canvas', {}).get('source_proxy_size'),
+                    expected_reference_sha256=(run.get('reference') or {}).get('sha256'))
+                foreground = apply_candidate_light(foreground, candidate_gain, alpha)
+            except (OSError, ValueError, TypeError) as exc:
+                candidate_subject_light_execution = {
+                    'schema': 'candidate_subject_light.v1', 'applied': False,
+                    'candidate_texture_imported': False, 'candidate_geometry_imported': False,
+                    'alpha_modified': False, 'visual_acceptance': False,
+                    'bypass_reason': 'candidate_light_evidence_unavailable',
+                    'error': str(exc)[:500]}
+        else:
+            candidate_subject_light_execution['bypass_reason'] = 'candidate_reference_or_occupancy_missing'
+        environment_gain, environment_light_execution = estimate_environment_light(
+            background, background_validity, alpha)
+        foreground = apply_environment_light(foreground, environment_gain, alpha)
+    else:
+        environment_light_execution = {'schema': 'source_environment_light.v1',
+            'applied': False, 'bypass_reason': 'source_environment_light_disabled',
+            'candidate_subject_RGB_used': False, 'alpha_modified': False,
+            'visual_acceptance': False}
     # Coverage is derived once, not consumed as a separately editable opacity.
     # Fp is an owned working buffer; compose into it instead of allocating
     # three more full-canvas coverage/product/result temporaries.
@@ -630,9 +780,12 @@ def _apply_native_plan(source_linear,plan,geometry,run,include_optics):
         'background_coverage':'derived 1-alpha; exactly one final composition',
         'background_reconstructed':any(record['kind']=='background_design' and record['applied'] for record in records),
         'denoise_stage':'premultiplied_source_foreground_opaque_neighborhoods_only',
-        'colour_match_method': 'frozen_original_reference_appearance_stack_before_composition',
+        'portrait_beauty':beauty_execution,
+        'colour_match_method': 'frozen_original_reference_appearance_stack_then_candidate_light_evidence_before_composition',
         'source_render_plan':source_light_execution,'background_render_plan':background_light_execution,
         'composite_render_plan':composite_light_execution,'source_color_plan':color_execution,
+        'candidate_subject_light':candidate_subject_light_execution,
+        'source_environment_light':environment_light_execution,
         'layers':records,'design_provenance':plan.get('provenance'),
         'authored_receiver_shadow':plan.get('execution',{}).get('authored_receiver_shadow'),
         'highlight_clipping':'deferred_to_shared_display_transform'}

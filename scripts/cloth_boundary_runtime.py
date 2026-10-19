@@ -40,6 +40,43 @@ def endpoint_binding(plan, run=None):
     return result
 
 
+def endpoint_binding_for_reuse(plan, run=None):
+    """Build the cloth endpoint identity without replaying the hair ROI.
+
+    ``endpoint_binding`` is also used by full layer validation, where
+    ``preceding_hair_identity`` deliberately calls ``hair.validate_layer`` to
+    compare every native target patch.  A retry fast path has already loaded
+    the frozen cloth assets and only needs to establish that the preceding
+    hair layer identity is unchanged; replaying a 3k x 6k hair patch here
+    repeated the expensive validation before the cache decision.  The frozen
+    hair binding and controls digest are still compared exactly, and the
+    normal validator remains the owner of the full pixel contract whenever a
+    layer is newly prepared or applied.
+    """
+    result = hair.endpoint_binding(plan, run)
+    layers = [row for row in plan['layers'] if row['kind'] == hair.KIND]
+    if len(layers) > 1:
+        raise ValueError('Cloth light requires at most one preceding hair layer')
+    if not layers:
+        identity = None
+    else:
+        layer = layers[0]
+        frozen, _ = hair._read(layer['assets']['frozen_delta'])
+        receipt, _ = hair._read(layer['assets']['qualification_receipt'])
+        if (layer.get('params', {}).get('binding') != frozen.get('binding')
+                or receipt.get('state') not in ('prepared', 'no_change')):
+            raise ValueError('Preceding hair layer is not an intact frozen identity')
+        identity = {'schema': frozen['schema'], 'recipe': frozen['recipe'],
+            'binding': frozen['binding'], 'delta_sha256': frozen['delta']['sha256'],
+            'patches': frozen['patches'], 'enabled': bool(layer.get('enabled')),
+            'strength': float(layer.get('strength', 1)),
+            'bypass_reason': ('boundary_light_disabled'
+                              if not layer.get('enabled') or not layer.get('strength', 1)
+                              else None)}
+    result['preceding_hair_digest'] = _digest(identity)
+    return result
+
+
 def endpoint(plan, run, box, size):
     values = hair.endpoint(plan, run, box, size)
     layers = [row for row in plan['layers'] if row['kind'] == hair.KIND]

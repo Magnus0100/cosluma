@@ -22,6 +22,106 @@ class MemoryResponse(io.BytesIO):
         self.headers['Content-Type'] = 'text/event-stream' if sse else 'application/json'
 
 
+def timing_cases(root, source, config):
+    """Distinguish real I/O boundaries with known delays, without network or sleeps."""
+    passed = []
+    original_dumps, original_loads = json.dumps, json.loads
+    original_input, original_base64, original_profile = vision._input_image, vision.base64.b64encode, vision._profile_json
+    for name, response_value, sse, expected, error_type in [
+        ('timed-json', {'status': 'completed', 'output_text': '{"ok":true}'}, False, 62, None),
+        ('timed-sse', b'data: {"type":"response.output_text.delta","delta":"ignored"}\n'
+                      b'data: {"type":"response.completed","response":{"status":"completed","output_text":"{\\"ok\\":true}"}}\n', True, 71, None),
+        ('timed-invalid-profile', {'status': 'completed', 'output_text': '{"broken":'}, False, 62, vision.VisionResponseError),
+        ('timed-http', 'http', False, 39, vision.VisionHTTPError),
+        ('timed-timeout', 'timeout', False, 32, TimeoutError),
+        ('timed-read-failure', 'read-failure', False, 39, OSError),
+        ('timed-invalid-envelope', b'{', False, 41, json.JSONDecodeError),
+    ]:
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        class TimedResponse(MemoryResponse):
+            def read(self, *args):
+                advance(7)
+                if response_value == 'read-failure':
+                    raise OSError('synthetic read failure')
+                return super().read(*args)
+            def __next__(self):
+                advance(7)
+                return super().__next__()
+        response = TimedResponse(response_value if response_value not in ('http', 'timeout', 'read-failure') else b'error', sse)
+        calls = []
+        def opened(request, *, timeout):
+            advance(5)
+            calls.append(request)
+            assert timeout == 180 and request.full_url.endswith('/responses')
+            body = original_loads(request.data)
+            assert body['model'] == 'gpt-6.1-sol' and body['stream'] is True and body['store'] is False
+            assert request.get_header('Authorization') == 'Bearer local-secret'
+            if response_value == 'http':
+                raise urllib.error.HTTPError(request.full_url, 502, 'synthetic gateway failure', {}, response)
+            if response_value == 'timeout':
+                raise TimeoutError('synthetic timed out')
+            return response
+        def encode(value, *args, **kwargs):
+            if isinstance(value, dict) and 'model' in value:
+                advance(3)
+            return original_dumps(value, *args, **kwargs)
+        def parse(*args, **kwargs):
+            advance(2)
+            return original_loads(*args, **kwargs)
+        def prepare(*args, **kwargs):
+            advance(11)
+            return original_input(*args, **kwargs)
+        def base64_encode(*args, **kwargs):
+            advance(13)
+            return original_base64(*args, **kwargs)
+        def profile(*args, **kwargs):
+            advance(19)
+            return original_profile(*args, **kwargs)
+        directory = root/name
+        error = None
+        with patch.object(vision, 'perf_counter', side_effect=lambda: clock[0]), \
+             patch.object(vision, '_connection', return_value=(config, 'http://localhost/v1', 'local-secret', None)), \
+             patch.object(vision, '_input_image', side_effect=prepare), \
+             patch.object(vision.base64, 'b64encode', side_effect=base64_encode), \
+             patch.object(vision, '_profile_json', side_effect=profile), \
+             patch.object(vision.json, 'dumps', side_effect=encode), \
+             patch.object(vision.json, 'loads', side_effect=parse), \
+             patch.object(vision.urllib.request, 'urlopen', side_effect=opened):
+            try:
+                payload, provenance = vision.request_vision_json(source, directory, 'Timing board prompt', vision_model='gpt-6.1-sol')
+            except Exception as exc:
+                assert error_type and isinstance(exc, error_type), (name, exc)
+                error = {'type': type(exc).__name__, 'message': str(exc), **vision.error_metadata(exc)}
+                timings = error['timings']
+            else:
+                assert error_type is None and payload == {'ok': True}, name
+                timings = provenance['timings']
+        assert len(calls) == 1 and timings['total_seconds'] == expected, (name, timings)
+        assert timings['image_prepare_seconds'] == 11 and timings['image_base64_seconds'] == 13
+        request_timings, = timings['http_requests']
+        assert request_timings['request_encode_seconds'] == 3 and request_timings['wait_headers_seconds'] == 5
+        assert request_timings['request_bytes'] == len(calls[0].data)
+        assert request_timings['response_read_seconds'] == (14 if sse else 0 if response_value == 'timeout' else 7)
+        assert request_timings['response_parse_seconds'] == (4 if sse else 0 if response_value in ('http', 'timeout', 'read-failure') else 2)
+        assert timings['profile_parse_seconds'] == (21 if error_type in (None, vision.VisionResponseError) else 0)
+        if error:
+            expected_policy = 'one_retry_after_completed_response_invalid_json' if error_type is vision.VisionResponseError else \
+                'one_retry_after_explicit_http_429_or_5xx' if error_type is vision.VisionHTTPError else None
+            assert vision.retry_policy_for_error(error) == expected_policy
+            if error_type is vision.VisionResponseError:
+                receipt = json.loads((directory/'response-failure.json').read_text())
+                assert receipt['timings'] == timings and timings['failed_stage'] == 'profile_parse_seconds'
+            else:
+                assert timings['failed_stage'] == 'http_request'
+        else:
+            assert 'failed_stage' not in timings and 'failed_stage' not in request_timings
+        assert 'local-secret' not in str(timings) and 'data:image/' not in str(timings)
+        passed.append(name+'_phase_receipt_and_retry_preserved')
+    return passed
+
+
 def failure_cases(root, source, config):
     passed = []
     def execute(name, response, *, sse=False, chat=False):
@@ -213,7 +313,7 @@ def main():
         source = root / "source.png"
         Image.new("RGB", (64, 96), (50, 70, 100)).save(source)
         requests = []
-        def local_response(endpoint, key, body=None):
+        def local_response(endpoint, key, body=None, *, timings=None):
             requests.append(endpoint)
             assert key == "local-secret"
             if endpoint.endswith("/responses"):
@@ -231,7 +331,7 @@ def main():
             assert len(requests) == 2
             assert provenance["source"]["sha256"] == vision.reference_provider.sha256(source)
             assert provenance["input_sha256"] == vision.reference_provider.sha256(Path(provenance["api_input"]["path"]))
-            assert "local-secret" not in str(provenance) and "base64" not in str(provenance)
+            assert "local-secret" not in str(provenance) and "data:image/" not in str(provenance) and "base64," not in str(provenance)
             try:
                 vision.request_vision_json(source, root / "probe", "Identify", vision_model="gpt-image-2.5-sunburst")
             except ValueError:
@@ -241,6 +341,7 @@ def main():
             assert len(requests) == 2
         assert vision._vision_models({"data": [{"id": "gpt-image-1"}, {"id": "gpt-6.1-sol"}]}) == ["gpt-6.1-sol"]
         passed = failure_cases(root, source, config)
+        passed.extend(timing_cases(root, source, config))
     print(json.dumps({'schema': 'vision_transport_smoke.v2', 'status': 'passed',
         'cases_passed': len(passed)+1, 'cases': ['original_protocol_model_and_provenance_contract', *passed],
         'network_requests': 0, 'gpu_requests': 0, 'hidden_transport_retries': 0}))

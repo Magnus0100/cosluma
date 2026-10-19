@@ -10,6 +10,9 @@ SCHEMA = 'system_post_completion.v2'
 
 def _eligible(run, args):
     from generation_design import DESIGN_VERSION
+    from single_source_workflow import task_visual_review_allowed
+    if not task_visual_review_allowed(run, args):
+        return False
     design = run.get('generation_design') or {}
     task = run.get('task_intent') or (run.get('options') or {}).get('task_intent') or getattr(args, 'task_intent', {}) or {}
     return bool((task.get('mode') in ('existing_reference', 'create_reference')
@@ -282,6 +285,12 @@ def complete_once(root, run, args):
         budget['reference_correction_budget'] = reference_budget
         budget['independent_effect_image_budget'] = effect_budget
         budget['independent_effect_image_submissions'] = effects.get('independent_effect_image_submissions', 0)
+        if 'regional_refinement_image_submissions' in budget:
+            # Recompute from disjoint roles, never add regional submissions to
+            # a total that may already include the same frozen region IDs.
+            budget['total_image_submissions'] = (budget.get('image_submissions', 0)
+                + budget.get('correction_image_submissions', 0)
+                + budget['regional_refinement_image_submissions'])
         budget['total_image_submissions_including_effects'] = (budget.get('total_image_submissions', budget.get('image_submissions', 0))
             + budget['independent_effect_image_submissions'])
         save_current()

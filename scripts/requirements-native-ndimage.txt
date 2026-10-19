@@ -1,0 +1,11 @@
+# Install only in the selected native CUDA worker runtime, never the desktop.
+# Qualified official Windows CP312 wheels; existing NumPy/SciPy/Torch retained.
+# Wheel SHA256 c9571d3b5f2e65758137e210f7fb3c3b34767f0af6b6ca04035a244b6141ee12
+cupy-cuda12x==14.2.0
+# Wheel SHA256 e29e59829c297a7a5233bd9cc71094fc5bddbd076951482670178f9eade39b1f
+cuda-pathfinder==1.8.3
+# Wheel SHA256 c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8
+nvidia-cuda-runtime-cu12==12.8.90
+# LibRaw VCOMP only; Torch/BLAS keep the existing native worker thread limits.
+# Wheel SHA256 43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb
+threadpoolctl==3.6.0

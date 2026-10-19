@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from runtime_resources import code_path
+from asset_identity import sha256_file
 
 import numpy as np
 from PIL import Image
@@ -22,8 +23,8 @@ from revision_state import merge_appearance_revision,appearance_revision_patch
 
 def _renderer_identity():
     from float_appearance import ENGINE
-    names = ('authored_receiver_shadow.py', 'clone_retouch.py', 'colour_space.py', 'design_reconstruction.py', 'display_transform.py', 'float_appearance.py', 'hsl_adjust.py', 'local_colour_brush.py', 'native_environment_completion.py', 'native_sole_contact.py', 'native_source_baseline.py', 'raw_support.py', 'reference_appearance_stack.py', 'reference_appearance_controls.py', 'revision_state.py', 'scene_design.py', 'scene_receiver_intent.py', 'source_appearance_responsibility.py', 'source_color.py', 'source_preview.py', 'source_relight.py', 'tone_curves.py', 'image_helpers.py')
-    return {'engine': ENGINE, 'code': {name: hashlib.sha256(code_path(name).read_bytes()).hexdigest() for name in names}}
+    names = ('authored_receiver_shadow.py', 'clone_retouch.py', 'colour_space.py', 'design_reconstruction.py', 'display_transform.py', 'float_appearance.py', 'hsl_adjust.py', 'local_colour_brush.py', 'native_environment_completion.py', 'native_sole_contact.py', 'native_source_baseline.py', 'native_array_storage.py', 'raw_support.py', 'reference_appearance_stack.py', 'reference_appearance_controls.py', 'revision_state.py', 'scene_design.py', 'scene_receiver_intent.py', 'source_appearance_responsibility.py', 'source_color.py', 'source_preview.py', 'source_relight.py', 'tone_curves.py', 'image_helpers.py')
+    return {'engine': ENGINE, 'code': {name: sha256_file(code_path(name)) for name in names}}
 
 
 def _edited_run(run,body):
@@ -77,13 +78,95 @@ class SourcePreviewCache:
         self._sessions = {}
         self._lock = threading.RLock()
 
+    def _source_identity(self, run, native_plan):
+        """Return the byte identity used by the preview execution cache.
+
+        The run manifest's declared hash is useful for portable projects, but
+        it is not sufficient when a user replaces an input file in place.  We
+        therefore include the current file hash when the locator is available,
+        while retaining the declared hash and frozen baseline asset hashes.
+        Hashes are memoized by size and mtime so ordinary slider previews do
+        not repeatedly read a large RAW file.
+        """
+        source = run.get('source') or {}
+        raw_path = str(source.get('path') or '')
+        path = Path(raw_path) if raw_path else None
+        if path is not None and not path.is_absolute():
+            path = self.root / path
+        record = {'declared_sha256': source.get('sha256'),
+                  'path': str(path.resolve()) if path is not None else None}
+        if path is not None and path.is_file():
+            stat = path.stat()
+            # Use the shared stat-bound identity cache. The previous preview
+            # implementation read the complete source once per cache instance
+            # and retained only the most recent path, so switching between
+            # imported photos re-read every large RAW. sha256_file validates
+            # size, mtime and ctime before reusing an identity, preserving the
+            # byte-level replacement check without runtime full reads.
+            digest = sha256_file(path)
+            record.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                          current_sha256=digest)
+        baseline = (native_plan.get('source_baseline') or {}).get('assets') or {}
+        record['baseline_assets'] = {
+            name: asset.get('sha256') for name, asset in sorted(baseline.items())
+            if isinstance(asset, dict) and asset.get('sha256')
+        }
+        return record
+
+    def _session_key(self, run_id: str, run: dict, manifest: Path):
+        native_plan = design_plan_for_run(run)
+        return (run_id, manifest.stat().st_mtime_ns,
+                hashlib.sha256(json.dumps({'renderer': _renderer_identity(),
+                    'source': self._source_identity(run, native_plan),
+                    'source_reference': (native_plan.get('execution') or {}).get('source_reference'),
+                    'source_baseline': native_plan.get('source_baseline'),
+                    'working_domain': native_plan.get('working_domain')},
+                    sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+
+    @staticmethod
+    def _execution_identity(run_id, run, edited_run, native_plan, manifest, *, max_edge):
+        """Build a stable identity before invoking the pixel renderer."""
+        manifest_stat = manifest.stat()
+        source_identity = edited_run.get('_source_identity') or {}
+        # _source_identity is attached only for this calculation and is never
+        # persisted in a run or included in renderer inputs.
+        try:
+            display_transform = display_plan_for_run(edited_run)
+        except ValueError:
+            # Source-only native sessions materialize their explicit display
+            # plan while the proxy is opened.  The options and source identity
+            # are already part of this key, so use a stable pre-materialized
+            # marker until that session exists.
+            display_transform = {'method': 'source_only_deferred'}
+        payload = {
+            'schema': 'source_preview_execution.v2',
+            'run_id': run_id,
+            'source': source_identity,
+            'reference': (edited_run.get('reference') or {}).get('sha256'),
+            'native_plan': native_plan,
+            'options': edited_run.get('options') or {},
+            'manual_layers': edited_run.get('manual_layers'),
+            'denoise_strength': edited_run.get('denoise_strength'),
+            'display_transform': display_transform,
+            'renderer': _renderer_identity(),
+            'manifest_mtime_ns': manifest_stat.st_mtime_ns,
+            'max_edge': int(max_edge),
+            'workflow_cache': edited_run.get('workflow_cache') or
+                              (edited_run.get('options') or {}).get('workflow_cache'),
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(',', ':'), allow_nan=False).encode('utf8')
+        # Detach the persisted identity from ``edited_run``.  Source-only
+        # session preparation adds ``source_only_plan`` to the options after
+        # this function returns; retaining that mutable dict would turn a
+        # valid cache receipt into a self-invalidating one.
+        frozen_payload = json.loads(encoded.decode('utf8'))
+        return hashlib.sha256(encoded).hexdigest()[:32], frozen_payload
+
     def _session(self, run_id: str, run: dict, manifest: Path):
+        render_mode_for_run(run)
         native_plan=design_plan_for_run(run)
-        key = (run_id, manifest.stat().st_mtime_ns,
-               hashlib.sha256(json.dumps({'renderer':_renderer_identity(),
-                   'source_reference':(native_plan.get('execution') or {}).get('source_reference'),
-                   'source_baseline':native_plan.get('source_baseline'),
-                   'working_domain':native_plan.get('working_domain')},sort_keys=True).encode()).hexdigest())
+        key = self._session_key(run_id, run, manifest)
         if key in self._sessions:
             return self._sessions[key], True
         source = Path(run['source']['path'])
@@ -121,11 +204,6 @@ class SourcePreviewCache:
             return Image.new('L', size, 0)
 
         geometry = mask('silhouette')
-        # A preview is an execution of the current native renderer.  Historical
-        # unified/legacy manifests remain available through their saved assets
-        # and provenance, but are never re-rendered through this cache.
-        if render_mode_for_run(run) != 'native_source_design':
-            raise RuntimeError('Historical unified/legacy runs are read-only; source preview is unavailable.')
         # Source-only native runs intentionally have no foreground bundle.  The
         # renderer receives an identity proxy and keeps all source pixels bound
         # to the immutable RAW decode.
@@ -143,8 +221,38 @@ class SourcePreviewCache:
         started = time.perf_counter()
         with self._lock:
             edited_run = _prepare_receiver_edit(self.root,_edited_run(run,body))
-            session, hit = self._session(run_id, edited_run, manifest)
             design_plan = design_plan_for_run(edited_run)
+            edited_run['_source_identity'] = self._source_identity(edited_run, design_plan)
+            cache_key, cache_identity = self._execution_identity(
+                run_id, run, edited_run, design_plan, manifest, max_edge=self.max_edge)
+            directory = self.root / 'outputs/cache/source-preview' / run_id
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (cache_key + '.jpg')
+            metadata_path = directory / (cache_key + '.json')
+            session_key = self._session_key(run_id, edited_run, manifest)
+            # A preview cache hit must avoid the renderer entirely.  The JSON
+            # receipt is checked as well as the image so an interrupted write
+            # or stale artifact can never masquerade as a successful preview.
+            if path.is_file() and metadata_path.is_file():
+                try:
+                    metadata = json.loads(metadata_path.read_text('utf8'))
+                    if metadata.get('identity') == cache_identity:
+                        response = copy.deepcopy(metadata.get('response') or {})
+                        response.update({'ok': True, 'run_id': run_id,
+                                        'request_id': body.get('request_id'),
+                                        'preview_path': str(path.resolve()),
+                                        'cache_key': cache_key,
+                                        'cache_hit': True,
+                                        'session_cache_hit': session_key in self._sessions,
+                                        'preview_cache_hit': True,
+                                        'raw_decoded': False,
+                                        'elapsed_seconds': round(time.perf_counter() - started, 3)})
+                        return response
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    # Treat incomplete or old metadata as a miss and rebuild.
+                    pass
+
+            session, session_hit = self._session(run_id, edited_run, manifest)
             if session.get('source_only_plan'):
                 edited_run.setdefault('options', {})['source_only_plan'] = session['source_only_plan']
                 result, operator = render_source_only_float(session['source'], edited_run, session['geometry'])
@@ -157,16 +265,11 @@ class SourcePreviewCache:
             color_plan = operator.get('source_color_plan') or {'enabled': False, 'regions': []}
             execution = plan
             color_execution = color_plan
-            fingerprint = hashlib.sha256(json.dumps({'run': run_id, 'plan': plan, 'color_plan': color_plan,
-                'design_plan': design_plan, 'edited_options':edited_run.get('options'),
-                'display_transform': display_plan_for_run(edited_run),'renderer':_renderer_identity(),
-                'manifest': manifest.stat().st_mtime_ns}, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:20]
-            directory = self.root / 'outputs/cache/source-preview' / run_id
-            directory.mkdir(parents=True, exist_ok=True)
-            path = directory / (fingerprint + '.jpg')
             image = linear_preview(result, display_transform=display_plan_for_run(edited_run))
-            image.save(path, 'JPEG', quality=94, subsampling=0, icc_profile=image.info.get('icc_profile'))
-            return {'ok': True, 'run_id': run_id, 'request_id': body.get('request_id'),
+            temp_path = path.with_suffix('.jpg.tmp')
+            image.save(temp_path, format='JPEG', quality=94, subsampling=0, icc_profile=image.info.get('icc_profile'))
+            temp_path.replace(path)
+            response = {'ok': True, 'run_id': run_id, 'request_id': body.get('request_id'),
                     'preview_path': str(path.resolve()), 'source_render_plan': plan,
                     'source_color_plan': color_plan, 'color_execution': color_execution,
                     'design_reconstruction_plan': design_plan, 'design_execution': design_execution,
@@ -177,7 +280,19 @@ class SourcePreviewCache:
                     'display_transform': display_plan_for_run(edited_run),
                     'working_domain':'display_linear_sRGB',
                     'preview_size': session['preview_size'], 'source_size': session['source_size'],
-                    'cache_hit': hit, 'raw_decoded': not hit and session['precision'].get('source_reference')!='paired_native_baseline' and session['precision'].get('source_precision')=='raw16_linear', 'provisional': True,
+                    'cache_hit': False, 'session_cache_hit': session_hit,
+                    'preview_cache_hit': False,
+                    'cache_key': cache_key,
+                    'raw_decoded': not session_hit and session['precision'].get('source_reference')!='paired_native_baseline' and session['precision'].get('source_precision')=='raw16_linear', 'provisional': True,
                     'source_reference':session['precision'].get('source_reference','caller_source_decode'),
                     'precision': session['precision'], 'execution': execution,
                     'elapsed_seconds': round(time.perf_counter() - started, 3)}
+            metadata = {'schema': 'source_preview_execution.v2',
+                        'identity': cache_identity,
+                        'response': {key: value for key, value in response.items()
+                                     if key not in ('request_id', 'preview_path', 'elapsed_seconds',
+                                                    'cache_hit', 'session_cache_hit', 'preview_cache_hit')}}
+            temp_metadata = metadata_path.with_suffix('.json.tmp')
+            temp_metadata.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding='utf8')
+            temp_metadata.replace(metadata_path)
+            return response

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 from unittest.mock import patch
 import numpy as np
 from current_model_registry import load_registry, PROFILES, PATH_KEYS, SCHEMA
 from local_photo_analysis import local_runtime_paths, analysis_identity, local_models_ready
+from local_photo_analysis import _worker
 from local_semantics_worker import CLASS_NAMES
 from sapiens_model_profiles import profile, verified_checkpoint
 from source_foreground import estimate_source_background
@@ -22,7 +25,15 @@ def rejected(call):
 
 
 def main():
-    repo = Path(__file__).resolve().parents[1]/'.cache/local-models/sapiens2/repo'
+    # Bind the parser fixture to the current installed registry.  The old
+    # smoke hard-coded the retired project `.cache` junction, which made a
+    # clean D: installation look broken even when the registry selected a
+    # different drive.  Do not resurrect that compatibility path.
+    workspace = Path(__file__).resolve().parents[1]
+    installed = load_registry(workspace,
+                               required_keys=('semantics_repo_dir',),
+                               required_profiles=('semantics_profile',))
+    repo = Path(installed['semantics_repo_dir'])
     specification = profile('sapiens2_seg_0.4b', 'segmentation')
     config = repo/specification['config']
     assignments = {node.targets[0].id: node.value for node in ast.parse(config.read_text(encoding='utf8')).body
@@ -60,6 +71,20 @@ def main():
         bad={**paths,'matting_profile':'sapiens2_matting_1b'}
         with patch('source_foreground_cache.file_identity', side_effect=lambda path:'bound-'+str(path)):
             rejected(lambda: _identity(root,root/'source',root/'saliency',None,bad))
+        # The normal semantics/scene launcher must isolate the selected child
+        # without moving existing model caches or temporary storage off D:.
+        storage = {'TEMP': r'D:\cosplay-tests', 'TMP': r'D:\cosplay-tests',
+            'HF_HOME': r'D:\codex-models\cache', 'TORCH_HOME': r'D:\codex-models\cache\torch'}
+        observed_log = root/'worker-environment.log'
+        keys = ['PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', 'PYTHONNOUSERSITE', *storage]
+        code = f'import os,json,site; print(json.dumps({{"env":{{k:os.environ.get(k) for k in {keys!r}}},"user_site":site.ENABLE_USER_SITE}}))'
+        with patch.dict(os.environ, {**storage, 'PYTHONPATH': 'foreign-packages',
+                'PYTHONHOME': 'foreign-python', 'PYTHONUSERBASE': 'foreign-user'}):
+            _worker([sys.executable, '-B', '-c', code], observed_log)
+        child = json.loads(observed_log.read_text(encoding='utf8'))
+        assert all(child['env'][key] is None for key in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE'))
+        assert child['env']['PYTHONNOUSERSITE']=='1' and child['user_site'] is False
+        assert {key: child['env'][key] for key in storage}==storage
     alpha=np.zeros((24,32),np.float32);alpha[5:19,6:26]=1
     alpha[4,6:26]=.35;alpha[19,6:26]=.65;alpha[6:18,5]=.25;alpha[6:18,26]=.75
     trimap=np.full(alpha.shape,128,np.uint8);trimap[alpha==0]=0;trimap[alpha==1]=255

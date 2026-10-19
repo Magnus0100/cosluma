@@ -118,6 +118,17 @@ class PortraitRegionContracts(unittest.TestCase):
         self.assertEqual(fields["features_gate"][80, 160], 0)
         self.assertEqual(fields["material_skin_support"][59, 160], 0)
 
+    def test_region_npz_uses_standard_numpy_archive_contract(self):
+        """The fast writer remains readable by the worker's existing np.load paths."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "regions.npz"
+            labels = np.arange(12, dtype=np.uint8).reshape(3, 4)
+            support = np.linspace(0, 1, 12, dtype=np.float16).reshape(3, 4)
+            worker.save_npz(path, labels=labels, support=support)
+            with np.load(path, allow_pickle=False) as loaded:
+                np.testing.assert_array_equal(loaded["labels"], labels)
+                np.testing.assert_array_equal(loaded["support"], support)
+
 
 if __name__ == "__main__":
     unittest.main()

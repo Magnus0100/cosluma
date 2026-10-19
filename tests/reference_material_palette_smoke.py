@@ -7,7 +7,7 @@ import json
 import numpy as np
 
 from reference_colour_fit import REGIONS, fit, region_weights, apply
-from reference_material_palette import fit_palette, apply_palette, validate_palette, SETTINGS
+from reference_material_palette import fit_palette, apply_palette, validate_palette, SETTINGS, _samples
 from colour_space import to_lab, from_lab
 
 
@@ -26,6 +26,26 @@ def weights(labels, name):
 
 
 def main():
+    # Erosion leaves eleven rows and fifteen columns. The final cells have
+    # exactly 75% support; their shared corner has 9/16 and must be rejected.
+    # Cell medians must exclude the eroded pixels while retaining row order.
+    grid = np.arange(15*19*3, dtype=np.float32).reshape(15, 19, 3)/10000
+    sample_lab = grid+np.array([.4, .01, .01], np.float32)
+    sample_rgb = from_lab(sample_lab)
+    owners = np.full((15, 19), 3, np.int32)
+    interior = np.zeros(owners.shape, bool); interior[2:13, 2:17] = True
+    locations = np.array([[x+2, y+2] for y in (2, 6, 10) for x in (2, 6, 10, 14)
+                          if (y, x) != (10, 14)])
+    expected = np.array([np.median(sample_lab[y-2:y+2, x-2:x+2]
+                                  [interior[y-2:y+2, x-2:x+2]], axis=0)
+                         for x, y in locations], float)
+    samples, centres, folds = _samples(sample_rgb, sample_lab, owners,
+        np.ones(owners.shape), np.zeros(owners.shape), [3])
+    assert samples.tobytes() == expected.tobytes()
+    assert np.array_equal(centres, locations) and not folds.any()
+    empty, centres, folds = _samples(sample_rgb, sample_lab, owners,
+        np.zeros(owners.shape), np.zeros(owners.shape), [3])
+    assert empty.shape == (0, 3) and centres.shape == (0, 2) and folds.shape == (0,)
     params = fit([])
     source = solid([.5, .02, .03]); labels = np.ones(source.shape[:2], np.uint8)
     alpha = np.ones(labels.shape, np.float32); w = weights(labels, 'clothing')

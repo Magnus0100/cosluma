@@ -12,7 +12,7 @@ Environment overrides remain available:
 
     $env:COSPLAY_REFERENCE_API_BASE = "https://api.example/v1"
     $env:COSPLAY_REFERENCE_API_KEY = "..."       # never put this in a file
-    $env:COSPLAY_REFERENCE_MODEL = "gpt-image-1"
+    $env:COSPLAY_REFERENCE_MODEL = "gpt-image-2.5-sunburst"
 
 The endpoint can be overridden with ``COSPLAY_REFERENCE_API_URL`` or
 ``--api-url``.  The request is a multipart ``POST /images/edits`` and accepts
@@ -30,10 +30,13 @@ import os
 import secrets
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
+from asset_identity import sha256_file
 from typing import Any, Iterable, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,8 +46,9 @@ import register_reference  # noqa: E402
 import comfyui_adapter  # noqa: E402
 import provider_settings  # noqa: E402
 from raw_support import RGB_DECODE_VERSION, is_raw, open_rgb, _require_rawpy  # noqa: E402
+from installed_resources import resource_path  # noqa: E402
 
-REGISTRY_PATH = Path(getattr(sys, "_MEIPASS", ROOT)) / "providers" / "registry.json"
+REGISTRY_PATH = resource_path('providers/registry.json')
 
 # The registry is also the extension point for non-OpenAI engines.  Keeping
 # this small contract here lets the UI discover and dry-run an adapter without
@@ -93,18 +97,10 @@ def _provider_entry(name: Optional[str], entries: list[dict[str, Any]]) -> dict[
         aliases = {str(entry.get("id", "")).casefold(), str(entry.get("display", "")).casefold()}
         if folded in aliases:
             return entry
-    # Preserve historical labels and arbitrary user-defined providers even if
-    # an old registry file has not yet been updated.
-    if folded in {"ccswitch/sub2api", "ccswitch", "sub2api"}:
-        for entry in entries:
-            if str(entry.get("id", "")).casefold() == "ccswitch_sub2api":
-                return entry
     for entry in entries:
         if str(entry.get("kind", "")).casefold() == folded:
             return entry
-    return {"id": requested, "kind": "openai-compatible", "model": None,
-            "endpoint_env": "COSPLAY_REFERENCE_API_BASE", "key_env": "COSPLAY_REFERENCE_API_KEY",
-            "capabilities": [], "timeout": 180, "retry": {}, "enabled": True}
+    raise ValueError(f"Unknown reference provider: {requested!r}; configure it in providers/registry.json")
 
 
 def provider_registry() -> list[dict[str, Any]]:
@@ -197,11 +193,7 @@ def provider_health(*, provider: Optional[str] = None, api_base: Optional[str] =
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def prepare_condition_inputs(path: Path, image: Path, root: Path,
@@ -276,7 +268,8 @@ def prepare_api_input(image: Path, out_dir: Path, long_edge: int = 2048) -> tupl
     the project's camera-WB/no-auto-bright RGB boundary; only the API JPEG is
     resized. The derivative is an input artifact, never a reference candidate.
     """
-    from PIL import Image, ImageCms
+    from PIL import Image
+    from raw_support import deterministic_srgb_profile
 
     original = {"path": str(image.resolve()), "sha256": sha256(image), "bytes": image.stat().st_size}
     if not is_raw(image):
@@ -298,7 +291,7 @@ def prepare_api_input(image: Path, out_dir: Path, long_edge: int = 2048) -> tupl
     decoded.thumbnail((long_edge, long_edge), Image.Resampling.LANCZOS)
     target = out_dir.resolve() / "inputs" / "provider-input.jpg"
     target.parent.mkdir(parents=True, exist_ok=True)
-    srgb_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    srgb_profile = deterministic_srgb_profile()
     decoded.save(target, format="JPEG", quality=95, subsampling=0, icc_profile=srgb_profile)
     return target, {
         "path": str(target), "sha256": sha256(target), "bytes": target.stat().st_size,
@@ -329,7 +322,7 @@ def endpoint_for(api_base: Optional[str], api_url: Optional[str]) -> str:
     explicit = env_or(api_url, "COSPLAY_REFERENCE_API_URL")
     if explicit:
         return explicit.rstrip("/")
-    base = env_or(api_base, "COSPLAY_REFERENCE_API_BASE", "OPENAI_BASE_URL", default="https://api.openai.com/v1")
+    base = env_or(api_base, "COSPLAY_REFERENCE_API_BASE", default="https://api.openai.com/v1")
     assert base is not None
     return base.rstrip("/") + "/images/edits"
 
@@ -357,7 +350,6 @@ def provider_config(
     endpoint_env_value = entry.get("endpoint_env")
     endpoint_env = str(endpoint_env_value) if endpoint_env_value else None
     key_env = api_key_env or saved.get("secret_env") or str(entry.get("key_env") or "") or None
-    # Explicit legacy variables retain precedence over registry defaults.
     kind = str(entry.get("kind") or "openai-compatible")
     model_env = str(entry.get("model_env") or "") or None
     model_names = [name for name in (model_env,) if name]
@@ -365,8 +357,8 @@ def provider_config(
         model_names.append("COSPLAY_REFERENCE_MODEL")
     default_model = entry.get("model")
     if kind == "comfyui" and entry.get("workflow_resource"):
-        default_model = str(Path(getattr(sys, "_MEIPASS", ROOT)) / entry["workflow_resource"])
-    resolved_model = env_or(model, *model_names, default=saved.get("model") or default_model or (None if kind in {"local", "comfyui"} else "gpt-image-1"))
+        default_model = str(resource_path(entry['workflow_resource']))
+    resolved_model = env_or(model, *model_names, default=saved.get("model") or default_model or (None if kind in {"local", "comfyui"} else "gpt-image-2.5-sunburst"))
     if api_url:
         resolved_url = endpoint_for(api_base, api_url) if kind == "openai-compatible" else str(api_url).rstrip("/")
     elif api_base:
@@ -379,7 +371,7 @@ def provider_config(
     else:
         discovered_base = discovery.get("endpoint") if registry_id == "ccswitch_sub2api" else None
         explicit_url = os.environ.get("COSPLAY_REFERENCE_API_URL")
-        base = env_or(None, *(name for name in (endpoint_env, "COSPLAY_REFERENCE_API_BASE", "OPENAI_BASE_URL") if name),
+        base = env_or(None, *(name for name in (endpoint_env, "COSPLAY_REFERENCE_API_BASE") if name),
                       default=saved.get("endpoint") or discovered_base or "https://api.openai.com/v1")
         resolved_url = explicit_url or str(base).rstrip("/")
         if not explicit_url and not resolved_url.endswith("/images/edits"):
@@ -441,6 +433,36 @@ def multipart_body(image: Path, fields: dict[str, str]) -> tuple[bytes, str]:
     return b"".join(chunks), "multipart/form-data; boundary=" + boundary
 
 
+def error_chain(error: BaseException, key: str = "") -> list[dict[str, Any]]:
+    """Keep nested transport failures readable without logging credentials."""
+    result, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error)
+        if key:
+            message = message.replace(key, "<redacted>")
+        row = {"type": type(error).__name__, "message": message}
+        if getattr(error, "errno", None) is not None:
+            row["errno"] = error.errno
+        result.append(row)
+        reason = getattr(error, "reason", None)
+        error = error.__cause__ or (reason if isinstance(reason, BaseException) else None) or (
+            error.__context__ if not error.__suppress_context__ else None)
+    return result
+
+
+def _write_transport_record(path: Path, record: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf8")
+    temporary.replace(path)
+
+
+def _trace_headers(headers) -> dict[str, str]:
+    # Whitelist diagnostics; never persist cookies, authorization or signed URLs.
+    return {name: headers[name] for name in ('x-request-id', 'request-id', 'x-correlation-id',
+            'date', 'server', 'retry-after') if headers is not None and headers.get(name)}
+
+
 def request_edit(endpoint: str, key: str, image: Path, model: str, prompt: str,
                  size: Optional[str], timeout: float,
                  retry: Optional[dict[str, Any]] = None,
@@ -448,6 +470,7 @@ def request_edit(endpoint: str, key: str, image: Path, model: str, prompt: str,
     fields = {"model": model, "prompt": prompt, "response_format": "b64_json", "n": "1"}
     if size:
         fields["size"] = size
+    started = time.perf_counter()
     body, content_type = multipart_body(image, fields)
     request = urllib.request.Request(
         endpoint,
@@ -464,20 +487,60 @@ def request_edit(endpoint: str, key: str, image: Path, model: str, prompt: str,
     # variant gets one submission; further generation is an explicit user retry.
     # Older saved provider registries must not silently raise that spend limit.
     events = events if events is not None else []
+    events.append({"event": "provider_request", "method": "POST", "endpoint": endpoint,
+                   "model": model, "timeout_seconds": timeout, "request_bytes": len(body),
+                   "request_sha256": hashlib.sha256(body).hexdigest(),
+                   "image_bytes": image.stat().st_size, "image_sha256": sha256(image),
+                   "image_content_type": mimetypes.guess_type(image.name)[0],
+                   "content_type": content_type, "response_format": "b64_json", "n": 1,
+                   "encoding": "multipart_binary", "proxy_types": sorted(urllib.request.getproxies()),
+                   "proxy_bypass": urllib.request.proxy_bypass(urlsplit(endpoint).hostname or ""),
+                   "body_preparation_seconds": time.perf_counter()-started,
+                   "started_at": datetime.now(timezone.utc).isoformat()})
+    phase = "connect_send_wait_headers"
     try:
+        import workflow_timing
+        workflow_timing.annotate(model_request=True, http_request=True,
+            model_submissions=None, http_submissions=1)
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            headers_seconds = time.perf_counter()-started
+            phase = "read_response"
             raw = response.read()
             response_type = response.headers.get_content_type()
-        events.append({"event": "provider_attempt", "attempt": 1, "status": "ok"})
+            status = response.status
+            trace_headers = _trace_headers(response.headers)
+        workflow_timing.annotate(model_submissions=1)
+        events.append({"event": "provider_attempt", "attempt": 1, "status": "ok",
+                       "http_status": status, "headers_seconds": headers_seconds,
+                       "elapsed_seconds": time.perf_counter()-started,
+                       "response_bytes": len(raw), "response_content_type": response_type,
+                       "trace_headers": trace_headers,
+                       "response_sha256": hashlib.sha256(raw).hexdigest()})
     except urllib.error.HTTPError as exc:
-        detail = exc.read(1200).decode("utf-8", errors="replace").replace(key, "<redacted>")
+        read_error = None
+        try:
+            detail = exc.read(1200).decode("utf-8", errors="replace")
+        except (OSError, urllib.error.URLError) as error:
+            read_error = error_chain(error, key)
+            detail = "[error response body unavailable]"
+        if key:
+            detail = detail.replace(key, "<redacted>")
         events.append({"event": "provider_attempt", "attempt": 1, "status": "error",
-                       "http_status": int(exc.code), "retrying": False})
+                       "http_status": int(exc.code), "retrying": False,
+                       "phase": phase, "elapsed_seconds": time.perf_counter()-started,
+                       "error_chain": error_chain(exc, key), "response_detail": detail,
+                       "trace_headers": _trace_headers(exc.headers),
+                       "response_read_error_chain": read_error})
         raise RuntimeError(f"reference provider HTTP {exc.code}: {detail}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", None) or str(exc)
         events.append({"event": "provider_attempt", "attempt": 1, "status": "error",
-                       "error": "connection_or_timeout", "retrying": False})
+                       "error": "connection_or_timeout", "retrying": False,
+                       "phase": phase, "elapsed_seconds": time.perf_counter()-started,
+                       "error_chain": error_chain(exc, key)})
+        reason = str(reason)
+        if key:
+            reason = reason.replace(key, '<redacted>')
         raise RuntimeError(f"reference provider connection failed: {reason}") from exc
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -502,6 +565,7 @@ def request_edit(endpoint: str, key: str, image: Path, model: str, prompt: str,
         try:
             # Do not forward the API key to the returned URL; normal providers
             # return a presigned URL and compatible gateways should do the same.
+            workflow_timing.annotate(http_request=True, http_submissions=2)
             with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "image/*"}), timeout=timeout) as image_response:
                 return payload, image_response.read(), "url"
         except urllib.error.URLError as exc:
@@ -509,14 +573,174 @@ def request_edit(endpoint: str, key: str, image: Path, model: str, prompt: str,
     raise RuntimeError("reference provider data[0] has neither b64_json nor url")
 
 
-def write_candidate(image_bytes: bytes) -> Path:
-    handle = tempfile.NamedTemporaryFile(prefix="cosplay-reference-", suffix=".png", delete=False)
+def write_candidate(image_bytes: bytes, *, directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix="cosplay-reference-", suffix=".png",
+                                         dir=directory, delete=False)
     path = Path(handle.name)
     try:
         handle.write(image_bytes)
     finally:
         handle.close()
     return path
+
+
+QWEN_GRID_GATE_THRESHOLD = 0.02
+
+# The selected image-edit brief already contains source/character/style intent.
+# The transport must not replace it with a previous photo's effect or reject a
+# complete scene request based on prose keywords. Raster checks remain separate.
+QWEN_PROMPT_RECIPE_VERSION = "qwen-edit-verbatim-v2"
+
+
+class QwenPromptError(ValueError):
+    """Raised when no image-edit instruction was provided."""
+
+
+class QwenInputQualityError(RuntimeError):
+    """An invalid image or prompt rejected before any transport or model call."""
+
+    request_submitted = False
+    model_submissions = 0
+    image_generation_submissions = 0
+    http_submissions = 0
+
+    def __init__(self, message: str, *, quality: dict[str, Any] | None = None,
+                 receipt_path: Path | None = None):
+        super().__init__(message)
+        self.quality = quality
+        self.receipt_path = str(receipt_path) if receipt_path is not None else None
+
+
+def qwen_prompt_recipe(prompt: str) -> dict[str, Any]:
+    """Record and send the chosen brief verbatim, including exact retries."""
+    requested = str(prompt or "")
+    if not requested.strip():
+        raise QwenPromptError("local Qwen requires a non-empty edit prompt")
+    return {
+        "schema": "qwen_prompt_recipe.v1",
+        "version": QWEN_PROMPT_RECIPE_VERSION,
+        "mode": "verbatim_image_edit",
+        "requested_prompt": requested,
+        "effective_prompt": requested,
+        "transformed": False,
+    }
+
+
+def qwen_quality_gate(image_path: Path, *, content_sha256: str | None = None,
+                      context: str = "generated_output") -> dict[str, Any]:
+    """Reject only corroborated periodic detail in a generated output.
+
+    Real fabrics and architectural detail can exceed the same correlation
+    threshold as a generated lattice. Input scores remain useful diagnostics,
+    but cannot identify a model artifact or justify blocking a readable source.
+    """
+    if context not in {"source_input", "generated_output"}:
+        raise ValueError("Qwen quality context must be source_input or generated_output")
+    grid_policy = "diagnostic_only" if context == "source_input" else "reject_corroborated_periodic_grid"
+    from PIL import Image
+    from qwen_grid_diagnostic import grid_metrics, periodic_grid_evidence
+    try:
+        metrics = grid_metrics(image_path, content_sha256=content_sha256)
+    except (OSError, Image.DecompressionBombError, ValueError, TypeError, OverflowError) as error:
+        # A truncated or non-image ComfyUI response used to escape this gate
+        # as an exception before a quality-rejection receipt was written.  It
+        # is still a failed candidate, but represent it as a normal gate
+        # result so the caller can persist a readable diagnostic and continue
+        # with the next independent task.  Never report a caller-supplied
+        # digest as if the bytes were decoded successfully.
+        try:
+            failed_path = Path(image_path).expanduser().resolve()
+            failed_bytes = failed_path.stat().st_size
+        except OSError:
+            failed_path = Path(image_path).expanduser()
+            failed_bytes = None
+        return {
+            "schema": "qwen_grid_quality_gate.v1",
+            "context": context,
+            "grid_policy": grid_policy,
+            "decodable": False,
+            "grid_detected": None,
+            "threshold_exceeded": None,
+            "review_recommended": False,
+            "threshold": QWEN_GRID_GATE_THRESHOLD,
+            "diag_peak_lag_4_16": None,
+            "metrics": {
+                "path": str(failed_path),
+                "bytes": failed_bytes,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+            "reason": "unreadable_image",
+            "passed": False,
+        }
+    peak = float(metrics.get("diag_peak_lag_4_16", 0.0))
+    threshold_exceeded = peak > QWEN_GRID_GATE_THRESHOLD
+    periodicity = periodic_grid_evidence(metrics, threshold=QWEN_GRID_GATE_THRESHOLD)
+    grid_detected = periodicity["corroborated"]
+    rejected = context == "generated_output" and grid_detected
+    return {
+        "schema": "qwen_grid_quality_gate.v1",
+        "context": context,
+        "grid_policy": grid_policy,
+        "decodable": True,
+        "grid_detected": grid_detected,
+        "threshold_exceeded": threshold_exceeded,
+        "periodicity": periodicity,
+        "review_recommended": threshold_exceeded and not grid_detected,
+        "diagnostic_reason": "uncorroborated_diagonal_correlation" if threshold_exceeded and not grid_detected else None,
+        "threshold": QWEN_GRID_GATE_THRESHOLD,
+        "diag_peak_lag_4_16": peak,
+        "metrics": metrics,
+        "reason": "diagonal_grid" if rejected else None,
+        "passed": not rejected,
+    }
+
+
+def _qwen_quality_failure_detail(quality: dict[str, Any]) -> str:
+    """Format a gate failure without assuming a decoded raster exists."""
+    peak = quality.get("diag_peak_lag_4_16")
+    if isinstance(peak, (int, float)):
+        return (f"diagonal grid score {float(peak):.6f} "
+                f"> {float(quality['threshold']):.6f}")
+    reason = str(quality.get("reason") or "quality_gate_failed")
+    error = (quality.get("metrics") or {}).get("error")
+    return f"{reason}: {error}" if error else reason
+
+
+def register_returned_candidate(*, root: Path, image_path: Path, sample: str,
+                                out_dir: Path, source: Path, model: str, provider: str,
+                                prompt: str, provider_contract: dict[str, Any],
+                                generation_id: str | None = None,
+                                execution_strategy: str = "layered_reference_transfer",
+                                preserve_alpha: bool = False, asset_role: str = "design_reference",
+                                force: bool = False) -> dict[str, Any]:
+    """Use the normal reference registrar for one authenticated returned raster."""
+    output_sha256 = (provider_contract.get("response") or {}).get("output_sha256")
+    if not output_sha256 or sha256(image_path) != output_sha256:
+        raise ValueError("Returned output changed before candidate registration")
+    register_args = ["--root", str(root), "--image", str(image_path), "--sample", sample,
+        "--out-dir", str(out_dir), "--model", model, "--provider", provider,
+        "--prompt", prompt, "--source", str(source), "--asset-role", asset_role]
+    if generation_id:
+        register_args += ["--generation-id", generation_id]
+    if force:
+        register_args.append("--force")
+    if preserve_alpha:
+        register_args.append("--preserve-alpha")
+    code = int(register_reference.main(register_args) or 0)
+    provenance_path = out_dir.resolve() / f"{sample}.provenance.json"
+    candidate_path = out_dir.resolve() / f"{sample}.png"
+    if code or not provenance_path.is_file() or not candidate_path.is_file():
+        raise RuntimeError("Returned image did not reach candidate registration")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["execution_strategy"] = execution_strategy
+    provenance["provider_contract"] = provider_contract
+    _write_transport_record(provenance_path, provenance)
+    return {"code": code, "candidate_path": str(candidate_path),
+            "provenance_path": str(provenance_path)}
+
+
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -527,6 +751,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--inputs-json", type=Path, help="ordered, SHA-bound Qwen condition images")
     parser.add_argument("--preserve-alpha", action="store_true", help="retain actual generated alpha")
     parser.add_argument("--asset-role", choices=("design_reference", "effect_layer"), default="design_reference")
+    parser.add_argument("--execution-strategy", choices=("layered_reference_transfer",),
+                        default="layered_reference_transfer",
+                        help="explicit downstream appearance contract for this candidate")
     parser.add_argument("--sample", help="sample ID for the reference candidate")
     parser.add_argument("--prompt", help="exact generation prompt")
     parser.add_argument("--root", type=Path, default=ROOT)
@@ -603,6 +830,40 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         raise RuntimeError(f"provider kind {config.get('kind')} has no image generation endpoint")
     if config.get("kind") == "comfyui" and not config.get("workflow_configured"):
         raise RuntimeError("missing_workflow: set --model or COSPLAY_COMFYUI_WORKFLOW to an API workflow JSON file")
+    requested_prompt = str(args.prompt)
+    prompt_recipe: dict[str, Any] | None = None
+    if (config.get("kind") == "comfyui"
+            and config.get("registry_id", "").startswith("qwen_image")):
+        try:
+            prompt_recipe = qwen_prompt_recipe(requested_prompt)
+        except QwenPromptError as error:
+            # Record an empty instruction before upload or generation.
+            requested_out_dir = args.out_dir or Path("outputs/runs") / (
+                "provider-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f") + "/reference")
+            rejected_dir = requested_out_dir if requested_out_dir.is_absolute() else root / requested_out_dir
+            rejected_dir.mkdir(parents=True, exist_ok=True)
+            rejection_path = rejected_dir.resolve() / (args.sample + ".qwen-prompt-rejection.json")
+            rejection = {
+                "schema": "qwen_prompt_rejection.v1",
+                "state": "rejected_prompt",
+                "reason": "empty_edit_prompt",
+                "provider": config["registry_id"],
+                "model": model,
+                "requested_prompt": requested_prompt,
+                "recipe_version": QWEN_PROMPT_RECIPE_VERSION,
+                "image_generation_submissions": 0,
+                "request_submitted": False,
+                "model_submissions": 0,
+                "http_submissions": 0,
+                "error_type": "QwenInputQualityError",
+                "candidate_registered": False,
+                "error": str(error),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            rejection_path.write_text(json.dumps(rejection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            raise QwenInputQualityError(str(error) + "; receipt=" + str(rejection_path),
+                                        receipt_path=rejection_path) from error
+        args.prompt = str(prompt_recipe["effective_prompt"])
     requested_out_dir = args.out_dir or Path("outputs/runs") / ("provider-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")) / "reference"
     out_dir = requested_out_dir if requested_out_dir.is_absolute() else root / requested_out_dir
     if not args.force and any((out_dir / (args.sample + suffix)).exists()
@@ -612,7 +873,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     source = source.resolve() if source.is_absolute() else (root / source).resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
-    api_image, api_input = prepare_api_input(image, out_dir)
+    # Local 2K editing must receive enough source pixels for its portrait and
+    # landscape canvases. Keep the remote transport's existing upload bound.
+    input_edge = 4096 if config.get('kind') == 'comfyui' and config.get('registry_id', '').startswith('qwen_image') else 2048
+    api_image, api_input = prepare_api_input(image, out_dir, long_edge=input_edge)
+    source_sha256 = sha256(source)
     conditions = None
     if args.inputs_json:
         if config.get("kind") != "comfyui":
@@ -626,95 +891,205 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.asset_role == "effect_layer" and not args.preserve_alpha:
         raise ValueError("effect_layer requires explicit --preserve-alpha")
     transport_events: list[dict[str, Any]] = []
-    try:
-        if config.get("kind") == "comfyui":
-            if config["registry_id"] in {"qwen_image_2_1", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast"}:
-                from start_qwen_image import ensure_running
-                ensure_running(config["registry_id"], str(endpoint))
-            extra = {"condition_inputs": [{**row, "path": row["api_input"]["path"],
-                     "sha256": row["api_input"]["sha256"]} for row in conditions]} if conditions is not None else {}
-            payload, output_bytes, response_mode = comfyui_adapter.request_generation(
-                str(endpoint), api_image, Path(config["workflow_path"]), args.prompt, timeout, transport_events, key=key, **extra)
-        else:
-            payload, output_bytes, response_mode = request_edit(
-                str(endpoint), key, api_image, model, args.prompt, args.size, timeout,
-                retry=config.get("retry"), events=transport_events)
-    except Exception as error:
-        # Preserve a successful submission even when the service crashes before
-        # /view. This diagnostic never grants an image retry or acceptance.
-        out_dir.mkdir(parents=True, exist_ok=True)
-        failure = {"schema": "reference_transport_failure.v1", "error_type": type(error).__name__,
-                   "provider": config['registry_id'], "endpoint": endpoint,
-                   "api_input": api_input, "condition_inputs": conditions,
-                   "events": transport_events, "automatic_retry": False,
-                   "candidate_registered": False,
-                   "recorded_at": datetime.now(timezone.utc).isoformat()}
-        failure_path = out_dir / (args.sample + '.transport-failure.json')
-        with failure_path.open('x', encoding='utf8') as stream:
-            json.dump(failure, stream, ensure_ascii=False, indent=2)
-        raise
+    out_dir.mkdir(parents=True, exist_ok=True)
+    attempt_path = out_dir / (args.sample + '.transport-' +
+        datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f') + '.json')
+    attempt = {"schema": "reference_transport_attempt.v1", "state": "pending",
+               "provider": config['registry_id'], "endpoint": endpoint,
+               "request": {"method": "POST", "model": model, "prompt": args.prompt,
+                           "requested_prompt": requested_prompt,
+                           "prompt_recipe": prompt_recipe,
+                           "size": args.size, "timeout_seconds": timeout},
+               "source": {"path": str(source), "sha256": source_sha256},
+               "api_input": api_input, "condition_inputs": conditions,
+               "events": transport_events, "automatic_retry": False,
+               "candidate_registered": False,
+               "recorded_at": datetime.now(timezone.utc).isoformat()}
+    _write_transport_record(attempt_path, attempt)
+
+    # Input periodicity is diagnostic: real clothing or scene texture cannot
+    # be classified as a generated artifact by an absolute score. Reject only
+    # an unreadable input before starting ComfyUI, uploading, or submitting.
+    if (config.get("kind") == "comfyui"
+            and config.get("registry_id", "").startswith("qwen_image")):
+        input_quality = qwen_quality_gate(api_image, content_sha256=api_input.get("sha256"),
+                                         context="source_input")
+        attempt["input_quality"] = input_quality
+        if not input_quality["passed"]:
+            rejection = {
+                "schema": "reference_input_quality_rejection.v1",
+                "state": "rejected_input_quality",
+                "reason": input_quality["reason"],
+                "error_type": "QwenInputQualityError",
+                "provider": config["registry_id"],
+                "model": model,
+                "source": {"path": str(source), "sha256": source_sha256},
+                "api_input": api_input,
+                "input_quality": input_quality,
+                "candidate_registered": False,
+                "image_generation_submissions": 0,
+                "request_submitted": False,
+                "model_submissions": 0,
+                "http_submissions": 0,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            rejection_path = out_dir.resolve() / (args.sample + ".input-quality-rejection.json")
+            rejection_path.write_text(json.dumps(rejection, ensure_ascii=False, indent=2) + "\n",
+                                      encoding="utf-8")
+            attempt.update(state="rejected_input_quality",
+                           candidate_registered=False,
+                           request_submitted=False, model_submissions=0,
+                           image_generation_submissions=0, http_submissions=0,
+                           input_quality_rejection_path=str(rejection_path))
+            _write_transport_record(attempt_path, attempt)
+            raise QwenInputQualityError(
+                "local Qwen input rejected before model submission: "
+                + _qwen_quality_failure_detail(input_quality),
+                quality=input_quality, receipt_path=rejection_path)
+        _write_transport_record(attempt_path, attempt)
+
+    import workflow_timing
+    with workflow_timing.span('provider_transport', model_request=False, http_request=False,
+                              model_submissions=0, http_submissions=0):
+        transport_started = time.perf_counter()
+        try:
+            if config.get("kind") == "comfyui":
+                if config["registry_id"] in {"qwen_image_2_1", "qwen_image_2_1_uncensored", "qwen_image_2_1_fast", "qwen_image_2_1_uncensored_fast"}:
+                    from start_qwen_image import ensure_running
+                    ensure_running(config["registry_id"], str(endpoint))
+                extra = {"condition_inputs": [{**row, "path": row["api_input"]["path"],
+                         "sha256": row["api_input"]["sha256"]} for row in conditions]} if conditions is not None else {}
+                payload, output_bytes, response_mode = comfyui_adapter.request_generation(
+                    str(endpoint), api_image, Path(config["workflow_path"]), args.prompt, timeout, transport_events, key=key, **extra)
+            else:
+                payload, output_bytes, response_mode = request_edit(
+                    str(endpoint), key, api_image, model, args.prompt, args.size, timeout,
+                    retry=config.get("retry"), events=transport_events)
+        except Exception as error:
+            # Preserve a successful submission even when the service crashes before
+            # /view. This diagnostic never grants an image retry or acceptance.
+            out_dir.mkdir(parents=True, exist_ok=True)
+            failure = {"schema": "reference_transport_failure.v1", "error_type": type(error).__name__,
+                       "provider": config['registry_id'], "endpoint": endpoint,
+                       "api_input": api_input, "condition_inputs": conditions,
+                       "events": transport_events, "automatic_retry": False,
+                       "candidate_registered": False,
+                       "error_chain": error_chain(error, key),
+                       "elapsed_seconds": time.perf_counter()-transport_started,
+                       "attempt_path": str(attempt_path), "request": attempt['request'],
+                       "recorded_at": datetime.now(timezone.utc).isoformat()}
+            failure_path = out_dir / (args.sample + '.transport-failure.json')
+            attempt.update(failure, schema='reference_transport_attempt.v1', state='failed')
+            _write_transport_record(attempt_path, attempt)
+            # A previous diagnostic is not a candidate or a submission lock. Keep
+            # its history and never let FileExistsError mask the actual request error.
+            if failure_path.exists():
+                failure_path.replace(attempt_path.with_suffix('.previous-failure.json'))
+            _write_transport_record(failure_path, failure)
+            raise
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    generated_model = str((payload.get("comfyui") or {}).get("model_name") or model)
+    attempt.update(state='response_received', elapsed_seconds=time.perf_counter()-transport_started,
+                   response={"id": payload.get('id'), "created": payload.get('created'),
+                             "mode": response_mode, "image_bytes": len(output_bytes),
+                             "output_sha256": output_sha256, "generated_model": generated_model})
+    _write_transport_record(attempt_path, attempt)
     if not output_bytes:
         raise RuntimeError("reference provider returned an empty image")
     for row in conditions or []:
         if sha256(Path(row["api_input"]["path"])) != row["input_sha256"]:
             raise ValueError("Condition image changed during generation; candidate not registered")
-    temporary = write_candidate(output_bytes)
-    generated_model = str((payload.get("comfyui") or {}).get("model_name") or model)
+    temporary = write_candidate(output_bytes, directory=out_dir)
+    quality = None
     try:
-        register_args = [
-            "--root", str(root), "--image", str(temporary), "--sample", args.sample,
-            "--out-dir", str(out_dir), "--model", generated_model, "--provider", provider,
-            "--prompt", args.prompt, "--source", str(source),
-        ]
-        generation_id = payload.get("id") if config.get("kind") == "comfyui" else (args.generation_id or payload.get("id"))
-        if generation_id:
-            register_args += ["--generation-id", str(generation_id)]
-        if args.force:
-            register_args.append("--force")
-        if args.preserve_alpha:
-            register_args.append("--preserve-alpha")
-        register_args += ["--asset-role", args.asset_role]
-        code = register_reference.main(register_args)
-        provenance_path = out_dir.resolve() / f"{args.sample}.provenance.json"
-        if provenance_path.is_file():
-            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-            provenance["provider_contract"] = {
-                "schema_version": "1.0",
-                "protocol": config.get("protocol") or "openai-compatible",
-                "endpoint": endpoint,
-                "response_mode": response_mode,
-                "request": {
+        # Qwen's current local checkpoints can emit a strong diagonal lattice
+        # over faces and fabrics.  Do not register that raster as a usable
+        # reference: preserve it as an explicitly rejected staging artifact so
+        # the failure remains inspectable without contaminating a run.
+        if config.get("kind") == "comfyui" and config.get("registry_id", "").startswith("qwen_image"):
+            quality = qwen_quality_gate(temporary, content_sha256=output_sha256)
+            attempt["quality"] = quality
+            if not quality["passed"]:
+                rejected_path = out_dir.resolve() / (
+                    args.sample + ".quality-rejected-" +
+                    datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f') + ".png")
+                rejected_path.write_bytes(output_bytes)
+                rejection = {
+                    "schema": "reference_quality_rejection.v1",
+                    "state": "rejected_quality",
+                    "reason": "qwen_diagonal_grid_artifact",
+                    "provider": config["registry_id"],
                     "model": generated_model,
-                    "prompt": args.prompt,
-                    "size": args.size,
-                    "input_sha256": api_input["sha256"],
-                    "api_input": api_input,
-                },
-                "response": {
-                    "id": payload.get("id"),
-                    "created": payload.get("created"),
-                    "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
-                },
-                "transport": {
-                    "timeout_seconds": timeout,
-                    "retry": config.get("retry") or {},
-                    "events": transport_events,
-                },
-                "policy": {
-                    "manual_final_required": True,
-                    "dataset_lock_unchanged": True,
-                    "human_confirmation_required": True,
-                },
-                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-            if payload.get("comfyui"):
-                provenance["provider_contract"]["comfyui"] = payload["comfyui"]
-            if conditions is not None:
-                request = provenance["provider_contract"]["request"]
-                request["condition_inputs"] = conditions
-                request["edit_mask"] = next((row for row in conditions if row["role"] == "edit_mask"), None)
-            provenance_path.write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return int(code or 0)
+                    "source": {"path": str(source), "sha256": sha256(source)},
+                    "output_sha256": output_sha256,
+                    "rejected_path": str(rejected_path),
+                    "quality": quality,
+                    "candidate_registered": False,
+                    "image_generation_submissions": 1,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                rejection_path = out_dir.resolve() / (args.sample + ".quality-rejection.json")
+                rejection_path.write_text(json.dumps(rejection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                attempt.update(state="rejected_quality", candidate_registered=False,
+                               quality_rejection_path=str(rejection_path), quality=quality,
+                               quality_rejection_sha256=sha256(rejection_path),
+                               rejected_path=str(rejected_path))
+                _write_transport_record(attempt_path, attempt)
+                raise RuntimeError(
+                    "local Qwen output rejected before reference registration: "
+                    + _qwen_quality_failure_detail(quality))
+        provider_contract = {
+            "schema_version": "1.0",
+            "protocol": config.get("protocol") or "openai-compatible",
+            "endpoint": endpoint,
+            "response_mode": response_mode,
+            "request": {
+                "model": generated_model,
+                "prompt": args.prompt,
+                "requested_prompt": requested_prompt,
+                "prompt_recipe": prompt_recipe,
+                "size": args.size,
+                "input_sha256": api_input["sha256"],
+                "api_input": api_input,
+            },
+            "response": {
+                "id": payload.get("id"),
+                "created": payload.get("created"),
+                "output_sha256": output_sha256,
+            },
+            "transport": {
+                "timeout_seconds": timeout,
+                "retry": config.get("retry") or {},
+                "events": transport_events,
+            },
+            "policy": {
+                "manual_final_required": True,
+                "dataset_lock_unchanged": True,
+                "human_confirmation_required": True,
+            },
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if payload.get("comfyui"):
+            provider_contract["comfyui"] = payload["comfyui"]
+        if quality is not None:
+            provider_contract["quality"] = quality
+        if conditions is not None:
+            provider_contract["request"].update(condition_inputs=conditions,
+                edit_mask=next((row for row in conditions if row["role"] == "edit_mask"), None))
+        generation_id = payload.get("id") if config.get("kind") == "comfyui" else (args.generation_id or payload.get("id"))
+        registered = register_returned_candidate(root=root, image_path=temporary, sample=args.sample,
+            out_dir=out_dir, source=source, model=generated_model, provider=provider,
+            prompt=args.prompt, provider_contract=provider_contract, generation_id=generation_id,
+            execution_strategy=args.execution_strategy, preserve_alpha=args.preserve_alpha,
+            asset_role=args.asset_role, force=args.force)
+        attempt.update(state='registered', candidate_registered=True,
+                       candidate_path=registered["candidate_path"],
+                       provenance_path=registered["provenance_path"])
+        _write_transport_record(attempt_path, attempt)
+        failure_path = out_dir / (args.sample + '.transport-failure.json')
+        if failure_path.exists():
+            failure_path.replace(attempt_path.with_suffix('.previous-failure.json'))
+        return registered["code"]
     finally:
         try:
             temporary.unlink()

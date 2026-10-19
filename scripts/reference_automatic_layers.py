@@ -13,7 +13,8 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from reference_colour_fit import REGIONS
+from reference_colour_fit import REGIONS, SKIN
+from asset_identity import sha256_file
 
 POLICY = 'automatic_local_reference_fields.v1'
 CONFIG = {'lowpass_region_fraction': 1/24, 'minimum_lowpass_support': .1,
@@ -21,11 +22,12 @@ CONFIG = {'lowpass_region_fraction': 1/24, 'minimum_lowpass_support': .1,
           'minimum_region_pixels': 24, 'background_ring_fraction': [.006, .04],
           'observation_filter_iterations': 3, 'observation_edge_scale_floor': .012,
           'observation_edge_scale_ceiling': .06, 'observation_edge_cutoff_sigmas': 3.}
+QUALIFIED_FACE_CORE = .99
+_NUMBA_DOMAIN_SCAN = None
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 CORRESPONDENCE_RECORD = 'automatic_local_correspondence_record.v2'
@@ -186,17 +188,62 @@ def lowpass(values, mask):
         spatial_sigma=sigma*np.sqrt(3)*2**(iterations-iteration-1)/np.sqrt(4**iterations-1)
         wh=np.exp(-np.sqrt(2)*horizontal/spatial_sigma)*same_h
         wv=np.exp(-np.sqrt(2)*vertical/spatial_sigma)*same_v
-        for x in range(1,signal.shape[1]):
-            signal[:,x]+=wh[:,x-1,None]*(signal[:,x-1]-signal[:,x])
-        for x in range(signal.shape[1]-2,-1,-1):
-            signal[:,x]+=wh[:,x,None]*(signal[:,x+1]-signal[:,x])
-        for y in range(1,signal.shape[0]):
-            signal[y]+=wv[y-1,:,None]*(signal[y-1]-signal[y])
-        for y in range(signal.shape[0]-2,-1,-1):
-            signal[y]+=wv[y,:,None]*(signal[y+1]-signal[y])
+        _domain_transform_scan(signal, wh, wv)
     support[crop]=signal[...,-1]
     result[crop]=signal[...,:-1]/np.maximum(signal[...,-1,None],1e-6)
     return result,support,sigma
+
+
+def _domain_transform_scan(signal, horizontal, vertical):
+    """Run one recursive domain-transform pass in compiled native loops.
+
+    The recurrence is intentionally not replaced with a Gaussian: each scan
+    depends on its preceding pixel and must stop at semantic/OKLab edges.
+    Numba parallelizes the independent rows/columns while preserving the
+    four directional passes and float32 working buffer.  Desktop runtimes
+    without Numba retain the exact reference recurrence as a fallback.
+    """
+    global _NUMBA_DOMAIN_SCAN
+    if _NUMBA_DOMAIN_SCAN is None:
+        try:
+            from numba import njit, prange
+        except ImportError:
+            _NUMBA_DOMAIN_SCAN = False
+        else:
+            @njit(parallel=True, nogil=True, cache=False)
+            def scan(values, wh, wv):
+                height, width, channels = values.shape
+                for y in prange(height):
+                    for x in range(1, width):
+                        weight = wh[y, x-1]
+                        for channel in range(channels):
+                            values[y, x, channel] += weight*(values[y, x-1, channel]-values[y, x, channel])
+                    for x in range(width-2, -1, -1):
+                        weight = wh[y, x]
+                        for channel in range(channels):
+                            values[y, x, channel] += weight*(values[y, x+1, channel]-values[y, x, channel])
+                for x in prange(width):
+                    for y in range(1, height):
+                        weight = wv[y-1, x]
+                        for channel in range(channels):
+                            values[y, x, channel] += weight*(values[y-1, x, channel]-values[y, x, channel])
+                    for y in range(height-2, -1, -1):
+                        weight = wv[y, x]
+                        for channel in range(channels):
+                            values[y, x, channel] += weight*(values[y+1, x, channel]-values[y, x, channel])
+            _NUMBA_DOMAIN_SCAN = scan
+    if _NUMBA_DOMAIN_SCAN is False:
+        for x in range(1, signal.shape[1]):
+            signal[:,x]+=horizontal[:,x-1,None]*(signal[:,x-1]-signal[:,x])
+        for x in range(signal.shape[1]-2,-1,-1):
+            signal[:,x]+=horizontal[:,x,None]*(signal[:,x+1]-signal[:,x])
+        for y in range(1,signal.shape[0]):
+            signal[y]+=vertical[y-1,:,None]*(signal[y-1]-signal[y])
+        for y in range(signal.shape[0]-2,-1,-1):
+            signal[y]+=vertical[y,:,None]*(signal[y+1]-signal[y])
+        return signal
+    _NUMBA_DOMAIN_SCAN(signal, horizontal, vertical)
+    return signal
 
 
 def _observations(source_lab, reference_lab, sl, rl, alpha, maps, ids, excluded=None):
@@ -206,6 +253,13 @@ def _observations(source_lab, reference_lab, sl, rl, alpha, maps, ids, excluded=
     ss=np.zeros(sl.shape,np.float32);target_support=np.zeros(sl.shape,np.float32)
     mapped_labels=sample_reference(rl,maps,nearest=True).astype(np.int32)
     owner_scales={}
+    compatible=mapped_labels==sl
+    c = maps['confidence']*maps['valid']*sm*compatible
+    # Filtering cannot create missing same-person correspondence. Unsupported
+    # regions are rejected by both consumers before observing the arrays or
+    # their scale details, so avoid their two independent material filters.
+    if not np.any(c):
+        return sm,source_low,target,c,{}
     # A report group can include several material owners. Filtering the union
     # before enforcing ownership would contaminate a neighbour's observation.
     for owner in ids:
@@ -220,8 +274,6 @@ def _observations(source_lab, reference_lab, sl, rl, alpha, maps, ids, excluded=
         source_low[source_owner]=current[source_owner];ss[source_owner]=support[source_owner]
         target[source_owner]=sampled[source_owner];target_support[source_owner]=sampled_support[source_owner]
         owner_scales[str(owner)]={'source_sigma':sigma,'reference_sigma':ref_sigma}
-    compatible=mapped_labels==sl
-    c = maps['confidence']*maps['valid']*sm*compatible
     c *= (ss >= CONFIG['minimum_lowpass_support'])&(target_support >= CONFIG['minimum_lowpass_support'])
     return sm,source_low,target,c,{'material_owner_scales':owner_scales,
         'preblur_ownership':'each_exact_semantic_owner; no_region_union_filtering',
@@ -240,26 +292,54 @@ def _geometry(record, name, mask, confidence):
             'local_observation': record.get('regions',{}).get(name,{})}
 
 
+def _hair_face_core(support, labels):
+    if support is None:
+        return None
+    support = np.asarray(support)
+    if (support.shape != labels.shape or not np.isfinite(support).all()
+            or support.min() < 0 or support.max() > 1):
+        raise ValueError('Hair observation veto requires source-coordinate visible-face support')
+    return (support >= QUALIFIED_FACE_CORE) & np.isin(labels, REGIONS['hair'])
+
+
+def _hair_veto_report(core):
+    return {'fully_qualified_core_threshold':QUALIFIED_FACE_CORE,
+        'blocked_observation_and_solver_pixels':int(core.sum()) if core is not None else 0,
+        'saved_semantic_labels_changed':False,'soft_dose_consumption':'once_after_coordinate_sampling'}
+
+
 def colour_field(source_lab,reference_lab,source_labels,reference_labels,alpha,maps,record,
-                 *,excluded=None):
+                 *,excluded=None,visible_face_support=None,preserve_hair=False,
+                 allow_relaxed_continuation=False):
     from reference_adaptive_fusion import solve_field
     field = np.zeros((*source_labels.shape,3),np.float32)
     reports = {}
+    face_core = _hair_face_core(visible_face_support, source_labels)
     regions = {**REGIONS,'lips':[24,25]}
     for name,ids in regions.items():
+        if name == 'hair' and preserve_hair:
+            reports[name] = {'status':'source_hair_preserved','source_hair_preserved':True,
+                'eligible_pixels':0,'observed_pixels':0,'maximum_applied_chroma_shift':0.,
+                'reference_colour_mode':'source_preserved_no_dedicated_hair_field'}
+            continue
+        blocked = face_core if name == 'hair' else None
+        observation_excluded = excluded if blocked is None else blocked if excluded is None else excluded | blocked
         sm,current,target,c,scales = _observations(source_lab,reference_lab,source_labels,
-            reference_labels,alpha,maps,ids,excluded)
+            reference_labels,alpha,maps,ids,observation_excluded)
         geometry = _geometry(record,name,sm,c)
         if int(sm.sum()) < CONFIG['minimum_region_pixels'] or not np.any(c):
             reports[name] = {'eligible_pixels':0,'rejected':geometry['reason'],
                              'correspondence_support':geometry}
+            if name == 'hair': reports[name]['visible_face_veto'] = _hair_veto_report(blocked)
             continue
         # Labels still partition black/white and feature boundaries through
         # the original guide; excluded features are distinct solver domains.
         labels = source_labels.astype(np.int32).copy()
         if excluded is not None: labels[excluded] = 1000
+        if blocked is not None: labels[blocked] = 1001
         delta,solved = solve_field(target[...,1:]-current[...,1:],c,labels,source_lab,
-                                  maximum_norm=CONFIG['maximum_colour_delta'])
+                                  maximum_norm=CONFIG['maximum_colour_delta'],continuation_domain=sm,
+                                  allow_relaxed_continuation=allow_relaxed_continuation)
         delta[~sm] = 0
         field[...,:2] += delta
         active = np.linalg.norm(delta,axis=-1)>0
@@ -269,6 +349,8 @@ def colour_field(source_lab,reference_lab,source_labels,reference_labels,alpha,m
             'maximum_applied_chroma_shift':float(np.linalg.norm(delta,axis=-1).max()),
             'reference_colour_mode':'local_correspondence_multiscale_evidence_solve',
             'source_lightness_retained':True,'automatic_solver':solved}
+        if name == 'hair':
+            reports[name]['visible_face_veto'] = _hair_veto_report(blocked)
     # Regions are disjoint source labels, so there is no dose stacking.
     if np.linalg.norm(field[...,:2],axis=-1).max() > CONFIG['maximum_colour_delta']+1e-6:
         raise ValueError('Automatic material colour fields exceeded their shared budget')
@@ -297,26 +379,43 @@ def background_relation(source_lab,reference_lab,source_labels,reference_labels,
 
 
 def scene_field(source_lab,reference_lab,source_labels,reference_labels,alpha,protection,
-                maps,record):
+                maps,record,*,visible_face_support=None,physical_domains=None,preserve_hair=False,
+                allow_relaxed_continuation=False):
     from reference_adaptive_fusion import solve_field
     from reference_scene_balance import REGION_LIMITS
     field=np.zeros((*source_labels.shape,4),np.float32);reports={}
+    joint_observations={}
+    face_core = _hair_face_core(visible_face_support, source_labels)
     offset,background=background_relation(source_lab,reference_lab,source_labels,reference_labels,alpha)
     for name,ids in REGIONS.items():
         if name in {'bag','shoes'}: continue
+        if name == 'hair' and preserve_hair:
+            reports['head_hair'] = {'status':'source_hair_preserved','source_hair_preserved':True,
+                'eligible_pixels':0,'observed_pixels':0,'spatial_colour_dose':0.,'lightness_dose':0.,
+                'reference_mode':'source_preserved_no_dedicated_hair_field'}
+            continue
+        blocked = face_core if name == 'hair' else None
         sm,current,target,c,scales=_observations(source_lab,reference_lab,source_labels,
-            reference_labels,alpha,maps,ids)
+            reference_labels,alpha,maps,ids,blocked)
         geometry=_geometry(record,name,sm,c)
+        if physical_domains is not None and name in {'left_hand','right_hand','left_arm','right_arm'} and np.any(c):
+            joint_observations[name]=(sm,c,3*np.log2(np.maximum(target[...,0],.03)/np.maximum(current[...,0],.03))+offset)
         key='head_hair' if name=='hair' else name
         if int(sm.sum()) < CONFIG['minimum_region_pixels'] or not np.any(c):
             reports[key]={'eligible_pixels':0,'rejected':geometry['reason'],
                           'correspondence_support':geometry,'spatial_colour_dose':0.,'lightness_dose':0.}
+            if name == 'hair': reports[key]['visible_face_veto'] = _hair_veto_report(blocked)
             continue
         desired=3*np.log2(np.maximum(target[...,0],.03)/np.maximum(current[...,0],.03))+offset
         limits=REGION_LIMITS['hair' if name=='hair' else 'clothing' if name=='clothing' else 'skin']
         dose=c.copy()
-        ev,solved=solve_field(desired,dose,source_labels,source_lab,
-            maximum_norm=max(abs(x) for x in limits),minimum_value=limits[0],maximum_value=limits[1])
+        solver_labels=source_labels
+        if blocked is not None:
+            solver_labels=source_labels.astype(np.int32).copy()
+            solver_labels[blocked]=1001
+        ev,solved=solve_field(desired,dose,solver_labels,source_lab,
+            maximum_norm=max(abs(x) for x in limits),minimum_value=limits[0],maximum_value=limits[1],
+            continuation_domain=sm, allow_relaxed_continuation=allow_relaxed_continuation)
         if name not in {'hair','clothing'}: ev *= 1-.85*protection
         ev[~sm]=0
         # After colour fusion, S changes appearance lightness once. The palette
@@ -330,4 +429,65 @@ def scene_field(source_lab,reference_lab,source_labels,reference_labels,alpha,pr
             'protected_skin_L_dose':.15 if name not in {'hair','clothing'} else None,
             'reference_mode':'local_reference_lightness_and_observed_background_relationship',
             'automatic_solver':solved}
+        if name == 'hair':
+            reports[key]['visible_face_veto'] = _hair_veto_report(blocked)
+    if physical_domains is not None:
+        from source_skin_domains import POLICY as physical_policy,reference_evidence
+        owners=physical_domains['owners'];guide=physical_domains['source_lab']
+        if (owners.shape!=source_labels.shape or not np.issubdtype(owners.dtype,np.integer)
+                or guide.shape!=source_lab.shape or not np.isfinite(guide).all()
+                or physical_domains['report'].get('policy')!=physical_policy):
+            raise ValueError('Scene physical continuation requires its original-source fine domains')
+        joined=[]
+        for group in physical_domains['groups']:
+            domain=owners==group['owner']
+            confidence=np.zeros(source_labels.shape,np.float32)
+            desired=np.zeros(source_labels.shape,np.float32)
+            for sm,c,r in joint_observations.values():
+                selected=sm&domain
+                confidence[selected]=c[selected];desired[selected]=r[selected]
+            observed=int(np.count_nonzero(confidence))
+            evidence=reference_evidence(confidence,domain)
+            if not evidence['qualified']:
+                # Do not broaden a one-point/cluster estimate to a whole arm.
+                # Keep the original field and separate anatomical sampling
+                # owners, while still isolating disconnected fine components.
+                from scipy.ndimage import label as component_labels
+                sampling=physical_domains.setdefault('sampling_owners',owners.copy())
+                next_owner=int(sampling.max())+1
+                for raw in group['source_classes']:
+                    cc,count=component_labels(domain&(source_labels==raw))
+                    selected=cc>0;sampling[selected]=cc[selected]+next_owner;next_owner+=count+1
+                joined.append({**group,'status':'unsupported','observed_pixels':observed,
+                    'accepted_joint_observed_pixels':0,'reference_evidence':evidence,
+                    'reason':evidence['reason']+'; existing_field_and_anatomical_separation_retained'})
+                continue
+            limits=REGION_LIMITS['skin']
+            ev,solved=solve_field(desired,confidence,owners,guide,
+                maximum_norm=max(abs(v) for v in limits),minimum_value=limits[0],maximum_value=limits[1],
+                continuation_domain=domain, allow_relaxed_continuation=allow_relaxed_continuation)
+            ev*=1-.85*protection
+            field[...,0][domain]=ev[domain]
+            field[...,3][domain]=np.where(ev[domain]!=0,np.maximum(confidence[domain],.001),0)
+            observed_by_class={str(raw):int(np.count_nonzero(confidence*(source_labels==raw)))
+                for raw in group['source_classes']}
+            estimated_by_class={str(raw):int(np.count_nonzero(domain&(source_labels==raw)&(confidence==0)&(ev!=0)))
+                for raw in group['source_classes']}
+            joined.append({**group,'status':'source_proven_illumination_continuation',
+                'observed_pixels':observed,'reference_observed_by_source_class':observed_by_class,
+                'reference_evidence':evidence,
+                'estimated_without_direct_reference_by_source_class':estimated_by_class,
+                'reference_correspondence_extended':False,'source_RGB_smoothed':False,
+                'applied_EV_range':[float(ev[domain].min()),float(ev[domain].max())],
+                'automatic_solver':solved})
+            for name,ids in REGIONS.items():
+                if name not in {'left_hand','right_hand','left_arm','right_arm'}:continue
+                estimated=int(np.count_nonzero(domain&np.isin(source_labels,ids)&(confidence==0)&(ev!=0)))
+                if estimated:
+                    reports[name]['estimated_illumination_pixels']=reports[name].get('estimated_illumination_pixels',0)+estimated
+                    reports[name]['reference_observation_status']='unchanged; estimate_is_not_new_correspondence'
+        reports['physical_hand_arm_continuation']={'policy':physical_policy,
+            'source_domain_evidence':physical_domains['report'],'groups':joined,
+            'guarded_source_material_boundaries_respected':True,'legacy_other_regions_unchanged':True,
+            'observation_confidence_extended':False,'visual_acceptance':False}
     return field,reports,background

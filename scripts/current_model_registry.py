@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import uuid
+import sys
 from pathlib import Path
 
 from installed_resources import resource_path
@@ -32,8 +33,60 @@ PATH_LABELS = {
     'onnx_runtime_root': 'ONNX Runtime 安装目录',
 }
 
+# A registry describes the installable components, while a task only consumes
+# the capabilities it actually routes through.  Keep this mapping in one
+# place so the preflight, model manager and task plan cannot drift apart.
+CAPABILITY_KEYS = {
+    'source_silhouette': frozenset(('birefnet_model_path', 'onnx_runtime_root')),
+    'source_geometry': frozenset((
+        'python', 'semantics_checkpoint', 'semantics_repo_dir',
+        'vitmatte_model_root', 'birefnet_model_path', 'onnx_runtime_root')),
+    'reference_correspondence': frozenset(('dinov3_model_root',)),
+    'scene_analysis': frozenset(('scene_python', 'scene_model_root')),
+    'portrait_regions': frozenset(('face_model_path', 'face_python')),
+    'background_completion': frozenset(('lama_checkpoint',)),
+    'background_superresolution': frozenset(('background_sr_checkpoint',)),
+}
+CAPABILITY_LABELS = {
+    'source_silhouette': 'BiRefNet 人物轮廓与 ONNX 运行时',
+    'source_geometry': '人物语义、alpha 与发丝边缘',
+    'reference_correspondence': '原片与参考图对应',
+    'scene_analysis': '场景实例与遮挡分析',
+    'portrait_regions': '五官与人脸区域',
+    'background_completion': '背景补全',
+    'background_superresolution': '背景高清重建',
+}
+REQUIRED_REGISTRY_KEYS = frozenset(CAPABILITY_KEYS['source_geometry'])
+
+# Registry selection and validation are queried at nearly every preparation
+# boundary.  Keep the parsed JSON process-local and invalidate it on the full
+# stat identity (size + mtime + ctime).  Validation still runs on every
+# ``load_registry`` call; this cache only avoids repeated disk reads/parsing.
+_JSON_CACHE_LIMIT = 8
+_REGISTRY_JSON_CACHE: dict[tuple[str, int, int, int], dict] = {}
+_SELECTION_JSON_CACHE: dict[tuple[str, int, int, int], dict] = {}
+
+
+def _cached_json(path, cache):
+    path = Path(path).resolve()
+    stat = path.stat()
+    key = (str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+    value = cache.get(key)
+    if value is not None:
+        return dict(value)
+    value = json.loads(path.read_text(encoding='utf-8-sig'))
+    if not isinstance(value, dict):
+        return value
+    if len(cache) >= _JSON_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    cache[key] = dict(value)
+    return dict(value)
+
 
 def settings_directory():
+    configured = os.environ.get('COSPLAY_CONFIG_ROOT')
+    if configured:
+        return Path(configured).expanduser().resolve()
     base = Path(os.environ.get('LOCALAPPDATA') or Path.home() / '.local/share')
     return base / 'CosplayWorkbench/config'
 
@@ -42,16 +95,52 @@ def selection_path():
     return Path(os.environ.get('COSPLAY_MODEL_SETTINGS') or settings_directory() / 'model-selection.json')
 
 
+def model_directory():
+    """The user-visible model folder beside the EXE or source launcher."""
+    override = os.environ.get('COSPLAY_MODELS_ROOT')
+    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
+    return Path(override).expanduser().resolve() if override else base/'model'
+
+
+def resolve_config_paths(config, directory):
+    if not isinstance(config, dict):
+        return config
+    config = dict(config)
+    for key in PATH_KEYS:
+        value = config.get(key)
+        if isinstance(value, str) and value:
+            package_root = os.environ.get('COSPLAY_PACKAGE_ROOT')
+            if package_root is None and getattr(sys, 'frozen', False):
+                package_root = str(Path(sys.executable).resolve().parent)
+            if package_root:
+                value = value.replace('${PACKAGE_ROOT}', str(Path(package_root).resolve()))
+            path = Path(value).expanduser()
+            # Keep an explicitly absolute path lexical.  Calling ``resolve``
+            # here follows Windows junctions, which previously turned the
+            # declared D: model layout into a stale C:\\...\\.cache target
+            # without making the environment mix visible to the caller.  A
+            # relative portable registry still resolves against its own
+            # directory, while an absolute path remains bound to the drive
+            # selected by the installer and fails clearly if that asset is
+            # missing there.
+            config[key] = str(path if path.is_absolute() else (Path(directory)/path).resolve())
+    return config
+
+
 def registry_location(root=None, *, registry_path=None):
     selected = registry_path or os.environ.get('COSPLAY_MODEL_REGISTRY')
     origin = 'explicit' if registry_path else 'environment' if selected else None
+    portable = model_directory()/'local-models.json'
     if not selected and selection_path().is_file():
-        saved = json.loads(selection_path().read_text(encoding='utf-8-sig'))
+        saved = _cached_json(selection_path(), _SELECTION_JSON_CACHE)
         if not isinstance(saved, dict) or saved.get('schema') != 'cosplay_model_selection.v1' or not isinstance(saved.get('registry_path'), str):
             raise ValueError('Saved model selection is invalid; choose a model configuration again')
-        selected, origin = saved['registry_path'], 'user'
-        if not selected or not Path(selected).is_absolute():
+        if not saved['registry_path'] or not Path(saved['registry_path']).is_absolute():
             raise ValueError('Saved model selection requires an absolute registry path')
+        if saved.get('prefer_user') is True or not portable.is_file():
+            selected, origin = saved['registry_path'], 'user'
+    if not selected and portable.is_file():
+        selected, origin = str(portable), 'model_folder'
     if selected:
         path = Path(selected).expanduser()
     else:
@@ -68,42 +157,57 @@ def registry_location(root=None, *, registry_path=None):
     return path.resolve(), origin
 
 
-def validate_config(config):
+def validate_config(config, *, required_keys=None, required_profiles=None):
     if not isinstance(config, dict) or config.get('schema') != SCHEMA or not isinstance(config.get('ready'), bool):
         raise ValueError('Current installed-model registry schema/readiness required')
-    for key, expected in PROFILES.items():
+    profiles = PROFILES if required_profiles is None else {
+        key: PROFILES[key] for key in required_profiles if key in PROFILES}
+    unknown_profiles = set(required_profiles or ()) - set(PROFILES) if required_profiles is not None else set()
+    if unknown_profiles:
+        raise ValueError('Unknown installed-model profiles: ' + ', '.join(sorted(unknown_profiles)))
+    for key, expected in profiles.items():
         if config.get(key) != expected:
             raise ValueError('Unsupported installed-model profile: '+key+'='+str(config.get(key)))
-    for key in PATH_KEYS:
+    # Optional route components may be omitted from a current registry.  They
+    # are rejected by the task preflight only when that route requests their
+    # capability.  This lets a local portrait task run without stale scene or
+    # correspondence installations while retaining strict path validation for
+    # the source geometry stack needed by every route.
+    keys = REQUIRED_REGISTRY_KEYS if required_keys is None else frozenset(required_keys)
+    unknown = keys - set(PATH_KEYS)
+    if unknown:
+        raise ValueError('Unknown installed-model registry keys: ' + ', '.join(sorted(unknown)))
+    for key in keys:
         value = config.get(key)
         if not isinstance(value, str) or not value or not Path(value).is_absolute():
             raise ValueError('Installed-model registry requires an absolute path: '+PATH_LABELS[key])
     return config
 
 
-def load_registry(root=None, *, registry_path=None):
+def load_registry(root=None, *, registry_path=None, required_keys=None, required_profiles=None):
     path, _origin = registry_location(root, registry_path=registry_path)
     if not path.is_file():
         raise RuntimeError('Current installed-model registry is unavailable: '+str(path))
-    config = json.loads(path.read_text(encoding='utf-8-sig'))
+    config = resolve_config_paths(_cached_json(path, _REGISTRY_JSON_CACHE), path.parent)
     if not isinstance(config, dict) or config.get('schema') != SCHEMA or not isinstance(config.get('ready'), bool):
         raise ValueError('Current installed-model registry schema/readiness required')
     if not config['ready']:
         raise RuntimeError('Local models are not configured. Copy providers/local-models.example.json, '
                            'set installed model/runtime paths and ready=true, then set '
                            'COSPLAY_MODEL_REGISTRY to that file\'s absolute path.')
-    validate_config(config)
+    validate_config(config, required_keys=required_keys, required_profiles=required_profiles)
     return {**config, 'registry_path': path}
 
 
-def registry_status(root=None, *, registry_path=None):
+def registry_status(root=None, *, registry_path=None, required_keys=None, required_profiles=None):
     """Inspect only config and filesystem metadata; never load weights or runtimes."""
     path, origin = None, None
     config, rows, error = {}, [], None
     try:
         path, origin = registry_location(root, registry_path=registry_path)
-        config = json.loads(path.read_text(encoding='utf-8-sig'))
-        load_registry(root, registry_path=path)
+        config = resolve_config_paths(_cached_json(path, _REGISTRY_JSON_CACHE), path.parent)
+        load_registry(root, registry_path=path, required_keys=required_keys,
+                      required_profiles=required_profiles)
     except (OSError, ValueError, RuntimeError) as exc:
         error = str(exc)
     if not isinstance(config, dict):
@@ -141,16 +245,16 @@ def atomic_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def select_registry(path):
+def select_registry(path, *, prefer_user=True):
     path = Path(path).expanduser().resolve()
     load_registry(registry_path=path)
-    atomic_json(selection_path(), {'schema': 'cosplay_model_selection.v1', 'registry_path': str(path)})
+    atomic_json(selection_path(), {'schema': 'cosplay_model_selection.v1', 'registry_path': str(path), 'prefer_user': prefer_user})
     # Apply to this process and its future workers; explicit per-job paths remain authoritative.
     os.environ['COSPLAY_MODEL_REGISTRY'] = str(path)
     return registry_status()
 
 
-def save_user_config(config):
+def save_user_config(config, *, prefer_user=True):
     validate_config(config)
     if not config['ready']:
         raise ValueError('Model configuration must enable ready after paths are filled')
@@ -159,4 +263,4 @@ def save_user_config(config):
     # A second window must not overwrite a registry already bound to another job.
     path = settings_directory() / ('local-models.' + identity + '.json')
     atomic_json(path, values)
-    return select_registry(path)
+    return select_registry(path, prefer_user=prefer_user)

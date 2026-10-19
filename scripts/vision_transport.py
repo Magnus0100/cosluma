@@ -9,8 +9,10 @@ import re
 import tempfile
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 from PIL import Image, ImageCms
 
@@ -128,11 +130,14 @@ def _syntax_invalid(text):
 
 def error_metadata(exc, api_key_env=None):
     """Additional structured metadata; consumers retain type/message and HTTP ABI."""
+    metadata = {}
     if isinstance(exc, VisionHTTPError):
-        return {'http_status': exc.status}
+        metadata['http_status'] = exc.status
     if isinstance(exc, VisionResponseError) and exc.failure_evidence:
-        return {'failure_kind': exc.failure_kind, 'failure_evidence': dict(exc.failure_evidence)}
-    return {}
+        metadata.update(failure_kind=exc.failure_kind, failure_evidence=dict(exc.failure_evidence))
+    if getattr(exc, 'vision_timings', None) is not None:
+        metadata['timings'] = exc.vision_timings
+    return metadata
 
 
 def retry_policy_for_error(error):
@@ -224,6 +229,8 @@ def _save_response_failure(exc, out_dir, request_binding, protocol, key):
     receipt = {'schema': 'vision_response_failure.v1', 'failure_kind': exc.failure_kind,
         'event_type': exc._event_type, 'protocol': protocol,
         'request_binding': request_binding, 'response_payload': _record(payload_path)}
+    if getattr(exc, 'vision_timings', None) is not None:
+        receipt['timings'] = exc.vision_timings
     path = out_dir/'response-failure.json'
     _exclusive_json(path, receipt)
     exc.failure_evidence = _record(path)
@@ -237,42 +244,84 @@ def _safe_detail(value: str, key: str) -> str:
     return value[:500]
 
 
-def _request(endpoint: str, key: str, body: dict | None = None) -> dict:
-    request = urllib.request.Request(endpoint,
-        data=json.dumps(body).encode("utf-8") if body is not None else None,
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
-                 "Accept": "application/json, text/event-stream",
-                 "User-Agent": "cosplay-vision/1.0"})
+@contextmanager
+def _timed(timings, field):
+    started = perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            if response.headers.get_content_type() == "text/event-stream":
-                for line in response:
-                    if not line.startswith(b"data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == b"[DONE]":
-                        continue
-                    event = json.loads(data)
-                    if event.get("type") == "response.completed":
-                        return event["response"]
-                    if event.get("type") in {"error", "response.failed"}:
-                        message = event.get("message") or event.get("response", {}).get("error") or event.get("type")
-                        raise VisionResponseError('provider_failure', "vision response failed: " + _safe_detail(str(message), key),
-                            response=event, event_type=event.get('type'))
-                    if event.get('type') == 'response.incomplete':
-                        raise RuntimeError('vision response incomplete')
-                raise RuntimeError("vision response stream ended without a completed response")
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = _safe_detail(exc.read(4096).decode("utf-8", errors="replace"), key)
-        raise VisionHTTPError(exc.code, detail) from None
-    except urllib.error.URLError as exc:
-        raise RuntimeError("vision provider connection failed: " + _safe_detail(str(exc.reason), key)) from None
-    if not isinstance(payload, dict):
-        raise RuntimeError("vision provider returned a non-object JSON response")
-    if _terminal_provider_failure(payload):
-        raise VisionResponseError('provider_failure', 'vision response failed: '+_safe_detail(str(payload.get('error') or 'failed'), key), response=payload)
-    return payload
+        yield
+    except Exception:
+        timings['failed_stage'] = field
+        raise
+    finally:
+        timings[field] = timings.get(field, 0.0) + perf_counter() - started
+
+
+def _request(endpoint: str, key: str, body: dict | None = None, *, timings=None) -> dict:
+    """One HTTP request; header wait includes connection and sending, not just inference."""
+    timings = timings if timings is not None else {}
+    started = perf_counter()
+    timings.update(request_encode_seconds=0.0, wait_headers_seconds=0.0,
+                   response_read_seconds=0.0, response_parse_seconds=0.0)
+    try:
+        with _timed(timings, 'request_encode_seconds'):
+            encoded = json.dumps(body).encode("utf-8") if body is not None else None
+            request = urllib.request.Request(endpoint, data=encoded,
+                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream",
+                         "User-Agent": "cosplay-vision/1.0"})
+            timings['request_bytes'] = len(encoded) if encoded is not None else 0
+        try:
+            with _timed(timings, 'wait_headers_seconds'):
+                response = urllib.request.urlopen(request, timeout=TIMEOUT)
+            with response:
+                if response.headers.get_content_type() == "text/event-stream":
+                    timings['response_format'] = 'sse'
+                    lines = iter(response)
+                    while True:
+                        with _timed(timings, 'response_read_seconds'):
+                            line = next(lines, None)
+                        if line is None:
+                            break
+                        if not line.startswith(b"data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == b"[DONE]":
+                            continue
+                        with _timed(timings, 'response_parse_seconds'):
+                            event = json.loads(data)
+                        if event.get("type") == "response.completed":
+                            return event["response"]
+                        if event.get("type") in {"error", "response.failed"}:
+                            message = event.get("message") or event.get("response", {}).get("error") or event.get("type")
+                            raise VisionResponseError('provider_failure', "vision response failed: " + _safe_detail(str(message), key),
+                                response=event, event_type=event.get('type'))
+                        if event.get('type') == 'response.incomplete':
+                            raise RuntimeError('vision response incomplete')
+                    raise RuntimeError("vision response stream ended without a completed response")
+                timings['response_format'] = 'json'
+                with _timed(timings, 'response_read_seconds'):
+                    raw = response.read()
+                with _timed(timings, 'response_parse_seconds'):
+                    payload = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            timings['http_status'] = exc.code
+            with _timed(timings, 'response_read_seconds'):
+                raw = exc.read(4096)
+            with _timed(timings, 'response_parse_seconds'):
+                detail = _safe_detail(raw.decode("utf-8", errors="replace"), key)
+            raise VisionHTTPError(exc.code, detail) from None
+        except urllib.error.URLError as exc:
+            raise RuntimeError("vision provider connection failed: " + _safe_detail(str(exc.reason), key)) from None
+        if not isinstance(payload, dict):
+            raise RuntimeError("vision provider returned a non-object JSON response")
+        if _terminal_provider_failure(payload):
+            raise VisionResponseError('provider_failure', 'vision response failed: '+_safe_detail(str(payload.get('error') or 'failed'), key), response=payload)
+        return payload
+    except Exception:
+        timings['failed_stage'] = timings.get('failed_stage', 'response_validation')
+        raise
+    finally:
+        timings['total_seconds'] = perf_counter() - started
 
 
 def _connection(*, provider=None, api_base=None, api_url=None, api_key_env=None):
@@ -316,13 +365,6 @@ def _vision_models(payload: dict) -> list[str]:
             and not any(term in name.lower() for term in ("image", "audio", "realtime", "transcribe", "search", "spark"))]
 
 
-def discover_vision_models(*, provider=None, api_base=None, api_url=None, api_key_env=None) -> dict:
-    """Read actual gateway model IDs; never substitute an image model."""
-    config, endpoint, key, _ = _connection(provider=provider, api_base=api_base,
-                                          api_url=api_url, api_key_env=api_key_env)
-    models = _vision_models(_request(endpoint + "/models", key))
-    return {"provider": config["registry_id"], "endpoint": endpoint,
-            "models": models, "network_checked": True}
 
 
 def _model_rank(name: str):
@@ -368,85 +410,104 @@ def request_vision_json(source: Path, out_dir: Path, prompt: str, *, provider=No
                         vision_model=None, api_base=None, api_url=None,
                         api_key_env=None) -> tuple[dict, dict]:
     """Send one visual recognition request; errors remain explicit and usable."""
-    source, out_dir = Path(source).resolve(), Path(out_dir).resolve()
-    model = vision_model or os.environ.get("COSPLAY_VISION_MODEL")
-    if "gpt-image" in str(model).lower():
-        raise ValueError("gpt-image models cannot perform text vision recognition")
-    if out_dir.exists() and any(path.is_file() for path in out_dir.rglob('*')):
-        raise FileExistsError('Vision attempt evidence already exists; use a new independent directory')
-    config, endpoint, key, selected_endpoint = _connection(provider=provider,
-        api_base=api_base, api_url=api_url, api_key_env=api_key_env)
-    discovered_models = []
-    if not model:
-        discovered_models = _vision_models(_request(endpoint + "/models", key))
-        if not discovered_models:
-            raise RuntimeError("provider /models returned no GPT vision text model; set COSPLAY_VISION_MODEL")
-        model = max(discovered_models, key=_model_rank)
-    if "gpt-image" in str(model).lower():
-        raise ValueError("gpt-image models cannot perform text vision recognition")
-    source_before = reference_provider.sha256(source)
-    image, image_meta = _input_image(source, out_dir)
-    if image_meta['source']['sha256'] != source_before:
-        raise ValueError('Vision source changed during input preparation')
-    image_uri = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode("ascii")
-    final_prompt = _final_prompt(prompt)
-    protocol = "responses" if selected_endpoint != "/chat/completions" else "chat/completions"
-    fallback = None
-    binding_path = out_dir/'request-binding.json'
-    _exclusive_json(binding_path, {'schema': 'vision_request_binding.v1', 'source': _record(source),
-        'api_input': image_meta, 'prompt_sha256': hashlib.sha256(final_prompt.encode('utf-8')).hexdigest(),
-        'allowed_protocols': ['responses', 'chat/completions'] if protocol == 'responses' else ['chat/completions']})
-    binding = _record(binding_path)
-    def send(url, body):
-        try:
-            result = _request(url, key, body)
-            # Also inspect injected/non-streamed HTTP200 terminal envelopes.
-            if _terminal_provider_failure(result):
-                raise VisionResponseError('provider_failure', 'vision response failed: '+_safe_detail(str(result.get('error') or 'failed'), key), response=result)
-            return result
-        except VisionResponseError as exc:
-            _save_response_failure(exc, out_dir, binding, protocol, key)
-            raise
-    if protocol == "responses":
-        body = {"model": model, "store": False, "stream": True,
-                "input": [{"role": "user", "content": [
-                    {"type": "input_text", "text": final_prompt},
-                    {"type": "input_image", "image_url": image_uri}]}]}
-        try:
-            response = send(endpoint + "/responses", body)
-        except VisionHTTPError as exc:
-            unsupported = exc.status in {405, 501} or (exc.status == 404
-                and "model" not in exc.detail.lower()) or (exc.status in {400, 422}
-                and "responses" in exc.detail.lower()
-                and any(term in exc.detail.lower() for term in ("unsupported", "not supported", "unknown endpoint")))
-            if not unsupported:
-                raise
-            fallback = {"from": "responses", "http_status": exc.status, "reason": "endpoint_unsupported"}
-            protocol = "chat/completions"
-    if protocol == "chat/completions":
-        body = {"model": model, "messages": [{"role": "user", "content": [
-            {"type": "text", "text": final_prompt},
-            {"type": "image_url", "image_url": {"url": image_uri}}]}]}
-        response = send(endpoint + "/chat/completions", body)
-    text = _response_text(response, protocol)
-    if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("vision model returned no profile text")
+    started = perf_counter()
+    timings = {'schema': 'vision_transport_timings.v1', 'clock': 'perf_counter',
+        'image_prepare_seconds': 0.0, 'image_base64_seconds': 0.0,
+        'request_binding_seconds': 0.0, 'profile_parse_seconds': 0.0, 'http_requests': []}
+    binding = None
     try:
-        payload = _profile_json(text)
-    except RuntimeError as exc:
-        if isinstance(exc.__cause__, json.JSONDecodeError) and _completed(response, protocol):
-            failure = VisionResponseError('completed_invalid_json', 'completed vision model returned invalid profile JSON', response=response)
-            _save_response_failure(failure, out_dir, binding, protocol, key)
-            raise failure from None
+        source, out_dir = Path(source).resolve(), Path(out_dir).resolve()
+        model = vision_model or os.environ.get("COSPLAY_VISION_MODEL")
+        if "gpt-image" in str(model).lower():
+            raise ValueError("gpt-image models cannot perform text vision recognition")
+        if out_dir.exists() and any(path.is_file() for path in out_dir.rglob('*')):
+            raise FileExistsError('Vision attempt evidence already exists; use a new independent directory')
+        config, endpoint, key, selected_endpoint = _connection(provider=provider,
+            api_base=api_base, api_url=api_url, api_key_env=api_key_env)
+        def send(suffix, body=None):
+            request_timings = {'protocol': suffix.lstrip('/')}
+            timings['http_requests'].append(request_timings)
+            try:
+                result = _request(endpoint + suffix, key, body, timings=request_timings)
+                # Also inspect injected/non-streamed HTTP200 terminal envelopes.
+                if _terminal_provider_failure(result):
+                    raise VisionResponseError('provider_failure', 'vision response failed: '+_safe_detail(str(result.get('error') or 'failed'), key), response=result)
+            except Exception:
+                timings['failed_stage'] = 'http_request'
+                raise
+            return result
+        discovered_models = []
+        if not model:
+            discovered_models = _vision_models(send('/models'))
+            if not discovered_models:
+                raise RuntimeError("provider /models returned no GPT vision text model; set COSPLAY_VISION_MODEL")
+            model = max(discovered_models, key=_model_rank)
+        if "gpt-image" in str(model).lower():
+            raise ValueError("gpt-image models cannot perform text vision recognition")
+        with _timed(timings, 'image_prepare_seconds'):
+            source_before = reference_provider.sha256(source)
+            image, image_meta = _input_image(source, out_dir)
+            if image_meta['source']['sha256'] != source_before:
+                raise ValueError('Vision source changed during input preparation')
+        with _timed(timings, 'image_base64_seconds'):
+            image_uri = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode("ascii")
+        final_prompt = _final_prompt(prompt)
+        protocol = "responses" if selected_endpoint != "/chat/completions" else "chat/completions"
+        fallback = None
+        with _timed(timings, 'request_binding_seconds'):
+            binding_path = out_dir/'request-binding.json'
+            _exclusive_json(binding_path, {'schema': 'vision_request_binding.v1', 'source': _record(source),
+                'api_input': image_meta, 'prompt_sha256': hashlib.sha256(final_prompt.encode('utf-8')).hexdigest(),
+                'allowed_protocols': ['responses', 'chat/completions'] if protocol == 'responses' else ['chat/completions']})
+            binding = _record(binding_path)
+        if protocol == "responses":
+            body = {"model": model, "store": False, "stream": True,
+                    "input": [{"role": "user", "content": [
+                        {"type": "input_text", "text": final_prompt},
+                        {"type": "input_image", "image_url": image_uri}]}]}
+            try:
+                response = send("/responses", body)
+            except VisionHTTPError as exc:
+                unsupported = exc.status in {405, 501} or (exc.status == 404
+                    and "model" not in exc.detail.lower()) or (exc.status in {400, 422}
+                    and "responses" in exc.detail.lower()
+                    and any(term in exc.detail.lower() for term in ("unsupported", "not supported", "unknown endpoint")))
+                if not unsupported:
+                    raise
+                fallback = {"from": "responses", "http_status": exc.status, "reason": "endpoint_unsupported"}
+                protocol = "chat/completions"
+                timings.pop('failed_stage', None)
+        if protocol == "chat/completions":
+            body = {"model": model, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": final_prompt},
+                {"type": "image_url", "image_url": {"url": image_uri}}]}]}
+            response = send("/chat/completions", body)
+        with _timed(timings, 'profile_parse_seconds'):
+            text = _response_text(response, protocol)
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("vision model returned no profile text")
+            try:
+                payload = _profile_json(text)
+            except RuntimeError as exc:
+                if isinstance(exc.__cause__, json.JSONDecodeError) and _completed(response, protocol):
+                    raise VisionResponseError('completed_invalid_json', 'completed vision model returned invalid profile JSON', response=response) from None
+                raise
+        provenance = {"schema_version": "vision_transport.v1", "provider": config["registry_id"],
+            "model": model, "response_model": response.get("model"), "response_id": response.get("id"),
+            "endpoint": endpoint + "/" + protocol, "protocol": protocol,
+            "created_at": datetime.now(timezone.utc).isoformat(), "timeout_seconds": TIMEOUT,
+            "source": {"path": str(source), "sha256": reference_provider.sha256(source)},
+            "api_input": image_meta, "input_sha256": image_meta["sha256"],
+            "prompt_sha256": hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
+            "usage": response.get("usage"), "discovered_models": discovered_models,
+            "fallback": fallback, "network_used": True, "generation_used": False,
+            "docs_source": VISION_GUIDE}
+    except Exception as exc:
+        timings['total_seconds'] = perf_counter() - started
+        exc.vision_timings = timings
+        if isinstance(exc, VisionResponseError) and binding is not None:
+            _save_response_failure(exc, out_dir, binding, protocol, key)
         raise
-    provenance = {"schema_version": "vision_transport.v1", "provider": config["registry_id"],
-        "model": model, "response_model": response.get("model"), "response_id": response.get("id"),
-        "endpoint": endpoint + "/" + protocol, "protocol": protocol,
-        "created_at": datetime.now(timezone.utc).isoformat(), "timeout_seconds": TIMEOUT,
-        "source": {"path": str(source), "sha256": reference_provider.sha256(source)},
-        "api_input": image_meta, "input_sha256": image_meta["sha256"],
-        "prompt_sha256": hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
-        "usage": response.get("usage"), "discovered_models": discovered_models,
-        "fallback": fallback, "network_used": True, "generation_used": False,
-        "docs_source": VISION_GUIDE}
+    timings['total_seconds'] = perf_counter() - started
+    provenance['timings'] = timings
     return payload, provenance

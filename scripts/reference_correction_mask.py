@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from cache_roots import cache_dir
 from runtime_resources import code_path
 
 import numpy as np
@@ -14,6 +15,7 @@ from PIL import Image
 import cosplay_post_review as visual
 from local_semantics_worker import CLASS_NAMES
 from sapiens_model_profiles import profile
+from asset_identity import sha256_file
 
 SCHEMA = 'reference_correction_mask.v2'
 RECIPE = 'bound_reference_semantics_subject_guarded_ownership_v2'
@@ -34,8 +36,7 @@ def _read(path):
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _file(path):
@@ -142,7 +143,7 @@ def _source_protection(source_identity, source_analysis, root):
     if source_analysis is None and root is not None:
         from local_photo_analysis import analysis_identity
         expected = analysis_identity(Path(root), role='source')
-        choices = list((Path(root)/'outputs/cache/local-analysis'/_sha(source_identity)[:16]).glob('*/analysis.json'))
+        choices = list((cache_dir(root, 'local-analysis')/_sha(source_identity)[:16]).glob('*/analysis.json'))
         choices = [path for path in choices if _read(path).get('analysis_role') == 'source'
                    and _read(path).get('source', {}).get('sha256') == _sha(source_identity)
                    and _read(path).get('analysis_identity') == expected]
@@ -193,7 +194,7 @@ def prepare_correction_mask(reference: Path, actions: list, output: Path, *,
     if analysis is None:
         if root is None:
             raise ValueError('Existing reference semantic analysis is required for a local correction')
-        choices = list((Path(root)/'outputs/cache/local-analysis'/_sha(reference)[:16]).glob('*/analysis.json'))
+        choices = list((cache_dir(root, 'local-analysis')/_sha(reference)[:16]).glob('*/analysis.json'))
         from local_photo_analysis import analysis_identity
         expected_identity = analysis_identity(Path(root), role='candidate')
         choices = [p for p in choices if _read(p).get('analysis_role') == 'candidate'

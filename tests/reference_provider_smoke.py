@@ -15,6 +15,7 @@ from threading import Thread
 from PIL import Image
 
 import reference_provider
+import provider_settings
 
 
 def png_bytes() -> bytes:
@@ -26,6 +27,7 @@ def png_bytes() -> bytes:
 def main() -> int:
     previous_key = os.environ.get("COSPLAY_REFERENCE_API_KEY")
     previous_local_base = os.environ.get("COSPLAY_LOCAL_API_BASE")
+    previous_settings = os.environ.get("COSPLAY_PROVIDER_SETTINGS")
     registry = reference_provider.provider_registry()
     ids = {entry["id"] for entry in registry}
     assert {"openai-compatible", "ccswitch_sub2api", "manual_import", "local", "comfyui"} <= ids
@@ -41,6 +43,11 @@ def main() -> int:
     else:
         os.environ["COSPLAY_LOCAL_API_BASE"] = previous_local_base
     # Registry status exposes only booleans and env-var names, never secret values.
+    settings_file = Path(tempfile.mkdtemp(prefix="cosplay_provider_settings_smoke_")) / "provider-settings.json"
+    provider_settings.save_settings({"providers": {"ccswitch_sub2api": {
+        "model": "gpt-image-2.5-sunburst", "credential_source": "environment",
+    }}}, settings_file)
+    os.environ["COSPLAY_PROVIDER_SETTINGS"] = str(settings_file)
     os.environ["COSPLAY_REFERENCE_API_KEY"] = "smoke-secret"
     assert "smoke-secret" not in json.dumps(registry)
     health = reference_provider.provider_health(provider="CCSwitch/Sub2API")
@@ -49,6 +56,7 @@ def main() -> int:
     ccswitch = reference_provider.provider_config(provider="CCSwitch/Sub2API")
     assert ccswitch["registry_id"] == "ccswitch_sub2api"
     assert ccswitch["model"] == "gpt-image-2.5-sunburst"
+    assert ccswitch["timeout"] == 900
     output = png_bytes()
     observed: dict[str, str] = {}
     attempts = {"count": 0}
@@ -61,11 +69,11 @@ def main() -> int:
             observed["authorization"] = self.headers.get("Authorization", "")
             observed["content_type"] = self.headers.get("Content-Type", "")
             observed["body"] = body.decode("latin1")
-            if attempts["count"] == 1:
+            if attempts["count"] <= 2:
                 self.send_response(503)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"error":"transient offline smoke"}')
+                self.wfile.write(b'{"error":"transient offline smoke offline-smoke-key"}')
                 return
             payload = {"id": "offline-smoke-generation", "created": 1, "data": [{"b64_json": base64.b64encode(output).decode("ascii")}]}
             encoded = json.dumps(payload).encode("utf-8")
@@ -99,9 +107,24 @@ def main() -> int:
                 reference_provider.main(call)
             except RuntimeError as exc:
                 assert '503' in str(exc)
+                assert 'offline-smoke-key' not in str(exc)
+                assert '<redacted>' in str(exc)
             else:
                 raise AssertionError('HTTP failure must be returned without automatic paid retry')
             assert attempts['count'] == 1
+            failure = json.loads((out_dir / 'SMOKE.transport-failure.json').read_text('utf8'))
+            assert failure['error_chain'][0]['type'] == 'RuntimeError'
+            assert failure['events'][-1]['http_status'] == 503
+            assert failure['events'][-1]['elapsed_seconds'] >= 0
+            # A stale failure record must not mask the next real HTTP failure.
+            try:
+                reference_provider.main(call)
+            except RuntimeError as exc:
+                assert '503' in str(exc)
+            else:
+                raise AssertionError('Repeated HTTP failure must remain readable')
+            assert attempts['count'] == 2
+            assert len(list(out_dir.glob('SMOKE.transport-*.previous-failure.json'))) == 1
             # The next call is an explicit new invocation, not transport retry.
             code = reference_provider.main(call)
             provenance = json.loads((out_dir / "SMOKE.provenance.json").read_text(encoding="utf-8"))
@@ -109,11 +132,28 @@ def main() -> int:
             assert observed["authorization"] == "Bearer offline-smoke-key"
             assert "multipart/form-data" in observed["content_type"]
             assert "gpt-image-2.5-sunburst" in observed["body"]
-            assert attempts["count"] == 2
+            assert attempts["count"] == 3
             assert provenance["provider_contract"]["response"]["id"] == "offline-smoke-generation"
             transport_events = provenance["provider_contract"]["transport"]["events"]
             assert not any(event.get("event") == "provider_retry" for event in transport_events)
             assert sum(event.get('event') == 'provider_attempt' for event in transport_events) == 1
+            request = next(row for row in transport_events if row['event'] == 'provider_request')
+            assert request['request_bytes'] == len(observed['body'].encode('latin1'))
+            assert request['image_bytes'] == len(output)
+            assert request['encoding'] == 'multipart_binary'
+            assert len(request['image_sha256']) == 64
+            assert not (out_dir / 'SMOKE.transport-failure.json').exists()
+            history = [json.loads(path.read_text('utf8')) for path in out_dir.glob('SMOKE.transport-*.json')
+                       if not path.name.endswith('.previous-failure.json')]
+            assert sorted(row['state'] for row in history) == ['failed', 'failed', 'registered']
+            assert 'offline-smoke-key' not in json.dumps(history)
+            try:
+                reference_provider.main(call)
+            except FileExistsError:
+                pass
+            else:
+                raise AssertionError('Registered candidates must still prevent a new submission')
+            assert attempts['count'] == 3
             assert provenance["status"] == "reference_candidate"
             print(json.dumps({"ok": True, "candidate": str(out_dir / "SMOKE.png"), "provenance": str(out_dir / "SMOKE.provenance.json")}, ensure_ascii=False, indent=2))
     finally:
@@ -123,6 +163,10 @@ def main() -> int:
             os.environ.pop("COSPLAY_REFERENCE_API_KEY", None)
         else:
             os.environ["COSPLAY_REFERENCE_API_KEY"] = previous_key
+        if previous_settings is None:
+            os.environ.pop("COSPLAY_PROVIDER_SETTINGS", None)
+        else:
+            os.environ["COSPLAY_PROVIDER_SETTINGS"] = previous_settings
     return 0
 
 

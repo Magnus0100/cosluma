@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import time
+
+from asset_identity import sha256_file
 
 SCHEMA = 'automatic_subject_environment_completion.v1'
 RECORD_KEY = 'automatic_subject_environment_completion'
@@ -18,8 +19,7 @@ ARTIFACTS = ('auto_draft', 'render_master', 'render_scene_master')
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def read(path):

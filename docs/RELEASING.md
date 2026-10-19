@@ -23,7 +23,9 @@ GitHub 中可手动运行 `Prepare release assets` 工作流。它在 Windows �
 .\.venv\Scripts\python.exe .\scripts\verify_windows_release.py --source "<清洁源码目录>" --release "<发布资产目录>"
 ```
 
-程序包必须完整解压并保留 `_internal`。用户运行模型需要单独安装；发布包不得夹带模型权重、个人配置、照片、工程或服务凭据。包内开发文档中的源码命令使用对应 `source.zip`。
+程序包必须完整解压并保留 `_internal`。用户运行模型需要单独安装；发布包不得夹带模型权重、个人配置、照片、工程或服务凭据。开发所需源码命令使用对应 `source.zip`。
+
+Windows 包只附用户安装、配置、使用与许可说明。Agent 指南、开发文档、测试和构建工具放在对应 `source.zip`；包内 `SOURCE_CODE.md` 说明如何获取，指向开发材料的链接也统一转到该页。
 
 ## 发布到 GitHub
 
@@ -33,4 +35,4 @@ GitHub 中可手动运行 `Prepare release assets` 工作流。它在 Windows �
 
 发布前在干净工作区实际启动程序，检查基本制作、保存、重开和导出。图像算法有变化时另行验证真实素材与原尺寸细节；本次清理复用已有运行字节和已有冻结回放证据，不授予新的艺术效果或跨照片验收。
 
-启用仓库的私密漏洞报告入口，并按 [安全说明](../SECURITY.md) 接收报告。当前仓库仍是私有开发仓库，尚未发布公开 Release；发布前不要把本地验证记录或未审查资产上传到 GitHub。
+启用仓库的私密漏洞报告入口，并按 [安全说明](../SECURITY.md) 接收报告。首次开放仓库前按 [开源交付准备](OPEN_SOURCE_READINESS.md) 审查候选源码；发布前不要把本地验证记录或未审查资产上传到 GitHub。

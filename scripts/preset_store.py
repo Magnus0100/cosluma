@@ -8,12 +8,24 @@ the source-preserving renderer or visual review gate.
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any
+from installed_resources import resource_path
 
 SCHEMA_VERSION = "presets.v1"
-DEFAULT_PATH = (Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]) / "presets" / "presets.json"
+def _catalog_path():
+    if not getattr(sys, 'frozen', False) and Path(__file__).resolve().parent.name == '_internal':
+        path = Path(__file__).resolve().parent/'presets/presets.json'
+        if not path.is_file():
+            raise FileNotFoundError('Installed preset catalog is unavailable: '+str(path))
+        return path
+    return resource_path('presets/presets.json')
+
+
+DEFAULT_PATH = _catalog_path()
+REFINEMENT_PRESET = 'source_refinement'
 
 def _normalise(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
@@ -33,7 +45,47 @@ def _normalise(value: Any) -> dict[str, Any] | None:
         "manual_layers": value.get("manual_layers") if isinstance(value.get("manual_layers"), dict) else {},
         **({"provider": str(value["provider"])} if value.get("provider") else {}),
         **({"model": str(value["model"])} if value.get("model") else {}),
+        **({'refinement_profile': value['refinement_profile']} if ident == REFINEMENT_PRESET
+           and isinstance(value.get('refinement_profile'), dict) else {}),
     }
+
+
+def normalize_refinement_selector(selector):
+    if (not isinstance(selector, dict) or set(selector) - {'id', 'version', 'overrides'}
+            or selector.get('id') != REFINEMENT_PRESET
+            or type(selector.get('version')) is not int or selector['version'] != 1):
+        raise ValueError('Unknown bundled refinement profile/version')
+    result = {'id': REFINEMENT_PRESET, 'version': 1}
+    if 'overrides' in selector:
+        overrides = selector['overrides']
+        if (not isinstance(overrides, dict) or set(overrides) != {'input_prompt', 'character_notes'}
+                or any(not isinstance(overrides[key], str) or len(overrides[key]) > limit
+                       for key, limit in (('input_prompt', 64000), ('character_notes', 16000)))):
+            raise ValueError('Refinement overrides must bind actual editable request text')
+        result['overrides'] = dict(overrides)
+    return result
+
+
+def get_refinement_profile(selector):
+    """Resolve only the bundled, fixed-scope recommendation, never overrides."""
+    normalize_refinement_selector(selector)
+    row = next((item for item in json.loads(DEFAULT_PATH.read_text(encoding='utf8'))['presets']
+                if item.get('id') == REFINEMENT_PRESET), None)
+    profile = row.get('refinement_profile') if isinstance(row, dict) else None
+    allowed_goals = {'scene': 'preserve_and_enhance_source',
+        'skin': 'coherent_in_requested_lighting_without_whitening',
+        'materials': 'distinct_native_materials',
+        'atmosphere': 'restrained_depth_without_unrequested_entities'}
+    if (not isinstance(profile, dict) or set(profile) != {'id', 'version', 'goals'}
+            or profile['id'] != REFINEMENT_PRESET or type(profile['version']) is not int
+            or profile['version'] != 1 or profile['goals'] != allowed_goals
+            or not isinstance(row.get('prompt'), str) or not row['prompt'].strip()
+            or row.get('appearance') or row.get('appearance_regions') or row.get('manual_layers') or row.get('denoise_strength') != 0
+            or row.get('provider') or row.get('model')):
+        raise ValueError('Bundled refinement profile exceeds its fixed recommendation scope')
+    canonical = {**profile, 'preset_id': REFINEMENT_PRESET, 'prompt': row['prompt']}
+    content = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return {**canonical, 'profile_sha256': hashlib.sha256(content.encode('utf8')).hexdigest()}
 
 
 def list_presets(path: Path | None = None) -> list[dict[str, Any]]:

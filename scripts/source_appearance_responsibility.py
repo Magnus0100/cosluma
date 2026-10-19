@@ -196,11 +196,6 @@ def prepare(run, plan):
     descriptor['identity_sha256'] = hashlib.sha256(json.dumps(descriptor, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return descriptor
 
-def validate_plan(run, plan):
-    descriptor = plan.get('source_appearance_responsibility')
-    current = prepare(run, plan)
-    valid = descriptor == current
-    return {'valid': valid, 'errors': [] if valid else ['colour_match_status_stale']}
 
 def stage_summary(run, plan):
     descriptor = prepare(run, plan)

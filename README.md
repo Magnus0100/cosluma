@@ -2,26 +2,42 @@
 
 [![CI](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosplay/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-**English:** Cosplay Studio is a Windows desktop workbench for source-faithful cosplay photo finishing. It keeps source structure and texture while preparing editable appearance, lighting, background and effect layers. See [English overview](README.en.md).
+**English:** Cosplay Studio is a Windows desktop workbench for cosplay photo finishing, with a simple photo workspace and a professional layer/workflow view. It prepares editable portrait beauty, appearance, lighting, background and effect layers. See [English overview](README.en.md).
 
-面向Windows的Cos后期工作台：从原片和设计参考出发，保留原人物的结构与纹理，准备材质仿色、明暗、背景和效果，保存可继续编辑的高清草稿。
+面向Windows的Cos后期工作台：从原片出发，完成人像美化、参考仿色、人物与背景融合及独立光效，保存可继续编辑的高清作品。默认使用简洁的“快速制作”，专业模式提供精修工具与 Cos 节点画布，两种模式共用同一工程。
 
-当前源码版本为 `0.4.8`。项目提供桌面界面、CLI和本机HTTP接口；本地模型和生成服务单独配置。
+当前源码版本为 `0.5.46`。项目提供桌面界面、CLI和本机HTTP接口；本地模型和生成服务单独配置。
+
+完整 Cos 后期使用一条管线：原片 → 参考 → Beauty → 场景与原生 T/B/S → 边界受光 → 保存。参考可导入，也可由本地 ComfyUI/Qwen Image、GPT Image 或兼容 Provider 生成；默认生成 1 张，可显式增加候选数量。
+
+原景增强将原尺寸人物与可见背景作为细节基底，角色与主效要求进入检查计划；需要局部生图时显式选择一个背景区域并检查额度，局部之外保持原生像素。快速制作与专业画布共用同一管线及工程，输出仍需整图和原尺寸审片。
 
 ## 快速开始
 
-拿到Windows程序包后，解压完整的 `cosplay-workbench` 文件夹，保留EXE旁边的 `_internal`，双击 `cosplay-workbench.exe`。程序默认在 `%LOCALAPPDATA%\CosplayWorkbench\workspace` 创建可写工作区，并自动启动内嵌后台。
+拿到Windows程序包后，完整解压并保留EXE旁边的 `_internal`，使用安装目录的 `Start-Cosplay-Studio.cmd` 或桌面唯一快捷方式启动。程序默认在 `%USERPROFILE%\CosplayWorkbench\workspace` 创建可写工作区，启动内嵌后台，并尝试预热人像美化。实际加载完成才显示 Beauty 预热成功；Qwen 配置检查不证明服务已连接或模型已加载，开始前仍检查本次任务计划。
 
 需要指定工作区时，在程序目录打开PowerShell：
 
 ```powershell
-$workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
+$workspace = Join-Path $env:USERPROFILE 'CosplayWorkbench\workspace'
 .\cosplay-workbench.exe --root "$workspace" --embedded-backend --auto-start-backend
 ```
 
-打开“连接设置 → 配置分析模型”，可导入已有JSON或选择已安装的模型与Python路径，保存后软件会记住选择并显示缺失项。导入原片，选择“本地原片精修”“已有参考完整后期”或“创作参考并完成后期”，填写创作要求及保留背景、不要特效等限制。先检查制作计划，查看缺失配置、处理步骤、外部服务和生图预算，再开始制作。检查计划只读取文件和配置，不执行推理或网络请求。
+默认进入“快速制作”：导入原片，选择“仅人像美化”或“完整 Cos 后期”，可补充效果说明，对比画面，再保存高清版本和导出成片。美化完成后可直接调整强度；原片和当前效果并排显示，缩放和拖动同步，也可双击查看。处理中可取消任务。处理、保存与导出沿用同一工程和任务状态。
 
-已有参考会先对原片与参考做成对设计，再进入完整后期，所有图像生成预算为零；文本/视觉规划和审片有独立服务策略。完整参考后期目前需要文本/视觉服务，本地原片路线可离线处理。批量作品共享创作要求，每张分别建立设计、几何、遮罩和质量证据，失败项可独立重试。保存版本后查看整图、眼口及原尺寸证据，按缺项修复或补证据，人工审片后导出图片或可编辑工程。
+首次使用点击主界面的“模型管理”。软件优先使用主目录下的 [`model` 文件夹](model/README.md)，自动识别标准目录和已有安装；也可以选择一次模型总目录。分析模型与 BeautyGRPO 状态按用途显示，保存配置后重启继续使用；相对路径支持移动完整模型目录。逐项路径和 JSON 导入保留在高级设置。生成服务在设置中配置。专业创作入口可选择“本地原片精修”“已有参考完整后期”或“创作参考并完成后期”，填写创作要求和限制，再检查制作计划中的缺失配置、步骤、外部服务和生图预算。检查计划只读取文件和配置。
+
+节点架构的当前范围与后续路线见 [ComfyUI 架构借鉴](docs/COMFYUI_ARCHITECTURE.md)。
+
+源码与发行包的桌面、CLI 和 HTTP 都使用 `creative_task → production_coordinator → single_source_workflow`，唯一执行策略是 `layered_reference_transfer`。现行 worker 完成 Beauty、场景/人物图层、边界及保存；画布合同与真实执行事实分别记录。runtime 选择、节点职责、失败恢复和活动 job 互斥见[产品数据流](docs/PRODUCT_ARCHITECTURE.md)。
+
+所有制作入口先检查当前 task plan、源/参考身份、模型/runtime、控制与预算，再开始有归属的 job。无参考原片制作关闭参考及场景节点。预检失败不启动 worker；失败、取消或过期保留父版本及首错。旧冻结输出继续只读查看，缺现行任务合同的版本须创建新任务后继续制作。
+
+当前保留按显存预算选择设备/host staging 的共享背景 SR 和有界并行 TIFF 压缩。性能以当前请求的真实账本为准；当前仍未达到稳定发布。
+
+已有参考制作默认不新增图像生成；显式选择原景增强、使用本地Qwen并开启单区精修的新独立任务，可获全局参考0次、局部最多1次的检查预算。普通重试与最终修复不新增额度，详见[原景增强](docs/SOURCE_SCENE_ENHANCEMENT.md)。外部文本/视觉规划与审片显式可选，默认关闭。批量每张独立建立计划、job、版本与质量证据，失败项可独立重试。保存成功与人工艺术批准分别记录。
+
+当前请求与每模块实测见[流程与性能](docs/WORKFLOW_PERFORMANCE.md)。制作中显示阶段及累计用时；预计剩余时间只使用至少三次兼容成功记录，样本不足显示“估算中”。AI 审阅、执行完成和文件导出不能代替用户最终人工批准。
 
 每个桌面窗口绑定自己的工程和内嵌后台。默认端口占用时自动选择可用端口；界面显示实际地址。使用 `--root`打开另一工程的新窗口。
 
@@ -31,9 +47,11 @@ $workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
 
 ## 工作流程
 
-原片基线 → 原图与参考仿色 → 材质和明暗协调 → 人物、背景、接触与明确独立效果合成 → 整图与原生窗口审片 → 有资格的本地修复或补证据 → 保存、人工批准、重开与导出。
+当前生产数据流为：原片解码与输入冻结 → 导入或生成参考 → Beauty → 场景与原生人物仿色、明暗及背景图层 → 边界受光与合成 → 保存。保存后按显式服务策略取得整图与原生窗口审片，执行有资格的本地修复或补证据，人工批准、重开与导出分别记录。`local_portrait` 使用同一管线的无参考节点子集，关闭参考、场景及边界；该任务不隐式准备新的 BeautyGRPO 结果，可消费此前显式准备的冻结美化层。
 
-- 原片承担人物身份、几何和高频纹理；参考提供目标外观与场景。
+- BeautyGRPO 默认 100% 使用模型生成的脸部外观，保留生成肤质、清晰度和色调；只在 ROI 接缝和真实遮挡处融合。前额区域沿可见皮肤向发际线扩展，避免脸部椭圆造成上下额断层；不强制恢复原片纹理或锁定眼口颜色。可降低强度或在专业页按人脸恢复原片。范围与限制见[人像美化实跑与接入](docs/PORTRAIT_BEAUTY.md)。
+- 原片承担未编辑区域的结构与纹理；参考提供目标外观与场景。生成美化纹理单独记录，不声称是相机原生细节，美化和光效均不改变人物 alpha。
+- 专业 Cos 画布提供“仅人像美化”“完整 Cos 场景”“保留原片人物外观”预设。可调整已有可编辑节点的开关、强度、位置并保存/加载模板；参数对应真实工程图层。画布与任务计划共用节点契约，明确输入输出、颜色域及人物 alpha 职责；后台检查依赖、断连、重复输入和循环。状态刷新保留节点选择、布局及观察视图。当前连线固定，未实现自由接线或通用 ComfyUI 插件运行器。模板不携带另一张照片的图像、遮罩或私人配置。
 - 颜色和明暗可分别调整，已有冻结版本可重开；支持PNG/JPEG、真实TIFF16/32和portable v2工程。
 - “重新审片并本地修复”会取得新文本/视觉审片，按资格处理一次并保存独立版本，不新增参考或独立效果生图。
 - 对已审查鞋部窗口的地面细节损失，自动核对地面支持和原生透明度，从原片同坐标恢复亮度细节；保留当前背景的低频色彩基础，另存新版本并重新审片。
@@ -50,9 +68,11 @@ $workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
 
 ## 文档与参与
 
+使用 Agent 参与开发：先读英文 [AGENTS.md](AGENTS.md) 与 [Agent 开发指南](docs/AGENT_GUIDE.md)，按隔离工作区、模块导航和验证流程开始。
+
 [安装](docs/INSTALLATION.md) · [开发与构建](docs/DEVELOPMENT.md) · [Release发布](docs/RELEASING.md) · [文档索引](docs/README.md) · [参与贡献](CONTRIBUTING.md) · [安全与隐私](SECURITY.md) · [更新记录](CHANGELOG.md)
 
-当前实现及未解决问题见 [算法选择与范围](docs/ALGORITHM_DECISIONS.md)。0.4.8清理过时源码和文档，沿用现有联合受光流程与已接受艺术范围。
+当前实现及未解决问题见 [算法选择与范围](docs/ALGORITHM_DECISIONS.md) 和[人像美化实跑与接入](docs/PORTRAIT_BEAUTY.md)。0.5.0 引入可编辑学习型人像美化与普通/专业共享工作区，沿用现有联合受光流程；跨人物与场次的艺术质量仍需验证。
 
 ## 仓库结构
 
@@ -66,7 +86,7 @@ tests/         离线行为检查及临时工程 fixture
 LICENSES/      依赖和第三方组件的许可证原文
 ```
 
-更详细的提交边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。
+更详细的提交边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。公开交付流程见 [开源准备](docs/OPEN_SOURCE_READINESS.md)，使用不含旧 Git 历史的清洁源码目录建立公开历史。
 
 ## 开源许可
 

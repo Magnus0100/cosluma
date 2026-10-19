@@ -2,6 +2,8 @@
 
 欢迎改进 Cosplay Studio 的界面、文档、图像处理和可复现验证。先阅读 [开发指南](docs/DEVELOPMENT.md) 和 [产品数据流](docs/PRODUCT_ARCHITECTURE.md)，了解原片、参考、冻结资产及人工批准的职责。
 
+使用编码 Agent 时，从英文 [AGENTS.md](AGENTS.md) 和 [Agent 开发指南](docs/AGENT_GUIDE.md) 开始；其中提供环境建立、代码归属、最小启动和按改动选择验证的完整入口。
+
 ## 提交前
 
 使用 Windows x64、Python 3.12 和仓库固定的桌面依赖。模型权重及GPU运行时单独配置；纯文档或界面改动通常不需要下载模型。
@@ -24,10 +26,10 @@ git diff --check
 
 增加生产模块或外部worker时，同步维护 `scripts/runtime_manifest.json`；涉及打包时按开发指南检查Debug和Release。成功启动、数值一致、自动诊断和人工成片批准分别报告。
 
-当前仓库位于 GitHub 私有仓库；维护者会在开放协作前启用实际的 Issue 和 Pull Request 流程。贡献的授权条件以根目录 [LICENSE](LICENSE) 为准，第三方代码和模型须保留各自许可及来源。
+维护者在开放协作前确认目标仓库的 Issue 和 Pull Request 流程可用。贡献的授权条件以根目录 [LICENSE](LICENSE) 为准，第三方代码和模型须保留各自许可及来源。
 
 ## 公开源码导出
 
 本地开发历史包含私人工程及机器记录。公开仓库使用清洁源码导出建立新历史，不直接推送旧本地分支或标签。导出时检查实际内容、配置模板、第三方许可和依赖；`.gitignore`不能隐藏已经进入历史的内容。
 
-使用 `scripts/prepare_source_release.py`生成清洁目录及文件身份清单，具体命令见 [开发指南](docs/DEVELOPMENT.md)。
+使用 `scripts/prepare_source_release.py`生成清洁目录及文件身份清单，具体命令见 [开源交付准备](docs/OPEN_SOURCE_READINESS.md) 和 [开发指南](docs/DEVELOPMENT.md)。

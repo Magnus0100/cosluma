@@ -19,6 +19,7 @@ from pathlib import Path
 from PIL import Image, ImageCms, ImageDraw, ImageOps
 
 import vision_transport
+from asset_identity import sha256_file
 
 SCHEMA = 'cosplay_post_review.v2'
 COMPREHENSIVE_SCHEMA = SCHEMA
@@ -44,8 +45,7 @@ def _json_bytes(value):
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _digest(value):
@@ -207,6 +207,10 @@ reviewed in native feature pairs; their absence from this overview does not inva
 native_detail: genuine skin/hair/fabric/makeup detail at native 100%; whole-frame thumbnails cannot
 pass this. Optional verified native panels cover only their own local scope. If they are missing,
 reduced or insufficient, use unknown, not a claim of high-resolution source detail.
+When the supplied workflow includes a model-generated portrait-beauty layer, treat that layer's
+intentional skin smoothing and facial appearance as the selected beauty baseline. Do not fail
+native_detail merely because source pores or fine skin texture are absent; still fail newly added
+blur, eye/mouth damage, lost makeup or accessory detail, face/neck seams, and identity changes.
 scene_integration: person/environment/effects share plausible local colour, direction, exposure,
 shadows, selective reflections, edges and ground contact; no uniform glow or pasted cutout.
 
@@ -498,6 +502,8 @@ All lower crop panels are unreduced 1:1 samples; columns mix source and final ro
 above provide context ONLY. Do not review concept_hierarchy or effects_space on this native board.
 For EACH supplied pair return exactly the four LOCAL criteria, judged only within that pair:
 native_detail: visible texture/strands/weave/lip detail, new smoothing, repeated detail or sharpness loss.
+If the selected workflow uses model-generated portrait beauty, intentional smoothing already present
+in that chosen model appearance is not by itself a failure; inspect new damage and identity/feature loss.
 identity_makeup: source/final local shape, makeup line, expression, finger/garment construction or
 feature pattern preservation IF present in this pair; do not require other body parts to be shown.
 skin_materials: local material distinction, plausible contextual colour and transition, newly added

@@ -17,14 +17,14 @@ import importlib
 import cv2
 import numpy as np
 from material_solver_profiles import DEFAULT_PROFILE, solver_configuration
+from asset_identity import sha256_file
 
 DOMAIN = 'display_linear_sRGB'
 SCHEMA = 'qualified_material_finish.v1'
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _write(path, value):

@@ -13,12 +13,14 @@ from pathlib import Path
 from runtime_resources import code_path
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+from native_array_storage import save_proxy_arrays
+from scipy.ndimage import distance_transform_edt
 
 from reference_colour_fit import to_lab, from_lab, REGIONS
+from asset_identity import sha256_file
+from cache_roots import cache_dir
 
 SCHEMA = 'reference_scene_balance.v1'
-LIMITS = {'minimum_ev': -.15, 'maximum_ev': .4, 'maximum_ab': .025}
 PREPARATION_POLICY = 'reference_supported_macro_balance.v2'
 PREPARATION_LIMITS = {'minimum_ev': -.25, 'maximum_ev': .75, 'maximum_ab': .025}
 REGION_LIMITS = {'hair': [-.15, .75], 'clothing': [-.20, .35], 'skin': [-.25, .25]}
@@ -26,8 +28,7 @@ SDR_AREA_ROUNDOFF = 4 * np.finfo(np.float32).eps
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _json_sha(value):
@@ -38,17 +39,8 @@ def _read(path):
     return json.loads(Path(path).read_text(encoding='utf8'))
 
 
-def _smooth(value):
-    value = np.clip(value, 0, 1)
-    return value*value*(3-2*value)
 
 
-def _low(values, mask, sigma):
-    support = gaussian_filter(mask.astype(np.float32), sigma)
-    shape = (sigma, sigma) + (0,)*(values.ndim-2)
-    filtered = gaussian_filter(values*mask[(...,)+(None,)*(values.ndim-2)], shape)
-    divisor = np.maximum(support, 1e-5)[(...,)+(None,)*(values.ndim-2)]
-    return filtered/divisor, support
 
 
 def _receipt_limits(receipt):
@@ -79,28 +71,95 @@ def read_skin_protection(path, size):
     return protection
 
 
-def macro_ev(name, current_lightness, desired_ev, *, skin_protection=None):
-    """Only the broad EV field changes; source detail and coordinates remain."""
-    if name == 'head_hair':
-        low, high = np.quantile(current_lightness, [.4, .85])
-        highlight = _smooth((current_lightness-low)/max(high-low, .02))
-        return np.clip(desired_ev, -.15, 0)+np.clip(desired_ev, 0, .75)*(.25+.75*highlight)
-    if name == 'clothing':
-        low, high = np.quantile(current_lightness, [.25, .65])
-        dark = 1-_smooth((current_lightness-low)/max(high-low, .02))
-        return np.clip(desired_ev, -.20, 0)+np.clip(desired_ev, 0, .35)*dark
-    ev = np.clip(desired_ev, -.25, .25)
-    if skin_protection is not None:
-        ev = ev*(1-.85*np.clip(skin_protection, 0, 1))
-    return ev
 
 
-def excess_warm_suppression(predicted_ab, target_ab, source_high, mask):
-    """Warm target highlights are valid; suppress only excess relative to them."""
-    excess = predicted_ab-target_ab
-    orange = _smooth((excess[..., 1]-.003)/.014)
-    red = _smooth((excess[..., 0]-.018)/.014)*_smooth((excess[..., 1]+.004)/.014)
-    return .8*gaussian_filter(np.maximum(orange, red)*source_high*mask, 1.)*mask
+def extend_mouth_lightness(field, labels, alpha, feature_regions):
+    """Continue supported skin EV through the mouth without transferring colour.
+
+    Harmonic extension keeps the measured skin boundary fixed. Lip/teeth/inner
+    mouth RGB are not observations: they retain their existing detail and ab.
+    Unsupported components stay unchanged and retain their material owners.
+    """
+    from local_face_protection import mouth_lightness_domain
+    from scipy.ndimage import label
+    from scipy.sparse import coo_matrix, diags
+    from scipy.sparse.csgraph import connected_components
+    from scipy.sparse.linalg import spsolve
+
+    labels, alpha, field = map(np.asarray, (labels, alpha, field))
+    if (labels.ndim != 2 or alpha.shape != labels.shape or field.shape != (*labels.shape, 4)
+            or not np.isfinite(field).all() or not np.isfinite(alpha).all()
+            or alpha.min() < 0 or alpha.max() > 1):
+        raise ValueError('Mouth scene illumination requires finite matching fields and alpha')
+    mouth = mouth_lightness_domain(labels.shape, feature_regions, labels) & (alpha >= .995)
+    applied = np.zeros(labels.shape, bool)
+    result = field.copy()
+    report = {'policy': 'skin_boundary_harmonic_EV_inside_ordered_mouth.v1',
+              'status': 'identity', 'reason': 'no_source_mouth_domain',
+              'colour_dose_added': False, 'reference_mouth_observations_used': False,
+              'geometry_modified': False, 'regions': []}
+    if not mouth.any():
+        return result, applied, report
+    # Each face owns its local illumination boundary; distant people and
+    # bright background objects cannot provide an EV donor for this solve.
+    components, count = label(mouth)
+    for component in range(1, count+1):
+        ys, xs = np.nonzero(components == component)
+        top, left = max(0, int(ys.min())-1), max(0, int(xs.min())-1)
+        bottom, right = min(labels.shape[0], int(ys.max())+2), min(labels.shape[1], int(xs.max())+2)
+        roi = np.s_[top:bottom, left:right]
+        target = components[roi] == component
+        yy, xx = np.nonzero(target)
+        ids = np.full(target.shape, -1, np.int32)
+        ids[yy, xx] = np.arange(len(yy))
+        skin = (labels[roi] == 3) & (alpha[roi] >= .995) & (field[roi][..., 3] > 0) & ~mouth[roi]
+        rows, columns, values = [], [], []
+        degree = np.zeros(len(yy), np.float64)
+        boundary_count = np.zeros(len(yy), np.int32)
+        rhs = np.zeros((len(yy), 2), np.float64)
+        boundary = np.zeros(target.shape, bool)
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = yy+dy, xx+dx
+            valid = (ny >= 0) & (ny < target.shape[0]) & (nx >= 0) & (nx < target.shape[1])
+            index = np.flatnonzero(valid)
+            neighbours = ids[ny[valid], nx[valid]]
+            interior = neighbours >= 0
+            source = index[interior]
+            rows.extend(source.tolist()); columns.extend(neighbours[interior].tolist())
+            values.extend([-1.] * len(source)); degree[source] += 1
+            donor = ~interior & skin[ny[valid], nx[valid]]
+            source = index[donor]
+            donor_y, donor_x = ny[source], nx[source]
+            degree[source] += 1; boundary_count[source] += 1
+            rhs[source] += field[roi][donor_y, donor_x][:, (0, 3)]
+            boundary[donor_y, donor_x] = True
+        record = {'mouth_pixels': len(yy), 'skin_boundary_pixels': int(boundary.sum())}
+        adjacency = coo_matrix((values, (rows, columns)), shape=(len(yy), len(yy))).tocsr()
+        groups, group_ids = connected_components(adjacency, directed=False)
+        supported = boundary.sum() >= 8 and all(boundary_count[group_ids == group].sum() for group in range(groups))
+        if not supported:
+            record.update(status='rejected', reason='insufficient_owned_opaque_skin_EV_boundary')
+            report['regions'].append(record)
+            continue
+        matrix = adjacency + diags(degree)
+        solution = spsolve(matrix, rhs)
+        if not np.isfinite(solution).all():
+            raise ValueError('Nonfinite mouth scene illumination extension')
+        donor_ev = field[roi][boundary, 0]
+        result[roi][yy, xx, 0] = np.clip(solution[:, 0], donor_ev.min(), donor_ev.max())
+        result[roi][yy, xx, 1:3] = 0
+        result[roi][yy, xx, 3] = np.clip(solution[:, 1], 0, 1)
+        applied[roi][yy, xx] = True
+        record.update(status='prepared', reason='continuous_owned_skin_illumination',
+                      EV_range=[float(solution[:, 0].min()), float(solution[:, 0].max())])
+        report['regions'].append(record)
+    report.update(status='prepared' if applied.any() else 'rejected',
+                  reason='supported_skin_EV_continuation' if applied.any() else 'no_supported_skin_boundary',
+                  applied_mouth_pixels=int(applied.sum()),
+                  sampling_owner='face_illumination_only; colour_material_owners_unchanged')
+    return result, applied, report
+
+
 
 
 def _limited_lightness(lightness, ev):
@@ -127,8 +186,12 @@ def apply_scene_balance(values, field, strength=1):
     if (not 0 <= strength <= 1 or values.ndim != 3 or values.shape[-1] != 3
             or field.shape != (*values.shape[:2], 4)
             or not np.isfinite(values).all() or not np.isfinite(field).all()
-            or values.min() < 0 or values.max() > 1):
+            or values.min() < -1e-5 or values.max() > 1+1e-5):
         raise ValueError('Invalid scene balance input, field or strength')
+    # Native linear/SDR conversion can leave sub-ulp excursions at the
+    # endpoint after a large scene-design candidate is registered. They carry
+    # no visual information and must not abort the complete export.
+    values = np.clip(values, 0, 1)
     result = values.copy()
     active = np.any(field[..., :3] != 0, axis=-1)
     if strength == 0 or not active.any():
@@ -138,10 +201,10 @@ def apply_scene_balance(values, field, strength=1):
     selected = field[active]
     ev, ab = selected[:, 0], selected[:, 1:3]
 
-    def candidate(dose):
-        target = lab.copy()
-        target[:, 0] = _limited_lightness(lab[:, 0], ev*dose)
-        target[:, 1:] += ab*dose[:, None]
+    def candidate(dose, source_lab=lab, exposure=ev, chroma=ab):
+        target = source_lab.copy()
+        target[:, 0] = _limited_lightness(source_lab[:, 0], exposure*dose)
+        target[:, 1:] += chroma*dose[:, None]
         return from_lab(target)
 
     dose = np.full(len(lab), strength, np.float32)
@@ -149,16 +212,19 @@ def apply_scene_balance(values, field, strength=1):
     bad = (proposed.min(-1) < 0) | (proposed.max(-1) > 1) | ~np.isfinite(proposed).all(-1)
     if bad.any():
         # Fixed iterations give the same dose in any ROI/full-image execution.
-        low, high = dose.copy(), dose.copy()
-        low[bad] = 0
+        # Legal proposals never change in this search. Keep their first RGB
+        # result and evaluate only the initially conflicting pixels, with the
+        # same float32 bounds, candidate arithmetic and iteration count.
+        search_lab, search_ev, search_ab = lab[bad], ev[bad], ab[bad]
+        low, high = np.zeros(np.count_nonzero(bad), np.float32), dose[bad].copy()
         for _ in range(20):
             middle = (low+high)*.5
-            trial = candidate(middle)
+            trial = candidate(middle, search_lab, search_ev, search_ab)
             valid = np.isfinite(trial).all(-1) & (trial.min(-1) >= 0) & (trial.max(-1) <= 1)
-            low = np.where(bad & valid, middle, low)
-            high = np.where(bad & ~valid, middle, high)
-        dose[bad] = low[bad]
-        proposed = candidate(dose)
+            low = np.where(valid, middle, low)
+            high = np.where(~valid, middle, high)
+        dose[bad] = low
+        proposed[bad] = candidate(low, search_lab, search_ev, search_ab)
     fallback = ((dose < 1e-6) | ~np.isfinite(proposed).all(-1)
                 | (proposed.min(-1) < 0) | (proposed.max(-1) > 1))
     proposed[fallback] = original[fallback]
@@ -190,6 +256,7 @@ def _binding(parameters, colour_path, plan):
 
 def validate_scene_layer(receipt_path, parameters, colour_receipt_path, plan,
                          native_size, proxy_size):
+    """Return the validated field, receipt and original proxy baseline arrays."""
     receipt = _read(receipt_path)
     if (receipt.get('schema') != SCHEMA or receipt.get('working_domain') != 'display_linear_sRGB'
             or receipt.get('native_size') != list(native_size)
@@ -208,7 +275,8 @@ def validate_scene_layer(receipt_path, parameters, colour_receipt_path, plan,
     provenance = receipt['baseline_provenance']
     if _sha(provenance['receipt_copy_path']) != provenance['receipt_sha256']:
         raise ValueError('Frozen baseline receipt changed')
-    # The old master is intentionally not reopened: rendering overwrites it.
+    # The frozen proxy baseline is the consumer input; preparation already
+    # bound it to the immutable pre-scene native master.
     with np.load(receipt['asset']['path'], allow_pickle=False) as resource:
         field, baseline = resource['values'], resource['baseline_rgb']
     shape = (proxy_size[1], proxy_size[0])
@@ -221,12 +289,12 @@ def validate_scene_layer(receipt_path, parameters, colour_receipt_path, plan,
             or field[..., 3].min() < 0 or field[..., 3].max() > 1
             or np.any(field[field[..., 3] == 0, :3] != 0)):
         raise ValueError('Invalid scene balance field or baseline')
-    return field, receipt
+    return field, receipt, baseline
 
 
 def _labels(root, identity, size, expected):
     import cv2
-    for path in (root/'outputs/cache/local-analysis'/identity[:16]).glob('*/semantics/labels.npz'):
+    for path in (cache_dir(root, 'local-analysis')/identity[:16]).glob('*/semantics/labels.npz'):
         with np.load(path, allow_pickle=False) as resource:
             labels = cv2.resize(resource['labels'], size, interpolation=cv2.INTER_NEAREST)
         if hashlib.sha256(labels.tobytes()).hexdigest() == expected:
@@ -235,12 +303,14 @@ def _labels(root, identity, size, expected):
 
 
 def _master(path, native):
-    import cv2
+    import tifffile
     from float_appearance import srgb_to_linear
-    encoded = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    # OpenCV's filename reader cannot handle Windows Unicode paths reliably.
+    # The saved master is explicitly RGB TIFF, so preserve its channel order.
+    encoded = tifffile.imread(path)
     if encoded is None or encoded.dtype != np.uint16 or encoded.shape != (native[1], native[0], 3):
         raise ValueError('Baseline requires the native uint16 sRGB appearance TIFF')
-    linear = encoded[..., ::-1].astype(np.float32)/65535
+    linear = encoded.astype(np.float32)/65535
     del encoded
     for top in range(0, len(linear), 128):
         linear[top:top+128] = srgb_to_linear(linear[top:top+128])
@@ -277,12 +347,31 @@ def resize_sdr_baseline(values, size):
         'source_required_strict_SDR': True, 'pixel_operator_validation_unchanged': True}
 
 
+def scene_field_owners(labels, mouth_illumination, *, physical_domains=None):
+    """Only material/topology belongs to sampler domains; soft dose stays a field."""
+    labels=np.asarray(labels);mouth_illumination=np.asarray(mouth_illumination)
+    if labels.dtype.kind not in 'iu' or mouth_illumination.dtype!=np.dtype(bool) or labels.shape!=mouth_illumination.shape:
+        raise ValueError('Scene sampling requires integer material owners and a boolean mouth illumination domain')
+    owners=labels.astype(np.int32).copy()
+    if physical_domains is not None:
+        from source_skin_domains import POLICY
+        physical=physical_domains.get('sampling_owners',physical_domains['owners'])
+        if (physical.shape!=labels.shape or not np.issubdtype(physical.dtype,np.integer)
+                or physical_domains['report'].get('policy')!=POLICY):
+            raise ValueError('Scene sampling physical domains differ from its source topology')
+        mask=np.isin(labels,(6,7,11,15,16,20))
+        owners[mask]=physical[mask]
+    owners[mouth_illumination]=3
+    return owners
+
+
 def main():
     import cv2
     from raw_support import open_rgb, linear_preview
     from float_appearance import srgb_to_linear
-    from evaluate_reference_colour import sheet, optional_review_boxes
-    from render_reference_colour_composite import sample_maps
+    from evaluate_reference_colour import sheet
+    from render_reference_colour_composite import sample_reference_field
+    from portrait_beauty_layer import hair_correction_guard_for_run, sample_visible_face_support
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path.cwd())
@@ -295,9 +384,13 @@ def main():
     run, parameters = _read(args.run), _read(directory/'parameters.json')
     plan = run['options']['appearance_revision']['design_reconstruction_plan']
     native, size = tuple(plan['canvas']['source_oriented_size']), tuple(plan['canvas']['source_proxy_size'])
+    hair_guard = hair_correction_guard_for_run(run,root=root)
+    guard_binding = hair_guard['binding'] if hair_guard else None
     colour_path = directory/'reference-colour-layer.json'
     from reference_colour_blend import validate_layer
     _, colour = validate_layer(colour_path, parameters, native, size)
+    if colour.get('hair_correction_guard') != guard_binding:
+        raise ValueError('Scene preparation visible-face guard differs from its colour baseline')
     baseline_receipt_path = directory/'composite-receipt.json'
     baseline_receipt = _read(baseline_receipt_path)
     if (baseline_receipt.get('scene_balance_layer') or baseline_receipt.get('reference_scene_balance')
@@ -321,6 +414,7 @@ def main():
     print('Reading native 16-bit T+B appearance baseline', flush=True)
     native_baseline = _master(master, native)
     baseline, baseline_resampling = resize_sdr_baseline(native_baseline, size)
+    del native_baseline
     print(json.dumps({'baseline_resampling': baseline_resampling}), flush=True)
     with np.load(plan['source_baseline']['assets']['foreground_alpha']['path'], allow_pickle=False) as resource:
         native_alpha = resource['values']
@@ -328,6 +422,7 @@ def main():
             or native_alpha.min() < 0 or native_alpha.max() > 1):
         raise ValueError('Invalid source coverage for scene balance preparation')
     alpha = cv2.resize(native_alpha, size, interpolation=cv2.INTER_AREA)
+    del native_alpha
     protection_asset = plan['mask_roles']['identity_protection']
     if (_sha(protection_asset['path']) != parameters['binding']['source_protection']
             or protection_asset['sha256'] != parameters['binding']['source_protection']):
@@ -337,6 +432,14 @@ def main():
     ref_rgb = srgb_to_linear(np.asarray(image, np.float32)/255)
     sl = _labels(root, run['source']['sha256'], size, colour['binding']['source_labels_sha256'])
     rl = _labels(root, run['reference']['sha256'], image.size, colour['binding']['reference_labels_sha256'])
+    from local_face_protection import prepare_feature_materials
+    feature_domains = parameters['feature_material_domains']
+    if feature_domains['schema'] != 'feature_material_domains.v1':
+        raise ValueError('Scene preparation requires current feature material domains')
+    sl, protection, source_material_report = prepare_feature_materials(
+        sl, protection, feature_domains['source_regions'])
+    rl, _, reference_material_report = prepare_feature_materials(
+        rl, np.zeros(rl.shape, np.float32), feature_domains['reference_regions'])
     H = np.asarray(parameters['binding']['mapping'])
     face_H = np.asarray(colour['face_reference_mapping'])
     aligned = cv2.warpPerspective(ref_rgb, H, size)
@@ -351,14 +454,44 @@ def main():
     maps = load_maps(local_record,sl.shape,rl.shape,parameters,root=root,
         source_labels=sl,reference_labels=rl)
     print('Solving automatic local lightness and background relationship',flush=True)
+    face_support = sample_visible_face_support(hair_guard,(0,0,size[0],size[1]),size) if hair_guard else None
+    # Topology must use the original source, before T/B can introduce a false
+    # anatomical colour boundary. This is frozen source replay, never inference.
+    from native_source_baseline import source_for_reference_prepare
+    from source_skin_domains import build_hand_arm_domains,POLICY as physical_policy
+    original_source,original_precision,original_display=source_for_reference_prepare(
+        run,root=root,apply_beauty=False,writable=False)
+    original_proxy=cv2.resize(original_source,size,interpolation=cv2.INTER_AREA)
+    del original_source
+    original_lab=to_lab(original_proxy);del original_proxy
+    material_guards={name:op['source_material_guard'] for name,op in parameters['operators'].items()
+                     if op.get('source_material_guard')}
+    physical_owners,joint_groups,physical_report=build_hand_arm_domains(
+        sl,original_lab,alpha,material_guards=material_guards)
+    physical_report['original_source_input']={'source_sha256':run['source']['sha256'],
+        'decode_version':original_precision.get('decode_version'),'source_display':original_display,
+        'portrait_beauty_applied_to_topology_guide':False}
+    physical_domains={'owners':physical_owners,'groups':joint_groups,'report':physical_report,'source_lab':original_lab}
+    task_intent = run.get('task_intent') or (run.get('options') or {}).get('task_intent') or {}
+    constraints = task_intent.get('constraints') or {}
+    allow_relaxed_continuation = bool(
+        task_intent.get('mode') in {'create_reference', 'existing_reference'}
+        and constraints.get('reference_role') != 'source_conditioned_design'
+        and constraints.get('background_mode') != 'enhance_source')
     field,reports,automatic_background = scene_field(baseline_lab,to_lab(ref_rgb),sl,rl,
-        alpha,protection,maps,local_record)
+        alpha,protection,maps,local_record,visible_face_support=face_support,physical_domains=physical_domains,
+        preserve_hair=bool(parameters.get('source_hair_policy')),
+        allow_relaxed_continuation=allow_relaxed_continuation)
+    field, mouth_illumination, mouth_report = extend_mouth_lightness(
+        field, sl, alpha, feature_domains['source_regions'])
+    owners = scene_field_owners(sl,mouth_illumination,physical_domains=physical_domains)
     # Preview applies only where the composite is effectively opaque; no alpha is multiplied into the field again.
     print(json.dumps({'scene_input': {'baseline_shape':list(baseline.shape),
         'field_shape':list(field.shape),'baseline_finite':bool(np.isfinite(baseline).all()),
         'field_finite':bool(np.isfinite(field).all()),'baseline_min':float(baseline.min()),
         'baseline_max':float(baseline.max())}}), flush=True)
-    proposed = apply_scene_balance(baseline, field)
+    sampled = sample_reference_field(field,(0,0,size[0],size[1]),size,size,owners=owners,guard=hair_guard)
+    proposed = apply_scene_balance(baseline, sampled)
     proposed[alpha < .995] = baseline[alpha < .995]
     person_distance = distance_transform_edt(alpha < .01)
     exterior = (alpha < .01) & (person_distance >= 12) & (person_distance <= 80)
@@ -373,16 +506,20 @@ def main():
         bg_checks['nearby_background_exposure_residual_ev_q10_50_90'] = np.quantile(bg_delta, [.1,.5,.9]).tolist()
         bg_checks['nearby_background_relative_L_ratio_median'] = float(np.median(ref_lab[..., 0][exterior]/np.maximum(baseline_lab[..., 0][exterior], .03)))
     asset_path = directory/'scene-balance-layer.npz'
-    owners = sl.astype(np.int32).copy()
-    owners[protection >= .5] += 1000
-    np.savez_compressed(asset_path, values=field, baseline_rgb=baseline, owners=owners)
+    save_proxy_arrays(asset_path, {'values': field, 'baseline_rgb': baseline, 'owners': owners})
     receipt = {'schema': SCHEMA, 'working_domain': 'display_linear_sRGB', 'native_size': list(native),
                'support_policy': 'reference_support.v1',
                'automatic_policy': POLICY, 'local_correspondence_asset_sha256': local_record['asset']['sha256'],
+               'physical_domain_policy':physical_policy,
+               'physical_domain_producer_sha256':_sha(code_path('source_skin_domains.py')),
+               'feature_material_domains': {'source': source_material_report,
+                                            'reference': reference_material_report},
+               'mouth_lightness': mouth_report,
                'proxy_size': list(size), 'binding': _binding(parameters, colour_path, plan),
+               'hair_correction_guard': guard_binding,
                'algorithm_sha256': _sha(code_path('reference_scene_balance.py')),
                'asset': {'path': str(asset_path), 'sha256': _sha(asset_path),
-                         'representation': 'preweighted_EV_delta_a_delta_b_plus_QA_coverage; coverage_not_reapplied',
+                         'representation': 'EV_delta_a_delta_b_plus_QA_coverage; hair_visibility_dose_once_after_sampling; coverage_not_reapplied',
                          'baseline_rgb': 'native_uint16_sRGB_T+B_composite_decoded_linear_then_AREA; opaque_donors_alpha>=.995'},
                'baseline_provenance': {'master_path': str(master), 'master_sha256': baseline_receipt['output_sha256'],
                                        'receipt_copy_path': str(frozen_receipt), 'receipt_sha256': _sha(frozen_receipt),
@@ -400,25 +537,7 @@ def main():
     validate_scene_layer(receipt_path, parameters, colour_path, plan, native, size)
     sheet([linear_preview(baseline), linear_preview(aligned), linear_preview(proposed)],
           ['Native T+B baseline', 'Registered reference', 'Bounded scene balance (opaque preview)'], 2400).save(
-              directory/'scene-balance-review.jpg', quality=97)
-    validation_path = directory/'validation.json'
-    validation = _read(validation_path) if validation_path.is_file() else {}
-    face_box = optional_review_boxes(validation, native).get('face')
-    boxes = {'face': face_box} if face_box is not None else {}
-    if face_box is None:
-        print('Optional native face review skipped: source face crop is unavailable', flush=True)
-    yy, xx = np.nonzero(np.isin(sl, REGIONS['clothing']))
-    if len(xx):
-        pbox = (max(0, xx.min()-10), max(0, yy.min()-10), min(size[0], xx.max()+11), min(size[1], yy.min()+410))
-        boxes['clothing'] = [round(v*s) for v,s in zip(pbox,(native[0]/size[0],native[1]/size[1])*2)]
-    for name, box in boxes.items():
-        x0,y0,x1,y1 = box
-        current = native_baseline[y0:y1,x0:x1]
-        adjusted = apply_scene_balance(current, sample_maps(field, box, size, native, owners=owners))
-        adjusted[native_alpha[y0:y1,x0:x1] < .995] = current[native_alpha[y0:y1,x0:x1] < .995]
-        linear_preview(adjusted).save(directory/f'scene-balance-native-{name}.png')
-        sheet([linear_preview(current), linear_preview(adjusted)], ['Native baseline', 'Scene balance opaque preview'], 1800).save(
-            directory/f'scene-balance-{name}-review.jpg', quality=97)
+              directory/'scene-balance-proxy-review.jpg', quality=95)
     print(json.dumps({'receipt': str(receipt_path), 'regions': reports, 'background_checks': bg_checks,
                       'visual_acceptance': False}), flush=True)
 

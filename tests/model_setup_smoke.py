@@ -18,6 +18,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='cosplay-model-setup-') as folder, patch.dict(os.environ, clean, clear=True):
         root = Path(folder).resolve(); profile = root/'profile'
         os.environ.update({'LOCALAPPDATA': str(profile), 'QT_QPA_PLATFORM': 'offscreen',
+            'COSPLAY_MODELS_ROOT': str(root/'model'),
             'COSPLAY_PROVIDER_SETTINGS': str(profile/'providers.json')})
         example = json.loads((Path(__file__).resolve().parent.parent/'providers/local-models.example.json').read_text('utf8'))
         with patch.object(models, 'resource_path', return_value=root/'example.json'):
@@ -81,7 +82,9 @@ def main():
                 with opener.open(request, timeout=5) as response: return json.load(response)
             try:
                 assert not call('GET')['setup']['paths_available']
-                assert call('POST', {'registry_path': str(original)})['setup']['registry_path'] == str(original)
+                imported = call('POST', {'registry_path': str(original)})['setup']
+                assert imported['registry_path'] != str(original) and not imported['paths_available']
+                assert models.settings_directory() in Path(imported['registry_path']).parents
                 app = qt.QApplication.instance() or qt.QApplication([])
                 window = qt.Workbench(root/'ui-workspace', url, embedded_backend=True)
                 with patch.object(window, 'task'):

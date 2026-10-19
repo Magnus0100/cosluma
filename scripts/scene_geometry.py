@@ -8,11 +8,11 @@ from pathlib import Path
 import numpy as np
 import cv2
 from PIL import Image
+from asset_identity import sha256_file
 
 
 def digest(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def read_mask(path):

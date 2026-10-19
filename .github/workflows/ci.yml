@@ -22,4 +22,11 @@ jobs:
           cache-dependency-path: scripts/requirements-desktop.txt
       - run: python -m pip install -r scripts/requirements-desktop.txt
       - run: python scripts/check_repository.py
-      - run: python tests/run.py core
+      - name: Check offline behavior from clean public source
+        shell: pwsh
+        run: |
+          python -B scripts/prepare_source_release.py --output "$env:RUNNER_TEMP/cosplay-ci-source"
+          if ($LASTEXITCODE -ne 0) { throw 'Public source export failed' }
+          Set-Location "$env:RUNNER_TEMP/cosplay-ci-source"
+          python -B tests/run.py core
+          if ($LASTEXITCODE -ne 0) { throw 'Public source behavior checks failed' }

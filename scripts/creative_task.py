@@ -5,9 +5,10 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from asset_identity import sha256_file
 
 INTENT_SCHEMA = 'cosplay_task_intent.v1'
-PLAN_SCHEMA = 'cosplay_task_plan.v1'
+PLAN_SCHEMA = 'cosplay_task_plan.v2'
 MODES = {'local_portrait': '本地原片精修', 'existing_reference': '已有参考完整后期',
          'create_reference': '创作参考并完成后期'}
 REQUEST_FIELDS = frozenset(('source', 'reference', 'preset', 'provider', 'model', 'vision_model',
@@ -16,12 +17,24 @@ REQUEST_FIELDS = frozenset(('source', 'reference', 'preset', 'provider', 'model'
     'sample', 'run_id', 'parent_run_id',
     'generation_design', 'character_profile', 'appearance_revision', 'manual_layers', 'native_source_retouch',
     'preset_snapshot', 'effective_prompt', 'prompt_template_version', 'size', 'alpha_backend',
-    'denoise_strength', 'residual', 'preserve_project_selection', 'creative_task',
-    'async', 'sync', 'plan_id', 'generate', 'local_only', 'complete_post'))
+    'denoise_strength', 'residual', 'preserve_project_selection', 'defer_reference_selection', 'creative_task',
+    'async', 'sync', 'plan_id', 'generate', 'local_only', 'complete_post', 'final_repair_only',
+    'execution_strategy', 'preparation_policy', 'creative_direction', 'regional_resume_authorization',
+    'regional_candidate_reuse_authorization'))
 SHARED_FIELDS = frozenset(('preset', 'provider', 'model', 'vision_model', 'api_base', 'api_url',
     'api_key_env', 'character_name', 'character_notes', 'prompt', 'input_prompt',
     'variant_count', 'variant_styles', 'model_registry', 'algorithm_profile', 'material_finish_profile',
-    'size', 'creative_task'))
+    'size', 'defer_reference_selection', 'creative_task', 'execution_strategy', 'preparation_policy'))
+
+EXECUTION_STRATEGIES = frozenset({'layered_reference_transfer'})
+PREPARATION_POLICIES = frozenset({'prepare_current', 'replay_frozen'})
+
+
+def normalize_preparation_policy(value=None, *, default='replay_frozen'):
+    policy = default if value is None else value
+    if not isinstance(policy, str) or policy not in PREPARATION_POLICIES:
+        raise ValueError('Unsupported preparation policy: ' + str(policy))
+    return policy
 
 
 def digest(value):
@@ -30,12 +43,11 @@ def digest(value):
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def normalize_task_intent(value):
-    if not isinstance(value, dict) or set(value) - {'schema_version', 'mode', 'brief', 'constraints', 'services'}:
+    if not isinstance(value, dict) or set(value) - {'schema_version', 'mode', 'brief', 'constraints', 'services', 'regional_refinement'}:
         raise ValueError('Provide the current creative task intent')
     if value.get('schema_version') != INTENT_SCHEMA or value.get('mode') not in MODES:
         raise ValueError('Unsupported creative task schema or route')
@@ -44,19 +56,57 @@ def normalize_task_intent(value):
         raise ValueError('Creative brief must be text of at most 16000 characters')
     constraints = value.get('constraints', {})
     services = value.get('services', {})
-    if not isinstance(constraints, dict) or set(constraints) - {'preserve_background', 'no_effects'}:
+    if not isinstance(constraints, dict) or set(constraints) - {'preserve_background', 'no_effects', 'background_mode', 'reference_role', 'refinement_profile'}:
         raise ValueError('Unsupported creative task constraints')
-    if not isinstance(services, dict) or set(services) - {'text_vision'}:
+    if not isinstance(services, dict) or set(services) - {'text_vision', 'visual_review'}:
         raise ValueError('Unsupported creative task service policy')
-    for key, item in [*constraints.items(), *services.items()]:
+    boolean_options = [(key, item) for key, item in constraints.items() if key not in {'background_mode', 'reference_role', 'refinement_profile'}]
+    for key, item in [*boolean_options, *services.items()]:
         if type(item) is not bool:
             raise ValueError('Task option must be a boolean: ' + key)
     local = value['mode'] == 'local_portrait'
     if local and services.get('text_vision') is True:
         raise ValueError('Local portrait tasks do not call external text/vision services')
-    return {'schema_version': INTENT_SCHEMA, 'mode': value['mode'], 'brief': brief.strip(),
+    text_vision = services.get('text_vision', False)
+    visual_review = services.get('visual_review', False)
+    if visual_review and (local or not text_vision):
+        raise ValueError('Automatic visual review requires an external text/vision service')
+    result = {'schema_version': INTENT_SCHEMA, 'mode': value['mode'], 'brief': brief.strip(),
         'constraints': {key: constraints.get(key, local) for key in ('preserve_background', 'no_effects')},
-        'services': {'text_vision': services.get('text_vision', not local)}}
+        'services': {'text_vision': text_vision, 'visual_review': visual_review}}
+    if 'background_mode' in constraints:
+        if constraints['background_mode'] != 'enhance_source':
+            raise ValueError('Unsupported explicit background mode')
+        if local or result['constraints']['preserve_background']:
+            raise ValueError('Source enhancement requires a reference task with preserve_background false')
+        from creative_direction import has_no_effects_veto
+        result['constraints']['background_mode'] = 'enhance_source'
+        result['constraints']['no_effects'] |= has_no_effects_veto(brief)
+    if 'reference_role' in constraints:
+        reference_role = constraints['reference_role']
+        if (not isinstance(reference_role, str) or reference_role not in {'same_photo_finish', 'source_conditioned_design'}
+                or value['mode'] not in ({'existing_reference'} if reference_role == 'same_photo_finish' else {'existing_reference', 'create_reference'})
+                or result['constraints'].get('background_mode') != 'enhance_source'
+                or 'regional_refinement' in value):
+            raise ValueError('Explicit reference roles require the supported enhance_source route and no regional requests')
+        result['constraints']['reference_role'] = reference_role
+    if 'refinement_profile' in constraints:
+        from preset_store import normalize_refinement_selector
+        if (value['mode'] not in {'create_reference', 'existing_reference'}
+                or result['constraints'].get('reference_role') != 'source_conditioned_design'
+                or result['constraints'].get('background_mode') != 'enhance_source'
+                or 'regional_refinement' in value):
+            raise ValueError('Refinement recommendation requires the source-conditioned single-photo route')
+        selector = normalize_refinement_selector(constraints['refinement_profile'])
+        result['constraints']['refinement_profile'] = selector
+        from creative_direction import has_no_effects_veto
+        override_text = '\n'.join([brief, *selector.get('overrides', {}).values()])
+        result['constraints']['no_effects'] |= has_no_effects_veto(override_text) or '无特效' in override_text
+    if 'regional_refinement' in value:
+        from creative_direction import normalize_regional_refinement
+        result['regional_refinement'] = normalize_regional_refinement(value['regional_refinement'],
+            mode=value['mode'], background_mode=result['constraints'].get('background_mode'))
+    return result
 
 
 def image_budget(intent, variant_count=1):
@@ -65,8 +115,14 @@ def image_budget(intent, variant_count=1):
     if type(count) is not int or not 1 <= count <= 8:
         raise ValueError('Candidate count must be an integer from 1 to 8')
     create = intent['mode'] == 'create_reference'
-    return {'initial_reference': count if create else 0,
-            'reference_correction': 1 if create else 0, 'independent_effect': 1 if create else 0}
+    enhanced = intent['constraints'].get('background_mode') == 'enhance_source'
+    budget = {'initial_reference': count if create else 0,
+            'reference_correction': 1 if create and not enhanced else 0,
+            'independent_effect': 1 if create and not enhanced else 0}
+    if 'regional_refinement' in intent:
+        regional = intent['regional_refinement']
+        budget['regional_refinement'] = regional['maximum_submissions'] if intent['mode'] in {'create_reference', 'existing_reference'} else 0
+    return budget
 
 
 def task_brief(intent):
@@ -74,17 +130,421 @@ def task_brief(intent):
     lines = [intent['brief']] if intent['brief'] else []
     if intent['constraints']['preserve_background']:
         lines.append('保留原背景，不更换或重建场景。')
+    if intent['constraints'].get('background_mode') == 'enhance_source':
+        lines.append('保留原场景结构、主要物件、机位与透视，只适当清理和增强原景；禁止完整换景。')
+    if intent['constraints'].get('reference_role') == 'same_photo_finish':
+        lines.append('参考是用户声明的同照精修标尺；原片提供几何和原生纹理，参考仅提供影调及局部低频色映射；执行时核验配准，不直接合成参考RGB。')
+    if intent['constraints'].get('reference_role') == 'source_conditioned_design':
+        lines.append('只以本次原片生成同源美术设计参考，不读取或复刻用户人工成片；原片拥有几何和原生纹理，参考仅提供影调与局部低频色映射，执行时核验实际生成来源及配准。')
     if intent['constraints']['no_effects']:
         lines.append('不要添加特效。')
     return '\n'.join(lines)
 
 
-def image_generation_allowed(run_or_args):
-    if isinstance(run_or_args, dict):
-        intent = run_or_args.get('task_intent') or (run_or_args.get('options') or {}).get('task_intent')
-    else:
-        intent = getattr(run_or_args, 'task_intent', None)
-    return not intent or normalize_task_intent(intent)['mode'] == 'create_reference'
+def _validate_resume_proof(proof, intent, inputs):
+    import re
+    keys = {'schema', 'resume_from_run_id', 'origin_run_id', 'previous_plan_id',
+        'source_sha256', 'reference_sha256', 'reservation_sha256',
+        'reservation_binding_sha256', 'previous_direction_id', 'previous_manifest_sha256'}
+    if (not isinstance(proof, dict) or set(proof) != keys
+            or proof.get('schema') != 'regional_resume_authorization.v1'
+            or proof.get('resume_from_run_id') != intent['regional_refinement']['resume_from_run_id']):
+        raise ValueError('Regional resume requires its checked immutable authorization')
+    for key in ('resume_from_run_id', 'origin_run_id'):
+        if not isinstance(proof[key], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', proof[key]):
+            raise ValueError('Unsafe regional resume identity')
+    for key in keys - {'schema', 'resume_from_run_id', 'origin_run_id'}:
+        if not isinstance(proof[key], str) or not re.fullmatch('[0-9a-f]{64}', proof[key]):
+            raise ValueError('Regional resume proof must contain checked SHA256 identities')
+    if any(proof[role+'_sha256'] != (inputs.get(role) or {}).get('sha256') for role in ('source', 'reference')):
+        raise ValueError('Regional resume proof source/reference differs from checked inputs')
+
+
+def _resume_file(root, path):
+    """No links, traversal or mutable state repair while checking authorization."""
+    path = Path(path)
+    if not path.is_relative_to(root):
+        raise ValueError('Regional resume evidence must remain within its workspace')
+    for current in (path, *path.parents):
+        if current == root:
+            break
+        if current.is_symlink() or (hasattr(current, 'is_junction') and current.is_junction()):
+            raise ValueError('Regional resume evidence must not traverse links')
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Regional resume evidence is unavailable or malformed') from exc
+    if not isinstance(value, dict):
+        raise ValueError('Regional resume evidence must be an object')
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def verify_regional_resume(root, intent, inputs, direction, *, executing_plan_id=None):
+    """Pure preflight proof; the worker rechecks it under the origin journal lock."""
+    import re
+    root = Path(root).resolve()
+    regional = intent.get('regional_refinement') or {}
+    failed_id = regional.get('resume_from_run_id')
+    if (intent.get('mode') != 'existing_reference' or regional.get('maximum_submissions') != 1
+            or not isinstance(failed_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', failed_id)):
+        raise ValueError('No explicit zero-submission regional resume intent')
+    previous, manifest_sha = _resume_file(root, root/'outputs/runs'/failed_id/'manifest.json')
+    if previous.get('run_id') != failed_id or previous.get('status') not in {'blocked', 'failed', 'cancelled'}:
+        raise ValueError('Regional resume requires a stopped failed parent')
+    options = previous.get('options') or {}
+    previous_intent = previous.get('task_intent') or options.get('task_intent')
+    previous_plan = previous.get('task_plan') or options.get('task_plan')
+    saved_task_intent_for_replanning(previous_plan, previous_intent,
+        source_sha256=(inputs.get('source') or {}).get('sha256'),
+        reference_sha256=(inputs.get('reference') or {}).get('sha256'))
+    if any((previous.get(role) or {}).get('sha256') != (inputs.get(role) or {}).get('sha256') for role in ('source', 'reference')):
+        raise ValueError('Regional resume must reuse the exact failed source and global reference')
+    old_regional = previous_intent.get('regional_refinement') or {}
+    if (old_regional.get('maximum_submissions') != 1 or len(old_regional.get('regions') or []) != 1
+            or old_regional['regions'] != regional['regions']):
+        raise ValueError('Regional resume cannot change the original one-region instruction or core')
+    previous_direction = previous_plan.get('creative_direction') or {}
+    if (previous_intent.get('brief') != intent['brief']
+            or previous_intent.get('constraints') != intent['constraints']
+            or previous_intent.get('services') != intent['services']
+            or previous_direction.get('character') != direction.get('character')
+            or previous_direction.get('main_effect') != direction.get('main_effect')):
+        raise ValueError('Regional resume must retain the original role, brief and constraints')
+    from creative_direction import MARKER
+    if previous_direction.get('prompt', '').split(MARKER, 1)[0] != direction['prompt'].split(MARKER, 1)[0]:
+        raise ValueError('Regional resume cannot change the original editable prompt')
+    origin = (previous.get('generation_budget') or {}).get('origin_run_id') or failed_id
+    if not isinstance(origin, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', origin):
+        raise ValueError('Unsafe original regional reservation owner')
+    for job_path in (root/'outputs/jobs').glob('*/job.json'):
+        job, _ = _resume_file(root, job_path)
+        if executing_plan_id and (job.get('task_plan') or {}).get('plan_id') == executing_plan_id:
+            # The checked continuation's own running job is not its parent.
+            # The origin journal lock still arbitrates concurrent consumption.
+            continue
+        if job.get('status') in {'queued', 'running', 'cancelling'} and (
+                job.get('run_id') in {failed_id, origin} or job.get('parent_run_id') in {failed_id, origin}
+                or (((job.get('task_intent') or {}).get('regional_refinement') or {}).get('resume_from_run_id') == failed_id)):
+            raise ValueError('Regional resume parent or another continuation is still active')
+    reservation, reservation_sha = _resume_file(root,
+        root/'outputs/regional-reservations'/origin/'regional-refinement.json')
+    def submitted_id(value):
+        if isinstance(value, dict):
+            return any((key.replace('_', '').lower() in {'promptid', 'providerids'} and bool(item))
+                or submitted_id(item) for key, item in value.items() if key != 'attempt_history')
+        if isinstance(value, list):
+            return any(submitted_id(item) for item in value)
+        return False
+    if (reservation.get('schema') != 'regional_scene_refinement.v1'
+            or reservation.get('state') != 'failed_no_submission'
+            or type(reservation.get('model_submissions')) is not int or reservation['model_submissions'] != 0
+            or reservation.get('request_started') not in (None, False) or submitted_id(reservation)):
+        raise ValueError('Regional reservation is not proven unsubmitted; never grant an unknown request another allowance')
+    binding = reservation.get('binding') or {}
+    if (binding.get('source') != inputs['source']['sha256'] or binding.get('reference') != inputs['reference']['sha256']
+            or binding.get('core_box') != regional['regions'][0]['core_box']
+            or binding.get('checked_plan_id') != previous_plan['plan_id']
+            or binding.get('direction_id') != previous_direction.get('direction_id')):
+        raise ValueError('Regional failed reservation differs from its original checked task')
+    proof = {'schema': 'regional_resume_authorization.v1', 'resume_from_run_id': failed_id,
+        'origin_run_id': origin, 'previous_plan_id': previous_plan['plan_id'],
+        'source_sha256': inputs['source']['sha256'], 'reference_sha256': inputs['reference']['sha256'],
+        'previous_manifest_sha256': manifest_sha, 'reservation_sha256': reservation_sha,
+        'reservation_binding_sha256': digest(binding), 'previous_direction_id': previous_direction['direction_id']}
+    _validate_resume_proof(proof, intent, inputs)
+    return proof
+
+
+def revalidate_regional_resume(root, plan):
+    """Call just before consumption, under the worker's origin reservation lock."""
+    intent = normalize_task_intent(plan.get('intent'))
+    inputs = plan.get('inputs') or {}
+    from creative_direction import validate_direction
+    direction = validate_direction(plan.get('creative_direction'), intent,
+        source_sha256=(inputs.get('source') or {}).get('sha256'))
+    actual = verify_regional_resume(root, intent, inputs, direction, executing_plan_id=plan.get('plan_id'))
+    if actual != plan.get('regional_resume_authorization'):
+        raise ValueError('Regional resume evidence changed after checking the task plan')
+    return actual
+
+
+def _validate_candidate_reuse_proof(proof, intent, inputs):
+    import re
+    identities = {'previous_plan_id', 'previous_direction_id', 'source_sha256', 'reference_sha256',
+        'previous_manifest_sha256', 'reservation_sha256', 'reservation_binding_sha256'}
+    keys = identities | {'schema', 'reuse_generated_from_run_id', 'origin_run_id', 'prompt_id',
+        'conditioning_policy', 'assets', 'original_core_box', 'requested_core_box'}
+    roles = {'raw_candidate', 'raw_provenance', 'input_context', 'reliable_halo',
+        'condition_manifest', 'permission_mask', 'request', 'input_image'}
+    if (not isinstance(proof, dict) or set(proof) != keys
+            or proof.get('schema') != 'regional_candidate_reuse_authorization.v1'
+            or proof.get('conditioning_policy') != 'single_native_ROI_CPU_permission.v3'
+            or proof.get('reuse_generated_from_run_id') != intent['regional_refinement']['reuse_generated_from_run_id']
+            or not isinstance(proof.get('assets'), dict) or set(proof['assets']) != roles):
+        raise ValueError('Generated regional candidate requires its frozen one-photo reuse proof')
+    for key in identities:
+        if not isinstance(proof[key], str) or not re.fullmatch('[0-9a-f]{64}', proof[key]):
+            raise ValueError('Generated candidate proof requires content hashes')
+    for key in ('reuse_generated_from_run_id', 'origin_run_id', 'prompt_id'):
+        if not isinstance(proof[key], str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}', proof[key]):
+            raise ValueError('Generated candidate proof has unsafe run/provider identity')
+    for key in ('original_core_box', 'requested_core_box'):
+        box = proof[key]
+        if (not isinstance(box, list) or len(box) != 4 or any(type(v) is not int or v < 0 for v in box)
+                or not 0 < box[2]-box[0] <= 768 or not 0 < box[3]-box[1] <= 768):
+            raise ValueError('Generated candidate proof has an invalid native core')
+    if proof['requested_core_box'] != intent['regional_refinement']['regions'][0]['core_box']:
+        raise ValueError('Candidate reuse proof differs from explicitly requested CPU core')
+    for role in roles:
+        record = proof['assets'][role]
+        if (not isinstance(record, dict) or set(record) != {'path', 'sha256'}
+                or not isinstance(record['path'], str) or not Path(record['path']).is_absolute()
+                or not isinstance(record['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', record['sha256'])):
+            raise ValueError('Generated candidate proof has an invalid frozen asset')
+    if any(proof[role+'_sha256'] != (inputs.get(role) or {}).get('sha256') for role in ('source', 'reference')):
+        raise ValueError('Generated candidate proof differs from source/reference')
+
+
+def verify_regional_candidate_reuse(root, intent, inputs, direction, *, executing_plan_id=None):
+    """Read returned ONE-photo pixels; grants no request and never changes the journal."""
+    import re
+    import numpy as np
+    from PIL import Image
+    from creative_direction import MARKER
+    root = Path(root).resolve()
+    regional = intent.get('regional_refinement') or {}
+    failed_id = regional.get('reuse_generated_from_run_id')
+    if (intent.get('mode') != 'existing_reference' or regional.get('maximum_submissions') != 0
+            or intent.get('constraints', {}).get('background_mode') != 'enhance_source'
+            or len(regional.get('regions') or []) != 1 or not isinstance(failed_id, str)
+            or not re.fullmatch('[A-Za-z0-9_-]{1,128}', failed_id)):
+        raise ValueError('No explicit zero-generation candidate reuse intent')
+    previous, manifest_sha = _resume_file(root, root/'outputs/runs'/failed_id/'manifest.json')
+    if previous.get('run_id') != failed_id or previous.get('status') not in {'blocked', 'failed', 'cancelled'}:
+        raise ValueError('Candidate reuse requires a stopped failed run')
+    options = previous.get('options') or {}
+    old_intent = previous.get('task_intent') or options.get('task_intent')
+    old_plan = previous.get('task_plan') or options.get('task_plan')
+    saved_task_intent_for_replanning(old_plan, old_intent,
+        source_sha256=inputs['source']['sha256'], reference_sha256=inputs['reference']['sha256'])
+    if any((previous.get(role) or {}).get('sha256') != inputs[role]['sha256'] for role in ('source', 'reference')):
+        raise ValueError('Candidate reuse cannot change source or global reference')
+    old_regional = old_intent.get('regional_refinement') or {}
+    old_direction = old_plan.get('creative_direction') or {}
+    old_regions = old_regional.get('regions') or []
+    old_region_contract = [{key:value for key,value in row.items() if key != 'core_box'} for row in old_regions]
+    requested_region_contract = [{key:value for key,value in row.items() if key != 'core_box'} for row in regional['regions']]
+    if (old_regional.get('maximum_submissions') != 1 or len(old_regions) != 1 or old_region_contract != requested_region_contract
+            or old_intent.get('brief') != intent['brief'] or old_intent.get('constraints') != intent['constraints']
+            or old_intent.get('services') != intent['services']
+            or old_direction.get('character') != direction['character']
+            or old_direction.get('main_effect') != direction['main_effect']
+            or old_direction.get('prompt', '').split(MARKER, 1)[0] != direction['prompt'].split(MARKER, 1)[0]):
+        raise ValueError('Candidate reuse cannot change original role, brief, effect or region')
+    origin = (previous.get('generation_budget') or {}).get('origin_run_id') or failed_id
+    if not isinstance(origin, str) or not re.fullmatch('[A-Za-z0-9_-]{1,128}', origin):
+        raise ValueError('Unsafe generated candidate origin')
+    for job_path in (root/'outputs/jobs').glob('*/job.json'):
+        job, _ = _resume_file(root, job_path)
+        if executing_plan_id and (job.get('task_plan') or {}).get('plan_id') == executing_plan_id:
+            continue
+        if job.get('status') in {'queued', 'running', 'cancelling'} and (
+                job.get('run_id') in {failed_id, origin} or job.get('parent_run_id') in {failed_id, origin}):
+            raise ValueError('Generated candidate parent is still active')
+    ledger, ledger_sha = _resume_file(root, root/'outputs/regional-reservations'/origin/'regional-refinement.json')
+    prompt_id = ledger.get('prompt_id')
+    if (ledger.get('schema') != 'regional_scene_refinement.v1' or ledger.get('state') != 'generated_rejected'
+            or ledger.get('provider_returned') is not True or type(ledger.get('model_submissions')) is not int
+            or ledger['model_submissions'] != 1 or not isinstance(prompt_id, str)
+            or not re.fullmatch('[A-Za-z0-9_-]{1,128}', prompt_id)):
+        raise ValueError('Candidate reuse requires one known returned, rejected generation')
+    binding = ledger.get('binding') or {}
+    if (binding.get('source') != inputs['source']['sha256'] or binding.get('reference') != inputs['reference']['sha256']
+            or binding.get('core_box') != old_regions[0]['core_box']
+            or binding.get('checked_plan_id') != old_plan['plan_id']
+            or binding.get('direction_id') != old_direction.get('direction_id')):
+        raise ValueError('Returned candidate differs from its original checked binding')
+    requested_core = regional['regions'][0]['core_box']
+    original_context = binding.get('context_box')
+    native = binding.get('native_size')
+    if (not isinstance(original_context, list) or len(original_context) != 4
+            or any(type(v) is not int for v in original_context)
+            or not isinstance(native, list) or len(native) != 2 or any(type(v) is not int or v < 1 for v in native)
+            or not 0 <= requested_core[0] < requested_core[2] <= native[0]
+            or not 0 <= requested_core[1] < requested_core[3] <= native[1]
+            or not original_context[0] <= requested_core[0] < requested_core[2] <= original_context[2]
+            or not original_context[1] <= requested_core[1] < requested_core[3] <= original_context[3]):
+        raise ValueError('Explicit candidate CPU core must remain inside the original raw context and native canvas')
+    if native != ((old_plan.get('inputs') or {}).get('source') or {}).get('regional_native_size'):
+        raise ValueError('Retained candidate canvas differs from original metadata preflight')
+    def file_asset(record):
+        if not isinstance(record, dict) or not isinstance(record.get('path'), str):
+            raise ValueError('Generated candidate asset is missing')
+        path = Path(record['path'])
+        if not path.is_absolute() or not path.is_relative_to(root):
+            raise ValueError('Generated candidate assets must remain in the workspace')
+        for ancestor in (path, *path.parents):
+            if ancestor == root:
+                break
+            if ancestor.is_symlink() or (hasattr(ancestor, 'is_junction') and ancestor.is_junction()):
+                raise ValueError('Generated candidate assets must not traverse links')
+        if not path.is_file():
+            raise ValueError('Generated candidate asset no longer exists')
+        current_sha = sha(path)
+        if record.get('sha256', current_sha) != current_sha:
+            raise ValueError('Generated candidate asset content changed')
+        return {'path': str(path), 'sha256': current_sha}
+    for role in ('raw_candidate', 'raw_provenance'):
+        if not isinstance(ledger.get(role), dict) or not isinstance(ledger[role].get('sha256'), str):
+            raise ValueError('Returned candidate must have its original recorded asset hash')
+    assets = {role: file_asset(ledger.get(role)) for role in ('raw_candidate', 'raw_provenance')}
+    directory = Path(assets['raw_candidate']['path']).parent.parent
+    for role, filename in (('input_context', 'input-context.npz'), ('reliable_halo', 'reliable-halo.npz'),
+                           ('condition_manifest', 'conditions.json'), ('permission_mask', 'permission.png'), ('request', 'request.json')):
+        assets[role] = file_asset({'path': str(directory/filename)})
+    conditions, _ = _resume_file(root, assets['condition_manifest']['path'])
+    condition_inputs = conditions.get('inputs') or []
+    if (len(condition_inputs) != 1 or condition_inputs[0].get('role') != 'source'
+            or condition_inputs[0].get('coordinate_space') != 'source_canvas_roi'
+            or (conditions.get('permission_mask') or {}).get('transmitted_to_model') is not False):
+        raise ValueError('Only the single local photograph conditioning policy may be reused')
+    assets['input_image'] = file_asset(condition_inputs[0])
+    if file_asset(conditions.get('permission_mask')) != assets['permission_mask']:
+        raise ValueError('Candidate permission asset differs from its conditions')
+    provenance, _ = _resume_file(root, assets['raw_provenance']['path'])
+    contract = provenance.get('provider_contract') or {}
+    actual = contract.get('comfyui') or {}
+    graph = (actual.get('request') or {}).get('prompt') or {}
+    encoders = [row.get('inputs') or {} for row in graph.values() if row.get('class_type') == 'CosplayTextEncodeQwenImage21']
+    uploads = actual.get('condition_inputs') or []
+    events = (contract.get('transport') or {}).get('events') or []
+    submitted = [event for event in events if event.get('event') == 'comfyui_submitted']
+    loaders = [(key, row.get('inputs') or {}) for key, row in graph.items() if row.get('class_type') == 'LoadImage']
+    if (len(uploads) != 1 or len(encoders) != 1
+            or [key for key in encoders[0] if key.startswith('images.')] != ['images.image_1']
+            or len(loaders) != 1 or encoders[0].get('images.image_1') != [loaders[0][0], 0]
+            or loaders[0][1].get('image') != (uploads[0].get('upload') or {}).get('name')
+            or len(submitted) != 1 or submitted[0].get('prompt_id') != prompt_id
+            or provenance.get('generation_id') != prompt_id or actual.get('prompt_id') != prompt_id
+            or (contract.get('response') or {}).get('id') != prompt_id
+            or (submitted[0].get('request') or {}).get('prompt') != graph
+            or encoders[0].get('prompt') != binding.get('prompt') or provenance.get('prompt') != binding.get('prompt')
+            or file_asset(uploads[0]) != assets['input_image']
+            or (provenance.get('source') or {}).get('sha256') != inputs['source']['sha256']
+            or file_asset(provenance.get('asset')) != assets['raw_candidate']):
+        raise ValueError('Actual transport does not prove the one-photo returned local candidate')
+    request, _ = _resume_file(root, assets['request']['path'])
+    if (((request.get('run') or {}).get('task_plan') or {}).get('plan_id') != old_plan['plan_id']
+            or (request.get('plan') or {}).get('canvas', {}).get('source_oriented_size') != binding.get('native_size')):
+        raise ValueError('Candidate request differs from the original checked native canvas')
+    def pixels_sha(values):
+        values = np.ascontiguousarray(values)
+        return hashlib.sha256(str((values.shape, values.dtype.str)).encode()+values.tobytes()).hexdigest()
+    with np.load(assets['input_context']['path'], allow_pickle=False) as archive:
+        context = archive['values']
+    with np.load(assets['reliable_halo']['path'], allow_pickle=False) as archive:
+        reliable = archive['values']
+    core, box = binding.get('core_box'), binding.get('context_box')
+    if (context.shape != (1024, 1024, 3) or reliable.shape != (1024, 1024)
+            or not np.isfinite(context).all() or not np.isfinite(reliable).all()
+            or np.any((reliable != 0) & (reliable != 1)) or not isinstance(box, list) or len(box) != 4
+            or box[2]-box[0] != 1024 or box[3]-box[1] != 1024
+            or not 0 <= core[0]-box[0] < core[2]-box[0] <= 1024
+            or not 0 <= core[1]-box[1] < core[3]-box[1] <= 1024
+            or pixels_sha(context) != binding.get('context_pixels_sha256')
+            or pixels_sha(context[core[1]-box[1]:core[3]-box[1],core[0]-box[0]:core[2]-box[0]]) != binding.get('base_core_pixels_sha256')):
+        raise ValueError('Retained candidate context differs from its original base binding')
+    permission = np.zeros((1024, 1024), bool)
+    permission[core[1]-box[1]:core[3]-box[1],core[0]-box[0]:core[2]-box[0]] = True
+    with Image.open(assets['permission_mask']['path']) as image:
+        mask = np.asarray(image)
+    if mask.shape != permission.shape or not np.array_equal(mask, permission.astype('uint8')*255) or pixels_sha(permission) != binding.get('permission_pixels_sha256'):
+        raise ValueError('Retained candidate permission differs from the frozen native core')
+    with Image.open(assets['raw_candidate']['path']) as image:
+        if image.size != (1024, 1024):
+            raise ValueError('Retained model output has a different canvas')
+    proof = {'schema': 'regional_candidate_reuse_authorization.v1',
+        'reuse_generated_from_run_id': failed_id, 'origin_run_id': origin,
+        'previous_plan_id': old_plan['plan_id'], 'previous_direction_id': old_direction['direction_id'],
+        'source_sha256': inputs['source']['sha256'], 'reference_sha256': inputs['reference']['sha256'],
+        'previous_manifest_sha256': manifest_sha, 'reservation_sha256': ledger_sha,
+        'reservation_binding_sha256': digest(binding), 'prompt_id': prompt_id,
+        'conditioning_policy': 'single_native_ROI_CPU_permission.v3', 'assets': assets,
+        'original_core_box': binding['core_box'], 'requested_core_box': requested_core}
+    _validate_candidate_reuse_proof(proof, intent, inputs)
+    return proof
+
+
+def revalidate_regional_candidate_reuse(root, plan):
+    intent = normalize_task_intent(plan.get('intent'))
+    from creative_direction import validate_direction
+    direction = validate_direction(plan.get('creative_direction'), intent,
+        source_sha256=((plan.get('inputs') or {}).get('source') or {}).get('sha256'))
+    proof = verify_regional_candidate_reuse(root, intent, plan['inputs'], direction, executing_plan_id=plan.get('plan_id'))
+    if proof != plan.get('regional_candidate_reuse_authorization'):
+        raise ValueError('Returned candidate evidence changed after checking the task')
+    return proof
+
+
+def _validate_refinement_inheritance(proof, intent, inputs):
+    selector = intent['constraints'].get('refinement_profile')
+    inherited = selector is not None and intent['mode'] == 'existing_reference'
+    if not inherited:
+        if proof is not None:
+            raise ValueError('Unexpected refinement inheritance without an existing checked recommendation')
+        return
+    from preset_store import get_refinement_profile
+    if (not isinstance(proof, dict) or proof.get('schema') != 'refinement_profile_inheritance.v1'
+            or proof.get('profile') != selector
+            or proof.get('profile_sha256') != get_refinement_profile(selector)['profile_sha256']
+            or proof.get('source_sha256') != (inputs.get('source') or {}).get('sha256')
+            or proof.get('reference_sha256') != (inputs.get('reference') or {}).get('sha256')):
+        raise ValueError('Existing refinement recommendation requires its saved checked inheritance')
+    import re
+    if not isinstance(proof.get('parent_run_id'), str) or not re.fullmatch(r'run-[A-Za-z0-9_-]{1,120}', proof['parent_run_id']):
+        raise ValueError('Invalid saved refinement origin')
+    for key in ('previous_plan_id', 'previous_direction_id', 'previous_manifest_sha256'):
+        if not isinstance(proof.get(key), str) or not re.fullmatch('[0-9a-f]{64}', proof[key]):
+            raise ValueError('Incomplete saved refinement identity')
+
+
+def _refinement_inheritance(root, intent, inputs, parent_run_id):
+    """Pure read proof; an old no-profile run can never acquire this default."""
+    import re
+    if not isinstance(parent_run_id, str) or not re.fullmatch(r'run-[A-Za-z0-9_-]{1,120}', parent_run_id):
+        raise ValueError('Existing refinement recommendation requires a saved parent run')
+    base = root/'outputs/runs'
+    path = base/parent_run_id/'manifest.json'
+    if not path.resolve().is_relative_to(base.resolve()):
+        raise ValueError('Saved refinement origin escapes its project')
+    try:
+        previous = json.loads(path.read_text(encoding='utf8'))
+    except (OSError, ValueError) as exc:
+        raise ValueError('Saved refinement origin is unavailable or invalid') from exc
+    if not isinstance(previous, dict):
+        raise ValueError('Saved refinement origin must be a run manifest')
+    if (previous.get('run_id') != parent_run_id
+            or previous.get('status') not in {'needs_visual_review', 'accepted', 'delivered', 'blocked', 'failed', 'cancelled'}
+            or (previous.get('source') or {}).get('sha256') != inputs['source']['sha256']
+            or (previous.get('reference') or {}).get('sha256') != inputs['reference']['sha256']):
+        raise ValueError('Saved refinement source/reference or inactive state differs')
+    old_intent = previous.get('task_intent') or (previous.get('options') or {}).get('task_intent')
+    old_plan = previous.get('task_plan') or (previous.get('options') or {}).get('task_plan')
+    verified = saved_task_intent_for_replanning(old_plan, old_intent,
+        source_sha256=inputs['source']['sha256'], reference_sha256=inputs['reference']['sha256'])
+    selector = intent['constraints']['refinement_profile']
+    if (verified['constraints'].get('refinement_profile') != selector
+            or verified.get('brief') != intent.get('brief')):
+        raise ValueError('Saved refinement profile/overrides or brief differs; check a new creative task')
+    from preset_store import get_refinement_profile
+    proof = {'schema': 'refinement_profile_inheritance.v1', 'parent_run_id': parent_run_id,
+        'previous_plan_id': old_plan['plan_id'], 'previous_direction_id': old_plan['creative_direction']['direction_id'],
+        'previous_manifest_sha256': sha(path), 'source_sha256': inputs['source']['sha256'],
+        'reference_sha256': inputs['reference']['sha256'], 'profile': copy.deepcopy(selector),
+        'profile_sha256': get_refinement_profile(selector)['profile_sha256']}
+    _validate_refinement_inheritance(proof, intent, inputs)
+    return proof
 
 
 def validate_task_plan(plan, intent):
@@ -93,13 +553,66 @@ def validate_task_plan(plan, intent):
         raise ValueError('Current task execution requires a checked task plan')
     if plan.get('intent') != intent or plan.get('mode') != intent['mode'] or plan.get('ready') is not True:
         raise ValueError('Task plan does not match its current intent or is blocked')
-    expected = image_budget(intent, (plan.get('image_budget') or {}).get('initial_reference', 0)
+    budget = plan.get('image_budget')
+    if not isinstance(budget, dict) or any(type(value) is not int or value < 0 for value in budget.values()):
+        raise ValueError('Task image budget must contain nonnegative integer limits')
+    expected = image_budget(intent, budget.get('initial_reference', 0)
                             if intent['mode'] == 'create_reference' else 1)
     if plan.get('image_budget') != expected:
         raise ValueError('Task image budget differs from its route')
+    _validate_refinement_inheritance(plan.get('refinement_inheritance'), intent, plan.get('inputs') or {})
+    from creative_direction import validate_reference_contract
+    validate_reference_contract(plan.get('reference_contract'), intent, plan.get('inputs') or {})
+    resume = (intent.get('regional_refinement') or {}).get('resume_from_run_id')
+    proof = plan.get('regional_resume_authorization')
+    if resume:
+        _validate_resume_proof(proof, intent, plan.get('inputs') or {})
+    elif proof is not None:
+        raise ValueError('Unexpected regional resume authorization')
+    if plan.get('final_repair_only') and budget.get('regional_refinement', 0):
+        raise ValueError('Final local repair cannot resume regional image generation')
+    reuse = (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id')
+    if reuse:
+        _validate_candidate_reuse_proof(plan.get('regional_candidate_reuse_authorization'), intent, plan.get('inputs') or {})
+        if plan.get('final_repair_only'):
+            raise ValueError('Final repair cannot replace frozen upstream pixels with a rejected candidate')
+    elif 'regional_candidate_reuse_authorization' in plan:
+        raise ValueError('Unexpected generated candidate reuse proof')
+    if intent['constraints'].get('background_mode') == 'enhance_source':
+        from creative_direction import validate_direction
+        validate_direction(plan.get('creative_direction'), intent,
+            source_sha256=((plan.get('inputs') or {}).get('source') or {}).get('sha256'))
+    elif 'creative_direction' in plan:
+        raise ValueError('Unexpected creative direction without explicit source enhancement')
     if not isinstance(plan.get('plan_id'), str) or len(plan['plan_id']) != 64:
         raise ValueError('Task plan has no checked content identity')
+    strategy = plan.get('execution_strategy')
+    if strategy not in EXECUTION_STRATEGIES:
+        raise ValueError('Task plan has no checked execution strategy')
+    normalize_preparation_policy(plan.get('preparation_policy'))
+    if plan.get('final_repair_only') is True and plan.get('preparation_policy', 'replay_frozen') != 'replay_frozen':
+        raise ValueError('Final local repair must keep its frozen upstream preparation')
+    from cos_node_registry import compile_workflow
+    if plan.get('layer_workflow') != compile_workflow(intent['mode']):
+        raise ValueError('Task layer workflow differs from the current checked node contracts')
     return copy.deepcopy(plan)
+
+
+def saved_task_intent_for_replanning(plan, intent, *, source_sha256, reference_sha256=None):
+    """Replan only a saved task that satisfies the current execution contract."""
+    intent = normalize_task_intent(intent)
+    validate_task_plan(plan, intent)
+    inputs = plan.get('inputs')
+    source = inputs.get('source') if isinstance(inputs, dict) else None
+    if (not isinstance(source, dict) or not source_sha256 or source.get('sha256') != source_sha256):
+        raise ValueError('Saved task source binding differs from the saved version')
+    reference = inputs.get('reference')
+    if intent['mode'] == 'existing_reference':
+        if (not isinstance(reference, dict) or not reference_sha256 or reference.get('sha256') != reference_sha256):
+            raise ValueError('Saved task reference binding differs from the saved version')
+    elif reference is not None or (intent['mode'] == 'local_portrait' and reference_sha256 is not None):
+        raise ValueError('Saved task has an unexpected reference binding')
+    return copy.deepcopy(intent)
 
 
 def _input(root, value, role):
@@ -114,11 +627,49 @@ def _input(root, value, role):
     return {'path': str(path), 'sha256': sha(path), 'bytes': path.stat().st_size}
 
 
+def _region_canvas(source):
+    """Read oriented image headers only; no fallback image decode in planning."""
+    from raw_support import is_raw
+    path = Path(source['path'])
+    if is_raw(path):
+        import rawpy
+        with rawpy.imread(str(path)) as raw:
+            width, height = int(raw.sizes.width), int(raw.sizes.height)
+            if int(raw.sizes.flip or 0) in {5,6,7,8}:
+                width, height = height, width
+    else:
+        from PIL import Image
+        with Image.open(path) as image:
+            width, height = image.size
+            if image.getexif().get(274) in {5,6,7,8}:
+                width, height = height, width
+    if width <= 0 or height <= 0:
+        raise ValueError('Native regional canvas metadata is unavailable')
+    return [width,height]
+
+
 def _services(request, intent):
     if not intent['services']['text_vision']:
-        return {'text_vision': False, 'image_generation': False, 'offline': True,
+        generation = intent['mode'] == 'create_reference'
+        services = {'text_vision': False, 'visual_review': False, 'image_generation': generation, 'offline': not generation,
                 'configured': True, 'network_probed': False, 'sent_content': [],
-                'text_vision_requests_upper_bound': 0, 'price': '不调用外部服务'}
+                'text_vision_requests_upper_bound': 0,
+                'price': '不调用文本/视觉规划服务；生图费用另计' if generation else '不调用外部服务'}
+        if (intent.get('regional_refinement') or {}).get('maximum_submissions'):
+            # This opt-in has already passed the local-Qwen provider gate.
+            # Existing-reference resume forbids a new global reference, while
+            # still making one real local image-model submission possible.
+            services.update(image_generation=True, local_image_inference=True,
+                image_generation_location='local_machine',
+                regional_image_submissions_upper_bound=1,
+                price='本机Qwen图像推理；不调用外部文本/视觉服务。模型提交次数与GPU用时见执行回执，不据此推定外部API费用。')
+        if intent['constraints'].get('reference_role') == 'source_conditioned_design':
+            services.update(local_image_inference=generation, image_generation_location='local_machine',
+                global_image_submissions_upper_bound=1 if generation else 0,
+                offline=True,
+                price=('本机Qwen仅以原片生成设计参考；不调用外部文本/视觉服务，实际模型提交与GPU用时见回执。'
+                    if generation else '复用已核验的同源Qwen设计参考；新增生图0次，执行CPU外观映射，不调用外部文本/视觉服务。'))
+        return services
     try:
         from vision_transport import _connection
         config, endpoint, _credential, protocol = _connection(**{key: request.get(key)
@@ -127,9 +678,13 @@ def _services(request, intent):
                       'protocol': protocol}
     except (ValueError, RuntimeError, OSError) as exc:
         connection = {'configured': False, 'reason': str(exc)[:400]}
-    return {**connection, 'text_vision': True, 'image_generation': intent['mode'] == 'create_reference',
+    sent_content = ['原片观察图', '已有参考或生成参考', '创作要求']
+    if intent['services']['visual_review']:
+        sent_content.append('成片与匹配原尺寸审片窗口')
+    return {**connection, 'text_vision': True, 'visual_review': intent['services']['visual_review'],
+        'image_generation': intent['mode'] == 'create_reference',
         'offline': False, 'network_probed': False,
-        'sent_content': ['原片观察图', '已有参考或生成参考', '成片与匹配原尺寸审片窗口', '创作要求'],
+        'sent_content': sent_content,
         'text_vision_requests_upper_bound': None,
         'text_vision_budget_basis': 'bounded_stage_attempts; actual board count depends on observed regions',
         'price': '价格未知；实际服务请求与用量保存于任务回执'}
@@ -169,6 +724,28 @@ def plan_task(root, body):
         if key in body and body[key] != current:
             raise ValueError('Only the current algorithm is supported: ' + key)
     intent = normalize_task_intent(body.get('creative_task'))
+    if intent['constraints'].get('reference_role') in {'same_photo_finish', 'source_conditioned_design'} and (
+            'regional_resume_authorization' in body or 'regional_candidate_reuse_authorization' in body):
+        raise ValueError('Explicit appearance reference roles cannot inherit regional resume or generated-candidate proofs')
+    if (intent['constraints'].get('background_mode') == 'enhance_source'
+            and intent['services']['text_vision']):
+        raise ValueError('Source enhancement currently uses a checked offline design; external planning is not enabled on this route')
+    strategy = body.get('execution_strategy')
+    if strategy is None:
+        strategy = 'layered_reference_transfer'
+    if strategy not in EXECUTION_STRATEGIES:
+        raise ValueError('Unsupported execution strategy: ' + str(strategy))
+    final_repair = body.get('final_repair_only', False)
+    if type(final_repair) is not bool or (final_repair and intent['mode'] != 'existing_reference'):
+        raise ValueError('Final local repair requires an existing-reference task')
+    policy = normalize_preparation_policy(body.get('preparation_policy'),
+        default='replay_frozen' if final_repair else 'prepare_current')
+    if final_repair and policy != 'replay_frozen':
+        raise ValueError('Final local repair must keep its frozen upstream preparation')
+    if final_repair and (intent.get('regional_refinement') or {}).get('maximum_submissions'):
+        raise ValueError('Final local repair cannot grant regional image generation')
+    if final_repair and (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id'):
+        raise ValueError('Final local repair must replay its saved upstream pixels')
     local, supplied = intent['mode'] == 'local_portrait', intent['mode'] == 'existing_reference'
     if body.get('generate') is True and (local or supplied):
         raise ValueError('This route forbids all image generation')
@@ -180,38 +757,113 @@ def plan_task(root, body):
                if key not in {'creative_task', 'plan_id', 'generate', 'local_only', 'complete_post'}}
     inputs = {'source': _input(root, body.get('source'), 'source')}
     request['source'] = inputs['source']['path']
+    if ((intent.get('regional_refinement') or {}).get('maximum_submissions')
+            or (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id')):
+        from reference_provider import provider_config
+        regional_provider = provider_config(**{key: body.get(key) for key in
+            ('provider','model','api_base','api_url','api_key_env')})
+        if regional_provider.get('kind') != 'comfyui' or not str(regional_provider.get('registry_id','')).startswith('qwen_image'):
+            raise ValueError('Native regional editing currently requires a local Qwen ComfyUI provider')
+        canvas = _region_canvas(inputs['source'])
+        for region in intent['regional_refinement']['regions']:
+            if region['core_box'][2] > canvas[0] or region['core_box'][3] > canvas[1]:
+                raise ValueError('Regional core lies outside the native source canvas')
+        inputs['source']['regional_native_size'] = canvas
     if supplied:
         inputs['reference'] = _input(root, body.get('reference'), 'reference')
         request['reference'] = inputs['reference']['path']
+        if intent['constraints'].get('reference_role') == 'source_conditioned_design':
+            from creative_direction import verify_source_conditioned_reference
+            inputs['reference']['source_conditioned_binding'] = verify_source_conditioned_reference(
+                root, inputs['source']['sha256'], inputs['reference'])
+    if (intent['constraints'].get('reference_role') == 'source_conditioned_design'
+            and intent['mode'] == 'create_reference'):
+        from reference_provider import provider_config
+        design_provider = provider_config(**{key: body.get(key) for key in
+            ('provider','model','api_base','api_url','api_key_env')})
+        if design_provider.get('kind') != 'comfyui' or not str(design_provider.get('registry_id','')).startswith('qwen_image'):
+            raise ValueError('Source-conditioned art direction currently requires the local Qwen source-only route')
+    from creative_direction import reference_contract_for
+    reference_contract = reference_contract_for(intent, inputs)
     count = body.get('variant_count', 1)
-    budget = image_budget(intent, count)
-    if not local and not intent['services']['text_vision']:
-        policy_block = ['完整参考后期需文本/视觉计划与审片；当前任务未允许该服务。可使用本地原片路线继续离线编辑。']
-    else:
-        policy_block = []
-    brief = task_brief(intent)
+    if intent['constraints'].get('background_mode') == 'enhance_source':
+        if count != 1 or body.get('variant_styles') or body.get('defer_reference_selection', False):
+            raise ValueError('Source enhancement supports one checked candidate only; variant styles and deferred selection are unsupported')
     input_prompt = str(body.get('input_prompt') or body.get('prompt') or DEFAULT_PROMPT)
-    request.update(task_intent=intent, creative_task=intent,
+    selector = intent['constraints'].get('refinement_profile')
+    if selector is not None:
+        from creative_direction import refinement_overrides
+        from preset_store import get_preset, get_refinement_profile
+        profile = get_refinement_profile(selector)
+        actual = refinement_overrides(input_prompt, body.get('character_notes', ''))
+        if 'overrides' in selector and selector['overrides'] != actual:
+            raise ValueError('Profile override context differs from actual prompt/character notes')
+        selector['overrides'] = actual
+        intent = normalize_task_intent(intent)
+        if body.get('preset') not in (None, '', profile['preset_id']):
+            raise ValueError('Recommended profile differs from the selected artistic preset')
+        preset = get_preset(profile['preset_id'])
+        if 'preset_snapshot' in body and body['preset_snapshot'] != preset:
+            raise ValueError('Recommended preset snapshot differs from the bundled product profile')
+        request.update(preset=profile['preset_id'], preset_snapshot=copy.deepcopy(preset))
+    budget = image_budget(intent, count)
+    brief = task_brief(intent)
+    request.update(task_intent=intent, creative_task=intent, execution_strategy=strategy, preparation_policy=policy,
         input_prompt=input_prompt, prompt=input_prompt, variant_count=count,
         generate=intent['mode'] == 'create_reference', local_only=local, complete_post=not local,
-        cosplay_correction_budget=1 if intent['mode'] == 'create_reference' else 0,
+        cosplay_correction_budget=budget['reference_correction'],
         preserve_project_selection=bool(body.get('preserve_project_selection', True)))
     # Keep the user's editable prompt separate from deterministic task constraints.
     request['task_brief'] = brief
-    models = registry_status(root, registry_path=body.get('model_registry'))
-    required_keys = {'python', 'semantics_checkpoint', 'semantics_repo_dir', 'vitmatte_model_root'} if local else {
-        row['key'] for row in models['paths']}
+    direction = None
+    resume_authorization = None
+    reuse_authorization = None
+    if intent['constraints'].get('background_mode') == 'enhance_source':
+        from creative_direction import compile_direction
+        direction = compile_direction(intent, source_sha256=inputs['source']['sha256'],
+            character_name=body.get('character_name', ''), character_notes=body.get('character_notes', ''),
+            input_prompt=input_prompt)
+        if 'creative_direction' in body and body['creative_direction'] != direction:
+            raise ValueError('Supplied creative direction differs from the checked task')
+        request['creative_direction'] = direction
+        request['prompt'] = request['effective_prompt'] = direction['prompt']
+        if (intent.get('regional_refinement') or {}).get('resume_from_run_id'):
+            resume_authorization = verify_regional_resume(root, intent, inputs, direction)
+            if ('regional_resume_authorization' in body
+                    and body['regional_resume_authorization'] != resume_authorization):
+                raise ValueError('Supplied regional resume proof differs from current failed evidence')
+            request['regional_resume_authorization'] = copy.deepcopy(resume_authorization)
+        if (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id'):
+            reuse_authorization = verify_regional_candidate_reuse(root, intent, inputs, direction)
+            if ('regional_candidate_reuse_authorization' in body
+                    and body['regional_candidate_reuse_authorization'] != reuse_authorization):
+                raise ValueError('Supplied candidate reuse proof differs from current returned evidence')
+            request['regional_candidate_reuse_authorization'] = copy.deepcopy(reuse_authorization)
+    elif 'creative_direction' in body:
+        raise ValueError('Creative direction requires explicit source enhancement')
+    if resume_authorization is None and 'regional_resume_authorization' in body:
+        raise ValueError('Regional resume proof requires an explicit unsubmitted continuation')
+    if reuse_authorization is None and 'regional_candidate_reuse_authorization' in body:
+        raise ValueError('Generated candidate proof requires an explicit zero-generation reuse task')
+    # Node-specific checks apply only to enabled production capabilities.
+    models = registry_status(root, registry_path=body.get('model_registry'),
+                             required_keys=(), required_profiles=())
+    from task_model_preflight import inspect_task_models
+    beauty_requested = (bool((body.get('appearance_revision') or {}).get('portrait_beauty'))
+        or (not local and strategy == 'layered_reference_transfer'))
+    installation = inspect_task_models(models.get('config', {}), mode=intent['mode'],
+        execution_strategy=strategy, complete_post=not local,
+        use_beautygrpo=beauty_requested)
+    required_keys = set(installation.get('required_path_keys') or ())
     paths = [{key: row[key] for key in ('key', 'label', 'kind', 'available', 'status')}
              for row in models['paths'] if row['key'] in required_keys]
-    blockers = list(policy_block)
+    blockers = []
     storage = _storage(root, request, intent)
     if not storage['ready']:
         blockers.append('工作区或任务名称过长，无法安全保存完整工程；请使用较短的工作区路径或任务名称。')
     if not models['configured']:
         blockers.append('当前分析模型配置不可用：' + str(models.get('error') or '尚未配置'))
     blockers.extend('缺少 ' + row['label'] for row in paths if not row['available'])
-    from task_model_preflight import inspect_task_models
-    installation = inspect_task_models(models.get('config', {}), mode=intent['mode'])
     blockers.extend(installation['blocking_reasons'])
     services = _services(request, intent)
     if not services['configured']:
@@ -223,6 +875,9 @@ def plan_task(root, body):
         services['generation_configured'] = bool(health.get('ready'))
         if not health.get('ready'):
             blockers.append('生图服务未就绪：' + str(health.get('reason') or health.get('status')))
+    defer_selection = body.get('defer_reference_selection', False)
+    if type(defer_selection) is not bool:
+        raise ValueError('defer_reference_selection must be a boolean')
     registry_file = Path(models['registry_path']) if models.get('registry_path') else None
     config_identity = {'path': str(registry_file) if registry_file else None,
         'sha256': sha(registry_file) if registry_file and registry_file.is_file() else None}
@@ -233,21 +888,59 @@ def plan_task(root, body):
         'registry_identity': config_identity, 'verification_scope': 'installation_structure_small_file_and_recorded_identity',
         'inference_verified': False}
     stage_names = (['原片解码与本地精修', '高清保存', '人工审片与导出'] if local else
-        ['原片与参考成对设计' if supplied else '角色与本图设计',
+        [('原片与参考成对设计' if supplied else '角色与本图设计')
+         if intent['services']['text_vision'] else '用户要求、所选风格与源图绑定',
          '复用已有参考' if supplied else '创作风格参考', '原片精修与原生人物基线',
          '仿色、材质与明暗协调', '背景、接触与已拥有的特效合成',
-         '整图和匹配原尺寸审片', '有资格的一轮本地修复与复审', '人工审片、重开与导出'])
+         *(['整图和匹配原尺寸审片', '有资格的一轮本地修复与复审']
+           if intent['services']['visual_review'] else []), '人工审片、重开与导出'])
+    if intent['mode'] == 'create_reference' and defer_selection:
+        stage_names.insert(1, '生成多张角色风格候选并等待选择')
+    if (intent['mode'] == 'create_reference' and health.get('kind') == 'comfyui'
+            and count == 1 and not defer_selection and strategy == 'layered_reference_transfer'):
+        stage_names.insert(stage_names.index('创作风格参考'), '原片人像美化并冻结（本地生图前）')
+        stage_names[stage_names.index('原片精修与原生人物基线')] = '原生人物基线（复用已冻结美化）'
+    if direction is not None:
+        stage_names[stage_names.index('背景、接触与已拥有的特效合成')] = '保留原景结构、原生背景与有据角色效果合成'
+        if budget.get('regional_refinement', 0):
+            stage_names.insert(stage_names.index('仿色、材质与明暗协调'), '一次许可背景局部精修；失败保留原版本')
+        elif reuse_authorization is not None:
+            stage_names.insert(stage_names.index('仿色、材质与明暗协调'), '复用已返回的单区候选并重新核验合成；新增生图0次')
+    if reference_contract is not None:
+        index = stage_names.index('仿色、材质与明暗协调')
+        verification = ('执行时核验用户声明的同照参考配准与有效范围' if reference_contract['role'] == 'same_photo_finish'
+            else '执行时核验Qwen同源生成来源、配准与有效范围')
+        stage_names[index:index+1] = [verification,
+            'CPU影调与色彩归一（条件启用）', '源图引导的局部低频色映射系数场校正（条件启用）']
     plan = {'schema_version': PLAN_SCHEMA, 'mode': intent['mode'], 'label': MODES[intent['mode']],
         'intent': intent, 'inputs': inputs, 'ready': not blockers, 'blocking_reasons': blockers,
         'stages': [{'id': str(i+1), 'label': label} for i, label in enumerate(stage_names)],
         'capabilities': capabilities, 'services': services, 'image_budget': budget,
         'generation_submissions_upper_bound': sum(budget.values()),
+        'candidate_selection': {'required': bool(intent['mode'] == 'create_reference' and defer_selection),
+                               'default_variant_count': count if intent['mode'] == 'create_reference' else 0,
+                               'selection_action': 'select_variant' if intent['mode'] == 'create_reference' and defer_selection else None},
         'outputs': ['原尺寸PNG', '真实TIFF16/32母版', '可继续编辑的产品工程'],
         'limitations': ['自动审片只证明实际观察范围，人工最终批准单独记录。',
             '自动投影阴影、镜面或湿地反射生成尚未支持。',
             '共享创作要求不等于已验证的套图风格一致算法。'],
         'estimated_seconds': None, 'estimate_basis': '没有足够的当前硬件任务统计',
         'preflight_network_requests': 0, 'preflight_model_inferences': 0, 'preflight_jobs_created': 0}
+    from cos_node_registry import compile_workflow
+    plan['execution_strategy'] = strategy
+    plan['preparation_policy'] = policy
+    plan['final_repair_only'] = final_repair
+    plan['layer_workflow'] = compile_workflow(intent['mode'])
+    if direction is not None:
+        plan['creative_direction'] = copy.deepcopy(direction)
+    if reference_contract is not None:
+        plan['reference_contract'] = reference_contract
+    if selector is not None and supplied:
+        plan['refinement_inheritance'] = _refinement_inheritance(root, intent, inputs, body.get('parent_run_id'))
+    if resume_authorization is not None:
+        plan['regional_resume_authorization'] = copy.deepcopy(resume_authorization)
+    if reuse_authorization is not None:
+        plan['regional_candidate_reuse_authorization'] = copy.deepcopy(reuse_authorization)
     execution = {key: value for key, value in request.items() if key not in {'async', 'sync'}}
     plan['plan_id'] = digest({'plan': plan, 'request': execution})
     public_request = {key: value for key, value in request.items()
@@ -264,7 +957,7 @@ def execution_request(root, body):
         raise ValueError('Task is blocked: ' + '; '.join(plan['blocking_reasons']))
     request = checked['request']
     request['task_intent'] = request.pop('creative_task')
-    request['cosplay_correction_budget'] = 1 if plan['mode'] == 'create_reference' else 0
+    request['cosplay_correction_budget'] = plan['image_budget']['reference_correction']
     request['task_plan'] = plan
     return request
 
@@ -290,22 +983,14 @@ def plan_batch(root, body):
             raise ValueError('Duplicate source image in the batch')
         seen.add(key)
         items.append({'index': index, **checked})
-    budget = {key: sum(row['plan']['image_budget'][key] for row in items)
-              for key in ('initial_reference', 'reference_correction', 'independent_effect')}
+    if 'regional_refinement' in intent and (intent['regional_refinement']['maximum_submissions']
+            or intent['regional_refinement'].get('reuse_generated_from_run_id')):
+        raise ValueError('Native regional geometry cannot be shared across batch sources')
+    budget = {key: sum(row['plan']['image_budget'].get(key, 0) for row in items)
+              for key in dict.fromkeys(key for row in items for key in row['plan']['image_budget'])}
     plan = {'schema_version': 'cosplay_batch_task_plan.v1', 'shared_task': intent,
         'items': items, 'ready': all(row['plan']['ready'] for row in items),
         'image_budget_total': budget, 'per_image_geometry_shared': False,
         'automatic_style_consistency_claimed': False}
     plan['plan_id'] = digest(plan)
     return {'ok': True, 'batch_plan': plan, 'request': copy.deepcopy(body)}
-
-
-def format_task_plan(plan):
-    lines = [plan['label'], '可以开始制作' if plan['ready'] else '请先补齐以下配置']
-    lines += plan['blocking_reasons']
-    lines.append('处理步骤：' + ' → '.join(row['label'] for row in plan['stages']))
-    lines.append('图像生成提交上限：' + str(plan['generation_submissions_upper_bound']))
-    lines.append('外部文本/视觉服务：' + ('会使用；' + plan['services']['price']
-                 if plan['services']['text_vision'] else '不使用'))
-    lines.append('模型检查：安装结构、小文件与记录身份；完整权重内容和推理由实际处理核验。')
-    return '\n'.join(lines)

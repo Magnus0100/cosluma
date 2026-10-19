@@ -11,12 +11,14 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_dilation, gaussian_filter
 
-from local_photo_analysis import (_worker, local_runtime_paths, prepare_local_appearance,
+from local_photo_analysis import (_worker, local_runtime_paths, prepare_local_appearance_pair,
                                   analysis_identity, file_identity)
 from raw_support import open_rgb, RGB_DECODE_VERSION
-from source_alpha import source_silhouette
+from source_alpha import source_silhouette, SilhouetteSessionScope
 from runtime_resources import code_path
 from source_appearance_responsibility import prepare as prepare_source_responsibility
+from asset_identity import sha256_file
+import workflow_timing
 
 RECIPE = 'native-source-design-v32-independent-source-semantics'
 
@@ -36,6 +38,11 @@ def _current_plan_cache(plan, *, expected_source_sha256=None, expected_candidate
     preparation never infers missing fields or executes an older contract.
     """
     if not isinstance(plan, dict) or plan.get('recipe') != RECIPE:
+        return False
+    execution = plan.get('execution') or {}
+    if (execution.get('source_environment_light') is not True
+            or execution.get('automatic_subject_lighting') !=
+                'candidate_subject_light_evidence_then_source_environment_light'):
         return False
     if not _current_layer_graph(plan):
         return False
@@ -78,6 +85,13 @@ def _current_plan_cache(plan, *, expected_source_sha256=None, expected_candidate
     except (ValueError, TypeError, KeyError):
         return False
     provenance = plan.get('provenance') if isinstance(plan.get('provenance'), dict) else {}
+    if provenance.get('source_scene_enhancement'):
+        try:
+            from source_scene_enhancement import validate_observation
+            validate_observation(plan, {'source':{'sha256':plan['source_sha256']},
+                                        'reference':{'sha256':plan['candidate_sha256']}})
+        except (OSError,ValueError,KeyError,TypeError):
+            return False
     contract = provenance.get('candidate_floor_contract')
     required_contract = {'analysis_status', 'clean_established',
                          'automatic_cleanup_applied', 'allowed_interpretation'}
@@ -97,8 +111,13 @@ def _current_layer_graph(plan):
 
 
 def _hash(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
+
+
+def _note_cache(measured, result):
+    if measured is not None:
+        hit = result.get('cache_hit')
+        measured.annotate(cache_hit=hit, model_request=None if hit is None else not hit)
 
 
 def _background_stage_identity(root, input_path, removal_path, python, *, registry_path=None):
@@ -177,6 +196,117 @@ def _prepare_background_stage(root, input_path, removal_path, python, log_path, 
                                      'binding': str((directory / 'binding.json').resolve())}}
 
 
+def _background_sr_identity(root, run, plan, weight_path):
+    """Return the content identity for native background detail.
+
+    SR is a derived environment asset.  Its cache key deliberately contains
+    only the bound source/reference environment inputs and operator identity;
+    a run id or disposable reconstruction directory must not force another
+    CUDA model load.  The checkpoint is bound by its installed file metadata
+    and the worker's pinned model digest (the worker performs the model load
+    audit once, during a cache miss).
+    """
+    layer = next(row for row in plan['layers'] if row.get('kind') == 'background_design')
+    assets = layer['assets']
+    removal = plan['mask_roles']['candidate_removal']
+    mapping = plan['canvas']['candidate_mapping']['candidate_processing_proxy_to_final_proxy']
+    reflection_assets = []
+    for row in plan.get('layers', []):
+        if row.get('kind') == 'trusted_source_reflection' and row.get('enabled'):
+            region = (row.get('assets') or {}).get('region_mask') or {}
+            reflection_assets.append({'kind': row.get('kind'), 'sha256': region.get('sha256')})
+    reflection_assets.sort(key=lambda item: (item.get('kind') or '', item.get('sha256') or ''))
+    weight = Path(weight_path).resolve()
+    stat = weight.stat()
+    return {
+        'schema_version': 'background_superresolution_cache.v1',
+        'source_sha256': run['source']['sha256'],
+        'reference_sha256': run['reference']['sha256'],
+        'background_sha256': assets['background']['sha256'],
+        'validity_sha256': assets['validity']['sha256'],
+        'candidate_removal_sha256': removal['sha256'],
+        'target_size': list(plan['canvas']['source_oriented_size']),
+        'candidate_mapping': mapping,
+        'reflection_assets': reflection_assets,
+        'worker_sha256': _hash(code_path('background_superresolution_worker.py')),
+        'checkpoint': {'path': str(weight), 'size': stat.st_size,
+                       'mtime_ns': stat.st_mtime_ns},
+        'model_digest': '8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292',
+        'parameters': {'tile': 256, 'sr_execution': 'auto'},
+    }
+
+
+def _background_sr_cache_result(directory, identity):
+    """Read a complete SR cache without re-hashing its large array payloads."""
+    directory = Path(directory)
+    binding_path = directory / 'binding.json'
+    manifest_path = directory / 'manifest.json'
+    if not binding_path.is_file() or not manifest_path.is_file():
+        return None
+    try:
+        binding = _read(binding_path)
+        stat = manifest_path.stat()
+        if (binding.get('schema_version') != 'background_superresolution_cache.v1'
+                or binding.get('request_identity') != identity
+                or binding.get('manifest_size') != stat.st_size
+                or binding.get('manifest_mtime_ns') != stat.st_mtime_ns):
+            return None
+        result = _read(manifest_path)
+        if (result.get('schema_version') != 'background_superresolution.v1'
+                or result.get('model', {}).get('sha256') != identity['model_digest']
+                or result.get('person_geometry_changed') is not False):
+            return None
+        for key in ('background', 'validity'):
+            asset = (result.get('assets') or {}).get(key) or {}
+            path = Path(asset.get('path', ''))
+            source_asset = (result.get('source_assets') or {}).get(key) or {}
+            expected_sha = identity['background_sha256'] if key == 'background' else identity['validity_sha256']
+            if not path.is_file() or source_asset.get('sha256') != expected_sha or not asset.get('sha256'):
+                return None
+            # The worker owns all result files.  Keep cache hits cheap while
+            # ensuring a manifest cannot redirect the renderer outside it.
+            try:
+                path.resolve().relative_to(directory.resolve())
+            except ValueError:
+                return None
+        support = Path(result.get('detail_support', ''))
+        if not support.is_file():
+            return None
+        return {**result, 'stage_cache': {'cache_hit': True,
+                'directory': str(directory.resolve()), 'binding': str(binding_path.resolve())}}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _prepare_background_sr(root, run, plan, python, input_path, log_path, *, registry_path=None):
+    """Run or reuse native background SR using a content-addressed cache."""
+    paths = local_runtime_paths(root, registry_path=registry_path)
+    weight = Path(paths['model_registry']['background_sr_checkpoint']).resolve()
+    identity = _background_sr_identity(root, run, plan, weight)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+    directory = Path(root) / 'outputs/cache/background-superresolution' / key
+    directory.mkdir(parents=True, exist_ok=True)
+    cached = _background_sr_cache_result(directory, identity)
+    if cached is not None:
+        return cached
+    _worker([python, '-X', 'utf8', code_path('background_superresolution_worker.py'),
+             '--run', input_path, '--weights', weight, '--output', directory], log_path)
+    manifest_path = directory / 'manifest.json'
+    result = _read(manifest_path)
+    if result.get('schema_version') != 'background_superresolution.v1':
+        raise RuntimeError('Background SR producer returned an unknown manifest')
+    stat = manifest_path.stat()
+    _write(directory / 'binding.json', {
+        'schema_version': 'background_superresolution_cache.v1',
+        'request_identity': identity,
+        'manifest_path': str(manifest_path.resolve()),
+        'manifest_size': stat.st_size,
+        'manifest_mtime_ns': stat.st_mtime_ns,
+    })
+    return {**result, 'stage_cache': {'cache_hit': False,
+            'directory': str(directory.resolve()), 'binding': str((directory / 'binding.json').resolve())}}
+
+
 def _asset(path, *, size, coordinate_space, color_space='none', representation='scalar',
            radiometric_origin='not_radiometric'):
     return {'path': str(Path(path).resolve()), 'sha256': _hash(path), 'size': list(size),
@@ -204,6 +334,7 @@ def ready(root, *, registry_path=None):
 
 def production_code_files():
     return ('reference_pipeline.py',
+     'reference_stage_worker.py',
      'reference_appearance_prepare.py',
      'reference_appearance_stack.py',
      'reference_appearance_controls.py',
@@ -218,7 +349,14 @@ def production_code_files():
      'local_background_worker.py',
      'source_alpha.py',
      'source_foreground.py',
+     'native_cuda_matting.py', 'native_cuda_fields.py', 'native_cuda_sampling.py',
+     'native_array_storage.py',
      'source_foreground_cache.py',
+     'boundary_light_coordination_worker.py', 'boundary_light_geometry_context.py',
+     'boundary_light_worker.py', 'boundary_light_runtime.py',
+     'cloth_boundary_worker.py', 'cloth_boundary_runtime.py',
+     'reference_boundary_light_transfer.py', 'reference_cloth_boundary_transfer.py',
+     'reference_hair_boundary_registration.py', 'native_cuda_filters.py', 'native_cuda_ndimage.py',
      'sapiens_model_profiles.py',
      'source_semantic_binding.py',
      'local_face_protection.py',
@@ -273,6 +411,10 @@ def production_code_files():
      'native_receiver_preservation.py',
      'display_transform.py',
      'native_environment_completion.py',
+     'source_scene_enhancement.py',
+     'candidate_subject_light.py',
+     'source_environment_light.py',
+     'regional_scene_worker.py',
      'native_matte.py',
      'native_matte_worker.py',
      'native_matte_dependencies.py',
@@ -332,6 +474,10 @@ def identity_for_run(root, run):
         'vitmatte':runtime['vitmatte_model_root']/'model.safetensors',
         'background_sr':Path(config['background_sr_checkpoint'])}
     return {'source': run['source']['sha256'], 'candidate': _hash(candidate), 'recipe': RECIPE,
+        'source_scene_policy': {
+            'constraints':copy.deepcopy((run.get('task_intent') or {}).get('constraints') or {}),
+            'regional_refinement':copy.deepcopy((run.get('task_intent') or {}).get('regional_refinement')),
+            'creative_direction':copy.deepcopy(run.get('creative_direction') or (run.get('task_plan') or {}).get('creative_direction'))},
         'native_source_retouch': __import__('native_source_baseline').retouch_identity(run,root=root),
         'local_model_registry': _model_registry_receipt(runtime),
         'scene_intent': scene_intent_identity(run.get('generation_design') or {}, run['reference']),
@@ -346,18 +492,12 @@ def identity_for_run(root, run):
         'scene_models':scene_model_identity(config['scene_model_root'], profile=config['scene_profile']),
         'operators': {name:file_identity(code_path(name)) for name in production_code_files()},
         'parameters': {'candidate_mask_dilation_short_side': .012,
-            'colour_match_strategy': 'original_reference_colour_match_then_composite',
+            'colour_match_strategy': 'original_reference_colour_match_then_candidate_light_evidence_then_composite',
             'mapping': 'background_feature_homography_with_validity_or_center_cover',
             'foreground': 'native_vitmatte_pymatting_paired',
             'extra_background_optics_default': 'disabled_baked_plate',
             'background_native_detail':'realesrgan_compact_residual_outside_removal_and_reflection',
             'floor_reflection':'preserve_qualified_paired_observations_without_source_RGB_donor'}}
-
-
-def prepare(root, run, *, rebuild_subject=False):
-    """Production preparation follows the same reference pipeline as the UI."""
-    from reference_pipeline import prepare as prepare_reference_pipeline
-    return prepare_reference_pipeline(root, run, rebuild=rebuild_subject)
 
 
 def _model_registry_receipt(runtime):
@@ -368,19 +508,16 @@ def _model_registry_receipt(runtime):
             'dinov3_profile':runtime['model_registry']['dinov3_profile']}
 
 
-def _same_model_registry(previous, current):
-    if not isinstance(previous, dict):
-        return False
-    return all(previous.get(key) == current[key]
-               for key in ('sha256', 'semantics_profile', 'matting_profile', 'scene_profile', 'dinov3_profile'))
 
 
-def prepare_scene(root, run, *, rebuild_subject=False):
+def prepare_scene(root, run, *, rebuild_subject=False, cancel=None):
     from native_source_baseline import retouch_identity, retouch_baseline_record
     root = Path(root)
     registry_path = (run.get('options') or {}).get('model_registry')
     registry_receipt = _model_registry_receipt(local_runtime_paths(root, registry_path=registry_path))
     started = time.perf_counter()
+    if cancel and cancel():
+        raise InterruptedError('Scene preparation cancelled')
     previous = ((run.get('options') or {}).get('appearance_revision') or {}).get('design_reconstruction_plan')
     source, candidate = Path(run['source']['path']), Path(run['reference']['path'])
     source = source if source.is_absolute() else root/source
@@ -408,6 +545,9 @@ def prepare_scene(root, run, *, rebuild_subject=False):
             from design_scene_assets import prepare_native_receivers
             cached = prepare_native_receivers(root, run, cached)
             cached['source_appearance_responsibility'] = prepare_source_responsibility(run, cached)
+            if cached.get('provenance', {}).get('source_scene_enhancement'):
+                from source_scene_enhancement import execution_stats
+                cached['provenance']['source_scene_enhancement'].update(execution_stats(run, cached, reused=True))
             from foreground_effects import prepare_effects
             effects=prepare_effects(root,run,cached)
             cached=effects['plan']
@@ -415,40 +555,83 @@ def prepare_scene(root, run, *, rebuild_subject=False):
             return {'ok': True, 'design_reconstruction_plan': cached, 'cache_hit': True,
                     'independent_effect_requests':effects['requests'],
                     'elapsed_seconds': round(time.perf_counter()-started, 3)}
-    source_analysis = prepare_local_appearance(root, source, source_hash=source_hash, registry_path=registry_path)
-    candidate_analysis = prepare_local_appearance(root, candidate, source_hash=candidate_hash,
-                                                 role='candidate', registry_path=registry_path)
-    source_png = Path(source_analysis['analysis_directory'])/'source-srgb.png'
-    candidate_png = Path(candidate_analysis['analysis_directory'])/'source-srgb.png'
-    source_image = Image.open(source_png).convert('RGB')
-    candidate_image = open_rgb(candidate)
-    candidate_image.thumbnail((1536, 1536), Image.Resampling.LANCZOS)
-    candidate_png = directory/'candidate-srgb.png'
-    candidate_image.save(candidate_png)
-    sa, source_saliency = source_silhouette(root, source, source_image, source_hash=source_hash, registry_path=registry_path)
-    ca, candidate_saliency = source_silhouette(root, candidate, candidate_image, source_hash=candidate_hash, registry_path=registry_path)
+    # Source and reference use the same pinned Sapiens2 checkpoint.  Prepare
+    # both through one worker so the model/import/CUDA setup happens once;
+    # each image still retains its own content-addressed semantic cache and
+    # result contract.
+    decoded_images = {}
+    try:
+        with workflow_timing.span('source_reference_semantics', http_request=False) as measured:
+            source_analysis, candidate_analysis = prepare_local_appearance_pair(
+                root, source, candidate, source_hash=source_hash, candidate_hash=candidate_hash,
+                registry_path=registry_path, decoded_images=decoded_images)
+            if measured:
+                measured.annotate(cache_hit=bool(source_analysis.get('cache_hit') and candidate_analysis.get('cache_hit')),
+                                  source_cache_hit=source_analysis.get('cache_hit'),
+                                  reference_cache_hit=candidate_analysis.get('cache_hit'),
+                                  model_request=not bool(source_analysis.get('cache_hit') and candidate_analysis.get('cache_hit')),
+                                  model_worker_submissions=0 if source_analysis.get('cache_hit') and candidate_analysis.get('cache_hit') else 1)
+        source_png = Path(source_analysis['analysis_directory'])/'source-srgb.png'
+        with Image.open(source_png) as source_proxy:
+            source_image = source_proxy.convert('RGB')
+        candidate_shared = decoded_images.get('candidate')
+        if candidate_shared is None:
+            candidate_shared = {'path': str(candidate.resolve()), 'sha256': candidate_hash,
+                                'image': open_rgb(candidate)}
+            decoded_images['candidate'] = candidate_shared
+        candidate_image = candidate_shared['image'].copy()
+        candidate_image.thumbnail((1536, 1536), Image.Resampling.LANCZOS)
+        candidate_png = directory/'candidate-srgb.png'
+        candidate_image.save(candidate_png)
+        # Scene analysis needs only the semantic masks, not the later native
+        # foreground. Consume/close full RGB now, before saliency and matting.
+        from local_scene_analysis import prepare_local_scene
+        with workflow_timing.span('scene_analysis', http_request=False) as measured:
+            scene = prepare_local_scene(root, source, candidate, source_hash=source_hash, candidate_hash=candidate_hash,
+                source_subject_mask=source_analysis['semantic_result']['labels_path'],
+                candidate_subject_mask=candidate_analysis['semantic_result']['labels_path'], registry_path=registry_path,
+                decoded_images=decoded_images)
+            _note_cache(measured, scene)
+    finally:
+        for record in decoded_images.values():
+            record['image'].close()
+        decoded_images.clear()
+    with SilhouetteSessionScope() as saliency_session:
+        with workflow_timing.span('source_saliency', http_request=False) as measured:
+            sa, source_saliency = source_silhouette(root, source, source_image, source_hash=source_hash,
+                registry_path=registry_path, session_scope=saliency_session)
+            _note_cache(measured, source_saliency)
+        with workflow_timing.span('reference_saliency', http_request=False) as measured:
+            ca, candidate_saliency = source_silhouette(root, candidate, candidate_image, source_hash=candidate_hash,
+                registry_path=registry_path, session_scope=saliency_session)
+            _note_cache(measured, candidate_saliency)
     saliency_path, candidate_alpha_path = directory/'source-saliency-seed.png', directory/'candidate-occupancy.png'
     sa.save(saliency_path); ca.save(candidate_alpha_path)
     from source_foreground_cache import prepare_source_foreground
-    foreground = prepare_source_foreground(root, source, source_hash=source_hash,
-        saliency_path=saliency_path, semantics_path=source_analysis['semantic_result']['labels_path'],
-        registry_path=registry_path,native_retouch_binding=(run.get('options') or {}).get('native_source_retouch'))
+    with workflow_timing.span('source_foreground', http_request=False) as measured:
+        foreground = prepare_source_foreground(root, source, source_hash=source_hash,
+            saliency_path=saliency_path, semantics_path=source_analysis['semantic_result']['labels_path'],
+            registry_path=registry_path,native_retouch_binding=(run.get('options') or {}).get('native_source_retouch'),
+            cancel=cancel)
+        _note_cache(measured, foreground)
+        alpha_execution = foreground.get('alpha_cache') or {}
+        batches = alpha_execution.get('model_inference_batches_this_attempt')
+        if measured and isinstance(batches, int):
+            measured.annotate(model_request=batches > 0, model_submissions=batches,
+                              alpha_cache_hit=alpha_execution.get('cache_hit'))
     source_precision = foreground['provenance']['source_precision']['source_precision']
     source_origin = ('LibRaw16_source' if source_precision == 'raw16_linear'
                      else 'inverse_sRGB_source_raster8')
     source_size = foreground['native_source_size']
     source_proxy_size = list(source_image.size)
-    from local_scene_analysis import prepare_local_scene
-    scene = prepare_local_scene(root, source, candidate, source_hash=source_hash, candidate_hash=candidate_hash,
-        source_subject_mask=source_analysis['semantic_result']['labels_path'],
-        candidate_subject_mask=candidate_analysis['semantic_result']['labels_path'], registry_path=registry_path)
     # The captured source reflection mixes old floor and lighting radiance.
     # It produced gray blocks even after material rebinding. New projects do
     # not prepare this rejected donor; historical images remain read-only evidence.
     from design_scene_assets import removal_inputs, prepare_design_scene_assets
     extras = removal_inputs(scene, candidate_image.size)
     from local_floor_pollution import prepare_candidate_floor_pollution, protect_verified_reflections
-    floor_pollution=prepare_candidate_floor_pollution(root,scene,registry_path=registry_path)
+    with workflow_timing.span('floor_observation', http_request=False, model_request=None):
+        floor_pollution=prepare_candidate_floor_pollution(root,scene,registry_path=registry_path)
     # A local cleanup result is deliberately conservative: unsupported and
     # empty searches, as well as partial fragment removal, never establish a
     # globally clean candidate floor.  Preserve the state in the immutable
@@ -469,16 +652,28 @@ def prepare_scene(root, run, *, rebuild_subject=False):
     removal_path = directory/'candidate-removal-mask.png'
     Image.fromarray(np.uint8(removal)*255).save(removal_path)
     paths = local_runtime_paths(root, registry_path=registry_path)
-    background_result = _prepare_background_stage(root, candidate_png, removal_path, paths['python'],
-                                                 directory/'background-worker.log', registry_path=registry_path)
+    from source_scene_enhancement import mode as source_enhance_mode
+    enhance_source=source_enhance_mode(run)
+    if enhance_source:
+        background_result={'clean_png':str(candidate_png),
+            'provenance':{'state':'not_requested_source_owned_scene','candidate_RGB_is_background_donor':False},
+            'stage_cache':{'state':'not_requested','cache_hit':False}}
+    else:
+        with workflow_timing.span('background_removal', http_request=False) as measured:
+            background_result = _prepare_background_stage(root, candidate_png, removal_path, paths['python'],
+                                                         directory/'background-worker.log', registry_path=registry_path)
+            if measured:
+                hit = background_result['stage_cache']['cache_hit']
+                measured.annotate(cache_hit=hit, model_request=not hit)
     from float_appearance import srgb_to_linear
     clean = srgb_to_linear(np.asarray(Image.open(background_result['clean_png']).convert('RGB'), np.float32)/255)
-    scene_assets = prepare_design_scene_assets(scene, clean, source_image.size, directory/'scene-assets',
-        source_foreground_alpha=foreground['alpha_path'],source_semantics={
-            'path':source_analysis['semantic_result']['labels_path'],
-            'sha256':_hash(source_analysis['semantic_result']['labels_path']),
-            **{key:source_analysis['semantic_result'].get(key) for key in (
-                'model', 'model_profile', 'model_revision', 'checkpoint_sha256', 'config_sha256', 'taxonomy_sha256')}})
+    with workflow_timing.span('scene_assets', model_request=False, http_request=False):
+        scene_assets = prepare_design_scene_assets(scene, clean, source_image.size, directory/'scene-assets',
+            source_foreground_alpha=foreground['alpha_path'],source_semantics={
+                'path':source_analysis['semantic_result']['labels_path'],
+                'sha256':_hash(source_analysis['semantic_result']['labels_path']),
+                **{key:source_analysis['semantic_result'].get(key) for key in (
+                    'model', 'model_profile', 'model_revision', 'checkpoint_sha256', 'config_sha256', 'taxonomy_sha256')}})
     from scene_design import build_scene_design
     scene_design=build_scene_design(scene,run.get('generation_design') or {},analysis_grid=source_image.size,
         reference=run['reference'], environment_assets={
@@ -487,8 +682,17 @@ def prepare_scene(root, run, *, rebuild_subject=False):
                 coordinate_space='candidate_proxy',representation='pollution_removal')})
     scene_assets['background'].update(radiometric_origin='inverse_sRGB_generated_display',
         color_primaries='sRGB', transfer_function='linear')
-    from local_face_protection import prepare_face_protection
-    source_face = prepare_face_protection(root, source_png, source_analysis['semantic_result'], registry_path=registry_path)
+    from local_face_protection import prepare_face_protection_pair
+    with workflow_timing.span('source_face_protection', http_request=False) as measured:
+        source_face, reference_face = prepare_face_protection_pair(root,
+            source_png, source_analysis['semantic_result'],
+            Path(candidate_analysis['analysis_directory'])/'source-srgb.png',
+            candidate_analysis['semantic_result'], registry_path=registry_path)
+        if measured:
+            measured.annotate(cache_hit=bool(source_face.get('cache_hit') and reference_face.get('cache_hit')),
+                source_cache_hit=source_face.get('cache_hit'), reference_cache_hit=reference_face.get('cache_hit'),
+                paired_source_reference=True,
+                model_worker_submissions=0 if source_face.get('cache_hit') and reference_face.get('cache_hit') else 1)
     masks = {
         'foreground_alpha': _asset(foreground['alpha_path'], size=source_size, coordinate_space='source_canvas', representation='coverage'),
         'candidate_occupancy': _asset(candidate_alpha_path, size=candidate_image.size, coordinate_space='candidate_proxy', representation='segmentation'),
@@ -564,7 +768,7 @@ def prepare_scene(root, run, *, rebuild_subject=False):
     source_display=source_transform_for_precision(source_precision)
     plan = {'schema_version':'design_reconstruction_plan.v1','enabled':True,
         'working_domain':source_display['input_domain'],
-        'summary':'先用参考图对原图人物仿色，再与环境溶图；本人、妆容与纹理来自原图。',
+        'summary':'先保留原图人物身份、几何与纹理，再提取 GPT 候选人物的低频光照证据与背景光场，最后统一合成。',
         'source_sha256':source_hash,'candidate_sha256':candidate_hash,'recipe':RECIPE,
         'canvas':{'source_oriented_size':source_size,'source_proxy_size':source_proxy_size,
             'foreground_coordinate_space':'source_canvas','candidate_mapping':scene_assets['mapping']},
@@ -578,13 +782,15 @@ def prepare_scene(root, run, *, rebuild_subject=False):
                 'foreground_alpha':dict(masks['foreground_alpha']),
                 'old_environment':dict(layers[0]['assets']['old_environment'])}},
         'generation_identity':generation_identity,'layers':layers,'mask_roles':masks,'scene_design':scene_design,
-        'execution':{'stages':'fixed_foreground_environment_receiver_composite_optics',
+        'execution':{'stages':'fixed_foreground_candidate_relight_environment_receiver_composite_optics',
             'background_coverage':'derived_one_minus_native_alpha','foreground_base':'paired_native_Fp',
-            'automatic_subject_lighting':'original_reference_colour_match_then_composite',
+            'automatic_subject_lighting':'candidate_subject_light_evidence_then_source_environment_light',
+            'source_environment_light':True,
             'skin_appearance_baseline':'source_detail_design_gain_pre_manual',
             'source_reference':'paired_native_baseline','receiver_context':'current_environment'},
         'effect_ownership':{'candidate_plate':'observed_baked_or_unknown',
             'person_colour_match':'reference_colour_statistics_applied_to_original_pixels',
+            'candidate_subject_light':'low_frequency_reference_light_evidence_only; source_pixels_remain_output_owner',
             'extra_background_fog':'disabled','extra_bloom':'disabled','rim':'disabled_explicit_increment'},
         'provenance':{'local_model_registry':registry_receipt,
             'source_foreground':foreground,'saliency_seed':source_saliency,'candidate_occupancy':candidate_saliency,
@@ -600,40 +806,52 @@ def prepare_scene(root, run, *, rebuild_subject=False):
             'contamination':{key:value for key,value in extras.items() if key != 'extra_removal_mask'},
             'gpt_image_calls':0,'candidate_reused':True},
         'limitations':foreground.get('limitations',[])+scene_assets.get('limitations',[])+[
-            'Reference colour matching retains the original person geometry and texture; visual quality needs review.',
+            'Reference colour matching and candidate light evidence retain the original person geometry and texture; visual quality needs review.',
             f'Candidate floor cleanup state is {floor_pollution_state}; detected local fragments do not establish a fully clean floor.',
             'Background detail enhancement synthesizes detail absent from the design reference.',
             'Transparent edges and subject/environment integration require visual inspection.']}
-    # Native environment detail is part of new-project preparation, not a
-    # separate manual experiment the user must run after generating a design.
-    background_run={**run,'options':{**run.get('options',{}),'appearance_revision':{
-        **(run.get('options',{}).get('appearance_revision') or {}),'design_reconstruction_plan':plan}}}
-    background_input=directory/'background-sr-input.json'
-    _write(background_input,background_run)
-    background_sr_dir=directory/'background-native-detail'
-    _worker([paths['python'],'-X','utf8',code_path('background_superresolution_worker.py'),
-        '--run',background_input,'--weights',Path(paths['model_registry']['background_sr_checkpoint']),
-        '--output',background_sr_dir],directory/'background-sr.log')
-    sr=_read(background_sr_dir/'manifest.json')
-    background_layer=next(layer for layer in plan['layers'] if layer['kind']=='background_design')
-    background_layer['assets'].update(sr['assets'])
-    # Frozen compact observations authorize later CPU data-consistency repair;
-    # they are neither native detail nor permission to paste candidate people.
-    background_layer['assets']['compact_observation']=copy.deepcopy(sr['source_assets']['background'])
-    background_layer['assets']['compact_validity']=copy.deepcopy(sr['source_assets']['validity'])
-    observation_path=directory/'background-observation.json'
-    observation_binding=plan['provenance']['background_stage_cache']['binding']
-    _write(observation_path,{'schema':'background_observation.v1','source_sha256':source_hash,
-        'reference_sha256':candidate_hash,'sr_provenance':copy.deepcopy(sr),
-        'clean_stage_binding':{'path':str(Path(observation_binding).resolve()),'sha256':_hash(observation_binding)},
-        'clean_input_asset':{'path':str(candidate_png.resolve()),'sha256':_hash(candidate_png)}})
-    background_layer['assets']['background_observation']={
-        'path':str(observation_path.resolve()),'sha256':_hash(observation_path),
-        'representation':'frozen_background_observation_receipt'}
-    plan['provenance']['background_native_detail']=sr
-    # The completed design owns environment appearance. Source silhouette
-    # topology cannot authorize importing a different source background.
-    plan = _prepare_registered_environment(root, run, plan)
+    if enhance_source:
+        from source_scene_enhancement import prepare as prepare_source_scene
+        with workflow_timing.span('source_scene_enhancement', model_request=False, http_request=False) as measured:
+            plan = prepare_source_scene(root, run, plan, directory/'source-scene-enhancement', cancel=cancel)
+            if measured:
+                stats = plan['provenance']['source_scene_enhancement']
+                measured.annotate(model_request=bool(stats['new_model_submissions']),
+                                  model_submissions=stats['new_model_submissions'])
+    else:
+        # Native environment detail is part of new-project preparation, not a
+        # separate manual experiment the user must run after generating a design.
+        background_run={**run,'options':{**run.get('options',{}),'appearance_revision':{
+            **(run.get('options',{}).get('appearance_revision') or {}),'design_reconstruction_plan':plan}}}
+        background_input=directory/'background-sr-input.json'
+        _write(background_input,background_run)
+        with workflow_timing.span('background_superresolution', model_request=True, http_request=False):
+            sr = _prepare_background_sr(root, run, plan, paths['python'], background_input,
+                                        directory/'background-sr.log', registry_path=registry_path)
+            # Keep the cache decision visible in the workflow ledger; unlike the
+            # derived arrays, this annotation is cheap and does not hash payloads.
+            workflow_timing.annotate(cache_hit=sr.get('stage_cache', {}).get('cache_hit'),
+                                     model_request=not sr.get('stage_cache', {}).get('cache_hit', False))
+        background_layer=next(layer for layer in plan['layers'] if layer['kind']=='background_design')
+        background_layer['assets'].update(sr['assets'])
+        # Frozen compact observations authorize later CPU data-consistency repair;
+        # they are neither native detail nor permission to paste candidate people.
+        background_layer['assets']['compact_observation']=copy.deepcopy(sr['source_assets']['background'])
+        background_layer['assets']['compact_validity']=copy.deepcopy(sr['source_assets']['validity'])
+        observation_path=directory/'background-observation.json'
+        observation_binding=plan['provenance']['background_stage_cache']['binding']
+        _write(observation_path,{'schema':'background_observation.v1','source_sha256':source_hash,
+            'reference_sha256':candidate_hash,'sr_provenance':copy.deepcopy(sr),
+            'clean_stage_binding':{'path':str(Path(observation_binding).resolve()),'sha256':_hash(observation_binding)},
+            'clean_input_asset':{'path':str(candidate_png.resolve()),'sha256':_hash(candidate_png)}})
+        background_layer['assets']['background_observation']={
+            'path':str(observation_path.resolve()),'sha256':_hash(observation_path),
+            'representation':'frozen_background_observation_receipt'}
+        plan['provenance']['background_native_detail']=sr
+        # The completed design owns environment appearance. Source silhouette
+        # topology cannot authorize importing a different source background.
+        with workflow_timing.span('environment_registration', model_request=False, http_request=False):
+            plan = _prepare_registered_environment(root, run, plan)
     # Bind the final owned plate after SR and environment registration, not only
     # the intermediate plate used during scene construction.
     from scene_design import bind_scene_environment, bind_plan_receiver_intent
@@ -644,10 +862,12 @@ def prepare_scene(root, run, *, rebuild_subject=False):
         'candidate_removal':plan['mask_roles']['candidate_removal']}
     plan['scene_design']=bind_scene_environment(plan['scene_design'],environment_bindings)
     from design_scene_assets import prepare_native_receivers
-    plan=prepare_native_receivers(root,run,plan)
-    plan['source_appearance_responsibility'] = prepare_source_responsibility(run, plan)
+    with workflow_timing.span('receiver_preparation', model_request=False, http_request=False):
+        plan=prepare_native_receivers(root,run,plan)
+        plan['source_appearance_responsibility'] = prepare_source_responsibility(run, plan)
     from foreground_effects import prepare_effects
-    effects = prepare_effects(root, run, plan)
+    with workflow_timing.span('foreground_effect_preparation', model_request=None, http_request=None):
+        effects = prepare_effects(root, run, plan)
     plan = effects['plan']
     _write(plan_path,plan)
     return {'ok':True,'design_reconstruction_plan':plan,'cache_hit':False,

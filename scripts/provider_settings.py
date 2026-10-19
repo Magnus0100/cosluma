@@ -23,6 +23,8 @@ def settings_path() -> Path:
     override = os.environ.get("COSPLAY_PROVIDER_SETTINGS")
     if override:
         return Path(override).expanduser().resolve()
+    if os.environ.get('COSPLAY_CONFIG_ROOT'):
+        return Path(os.environ['COSPLAY_CONFIG_ROOT']).expanduser().resolve()/'provider-settings.json'
     folder = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
     return folder / "CosplayWorkbench" / "provider-settings.json"
 

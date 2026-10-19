@@ -8,6 +8,32 @@ import sys
 from sam31_model_profile import CHECKPOINT, DETECTOR_TENSORS, PREPROCESS, image_state, model_identity
 
 
+def _runtime_package_version(distribution: str) -> str:
+    """Read the loaded runtime's version before consulting shared dist-info.
+
+    The pinned SAM3.1 venv intentionally shares some site-packages.  When the
+    worker script lives in the packaged application, importlib.metadata can
+    select the shared NumPy dist-info even though the isolated interpreter has
+    loaded its own NumPy module.  Module versions are the authoritative ABI
+    check for those packages.
+    """
+    runtime_site = Path(sys.executable).resolve().parents[1] / 'Lib' / 'site-packages'
+    normalized = distribution.replace('_', '-').lower()
+    for candidate in importlib.metadata.distributions(path=[str(runtime_site)]):
+        name = str(candidate.metadata.get('Name') or '').replace('_', '-').lower()
+        if name == normalized:
+            return str(candidate.version)
+    module_name = {'opencv-python': 'cv2', 'triton-windows': 'triton'}.get(distribution, distribution)
+    try:
+        module = __import__(module_name)
+        version = getattr(module, '__version__', None)
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    return importlib.metadata.version(distribution)
+
+
 def load_model(directory, device, *, identity=None):
     import torch
     from sam3 import model_builder as b
@@ -19,7 +45,7 @@ def load_model(directory, device, *, identity=None):
     if Path(sys.executable).resolve() != Path(identity['runtime']['python']).resolve():
         raise ValueError('SAM3.1 worker interpreter differs from the pinned runtime')
     for package, expected_version in identity['runtime']['packages'].items():
-        if importlib.metadata.version(package) != expected_version:
+        if _runtime_package_version(package) != expected_version:
             raise ValueError('SAM3.1 runtime package version differs: '+package)
     if device != 'cuda' or not torch.cuda.is_available():
         raise RuntimeError('SAM3.1 static inference requires the explicit CUDA runtime')

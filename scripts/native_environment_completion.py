@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_fill_holes, map_coordinates
+from asset_identity import sha256_file
 
 SCHEMA = 'native_environment_completion.v1'
 ORIGIN_CODES = {'unknown_or_outside_mapping': 0, 'design_background_observed_resampled': 1,
@@ -22,8 +23,7 @@ ORIGIN_CODES = {'unknown_or_outside_mapping': 0, 'design_background_observed_res
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _bound(asset):

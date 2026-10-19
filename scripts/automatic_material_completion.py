@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from cache_roots import cache_dir
 
 
 SCHEMA = 'automatic_material_completion.v1'
@@ -81,7 +82,7 @@ def selected_cached_analysis(root, run, *, role, source_sha256):
         raise ValueError('Unsupported material analysis role')
     expected = analysis_identity(root, role=role,
         registry_path=run.get('options', {}).get('model_registry'))
-    directory = Path(root)/'outputs/cache/local-analysis'/source_sha256[:16]
+    directory = cache_dir(root, 'local-analysis')/source_sha256[:16]
     matches = []
     for path in directory.glob('*/analysis.json'):
         record = _read(path)

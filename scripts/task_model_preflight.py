@@ -11,7 +11,8 @@ import json
 from pathlib import Path
 import re
 
-from current_model_registry import DIRECTORY_KEYS, PATH_KEYS, PATH_LABELS, validate_config
+from current_model_registry import (CAPABILITY_KEYS, CAPABILITY_LABELS,
+    DIRECTORY_KEYS, PATH_KEYS, PATH_LABELS, validate_config)
 from sapiens_model_profiles import profile as sapiens_profile
 from sam31_model_profile import (CHECKPOINT, CHECKPOINT_BYTES, CODE_CONTENT_SHA,
     IMAGE_SHA, PUBLIC_METADATA_SHA, RUNTIME_FILES, RUNTIME_PACKAGES, WEIGHT_REVISION)
@@ -19,6 +20,18 @@ from sam31_model_profile import (CHECKPOINT, CHECKPOINT_BYTES, CODE_CONTENT_SHA,
 SCHEMA = 'cosplay_task_model_preflight.v1'
 SMALL_FILE_LIMIT = 16 * 1024 * 1024
 LOCAL_KEYS = frozenset(('python', 'semantics_checkpoint', 'semantics_repo_dir', 'vitmatte_model_root'))
+# Internal inspectors are split more finely than the public capability names:
+# this keeps the checks readable while the route contract stays centralized in
+# current_model_registry.CAPABILITY_KEYS.
+CAPABILITY_PATH_KEYS = {
+    'human_matting': frozenset(LOCAL_KEYS),
+    'reference_correspondence': frozenset(('dinov3_model_root',)),
+    'scene_understanding': frozenset(('scene_python', 'scene_model_root')),
+    'alpha_seed': frozenset(('birefnet_model_path', 'onnx_runtime_root')),
+    'background_repair': frozenset(('lama_checkpoint',)),
+    'background_superresolution': frozenset(('python', 'background_sr_checkpoint')),
+    'face_localization': frozenset(('face_model_path', 'face_python')),
+}
 # Literal architecture/provenance from the current ViT-L correspondence adapter.
 # Keeping this metadata-only module independent avoids importing numpy/PIL/torch.
 DINO_REPOSITORY = 'facebook/dinov3-vitl16-pretrain-lvd1689m'
@@ -26,6 +39,40 @@ DINO_REVISION = 'ea8dc2863c51be0a264bab82070e3e8836b02d51'
 DINO_CONFIG = {'model_type': 'dinov3_vit', 'patch_size': 16, 'hidden_size': 1024,
     'num_register_tokens': 4, 'num_hidden_layers': 24, 'num_attention_heads': 16}
 DINO_FILES = ('config.json', 'preprocessor_config.json', 'model.safetensors', 'README.md', 'LICENSE.md')
+
+
+def required_capabilities(mode, *, execution_strategy='layered_reference_transfer',
+                          complete_post=None, use_beautygrpo=False):
+    """Return the model capabilities consumed by one checked task route.
+
+    This is deliberately a route contract rather than a list of everything
+    installed on the machine.  Historical/experimental models are not part of
+    ``CAPABILITY_KEYS`` and therefore never enter production preflight.
+    """
+    if mode not in {'local_portrait', 'existing_reference', 'create_reference'}:
+        raise ValueError('Unsupported task model preflight mode: ' + str(mode))
+    if execution_strategy != 'layered_reference_transfer':
+        raise ValueError('Unsupported task execution strategy: ' + str(execution_strategy))
+    if complete_post is None:
+        complete_post = mode != 'local_portrait'
+    if type(complete_post) is not bool:
+        raise ValueError('complete_post must be a boolean')
+    required = set()
+    if mode == 'local_portrait':
+        # The local portrait route currently renders the source with the
+        # silhouette-only adapter.  It does not invoke the layered semantic
+        # geometry stack, so Sapiens2/ViTMatte must not block this route.
+        required.add('source_silhouette')
+    else:
+        required.update(('source_geometry', 'reference_correspondence', 'scene_analysis'))
+        if complete_post:
+            required.update(('portrait_regions', 'background_completion', 'background_superresolution'))
+    if use_beautygrpo:
+        # BeautyGRPO has its own installation registry and is checked by its
+        # preparation worker.  Keep it visible in the plan without pretending
+        # its files belong to the analysis registry.
+        required.add('portrait_beauty')
+    return frozenset(required)
 
 
 def _digest(value):
@@ -173,7 +220,7 @@ def _sapiens_and_matting(check, config):
             detail='' if (manifest.get('repository') == spec['repository'] and manifest.get('revision') == spec['revision']
                 and manifest.get('checkpoint_sha256') == spec['checkpoint_sha256']) else 'Sapiens2 recorded identity differs from current profile')
     check.packages('human_runtime', config['python'],
-        ('torch', 'transformers', 'numpy', 'pillow', 'safetensors', 'opencv-python'))
+        ('torch', 'transformers', 'numpy', 'pillow', 'safetensors', 'opencv-python', 'scipy'))
     matting = Path(config['vitmatte_model_root'])
     check.weight('vitmatte.checkpoint', matting / 'model.safetensors', base=matting)
     model = check.json_file('vitmatte.config', matting / 'config.json', base=matting)
@@ -189,6 +236,12 @@ def _sapiens_and_matting(check, config):
         okay = processor.get('image_processor_type') == 'VitMatteImageProcessor'
         check.check('vitmatte.processor', 'configuration', okay,
             detail='' if okay else 'ViTMatte preprocessor differs from current adapter')
+
+
+def _background_superresolution(check, config):
+    """Check only the runtime packages imported by the source-bound SR worker."""
+    check.packages('background_sr_runtime', config['python'],
+        ('torch', 'numpy', 'pillow', 'opencv-python', 'scipy'))
 
 
 def _dinov3(check, config):
@@ -269,19 +322,51 @@ def _sam31(check, config):
         pinned=RUNTIME_PACKAGES, extra_sites=sites)
 
 
-def inspect_task_models(config, *, mode='existing_reference'):
-    """Return serializable capability evidence with zero inference/network work."""
-    if mode not in {'local_portrait', 'existing_reference', 'create_reference'}:
-        raise ValueError('Unsupported task model preflight mode: ' + str(mode))
+def inspect_task_models(config, *, mode='existing_reference',
+                        execution_strategy='layered_reference_transfer',
+                        complete_post=None, use_beautygrpo=False):
+    """Return route-scoped model evidence with zero inference/network work.
+
+    Only the capabilities consumed by this route are inspected.  A model
+    installed for another route is explicitly marked ``not_requested`` and
+    cannot block this task.
+    """
+    requested = required_capabilities(mode, execution_strategy=execution_strategy,
+        complete_post=complete_post, use_beautygrpo=use_beautygrpo)
+    group_for = {
+        'source_silhouette': ('alpha_seed',),
+        'source_geometry': ('human_matting', 'alpha_seed'),
+        'reference_correspondence': ('reference_correspondence',),
+        'scene_analysis': ('scene_understanding',),
+        'portrait_regions': ('face_localization',),
+        'background_completion': ('background_repair',),
+        'background_superresolution': ('background_superresolution',),
+        'portrait_beauty': (),
+    }
+    # ``requested`` is a frozenset by contract; use a fixed worker order so
+    # plan identities stay identical between the desktop process and the CLI.
+    worker_order = ('human_matting', 'reference_correspondence',
+        'scene_understanding', 'face_localization', 'background_repair',
+        'background_superresolution', 'alpha_seed')
+    capabilities = tuple(group for group in worker_order
+                         if any(group in group_for[name] for name in requested))
+    required = frozenset().union(*(CAPABILITY_PATH_KEYS[key] for key in capabilities)) if capabilities else frozenset()
+    profile_for = {
+        'source_geometry': ('semantics_profile', 'matting_profile'),
+        'reference_correspondence': ('dinov3_profile',),
+        'scene_analysis': ('scene_profile',),
+    }
+    required_profiles = frozenset(profile for name in requested for profile in profile_for.get(name, ()))
     check = _Inspection()
     try:
-        validate_config(config)
+        # Validate only the route's paths.  In particular source-bound finish
+        # must remain runnable with a registry containing just its SR runtime.
+        validate_config(config, required_keys=required, required_profiles=required_profiles)
         check.check('registry.configuration', 'configuration', config['ready'],
             detail='' if config['ready'] else 'Installed-model registry is not enabled')
     except (OSError, ValueError) as exc:
         check.check('registry.configuration', 'configuration', False, detail=str(exc))
         config = config if isinstance(config, dict) else {}
-    required = LOCAL_KEYS if mode == 'local_portrait' else frozenset(PATH_KEYS)
     for key in PATH_KEYS:
         if key not in required:
             continue
@@ -298,30 +383,68 @@ def inspect_task_models(config, *, mode='existing_reference'):
                 check.weight(key, path)
         else:
             check.check(key, 'file_structure', False, detail='Missing installed-model path: ' + PATH_LABELS[key])
-    groups = [('human_matting', _sapiens_and_matting)]
-    if mode != 'local_portrait':
-        groups += [('dinov3', _dinov3), ('sam31', _sam31)]
+    groups = []
+    if 'human_matting' in capabilities:
+        groups.append(('human_matting', _sapiens_and_matting))
+    if 'background_superresolution' in capabilities:
+        groups.append(('background_superresolution', _background_superresolution))
+    if 'reference_correspondence' in capabilities:
+        groups.append(('dinov3', _dinov3))
+    if 'scene_understanding' in capabilities:
+        groups.append(('sam31', _sam31))
     for key, inspect in groups:
         try:
             inspect(check, config)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             check.check(key + '.inspection', 'configuration', False, detail='Cannot inspect ' + key + ': ' + str(exc))
-    if mode != 'local_portrait':
+    if 'alpha_seed' in capabilities or 'face_localization' in capabilities:
         try:
-            onnx = Path(config['onnx_runtime_root'])
-            check.file('onnx.runtime_module', onnx / 'onnxruntime/__init__.py', base=onnx)
-            native = [*sorted((onnx / 'onnxruntime/capi').glob('onnxruntime_pybind11_state*.pyd')),
-                *sorted((onnx / 'onnxruntime/capi').glob('onnxruntime_pybind11_state*.so'))]
-            check.check('onnx.native_module', 'file_structure', len(native) == 1 and native[0].stat().st_size > 0,
-                detail='' if len(native) == 1 and native[0].stat().st_size > 0 else 'ONNX runtime native module is missing/ambiguous')
-            check.packages('face_runtime', config['face_python'], ('mediapipe',))
+            if 'alpha_seed' in capabilities:
+                onnx = Path(config['onnx_runtime_root'])
+                check.file('onnx.runtime_module', onnx / 'onnxruntime/__init__.py', base=onnx)
+                native = [*sorted((onnx / 'onnxruntime/capi').glob('onnxruntime_pybind11_state*.pyd')),
+                    *sorted((onnx / 'onnxruntime/capi').glob('onnxruntime_pybind11_state*.so'))]
+                check.check('onnx.native_module', 'file_structure', len(native) == 1 and native[0].stat().st_size > 0,
+                    detail='' if len(native) == 1 and native[0].stat().st_size > 0 else 'ONNX runtime native module is missing/ambiguous')
+            if 'face_localization' in capabilities:
+                check.packages('face_runtime', config['face_python'], ('mediapipe',))
         except (OSError, ValueError, TypeError, KeyError) as exc:
             check.check('auxiliary_runtime.inspection', 'configuration', False, detail=str(exc))
+    beauty = None
+    if 'portrait_beauty' in requested:
+        from model_setup import beauty_status
+        beauty = beauty_status()
+        check.check('portrait_beauty.installation', 'recorded_identity', beauty['available'],
+            path=beauty.get('config_path'), detail=beauty.get('error') or '')
     structure = [row for row in check.checks if row['scope'] == 'file_structure']
     identities = [row for row in check.checks if row['scope'] in {'recorded_identity', 'small_file_content_identity'}]
     recorded = [row for row in check.checks if row['scope'] == 'recorded_identity']
     small = [row for row in check.checks if row['scope'] == 'small_file_content_identity']
-    return {'schema_version': SCHEMA, 'mode': mode, 'ready': not check.blockers,
+    # Keep conceptual capability names in plans and expose the worker groups
+    # used to produce the evidence.
+    capability_status = {}
+    known = set(CAPABILITY_KEYS) | {'portrait_beauty'}
+    for name in sorted(known):
+        if name in requested:
+            capability_status[name] = {'status': 'required', 'ready':
+                bool(beauty and beauty['available']) if name == 'portrait_beauty' else not bool(check.blockers),
+                'label': CAPABILITY_LABELS.get(name, name),
+                'keys': sorted(CAPABILITY_KEYS.get(name, ())),
+                'delegated': name == 'portrait_beauty'}
+        else:
+            capability_status[name] = {'status': 'not_requested', 'ready': None,
+                'label': CAPABILITY_LABELS.get(name, name),
+                'keys': sorted(CAPABILITY_KEYS.get(name, ())), 'delegated': False}
+    output_capabilities = sorted(requested)
+    return {'schema_version': SCHEMA, 'mode': mode,
+        'execution_strategy': execution_strategy,
+        'required_capabilities': output_capabilities,
+        'required_model_groups': list(capabilities),
+        'optional_capabilities': sorted(known - set(requested)),
+        'unused_capabilities': sorted(known - set(requested)),
+        'capability_status': capability_status,
+        'required_path_keys': [key for key in PATH_KEYS if key in required],
+        'ready': not check.blockers,
         'blocking_reasons': list(dict.fromkeys(check.blockers)), 'checks': check.checks,
         'file_structure_verified': bool(structure) and all(row['available'] for row in structure),
         'checked_identity_verified': bool(identities) and all(row['available'] for row in identities),

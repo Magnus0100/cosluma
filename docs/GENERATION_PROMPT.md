@@ -2,7 +2,9 @@
 
 当前流程要求完整 Cos 后期：本人妆造、精修、角色场景、主要效果、空间融合与材质光色。最终人物结构/高清纹理由原片提供，生成图是参考。验收见 [COSPLAY_POST_STANDARD.md](COSPLAY_POST_STANDARD.md)，数据流见 [PRODUCT_ARCHITECTURE.md](PRODUCT_ARCHITECTURE.md)。
 
-brief 为 `cosplay-post-v4`，风格为 `cosplay-complete-v2`，设计为 `cosplay-researched-design-v6-cosplay-post`。
+brief 为 `cosplay-post-v6`，风格为 `cosplay-character-portrait-v3`，设计为 `cosplay-researched-design-v7-character-portrait`。
+
+外部文本/视觉规划与自动审片是显式可选服务，默认关闭。下文的识别研究、成对视觉观察与结构化服务设计适用于启用这些服务的任务；关闭时沿用同一管线，使用用户 brief、所选风格及本地绑定，不因未授权外部服务阻断本地后期。创建参考默认生成 1 张，已有参考默认图像生成预算为零；显式原景增强＋本地Qwen单区新独立任务可另获局部最多1次预算，不生成全局参考，普通重试与最终修复不授新额度，见[原景增强](SOURCE_SCENE_ENHANCEMENT.md)。
 
 | 来源 | 职责 |
 |---|---|
@@ -26,7 +28,7 @@ brief 为 `cosplay-post-v4`，风格为 `cosplay-complete-v2`，设计为 `cospl
 - `user_constraints`：引用当前用户原文，模板、预设和旧设计不能冒充限制。
 - `foreground_effect_plan`：明确的 `enabled` 与 `layers`；未提供时保存为关闭的空计划。主效已烘焙于参考或无需独立增量时使用 `{"enabled":false,"layers":[]}`。
 
-普通人像允许 refine/none，仍须完成精修层次和光色。舞台/夜景/幻想/仪式须可见场景改造和有目的主效，用户限制优先。魔法不是所有风格必需。
+所有风格均允许 refine/none。风格首先体现为人物精修、妆造与服装色彩、主光塑形和画面主次；风格名称不授予换景或强制加特效。默认沿用原地点与空间布局，允许局部整理、替换干扰细节和克制氛围；明确要求完整换景时才设计 transform。暗调与恐怖题材仍保留皮肤高光、清晰眼神和暗部色彩，不能以全图压暗、染蓝、堆雾替代完成度。
 
 场景、效果、空间、精修、材质和取舍逐项进入发送文本。`composition_plan/environment_effects_plan` 从当前结构派生供场景消费者使用，不接收旧数字计划或前图别名。文字不能代替 alpha、RGBA、投影资格或三维光照；缺字段/约束冲突/旧数字计划不能 ready。
 

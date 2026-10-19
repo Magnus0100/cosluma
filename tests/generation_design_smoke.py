@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from generation_design import (DESIGN_VERSION, DRAMATIC_STYLES, normalize_design_brief,
+from generation_design import (DESIGN_VERSION, normalize_design_brief,
                                prepare_generation_design, sha256, correction_prompt)
 from generation_prompt import CHARACTER_MARKER, DEFAULT_PROMPT, DESIGN_MARKER, STYLE_MARKER
 from preset_store import get_preset
@@ -65,6 +65,9 @@ def main():
     assert 'DIAGNOSED SCENE AND EFFECT CORRECTIONS:' in scene_prompt and scene['action'] in scene_prompt
     assert 'placement and hierarchy may change' in scene_prompt
     assert 'Retain subject material colours' in scene_prompt
+    assert 'retain the intended fog colour and placement' in scene_prompt
+    assert 'actual hair, clothing, foliage and object occlusion intact' in scene_prompt
+    assert 'diagnosed mist or haze defects' not in material_prompt
     assert 'material regions' not in scene_prompt and 'Make transitions continuous' not in scene_prompt
     assert 'DIAGNOSED MATERIAL AND SCENE CORRECTIONS:' in mixed_prompt
     assert 'Retain subject material colours' not in mixed_prompt
@@ -107,6 +110,11 @@ def main():
         scene, effect = response['scene_transformation_plan'], response['primary_effect_plan']
         assert scene['description'] in sent and all(change in sent for change in scene['visible_changes'])
         assert effect['description'] in sent and effect['reason'] in sent
+        assert 'brightness transitions gradual within the specified background region' in sent
+        assert 'actual occluder or motivated light falloff' in sent
+        assert 'viewer-relative placement' in requests[-1]
+        assert 'Preserve explicitly requested effect colours and treatments.' in requests[-1]
+        assert "do not reuse another photograph's setting, hue or effect" in requests[-1]
         # The existing scene consumer still reads descriptive compatibility
         # fields; those must contain this plan, not an old saved shot's prose.
         from scene_design import normalize_scene_intent
@@ -135,9 +143,13 @@ def main():
         assert default_context['explicit_user_constraints'] == {'no_effects': False, 'preserve_background': False}
         assert default['design_brief']['primary_effect_plan']['mode'] == 'scene_effect'
 
-        for style_id in DRAMATIC_STYLES:
+        # A dramatic aesthetic may be achieved within the original setting.
+        # Preset choice must never force scene replacement or a new effect.
+        for style_id in ('stage_light', 'night_scene', 'fantasy_atmosphere', 'shrine_drama'):
             normalize_design_brief(plan_fixture(), style_id=style_id, user_brief='')
-            expect_rejected(plan_fixture(dramatic=False), style_id=style_id)
+            refined = normalize_design_brief(plan_fixture(dramatic=False), style_id=style_id, user_brief='')
+            assert refined['scene_transformation_plan']['mode'] == 'refine'
+            assert refined['primary_effect_plan']['mode'] == 'none'
 
         response = plan_fixture(dramatic=False)
         response['spatial_integration_plan'] = 'Retain the existing scene depth, object occlusion and ground contact.'
@@ -145,6 +157,7 @@ def main():
         soft = prepare_generation_design(source, root / 'soft', {},
             style_id='soft_skin', base_prompt=custom, character_research=research)
         assert 'No added scene effects:' in soft['effective_prompt']
+        assert 'Where the chosen effect contains illuminated mist' not in soft['effective_prompt']
         assert soft['design_brief']['primary_effect_plan']['mode'] == 'none'
         restriction = 'No effects. Preserve the original background.'
         limited = prepare_generation_design(source, root / 'limited', {},

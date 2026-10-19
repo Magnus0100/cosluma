@@ -15,14 +15,15 @@ import shutil
 import subprocess
 import time
 
+from asset_identity import sha256_file
+
 SCHEMA='automatic_native_retouch.v1'
 BINDING='automatic_native_retouch_binding.v1'
 MAXIMUM=8
 
 
 def read(path): return json.loads(Path(path).read_text(encoding='utf8'))
-def sha(path):
-    with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
+def sha(path): return sha256_file(path)
 def write(path,value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     temp=path.with_suffix(path.suffix+'.tmp');temp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf8');temp.replace(path)
@@ -103,6 +104,42 @@ def _bound_face_protection(face,proxy,semantic,output):
 
 
 
+def _validate_beauty_source_before_preparation(root,run):
+    """Check a frozen source lock before a fresh reference baseline exists."""
+    options=run.get('options') or {};revision=options.get('appearance_revision') or {}
+    from portrait_beauty_layer import validate_source_for_run,load_result,identity_for_run
+    # An existing plan must pass its full contract, including a malformed or
+    # empty plan. Only the genuinely new task has no baseline to validate yet.
+    if 'design_reconstruction_plan' in revision or 'source_only_plan' in options:
+        validate_source_for_run(run,root=root)
+        return
+    control=revision['portrait_beauty']
+    if not isinstance(control,dict) or set(control)-{'result','strength','disabled_faces'}:
+        raise ValueError('Beauty revision requires result, strength and disabled_faces')
+    result,_=load_result(control['result']);source=run.get('source') or {}
+    from raw_support import RGB_DECODE_VERSION,is_raw
+    precision=result.get('source_precision') or {}
+    if (not isinstance(precision,dict) or source.get('decode_version')!=RGB_DECODE_VERSION
+            or precision.get('decode_version')!=RGB_DECODE_VERSION
+            or result['source_sha256']!=source.get('sha256')):
+        raise ValueError('Beauty preparation must bind the current source and decoder')
+    if result['native_size']!=source.get('oriented_size'):
+        raise ValueError('Beauty layer belongs to a different native source canvas')
+    expected='raw16_linear' if is_raw(Path(source['path'])) else 'raster8_srgb'
+    if precision.get('source_precision')!=expected:
+        raise ValueError('Beauty preparation has a different source precision')
+    from display_transform import validate_source_transform
+    validate_source_transform(result['source_display'],expected)
+    from native_source_baseline import retouch_identity
+    retouch=retouch_identity(run,root=root)
+    stable={key:retouch[key] for key in ('delta_sha256','source_sha256','working_domain')} if retouch else None
+    if stable!=result.get('native_source_retouch'):
+        raise ValueError('Source retouch changed after beauty preparation; prepare beauty again')
+    identity_for_run(run)
+    # The reference producer will create the actual baseline. Its Beauty
+    # replay retains validate_source_for_run; no placeholder plan is invented.
+
+
 def prepare_once(root,run,args=None,*,source_analysis_path=None,cancel=None,reuse_layer_path=None,authorized=True,reuse_only=False):
     """ABI: return {run,status,layer_record}; invoke only at new/explicit work.
 
@@ -112,6 +149,17 @@ def prepare_once(root,run,args=None,*,source_analysis_path=None,cancel=None,reus
     """
     root=Path(root).resolve();retained=copy.deepcopy(run)
     if not authorized:return {'run':retained,'status':'not_authorized_for_new_preparation','layer_record':None}
+    if ((retained.get('options') or {}).get('appearance_revision') or {}).get('portrait_beauty'):
+        _validate_beauty_source_before_preparation(root,retained)
+        # BeautyGRPO and its reference fit already consume this source. A
+        # completion child must replay that input instead of adding a new
+        # upstream retouch and invalidating the generated face layer.
+        retained['automatic_native_retouch'] = {
+            'schema': SCHEMA, 'status': 'source_locked_by_portrait_beauty',
+            'source_sha256': run['source']['sha256'], 'generation_submissions': 0,
+            'upstream_source_changed': False}
+        return {'run':retained,'status':'source_locked_by_portrait_beauty',
+                'layer_record':(retained.get('options') or {}).get('native_source_retouch')}
     if (retained.get('options') or {}).get('native_source_retouch'):
         from native_source_baseline import retouch_identity
         retouch_identity(retained,root=root)

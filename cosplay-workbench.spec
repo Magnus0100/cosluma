@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 import ast
+import sys
 import sysconfig
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo,
@@ -32,8 +33,12 @@ _native_binaries = collect_dynamic_libs('rawpy')
 _ort_msvcp = _site_packages / 'PySide6' / 'MSVCP140_1.dll'
 if _ort_msvcp.is_file():
     _native_binaries.append((str(_ort_msvcp), '.'))
+_tbb = Path(sys.prefix) / 'Library' / 'bin' / 'tbb12.dll'
+if _tbb.is_file():
+    _native_binaries.append((str(_tbb), '.'))
 
 hiddenimports = ['backend_server', 'project_cli', 'reference_provider', 'provider_settings',
+                 'model_setup',
                  'workbench_store', 'tifffile', 'numpy', 'rawpy', 'export_artifact',
                  'raw_support', 'image_helpers', 
                  'register_reference',
@@ -41,6 +46,9 @@ hiddenimports = ['backend_server', 'project_cli', 'reference_provider', 'provide
                  'automatic_foreground_effects', 'automatic_foreground_effects_review',
                  'foreground_effects_runtime', 'effect_conditioning', 'effect_layout',
                  'effect_code_identity', 'effect_sampling', 'installed_resources', 'system_post_completion',
+                 'beautygrpo_prepare', 'beautygrpo_worker', 'portrait_regions_worker',
+                 'cv2', 'pymatting', 'numba', 'llvmlite',
+                 'portrait_beauty_layer', 'cos_workflow_graph', 'cos_workflow_canvas', 'simple_cos_workspace',
 ]
 
 
@@ -48,6 +56,19 @@ hiddenimports = ['backend_server', 'project_cli', 'reference_provider', 'provide
 # Developer checks and maintenance commands remain source-only. The manifest
 # includes all production imports, identity dependencies and worker entry points.
 import json
+sys.path.insert(0, str(Path('scripts').resolve()))
+from windows_installation import build_identity
+import hashlib
+_identity = build_identity(Path.cwd())
+_build_identity_path = Path('.cache/build-identity.json')
+_build_identity_path.parent.mkdir(parents=True, exist_ok=True)
+_build_identity_path.write_text(json.dumps(_identity, indent=2), encoding='utf8')
+_identity_sha = hashlib.sha256(json.dumps(_identity, sort_keys=True, separators=(',', ':')).encode('utf8')).hexdigest()
+_version_info.kids[0].kids[0].kids.extend([
+    StringStruct('BuildContentIdentity', _identity_sha),
+    StringStruct('SourceCommit', _identity['source_commit']),
+    StringStruct('Comments', 'Cosplay build '+_identity['source_commit']+' '+_identity_sha),
+])
 _runtime_names = frozenset(json.loads(Path('scripts/runtime_manifest.json').read_text('utf8'))['files'])
 
 def _source_only_script_names():
@@ -64,8 +85,10 @@ a = Analysis(
     pathex=['scripts', str(_site_packages)],
     binaries=_native_binaries,
     datas=[('providers/local-models.example.json', 'providers'), ('providers/registry.json', 'providers'), ('providers/qwen-image-2.1-models.example.json', 'providers'),
+           ('providers/beautygrpo.example.json', 'providers'),
            ('providers/workflows', 'providers/workflows'), ('providers/comfyui', 'providers/comfyui'), ('presets/presets.json', 'presets')]
           + _runtime_script_datas()
+          + [(str(_build_identity_path), '.')]
           + [('LICENSE', '.'), ('LICENSES', 'LICENSES'),
              ('docs/BINARY_LICENSES.md', 'docs'), ('docs/THIRD_PARTY_NOTICES.md', 'docs')],
     hiddenimports=hiddenimports,

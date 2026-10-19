@@ -18,8 +18,13 @@
 | Real-ESRGAN compact | 背景细节 | 模型目录及上游许可 |
 | MediaPipe face landmarker | 五官结构观察 | 模型来源及安装包 LICENSE |
 | Qwen Image 2.1 / ComfyUI / GGUF 节点 | 参考及独立效果生成 | 权重和节点分别登记，见 [QWEN_IMAGE_LOCAL.md](QWEN_IMAGE_LOCAL.md) |
+| madebyollin Texture-Fix VAE for Qwen Image 2.1 | 参考图的解码纹理修复 | Qwen Research License；非官方派生权重，固定来源与 SHA 见本地 Qwen 模型清单及 [模型卡](https://huggingface.co/madebyollin/texture-fix-vae-for-qwen-image-2.1) |
+| Nunchaku / SVDQuant | Beauty Kontext INT4 CUDA 与完整 LoRA 绑定 | Apache-2.0，固定官方 wheel 1.2.1 的 LICENCE.txt；权重沿用 FLUX.1-Kontext-dev 模型许可，见 [官方模型卡](https://huggingface.co/nunchaku-ai/nunchaku-flux.1-kontext-dev/blob/main/README.md) |
 
 本地权重和运行时不打入桌面程序包或 portable 工程。外部服务按其条款使用。旧模型与旧算法不作为当前生产入口；外部原始权重、许可证和历史安装回执保留，不为更新生产配置而改写。
+
+Beauty 通过 [Nunchaku 官方 API](https://github.com/nunchux-ai/nunchaku) 执行 INT4 Transformer，并调用官方 LoRA 转换器。代码许可原文保留在独立 Beauty 环境的 dist-info/licenses/LICENCE.txt；模型许可保留在模型目录。旧 comfy-aimdo BF16 backing 适配器已经移除，历史安装与许可记录保存于清理证据目录。
+
 
 ## DINOv3 固定身份
 

@@ -10,9 +10,3 @@ def options_for_choice(choice, root):
     path = load_registry(root)['registry_path']
     return {'algorithm_profile': 'dinov3_vitl16', 'model_registry': str(path),
             'material_finish_profile': 'owner_adaptive_multiscale_skin_v2'}
-
-
-def choice_for_options(options):
-    if options.get('algorithm_profile', 'dinov3_vitl16') != 'dinov3_vitl16':
-        raise ValueError('Saved model configuration is unsupported; create a current run')
-    return CURRENT

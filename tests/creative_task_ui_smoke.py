@@ -25,11 +25,14 @@ class Pool:
 
 def service_fixture(request, intent):
     enabled = intent['services']['text_vision']
-    return {'configured': True, 'text_vision': enabled, 'provider': 'fixture-service',
+    visual_review = intent['services']['visual_review']
+    return {'configured': True, 'text_vision': enabled, 'visual_review': visual_review, 'provider': 'fixture-service',
         'endpoint': 'https://fixture.invalid/v1', 'network_probed': False,
-        'sent_content': ['原片观察图', '参考', '匹配原尺寸窗口', '创作要求'] if enabled else [],
+        'sent_content': (['原片观察图', '参考', '创作要求'] +
+                         (['匹配原尺寸窗口'] if visual_review else [])) if enabled else [],
         'text_vision_requests_upper_bound': None if enabled else 0, 'price': '价格未知',
-        'offline': not enabled}
+        'offline': not enabled and intent['mode'] != 'create_reference',
+        'image_generation': intent['mode'] == 'create_reference'}
 
 
 def model_registry_fixture():
@@ -39,7 +42,7 @@ def model_registry_fixture():
                           ('semantics_repo_dir', '人物语义源码'), ('vitmatte_model_root', '原生 alpha'))]}
 
 
-def model_capability_fixture(config, *, mode='existing_reference'):
+def model_capability_fixture(config, *, mode='existing_reference', **kwargs):
     """Model metadata only; planning, input identities and Qt remain real."""
     return {'schema_version': 'cosplay_task_model_preflight.v1', 'mode': mode, 'ready': True,
         'blocking_reasons': [], 'checks': [], 'weight_checks': [],
@@ -63,10 +66,13 @@ def main():
         with patch('current_model_registry.registry_status', return_value=model_registry_fixture()), \
              patch('task_model_preflight.inspect_task_models', side_effect=model_capability_fixture), \
              patch.object(contract, '_services', side_effect=service_fixture), \
+             patch('reference_provider.provider_config', return_value={'kind':'comfyui','registry_id':'qwen_image_2_1_uncensored_fast'}), \
              patch('reference_provider.provider_health', return_value={'ready': True}):
             window = Window(root, 'http://127.0.0.1:1'); pool = Pool(); window.pool = pool
+            assert window.variant_count.value() == 1
             assert window.creative_task_mode.currentData() == 'local_portrait'
             assert not window.creative_text_vision.isChecked() and not window.creative_text_vision.isEnabled()
+            assert not window.creative_visual_review.isChecked() and not window.creative_visual_review.isEnabled()
             assert window.creative_plan_summary.isReadOnly() and not window.creative_start_button.isEnabled()
             assert not window.character_recognize.isEnabled() and not window.prepare_design_button.isEnabled()
             count = len(pool.tasks); window.recognize_character(); window.prepare_generation_design()
@@ -104,20 +110,31 @@ def main():
             assert supplied['plan']['inputs']['reference']['sha256'] == contract.sha(reference)
             pending.signals.result.emit(supplied)
             text = window.creative_plan_summary.toPlainText()
-            assert 'fixture-service' in text and '将发送' in text and '参考纠错 0' in text
-            assert '自动投影' in text and '价格未知' in text
+            assert '不使用' in text and '参考纠错 0' in text
+            assert '自动投影' in text and not window.creative_text_vision.isChecked()
             window.creative_start_button.click(); started = pool.tasks[-1]
             assert (started.path, started.label) == ('/api/tasks/start', 'existing-design')
             execution = contract.execution_request(root, started.body)
             assert execution['generate'] is False and execution['complete_post'] is True
+            assert execution['task_intent']['services']['visual_review'] is False
+            assert '未启用，保存后由人工审片' in text
             started.signals.error.emit('mocked submission failure')
 
+            assert not window.creative_visual_review.isEnabled()
+            window.set_background_mode('replace')
+            window.creative_text_vision.setChecked(True)
+            assert window.creative_visual_review.isEnabled()
+            window.creative_visual_review.setChecked(True)
+            assert window.creative_task_plan is None
+            assert window.creative_task_payload()['services']['visual_review'] is True
             window.creative_text_vision.setChecked(False); window.check_creative_task_plan()
+            assert not window.creative_visual_review.isChecked() and not window.creative_visual_review.isEnabled()
+            assert window.creative_task_payload()['services']['visual_review'] is False
             count = len(pool.tasks); window.recognize_character(); window.prepare_generation_design()
             assert len(pool.tasks) == count and not window.character_recognize.isEnabled()
-            pending = pool.tasks[-1]; blocked = contract.plan_task(root, pending.body); pending.signals.result.emit(blocked)
-            assert not window.creative_start_button.isEnabled() and '未允许' in window.creative_plan_summary.toPlainText()
-            count = len(pool.tasks); window.start_planned_creative_task(); assert len(pool.tasks) == count
+            pending = pool.tasks[-1]; unplanned = contract.plan_task(root, pending.body); pending.signals.result.emit(unplanned)
+            assert window.creative_start_button.isEnabled() and '不使用' in window.creative_plan_summary.toPlainText()
+            assert unplanned['request']['complete_post'] and not unplanned['plan']['services']['text_vision']
             window.creative_text_vision.setChecked(True); window.check_creative_task_plan(); stale = pool.tasks[-1]
             stale_value = contract.plan_task(root, stale.body)
             window.creative_task_brief.setPlainText('新的要求，只保留已有主效。'); stale.signals.result.emit(stale_value)
@@ -126,9 +143,26 @@ def main():
             latest.signals.result.emit(checked); assert window.creative_start_button.isEnabled()
             window.source_edit.setText(sources[1]); assert not window.creative_start_button.isEnabled()
 
+            window.run_source_only(); pending = pool.tasks[-1]
+            single = contract.plan_task(root, pending.body); pending.signals.result.emit(single)
+            assert single['plan']['image_budget']['initial_reference'] == 1
+            assert single['plan']['candidate_selection']['required'] is False
+            assert pending.body['defer_reference_selection'] is False and 'variant_styles' not in pending.body
+            window.creative_start_button.click(); started = pool.tasks[-1]
+            assert contract.execution_request(root, started.body)['complete_post'] is True
+            started.signals.error.emit('mocked submission failure')
+
+            window.set_background_mode('replace')
             window.variant_count.setValue(2); window.run_source_only(); pending = pool.tasks[-1]
             generated = contract.plan_task(root, pending.body); pending.signals.result.emit(generated)
             assert generated['plan']['mode'] == 'create_reference' and generated['plan']['image_budget']['initial_reference'] == 2
+            assert generated['plan']['candidate_selection']['required'] is True
+            assert pending.body['defer_reference_selection'] is True and len(pending.body['variant_styles']) == 2
+            authored_settings = window.generation_request_options()
+            authored_settings['variant_styles'] = ['night_scene', 'stage_light']
+            with patch.object(window, 'generation_request_options', return_value=authored_settings):
+                authored = window.creative_task_request_options('create_reference')
+            assert contract.plan_task(root, {**authored, 'source': sources[1]})['request']['variant_styles'] == ['night_scene', 'stage_light']
             window.creative_start_button.click(); started = pool.tasks[-1]
             assert started.label == 'one-click' and contract.execution_request(root, started.body)['generate'] is True
             started.signals.error.emit('mocked submission failure')

@@ -11,7 +11,7 @@ From the repository root, using the pinned desktop Python environment:
 .\.venv\Scripts\python.exe .\tests\run.py reference_appearance_stack boundary_light_coordination_worker
 ```
 
-`core` runs the ten routine CI checks. `all` runs the full component suite, which
+`core` runs the current routine CI checks. `all` runs the full component suite, which
 is appropriate when changing shared imports or test organization. Model-specific
 checks require the installed analysis runtime, selected with `--model-python`:
 
@@ -26,6 +26,12 @@ The runner supplies the production import path and disables bytecode writes.
 UI checks use temporary workspaces so they do not leave fixture projects in the
 checkout. Use `scripts/check_repository.py` for the source/resource/license gate;
 do not repeat its syntax validation with `compileall`.
+
+`public_source` runs in `core` and checks ignored/tracked private files, credential
+formats, private home paths, snapshot tampering and public version consistency.
+Optional private regional fixtures use `COSPLAY_REGIONAL_REGRESSION_DIRS` (an
+OS path-separated directory list); unconfigured fixtures are skipped, and an
+explicitly configured missing fixture fails.
 
 Release preparation additionally runs `desktop_dependency_gate` and
 `release_artifacts` for altered dependency/license bytes and damaged or unsafe

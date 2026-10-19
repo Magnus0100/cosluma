@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import time
+
+from asset_identity import sha256_file
 
 SCHEMA = 'automatic_subject_detail_completion.v1'
 RECORD_KEY = 'automatic_subject_detail_completion'
@@ -41,8 +42,15 @@ def _result(run, status, reason=None):
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    """Return the stat-bound identity used by every production worker.
+
+    Subject-detail completion is called after the native render and revisits
+    the same source/child assets while assembling its receipt.  Reusing the
+    shared identity cache avoids rereading large masters in this worker
+    process while preserving full hashing on first access or after a stat
+    change.
+    """
+    return sha256_file(path)
 
 
 def read(path):

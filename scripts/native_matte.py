@@ -4,6 +4,7 @@ import copy,hashlib,json,os,subprocess,time
 import numpy as np
 from PIL import Image,ImageDraw
 from native_matte_dependencies import refresh_matte_dependencies
+from asset_identity import sha256_file
 
 SOLVER='native-matte-cf-ml-paired-v2-measured-dependency-invalidation'
 
@@ -70,9 +71,9 @@ def _prepare(root,run_id,body):
     canvas=tuple(parent['canvas']['source_oriented_size']);strokes=_strokes(body,canvas);plan=_editing_plan(parent,body)
     if not strokes:return root,manifest,run,plan,None,None
     from runtime_resources import code_path
-    identity={'solver':SOLVER,'parent_run_id':run_id,'parent_manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    identity={'solver':SOLVER,'parent_run_id':run_id,'parent_manifest_sha256':sha256_file(manifest),
               'source_sha256':run['source']['sha256'],'strokes':strokes,'source_canvas':list(canvas),
-              'code':{name:hashlib.sha256(code_path(name).read_bytes()).hexdigest() for name in ('native_matte_worker.py','local_colour_brush.py')},
+              'code':{name:sha256_file(code_path(name)) for name in ('native_matte_worker.py','local_colour_brush.py')},
               'pymatting':'1.1.16 closed-form alpha + ML F/B; linear source; finite annotation support'}
     key=hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:24]
     directory=root/'outputs/cache/native-matte'/run['source']['sha256'][:16]/key;directory.mkdir(parents=True,exist_ok=True)

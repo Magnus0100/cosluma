@@ -15,6 +15,9 @@
 - 模型权重和本地运行时：`.safetensors`、`.onnx`、`.gguf`、`.pt`、`.pth`、`.ckpt`、`.bin`、`.tflite`等文件，以及`models/`、`weights/`、`checkpoints/`和`.cache/`目录。
 - 私人素材和运行结果：`data/`、`output/`、`outputs/`中的内容（目录说明文件除外）。
 - 本机环境和凭据：`.env.local`、本地模型注册表、`.venv/`、缓存、构建目录、发行包和工程工作区。
+- 私有实跑与临时材料：`evidence/`、`reports/`、`artifacts/`、`scratch/`、`logs/`、数据库和压缩包；公共文档只保留当前方法与合同。
+
+建立公开仓库时使用 `prepare_source_release.py --for-repository`，只导出公共源码文件；生成的 `SOURCE_MANIFEST.json` 属于 Release 快照，不进入公开仓库。已跟踪但位于公开白名单之外的文件会使 `check_repository.py` 失败。
 
 模型由用户从各自的开源社区来源自行下载，并放到自己的模型目录；源码通过 `COSPLAY_MODEL_REGISTRY` 或工作台配置读取这些绝对路径。仓库只保留来源地址、固定 revision、SHA-256 和许可说明，方便用户下载后核对身份，不上传模型本体。
 

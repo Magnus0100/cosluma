@@ -10,6 +10,7 @@ import copy
 from pathlib import Path
 
 from generation_design import DESIGN_VERSION
+from cache_roots import cache_dir
 
 
 def _reference_analysis(root, run):
@@ -22,7 +23,7 @@ def _reference_analysis(root, run):
     except (OSError, RuntimeError, ValueError):
         return None
     reference_sha = run['reference']['sha256']
-    directory = Path(root)/'outputs/cache/local-analysis'/reference_sha[:16]
+    directory = cache_dir(root, 'local-analysis')/reference_sha[:16]
     matching = []
     for path in directory.glob('*/analysis.json'):
         record = _read(path)
@@ -110,7 +111,8 @@ def continue_cosplay_post(root: Path, run: dict, args) -> dict:
         record['correction_submissions']=max(record['correction_submissions'],submission_count)
         shared=run.setdefault('generation_budget', {})
         shared['correction_image_submissions']=record['correction_submissions']
-        shared['total_image_submissions']=shared.get('image_submissions',0)+record['correction_submissions']
+        shared['total_image_submissions']=(shared.get('image_submissions',0)+record['correction_submissions']
+            + shared.get('regional_refinement_image_submissions',0))
 
     # Inspecting/repairing a reference must not mutate any existing master.
     preserved = {str(path): workflow.sha256(Path(path)) for path in

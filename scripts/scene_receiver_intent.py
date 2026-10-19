@@ -11,10 +11,7 @@ import copy
 import hashlib
 import json
 import math
-import os
-from pathlib import Path
 import re
-import tempfile
 
 SCHEMA = 'authored_receiver_intent.v1'
 BOUND_SCHEMA = 'source_bound_authored_receiver_intent.v1'
@@ -340,44 +337,3 @@ def validate_bound_receiver_intent(value, *, expected_binding=None):
     if value != expected:
         raise ValueError('Bound receiver intent identity, sources or execution boundary changed')
     return copy.deepcopy(expected)
-
-
-def serialize_receiver_intent(value=None, *, source_canvas_size=None):
-    return _json(normalize_receiver_intent(value, source_canvas_size=source_canvas_size))
-
-
-def deserialize_receiver_intent(text, *, source_canvas_size=None):
-    def reject(value):
-        raise ValueError('Receiver JSON contains nonfinite values: '+value)
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError('Receiver JSON contains a duplicate field: '+key)
-            result[key] = value
-        return result
-    return validate_receiver_intent(json.loads(text, parse_constant=reject, object_pairs_hook=pairs),
-        source_canvas_size=source_canvas_size)
-
-
-def save_receiver_intent(path, value=None, *, source_canvas_size=None):
-    """Atomically save only the small declaration; project paths are caller-owned."""
-    text = serialize_receiver_intent(value, source_canvas_size=source_canvas_size)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix='.'+path.name+'.', suffix='.tmp', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
-            stream.write(text+'\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return Path(path)
-
-
-def load_receiver_intent(path, *, source_canvas_size=None):
-    return deserialize_receiver_intent(Path(path).read_text(encoding='utf-8'),
-        source_canvas_size=source_canvas_size)

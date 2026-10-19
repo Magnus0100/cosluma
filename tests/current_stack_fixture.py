@@ -59,7 +59,7 @@ def prepare_fixture(root, *, native=(24, 20)):
             'params':{},'assets':{'foreground_premultiplied':fp,'old_environment':old,
                 'background':background,'validity':alpha}}],
         'execution':{'source_reference':'paired_native_baseline'}}
-    run = {'kind':'single_input_run','input_mode':'single_source','root':str(root),
+    run = {'execution_strategy':'layered_reference_transfer','task_intent':{'mode':'existing_reference'},'kind':'single_input_run','input_mode':'single_source','root':str(root),
         'run_id':'current-stack-fixture','sample':'current-stack-fixture','revision':1,
         'source':source_record,'reference':reference_record,
         'options':{'render_mode':'native_source_design','appearance_revision':{'design_reconstruction_plan':plan}}}
@@ -76,3 +76,15 @@ def prepare_fixture(root, *, native=(24, 20)):
     layer['assets']['reference_support'] = record(path)
     run['options']['appearance_revision']['design_reconstruction_plan'] = plan
     return run
+
+
+def bind_local_domain(field, size, *, mask=None):
+    """Attach a fixed source component to an analytic local-colour fixture."""
+    mask = np.ones(size[::-1], bool) if mask is None else np.asarray(mask, bool)
+    assert mask.shape == tuple(size[::-1])
+    packed = np.packbits(mask).tobytes()
+    field['application_policy'] = 'source_material_continuation.v1'
+    field['application_domain'] = {'schema':'source_component_support.v1',
+        'canvas_size':list(size), 'box':[0,0,*size], 'bits':packed.hex(),
+        'sha256':hashlib.sha256(packed).hexdigest()}
+    return field

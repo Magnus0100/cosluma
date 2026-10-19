@@ -10,19 +10,21 @@
 
 改变上游仿色、人物细节、环境层、背景、alpha或相关控制会使旧层停止回放。有生效的降噪、手工人物边缘或后续人物精修时，当前准备会拒绝，因为尚未独立观察这些操作后的最终像素。参考无可用受光或对应不足时保留当前版本。
 
-源码联合准备命令为：
+源码联合准备命令为（只写隔离的准备回执，不发布 revision）：
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\boundary_light_coordination_worker.py --root "工程目录" --run-id "版本ID" --output "新的准备目录" --save-child
+.\.venv\Scripts\python.exe .\scripts\boundary_light_coordination_worker.py --root "工程目录" --run-id "版本ID" --output "新的准备目录"
 ```
 
-单层使用同样参数执行 `boundary_light_worker.py` 或 `cloth_boundary_worker.py`。也可用 `--run-json` 读取当前编辑快照；分析Python须具备配置的完整模型依赖。`--save-child` 保存自持资产的可编辑子版本，随后仍须高清渲染与审片。后台使用 `POST /api/source-runs/<id>/reconstruct-design`，请求 `preparation_kind: "boundary_light_coordination"`；接口详见 [本机API](REVISION_API.md)。
+单层使用同样参数执行 `boundary_light_worker.py` 或 `cloth_boundary_worker.py`。也可用 `--run-json` 读取当前编辑快照；分析Python须具备配置的完整模型依赖。准备结果必须返回协调器，由 `adjust_source_run()` 在当前 checked task plan 下统一发布 revision；worker 本身不能保存 child。后台使用 `POST /api/source-runs/<id>/reconstruct-design`，请求 `preparation_kind: "boundary_light_coordination"`；接口详见 [本机API](REVISION_API.md)。
 
 ## 两层方法与职责
 
 发梢层从真实参考RGB、独立语义及ViTMatte/PyMatting前景观察中取得边缘相对同类内部的正响应。不透明参考可直接观察；半透明参考只使用有前景/背景分离支持且RGB有界的前景。内部对应锚点做局部初定位，双方独立轮廓、法向和语义另行核验，不能把内部对应有效或拟合误差当作精确发丝注册证明。
 
-参考响应先扣除当前人物已消费响应，再结合原片亮度细节及原alpha写入非负预乘RGB增量。源不透明亮度采用固定3×3原尺寸中值观察以温和减轻颗粒，参考亮带和暗缝不低通。头发参考响应是外观供体，作用区微纹理不能声称完全不变；脸、眼口、衣服和背景不取得头发归属。这是受光外观转移，不是物理重光照。
+发梢使用 `reference_hair_boundary_continuous_illumination_v3`：参考资格与RGB联合归一采样，低通取得照明包络，再扣除当前人物已消费响应。参考最近邻owner不能二次硬裁切原图；源语义不确定带只向头发内部渐隐，衣料增量保持零，保护与采样有效性连续衰减。保留源发丝结构，不注入参考细发纹理或亮度细节倍增。局部亮度增量受1.5EV上界与共享RGB色域余量约束，不逐通道截断。原alpha不变，写入非负预乘RGB增量；这是受光外观转移，不是物理重光照。
+
+发梢和衣料准备缓存均核验真实producer代码闭包；缺失或过期证据只能触发重新准备，不能冒充当前缓存命中。历史冻结资产仍可回放。流程节点签名使用同一闭包，边界算法升级会连同合成和导出失效，不会把旧边界结果标为当前算法。
 
 衣料层从原照片的成对基线确定主要源材料，配对参考/当前人物差值先扣除同材料内部偏置，再稳健拟合粗光色场。当前人物原尺寸明暗承载该场，避免复制参考褶皱和金边。仅独立几何、语义及有效支持合格的不透明外衣可写入，支持在资格域内渐隐，alpha不变。当前限定源owner 23、alpha≥0.95，不扩展到裤子、配饰、手或白色腰部。宽尺度褶皱与照明仍可能混淆，不声明恢复法线、反照率或入射光。
 
@@ -36,10 +38,12 @@
 
 ## 验收范围与限制
 
-现有受检保存图接受了发梢颗粒的轻微减轻、右肩及上臂暖布面协调和旧支持阶梯修复。0.4.7增加联合准备与一次应用流程，沿用已接受的0.4.6图像效果；0.4.8清理源码和文档，不增加艺术收益。
-
-厚发梢上弧、剩余碎亮点、明确肩头窄高光脊、完整肩袖强轮廓光及前臂袖口收尾仍未解决。两次肩头高光候选未达到正常整图标准，未进入生产。已接受范围不代表整作完成或其它照片通过。
+当前发梢节点处理有资格的连续低频受光；衣料节点处理右肩与上臂柔和暖色布面。强窄肩袖轮廓光、前臂收益及跨照片效果仍待验证。单张照片或局部窗口的观察不代表整作或其它照片通过。
 
 算法验证须覆盖无边缘响应、已消费光、统一变亮/变暖、背景柱面、错注册/语义、保护区及半透明资格。回放验证须覆盖错误端点、损坏资产、full/ROI/preview与迁移。实际艺术评审先看正常整图，再看相同原生窗口，核对纹理、亮带、暗缝和退步；能量增量、执行成功或技术一致性不能代替这些判断。最终结论绑定实际保存文件，并与技术报告分开。
 
 更完整的能力边界见 [算法选择与范围](ALGORITHM_DECISIONS.md)，作品批准标准见 [Cos成片标准](COSPLAY_POST_STANDARD.md)。
+
+### 发梢对应的严格备用观察
+
+当当前 DINO receipt 对发梢 owner 没有有效 token 时，主流程可以调用独立的 `reference_hair_boundary_registration.v1`。它只把已绑定的 MediaPipe 面部 landmark 作为初始仿射候选，然后重新验证 source/reference alpha、owner 4 轮廓、face q90、affine condition、发梢轮廓覆盖和 q90；失败就保留原计划。它不修改 DINO receipt、不把脸部纹理当发梢纹理，也不放宽 `0.7` 覆盖和 `8 px` 误差门禁。肩袖没有同等备用对应时仍安全拒绝，局部发梢成功不会单独提交联合 pair。

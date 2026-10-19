@@ -14,16 +14,74 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from asset_identity import sha256_file as _asset_sha256_file
 
-def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+
+@contextmanager
+def exclusive_file_lock(path: Path | str, *, timeout: float = 1800.0,
+                       poll: float = .1, cancel=None):
+    """Hold an OS-backed lock for one rebuildable cache identity."""
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.open('a+b')
+    started = time.monotonic(); acquired = False
+    try:
+        while not acquired:
+            if cancel and cancel():
+                raise InterruptedError('Cancelled while waiting for cache identity lock: '+str(path))
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    stream.seek(0); msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                if time.monotonic() - started >= timeout:
+                    raise TimeoutError('Timed out waiting for cache identity lock: '+str(path))
+                time.sleep(poll)
+        # Windows permits locking beyond EOF. Initialize the marker only
+        # after ownership: concurrent initializers can otherwise write into
+        # a byte range that the first process already locked.
+        if stream.seek(0, os.SEEK_END) == 0:
+            stream.write(b'\0'); stream.flush()
+        if cancel and cancel():
+            raise InterruptedError('Cancelled after acquiring cache identity lock: '+str(path))
+        yield path
+    finally:
+        if acquired:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    stream.seek(0); msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                stream.close()
+        else:
+            stream.close()
+
+
+def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024,
+                force: bool = False) -> str:
+    # Keep the public cache-store helper stable while sharing the production
+    # asset identity cache used by model workers and finish validation.
+    return _asset_sha256_file(path, chunk_size=chunk_size, force=force)
+
+
+def _index_transaction(function):
+    @wraps(function)
+    def locked(self, *args, **kwargs):
+        with exclusive_file_lock(self.root/'.index.lock'):
+            return function(self, *args, **kwargs)
+    return locked
 
 
 class ContentCache:
@@ -81,12 +139,23 @@ class ContentCache:
 
     def _save_index(self, value: dict[str, Any]) -> None:
         temp = self.index_path.with_name(f".cache-{uuid.uuid4().hex}.tmp")
-        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temp, self.index_path)
+        try:
+            with temp.open('x', encoding='utf8', newline='\n') as stream:
+                stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+                stream.flush(); os.fsync(stream.fileno())
+            os.replace(temp, self.index_path)
+        finally:
+            temp.unlink(missing_ok=True)
 
+    @_index_transaction
     def _record(self, key: str, *, source_sha256: str | None = None,
                 operation: str | None = None, params: dict[str, Any] | None = None,
                 dimensions: Any = None, artifact: str, path: Path) -> None:
+        self._record_unlocked(key, source_sha256=source_sha256, operation=operation,
+                              params=params, dimensions=dimensions, artifact=artifact, path=path)
+
+    def _record_unlocked(self, key: str, *, source_sha256=None, operation=None,
+                         params=None, dimensions=None, artifact: str, path: Path) -> None:
         index = self._load_index()
         entries = index.setdefault("entries", {})
         item = entries.setdefault(key, {"key": key, "artifacts": {}, "bytes": 0})
@@ -107,6 +176,7 @@ class ContentCache:
         item["bytes"] = max(0, int(item.get("bytes", 0)) - old_size + size)
         self._save_index(index)
 
+    @_index_transaction
     def put_bytes(self, key: str, artifact: str, data: bytes, *, metadata: dict[str, Any] | None = None) -> Path:
         if not artifact or "/" in artifact or "\\" in artifact or artifact in {"source", "delivery", "final"}:
             raise ValueError("invalid or protected cache artifact")
@@ -117,11 +187,11 @@ class ContentCache:
         temp.write_bytes(data)
         os.replace(temp, target)
         record = metadata or {}
-        self._record(key, source_sha256=record.get("source_sha256"), operation=record.get("operation"),
+        self._record_unlocked(key, source_sha256=record.get("source_sha256"), operation=record.get("operation"),
                      params=record.get("params"), dimensions=record.get("dimensions"), artifact=artifact, path=target)
         entry_meta = entry / "cache.json"
         entry_meta.write_text(json.dumps({"key": key, "artifact": artifact, **record}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        self.evict()
+        self._evict_unlocked()
         return target
 
     def put_image(self, key: str, image: Any, *, artifact: str = "proxy", format: str | None = None,
@@ -136,6 +206,7 @@ class ContentCache:
         name = artifact if artifact.endswith((".jpg", ".jpeg", ".png", ".webp")) else artifact + suffix
         return self.put_bytes(key, name, buffer.getvalue(), metadata=metadata)
 
+    @_index_transaction
     def get(self, key: str, artifact: str = "proxy") -> Path | None:
         entry = self.entry_dir(key)
         index = self._load_index()
@@ -152,6 +223,7 @@ class ContentCache:
 
     get_path = get
 
+    @_index_transaction
     def find_latest_proxy(self, source: Path | str, *, params: dict[str, Any] | None = None) -> Path | None:
         """Return the newest proxy matching the requested decoding/display params."""
         source_sha256 = self.source_hash(source)
@@ -192,13 +264,22 @@ class ContentCache:
         path = self.get(key, lookup)
         return {"key": key, "path": str(path), "cache_hit": True} if path else None
 
+    @_index_transaction
     def total_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self.root.glob("**/*") if path.is_file() and path.name != "cache.json")
+        return self._total_bytes_unlocked()
 
+    def _total_bytes_unlocked(self) -> int:
+        return sum(path.stat().st_size for path in self.root.glob("**/*")
+                   if path.is_file() and path.name != "cache.json" and not path.name.endswith(('.lock', '.tmp')))
+
+    @_index_transaction
     def evict(self) -> list[str]:
+        return self._evict_unlocked()
+
+    def _evict_unlocked(self) -> list[str]:
         index = self._load_index()
         removed: list[str] = []
-        while self.total_bytes() > self.max_bytes:
+        while self._total_bytes_unlocked() > self.max_bytes:
             entries = index.get("entries") or {}
             candidates = [(float(item.get("last_access", 0)), key) for key, item in entries.items() if isinstance(item, dict)]
             if not candidates:

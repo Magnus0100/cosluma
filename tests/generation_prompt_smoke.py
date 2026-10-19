@@ -9,7 +9,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from generation_prompt import (DEFAULT_PROMPT, PROMPT_VERSION, STYLE_MARKER, DESIGN_MARKER,
-                               CHARACTER_MARKER, compose_generation_prompt, prompt_template_version)
+                               CHARACTER_MARKER, compose_generation_prompt, prompt_template_version,
+                               prompt_for_new_task)
 from generation_design import prepare_generation_design
 from preset_store import get_preset
 
@@ -30,6 +31,12 @@ def main():
     assert compose_generation_prompt()==DEFAULT_PROMPT
     assert prompt_template_version(compose_generation_prompt('', back))==PROMPT_VERSION
     assert prompt_template_version(custom)=='custom'
+    assert prompt_for_new_task(custom, saved_version='custom') == custom
+    assert prompt_for_new_task('retired managed prose', saved_version='retired', style_prompt=night) == compose_generation_prompt(style_prompt=night)
+    assert prompt_for_new_task(DEFAULT_PROMPT, saved_version=PROMPT_VERSION) == DEFAULT_PROMPT
+    assert len(DEFAULT_PROMPT) < 1100
+    catalog = json.loads((Path(__file__).resolve().parents[1]/'presets/presets.json').read_text('utf8'))
+    assert catalog['prompt_template_version'] == PROMPT_VERSION
     try:
         prompt_template_version(custom, saved_version='prior-template')
         raise AssertionError('Retired prompt template accepted')

@@ -48,43 +48,6 @@ def donor_support_report(fields, weights, parameters):
         'policy_executed': True}
 
 
-def region_correspondence(source_mask, reference_mask, *, anchors=0,
-                          face_alignment=None, minimum_pixels=16):
-    """Reject spatial transfer lacking independently observed material geometry.
-
-    A held-out face landmark fit can certify a coarse facial colour map. Other
-    materials require both semantic shape overlap and accepted patch evidence.
-    Neither option certifies dense correspondence or permits output warping.
-    """
-    import numpy as np
-    sm, rm = np.asarray(source_mask), np.asarray(reference_mask)
-    if sm.shape != rm.shape or sm.ndim != 2 or sm.dtype != bool or rm.dtype != bool:
-        raise ValueError('Correspondence requires equal-canvas boolean material masks')
-    sc, rc = int(sm.sum()), int(rm.sum())
-    iou = float((sm & rm).sum()/max(int((sm | rm).sum()), 1))
-    evidence = {'source_pixels': sc, 'reference_pixels': rc, 'semantic_iou': iou,
-                'accepted_material_anchors': int(anchors), 'dense_correspondence': False,
-                'background_H_is_person_correspondence': False}
-    if min(sc, rc) < minimum_pixels:
-        return {**evidence, 'status': 'unsupported', 'allowed': False,
-                'reason': 'insufficient_same_material_support'}
-    if iou < .55:
-        return {**evidence, 'status': 'unsupported', 'allowed': False,
-                'reason': 'semantic_geometry_overlap_below_0.55'}
-    landmark_ok = bool(face_alignment and face_alignment.get('method') ==
-        'reference_only_similarity_from_source_reference_landmarks'
-        and face_alignment.get('check_errors_proxy_px')
-        and all(np.isfinite(x) and 0 <= x <= 3
-                for x in face_alignment['check_errors_proxy_px']))
-    if face_alignment is not None and not landmark_ok:
-        return {**evidence, 'status': 'unsupported', 'allowed': False,
-                'reason': 'unvalidated_person_face_correspondence'}
-    if not landmark_ok and anchors < 3:
-        return {**evidence, 'status': 'unsupported', 'allowed': False,
-                'reason': 'no_accepted_material_patch_correspondence'}
-    return {**evidence, 'status': 'partial', 'allowed': True,
-            'reason': ('heldout_face_landmarks_and_material_overlap' if landmark_ok else
-                       'material_shape_overlap_and_accepted_patches; coarse_only')}
 
 
 def _support(status, reason, **evidence):

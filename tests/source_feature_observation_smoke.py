@@ -377,7 +377,7 @@ def main():
         passed.append('no_run_root_cache_ancestry_resolves_exact_project')
         assert all(path.read_bytes() == contents for path, contents in original.items())
         passed.append('frozen_source_inputs_unchanged')
-    command = [sys.executable, '-B', '-c', "import sys; sys.path.insert(0, 'scripts'); import cosplay_native_review, cosplay_post_review, full_cosplay_review, source_feature_observation_worker; assert not ({'cv2','torch','mediapipe'} & set(sys.modules))"]
+    command = [sys.executable, '-B', '-c', "import sys; sys.path.insert(0, 'scripts'); import cosplay_native_review, cosplay_post_review, source_feature_observation_worker; assert not ({'cv2','torch','mediapipe'} & set(sys.modules))"]
     subprocess.run(command, check=True)
     passed.append('desktop_imports_no_cv2_torch_mediapipe')
     print(json.dumps({'schema': 'source_feature_observation_smoke.v1', 'status': 'passed',

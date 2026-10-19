@@ -12,7 +12,7 @@ SCHEMA = "native_edit_session.v2"
 MANUAL_KEYS = frozenset(("background", "particles", "outline_light", "garment_texture",
                          "clone_retouch", "tone_curves", "hsl_adjust", "local_colour_brush"))
 PAYLOAD_KEYS = frozenset(("params", "regions", "scope_controls", "slider_values", "manual_layers",
-                          "source_render_plan", "source_color_plan",
+                          "source_render_plan", "source_color_plan", "portrait_beauty", "workflow_graph",
                           "design_overrides", "native_matte_strokes", "receiver_intent", "receiver_shadow_plan"))
 
 
@@ -47,8 +47,23 @@ def binding_for_run(root: Path, run: dict):
     if project.get("workflow_mode") != "single_source":
         raise ValueError("工程不是 single_source 模式")
     plan = (options.get("appearance_revision") or {}).get("design_reconstruction_plan") or {}
-    if not plan or (plan.get("execution") or {}).get("source_reference") != "paired_native_baseline":
-        raise ValueError("当前版本缺少 native 原片基线")
+    local = options.get('source_only_plan') or {}
+    geometry = options.get('source_only_geometry') or {}
+    if plan:
+        if (plan.get('execution') or {}).get('source_reference') != 'paired_native_baseline':
+            raise ValueError('当前版本缺少 native 原片基线')
+        canvas = plan.get('canvas')
+    else:
+        from display_transform import source_transform_for_run
+        source_transform_for_run(run)
+        if (run.get('reference') or local.get('schema') != 'source_only_display_plan.v1'
+                or local.get('reference_assets_used') is not False or len(local.get('native_size') or []) != 2):
+            raise ValueError('当前版本缺少本地原片显像基线')
+        if geometry and (geometry.get('schema') != 'source_only_geometry.v1'
+                or geometry.get('source_sha256') != (run.get('source') or {}).get('sha256')
+                or geometry.get('native_size') != local['native_size']):
+            raise ValueError('本地原片几何与当前版本不符')
+        canvas = {'source_oriented_size': local['native_size'], 'source_proxy_size': local['native_size']}
     assets = {}
 
     def collect(node):
@@ -67,12 +82,20 @@ def binding_for_run(root: Path, run: dict):
     collect(run.get("reference") or {})
     collect(plan.get("mask_roles") or {})
     collect(plan.get("source_baseline") or {})
+    collect(geometry)
     for layer in plan.get("layers", []):
         collect(layer.get("assets") or {})
     appearance = options.get("appearance_revision") or {}
+    beauty = appearance.get('portrait_beauty')
+    if beauty:
+        from portable_project import validate_portrait_beauty
+        from portrait_beauty_layer import sha256
+        beauty_result, beauty_path = validate_portrait_beauty(run)
+        collect({'path': str(beauty_path), 'sha256': sha256(beauty_path)})
+        collect(beauty_result['faces'])
     from scene_receiver_intent import normalize_receiver_intent
     receiver_intent = normalize_receiver_intent(appearance.get("receiver_intent"),
-        source_canvas_size=(plan.get("canvas") or {}).get("source_oriented_size"))
+        source_canvas_size=(canvas or {}).get("source_oriented_size"))
     collect(((plan.get("scene_design") or {}).get("contact") or {}).get("authored_receiver_intent") or {})
     from authored_receiver_shadow import normalize_receiver_shadow_plan
     receiver_shadow_plan = normalize_receiver_shadow_plan(appearance.get("receiver_shadow_plan"))
@@ -81,6 +104,8 @@ def binding_for_run(root: Path, run: dict):
                 "manual_layers": {key: value for key, value in (options.get("manual_layers") or {}).items() if key in MANUAL_KEYS},
                 "source_render_plan": appearance.get("source_render_plan"),
                 "source_color_plan": appearance.get("source_color_plan"),
+                "portrait_beauty": beauty,
+                "workflow_graph": appearance.get('workflow_graph'),
                 "receiver_intent": receiver_intent,
                 "receiver_shadow_plan": receiver_shadow_plan,
                 "design_enabled": plan.get("enabled", True),
@@ -94,8 +119,9 @@ def binding_for_run(root: Path, run: dict):
                         "created_at": project.get("created_at"), "workflow_mode": "single_source"},
             "run_id": str(run["run_id"]), "revision": int(run["revision"]),
             "parent_run_id": run.get("parent_run_id"), "input_mode": "single_source",
-            "render_mode": "native_source_design", "canvas": plan.get("canvas"),
-            "source_baseline": plan.get("source_baseline"),
+            "render_mode": "native_source_design", "canvas": canvas,
+            "source_baseline": plan.get("source_baseline") or local,
+            "source_only_geometry": geometry or None,
             "source_sha256": (run.get("source") or {}).get("sha256"), "candidate_sha256": (run.get("reference") or {}).get("sha256"),
             "saved_editable_baseline_sha256": digest(baseline),
             "assets": [assets[key] for key in sorted(assets)]}
@@ -116,6 +142,24 @@ def validate_assets(binding):
         if sha.hexdigest() != asset["sha256"]:
             return "绑定资产内容变化：" + str(path)
     return None
+
+
+def _payload_assets(payload):
+    """A prepared but unsaved generated layer also owns immutable draft inputs."""
+    control = payload.get('portrait_beauty')
+    if not control:
+        return []
+    from portrait_beauty_layer import load_result, sha256
+    result, path = load_result(control['result'])
+    assets = {str(path): {'path': str(path), 'sha256': sha256(path)}}
+    for face in result['faces']:
+        for key in ('pixels', 'model_output'):
+            record = face.get(key)
+            if record:
+                asset = Path(record['path'])
+                asset = asset.resolve() if asset.is_absolute() else (path.parent/asset).resolve()
+                assets[str(asset)] = {'path': str(asset), 'sha256': record['sha256']}
+    return [assets[key] for key in sorted(assets)]
 
 
 class SessionDraftStore:
@@ -158,7 +202,10 @@ class SessionDraftStore:
             payload = editable_payload(record["payload"])
             if digest(payload) != record.get("payload_sha256"):
                 raise ValueError("会话草稿校验失败")
+            if record.get('payload_assets', []) != _payload_assets(payload):
+                raise ValueError('未保存的人像美化冻结结果变化')
             reason = validate_assets(binding)
+            reason = reason or validate_assets({'assets': record.get('payload_assets', [])})
             if reason:
                 raise ValueError(reason)
             return record, None
@@ -184,7 +231,8 @@ class SessionDraftStore:
                     stream.write(path.read_bytes()); stream.flush(); os.fsync(stream.fileno())
             old = None
         record = {"schema_version": SCHEMA, "binding": binding, "payload": payload,
-                  "payload_sha256": digest(payload), "updated_at": datetime.now(timezone.utc).isoformat()}
+                  "payload_sha256": digest(payload), "payload_assets": _payload_assets(payload),
+                  "updated_at": datetime.now(timezone.utc).isoformat()}
         if old and old.get("submission"):
             record["submission"] = old["submission"]
         self._write(path, record)

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter, convolve
+from asset_identity import sha256_file
 
 SCHEMA = 'native_subject_detail.v1'
 RECIPE = 'source_owned_geometry_scaled_log_luminance_bands_v2'
@@ -45,8 +46,7 @@ REGIONS = {'left_hand': (6,), 'right_hand': (15,),
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def read(path):

@@ -1,16 +1,17 @@
 """Refresh native contact after a paired foreground/matte edit."""
 from __future__ import annotations
 import copy
-import hashlib
 import json
 from pathlib import Path
+import hashlib
+from asset_identity import sha256_file
 
 SCHEMA = 'native_matte_dependency_refresh.v2'
 
 def refresh_matte_dependencies(parent, plan, result, directory, run):
     from design_scene_assets import bind_native_contact
     new = result['assets']
-    identity = {'schema': SCHEMA, 'producer_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    identity = {'schema': SCHEMA, 'producer_sha256': sha256_file(__file__),
         'source_sha256': run['source']['sha256'],
         'candidate_sha256': (run.get('reference') or {}).get('sha256'),
         'new_fp_sha256': new['foreground_premultiplied']['sha256'],

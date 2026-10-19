@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from asset_identity import sha256_file
 
 SCHEMA = 'source_semantic_binding.v1'
 ROLE = 'source_owned_review_semantics'
@@ -38,8 +39,7 @@ def load_source_semantics(asset, *, source_sha256, native_size, proxy_size):
             or len(asset['sha256']) != 64):
         raise ValueError('Frozen source semantics require an explicit file/hash binding')
     path = Path(asset['path']).resolve()
-    with path.open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+    actual = sha256_file(path)
     if actual != asset['sha256']:
         raise ValueError('Frozen source semantic bytes differ from the plan')
     specification = profile('sapiens2_seg_0.4b', 'segmentation')
@@ -67,8 +67,7 @@ def load_source_semantics(asset, *, source_sha256, native_size, proxy_size):
 def bind_source_semantics(result, *, source_sha256, native_size, proxy_size):
     """Publish only the analyzed source label asset, never an inferred locator."""
     path = Path(result['labels_path']).resolve()
-    with path.open('rb') as stream:
-        identity = hashlib.file_digest(stream, 'sha256').hexdigest()
+    identity = sha256_file(path)
     asset = {'schema_version': SCHEMA, 'path': str(path), 'sha256': identity,
         'source_sha256': source_sha256, 'native_size': list(native_size), 'size': list(proxy_size),
         'coordinate_space': 'source_proxy', 'role': ROLE, 'representation': 'semantic_labels',

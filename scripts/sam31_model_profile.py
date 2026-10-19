@@ -1,11 +1,13 @@
 """Sole current SAM3.1 static detector; masks are never alpha or replacement RGB."""
 from __future__ import annotations
 
-import hashlib
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
+
+from asset_identity import sha256_file
 
 IMAGE_PROFILE = 'sam31_static_detector_v1'
 CODE_COMMIT = '0570b3a5be9c4e694f23d85232fb55f4a6f1f7fc'
@@ -23,7 +25,7 @@ RUNTIME_PACKAGES = {'torch': '2.10.0+cu128', 'torchvision': '0.25.0+cu128',
     'triton-windows': '3.6.0.post26', 'ftfy': '6.1.1', 'setuptools': '80.9.0'}
 RUNTIME_FILES = {
     'runtime/pyvenv.cfg': '4ae9e9749a4146aa07a6655c9b5d374247748a7299658f67cc6abe03a972b3e2',
-    'runtime/Lib/site-packages/shared-model-runtime.pth': 'f63c773424140ba30158f8be898e1e363b5765b024c7c6de39a34996fa89375a'}
+    'runtime/Lib/site-packages/shared-model-runtime.pth': '958e93f128e3e3c548f945a1c584048405cede25d4f9712dab3542ce266636a2'}
 PREPROCESS = {'processor': 'official_Sam3Processor', 'resolution': 1008,
               'resize': 'square_1008_torchvision_v2', 'normalize_mean': [.5]*3,
               'normalize_std': [.5]*3, 'mask_logit_probability_threshold': .5,
@@ -34,8 +36,14 @@ PREPROCESS = {'processor': 'official_Sam3Processor', 'resolution': 1008,
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    """Return a stat-bound identity for model/runtime assets.
+
+    The first installation audit still reads every byte, but subsequent
+    production workers reuse the shared D: sidecar when path, size, mtime and
+    ctime are unchanged.  SAM3's 3.5 GB checkpoint must not be re-read on
+    every photo just to establish the same model identity.
+    """
+    return sha256_file(path)
 
 
 def content_sha(value):

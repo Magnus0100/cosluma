@@ -10,7 +10,6 @@ Start with [development](../docs/DEVELOPMENT.md). Build Windows packages with
 configuration, fill installed paths, and set `COSPLAY_MODEL_REGISTRY` before using
 local analysis models. Machine configuration is excluded from releases.
 
-The independent portrait beauty experiment uses `portrait_beauty.py prepare`
-and `replay`, with separately installed SegFace / skin models. It is source-only
-and is not part of the current EXE or reference workflow. See
-[actual scope and usage](../docs/PORTRAIT_BEAUTY_POC.md).
+Production portrait beauty uses `beautygrpo_prepare.py`, `beautygrpo_worker.py`
+and the shared frozen `portrait_beauty_layer.py`. See
+[actual scope and usage](../docs/PORTRAIT_BEAUTY.md).

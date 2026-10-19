@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import tempfile
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -66,7 +67,7 @@ def main():
     assert diag['regions']['clothing']['methods']==['dinov3_mutual_semantic_neighbours_local_geometry']
     rejected(lambda: geometric_matches([],observed,{**reference,'patch_size':14}))
     real_root=Path(__file__).resolve().parents[1]
-    runtime=real_root/'.cache/local-models/sapiens2/runtime/Scripts/python.exe'
+    runtime=Path(sys.executable)
     with tempfile.TemporaryDirectory(prefix='dinov3-current-cpu-') as folder:
         root=Path(folder);model=root/'model';fake_install(model)
         registry={'python':str(runtime),'dinov3_model_root':str(model)}

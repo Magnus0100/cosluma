@@ -64,9 +64,14 @@ def extract(model, image, labels, device, *, maximum_edge=None, preprocess=None,
     with torch.inference_mode():
         features = patch_tokens(model(pixel_values=tensor).last_hidden_state, size,
                                 patch_size=patch, token_layout=layout)
-        features = torch.nn.functional.normalize(features.float(), dim=-1).cpu().numpy()
-    if not np.isfinite(features).all():
-        raise ValueError('Model patch features contain nonfinite values')
+        features = torch.nn.functional.normalize(features.float(), dim=-1).contiguous()
+        if not bool(torch.isfinite(features).all()):
+            raise ValueError('Model patch features contain nonfinite values')
+        # The receipt needs only shape and finiteness, never all embeddings.
+        # Keep CUDA observations resident through mutual matching; CPU helper
+        # fixtures continue to use their ordinary NumPy representation.
+        if features.device.type == 'cpu':
+            features = features.numpy()
     width, height = size
     yy, xx = np.mgrid[:height//patch, :width//patch]
     points = np.stack([(xx+.5)*patch-.5, (yy+.5)*patch-.5], axis=-1).reshape(-1, 2)
@@ -74,8 +79,9 @@ def extract(model, image, labels, device, *, maximum_edge=None, preprocess=None,
         minimum_fraction=matching['minimum_token_material_fraction'])
     if len(features) != len(points):
         raise ValueError('DINO token grid does not match explicit patch preprocessing')
-    return {'features': features, 'points': points, 'labels': classes, 'fraction': fraction, 'size': size,
-            'patch_size': patch}
+    result = {'features': features, 'points': points, 'labels': classes, 'fraction': fraction, 'size': size,
+              'patch_size': patch, 'features_finite': True}
+    return result
 
 
 def mutual_matches(source, reference, *, settings=None):
@@ -89,16 +95,57 @@ def mutual_matches(source, reference, *, settings=None):
         if min(len(si), len(ri)) < 2:
             report['rejected'] = 'insufficient_same_semantic_tokens'
             continue
-        similarity = source['features'][si] @ reference['features'][ri].T
-        top = np.argsort(similarity, axis=1)[:, -2:]
-        reverse = similarity.argmax(axis=0)
-        reverse_top = np.sort(similarity, axis=0)[-2:]
-        best = top[:, 1]
-        score = similarity[np.arange(len(si)), best]
-        margin = score-similarity[np.arange(len(si)), top[:, 0]]
-        reverse_margin = reverse_top[1, best]-reverse_top[0, best]
-        keep = ((reverse[best] == np.arange(len(si))) & (score >= cfg['minimum_cosine'])
-                & (margin >= cfg['minimum_top2_margin']) & (reverse_margin >= cfg['minimum_top2_margin']))
+        source_device, reference_device = source['features'], reference['features']
+        if not isinstance(source_device, np.ndarray):
+            # DINO inference already lives on CUDA.  Keep the semantic
+            # matching there as a batched torch GEMM/top-k operation instead
+            # of copying all tokens to NumPy and invoking single-threaded
+            # OpenBLAS.  Only the small accepted/rejected vectors cross back
+            # to the coordinator.
+            import torch
+            device = source_device.device
+            if not isinstance(reference_device, torch.Tensor) or reference_device.device != device:
+                raise ValueError('CUDA feature observations use different devices')
+            with torch.inference_mode():
+                source_index = torch.as_tensor(si, device=device, dtype=torch.long)
+                reference_index = torch.as_tensor(ri, device=device, dtype=torch.long)
+                similarity = source_device.index_select(0, source_index) @ reference_device.index_select(0, reference_index).T
+                top_values, top_indices = torch.topk(similarity, k=2, dim=1, largest=True, sorted=True)
+                reverse_values, reverse_indices = torch.topk(similarity, k=2, dim=0, largest=True, sorted=True)
+                best = top_indices[:, 0]
+                score = top_values[:, 0]
+                margin = top_values[:, 0]-top_values[:, 1]
+                reverse_best = reverse_indices[0].index_select(0, best)
+                reverse_margin = (reverse_values[0]-reverse_values[1]).index_select(0, best)
+                keep = ((reverse_best == torch.arange(len(si), device=device))
+                        & (score >= cfg['minimum_cosine'])
+                        & (margin >= cfg['minimum_top2_margin'])
+                        & (reverse_margin >= cfg['minimum_top2_margin']))
+                accepted = torch.nonzero(keep, as_tuple=True)[0]
+                # One small readback, containing only accepted indices and
+                # observations. Rejected embeddings/matrices stay on CUDA.
+                packed = torch.stack((source_index[accepted].double(),
+                    reference_index[best[accepted]].double(), score[accepted].double(),
+                    torch.minimum(margin, reverse_margin)[accepted].double()), dim=1).cpu().numpy()
+            for source_index, reference_index, cosine, ambiguity in packed:
+                confidence = float(np.clip((cosine-cfg['minimum_cosine'])/(1-cfg['minimum_cosine']), 0, 1)
+                    * np.clip(ambiguity/.10, 0, 1))
+                rows.append({'source_index': int(source_index), 'reference_index': int(reference_index),
+                    'label': label, 'cosine': float(cosine), 'margin': float(ambiguity), 'confidence': confidence})
+            report['mutual_unambiguous'] = len(packed)
+            report['rejected_similarity_or_ambiguity_or_mutual'] = int(len(si)-len(packed))
+            continue
+        else:
+            similarity = source['features'][si] @ reference['features'][ri].T
+            top = np.argsort(similarity, axis=1)[:, -2:]
+            reverse = similarity.argmax(axis=0)
+            reverse_top = np.sort(similarity, axis=0)[-2:]
+            best = top[:, 1]
+            score = similarity[np.arange(len(si)), best]
+            margin = score-similarity[np.arange(len(si)), top[:, 0]]
+            reverse_margin = reverse_top[1, best]-reverse_top[0, best]
+            keep = ((reverse[best] == np.arange(len(si))) & (score >= cfg['minimum_cosine'])
+                    & (margin >= cfg['minimum_top2_margin']) & (reverse_margin >= cfg['minimum_top2_margin']))
         for local in np.flatnonzero(keep):
             confidence = float(np.clip((score[local]-cfg['minimum_cosine'])/(1-cfg['minimum_cosine']), 0, 1)
                 * np.clip(min(margin[local], reverse_margin[local])/.10, 0, 1))
@@ -468,6 +515,20 @@ def main():
     maps, diagnostics = build_maps(observations['source'], observations['reference'], labels['source'], labels['reference'],
         request['faces']['source'], request['faces']['reference'], zooms=zooms,
         settings=settings, algorithm_profile=profile)
+    # Do not retain the device-side token matrices while the worker serializes
+    # the pixel maps and receipt.  This releases the DINO activation storage
+    # before the process returns to the stage coordinator.
+    feature_observations = {role: {'model_size': list(obs['size']),
+        'patch_count': len(obs['features']), 'embedding_dimension': obs['features'].shape[1],
+        'excluded_class_tokens': layout['class_tokens'], 'excluded_register_tokens': layout['register_tokens'],
+        'patch_size': obs['patch_size'], 'features_finite': obs['features_finite']}
+        for role, obs in observations.items()}
+    for observation in observations.values():
+        observation.pop('features')
+    for source_zoom, reference_zoom, _ in zooms:
+        source_zoom.pop('features')
+        reference_zoom.pop('features')
+    del observations, zooms
     directory = Path(request['output_directory'])
     asset_path = directory/'local-correspondence.npz'
     temporary_asset = directory/('local-correspondence-'+str(os.getpid())+'.npz')
@@ -483,12 +544,11 @@ def main():
         'person_geometry_warped': False, 'reference_texture_imported': False, 'background_H_used': False,
         'visual_acceptance': False, 'diagnostics': {k:v for k,v in diagnostics.items() if k != 'regions'},
         'regions': diagnostics['regions'],
-        'feature_observations': {role: {'model_size': list(obs['size']),
-            'patch_count': len(obs['features']), 'embedding_dimension': obs['features'].shape[1],
-            'excluded_class_tokens': layout['class_tokens'], 'excluded_register_tokens': layout['register_tokens'],
-            'patch_size': obs['patch_size'], 'features_finite': bool(np.isfinite(obs['features']).all())}
-            for role, obs in observations.items()},
+        'feature_observations': feature_observations,
         'runtime': {'device': device,
+            'matching_backend': 'torch_cuda_matmul_topk' if device == 'cuda' else 'numpy_cpu',
+            'feature_matching_full_embeddings_read_back': device != 'cuda',
+            'matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
             'torch': torch.__version__, 'transformers': importlib.metadata.version('transformers'),
             'elapsed_seconds': round(time.perf_counter()-started, 3),
             'peak_gpu_allocated_bytes': torch.cuda.max_memory_allocated() if device == 'cuda' else 0,

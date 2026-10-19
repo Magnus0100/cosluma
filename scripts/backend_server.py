@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -28,22 +29,57 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from asset_identity import configure_persistent_cache, sha256_file
 try:
-    from runtime_resources import code_path
+    from runtime_resources import code_path, configure_cpu_runtime
 except ModuleNotFoundError:
-    from scripts.runtime_resources import code_path
+    from scripts.runtime_resources import code_path, configure_cpu_runtime
+
+configure_cpu_runtime()
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# ``start_task`` already passes through ``creative_task.execution_request``.
+# Keep the proof in-process rather than exposing a caller-controlled boolean;
+# the identity check below is impossible to forge over the HTTP boundary.
+_CHECKED_TASK_MARKER = object()
+_CHECKED_TASK_KEY = "_checked_task_marker"
 
 
 def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def _execution_binding(payload: dict[str, Any], *, kind: str | None = None) -> str:
+    """Stable source/reference/control identity used by the durable queue."""
+    plan = payload.get('task_plan') if isinstance(payload.get('task_plan'), dict) else {}
+    inputs = plan.get('inputs') if isinstance(plan.get('inputs'), dict) else {}
+    identity = {
+        'kind': kind or payload.get('kind'),
+        'source_sha256': (inputs.get('source') or {}).get('sha256') or payload.get('source'),
+        'reference_sha256': (inputs.get('reference') or {}).get('sha256') or payload.get('reference'),
+        'run_id': payload.get('run_id') or payload.get('parent_run_id'),
+        'plan_id': plan.get('plan_id'),
+        'execution_strategy': payload.get('execution_strategy') or plan.get('execution_strategy'),
+        'preparation_policy': payload.get('preparation_policy') or plan.get('preparation_policy', 'replay_frozen'),
+        'provider': payload.get('provider'), 'model': payload.get('model'),
+        'appearance_revision': payload.get('appearance_revision'),
+        'manual_layers': payload.get('manual_layers'),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':'), allow_nan=False).encode('utf-8')
+    return 'cos-exec-v1:' + hashlib.sha256(encoded).hexdigest()
+
+
 class Backend:
     def __init__(self, root: Path, *, embedded: bool = False, max_workers: int | None = None) -> None:
         self.root = root.resolve()
+        # Bind every worker and CLI subprocess to this project's D: output
+        # cache before any source identity is computed.
+        configure_persistent_cache(self.root)
+        from project_cli import create_native_project_if_missing
+        create_native_project_if_missing(self.root)
         self.embedded = embedded
         self.cli = code_path('project_cli.py')
         self.provider = code_path('reference_provider.py')
@@ -66,6 +102,7 @@ class Backend:
             raise ValueError("max_workers must be at least 1")
         self._worker_slots = threading.BoundedSemaphore(self.max_workers)
         self._source_preview_cache = None
+        self._beauty_broker = None
 
     def command(self, *args: str) -> dict[str, Any]:
         if self.embedded:
@@ -93,46 +130,20 @@ class Backend:
             "stderr": proc.stderr,
         }
 
-    def generate_reference(self, body: dict[str, Any]) -> dict[str, Any]:
-        sample = str(body.get("sample", "")).strip()
-        image = str(body.get("image", "")).strip()
-        prompt = str(body.get("prompt", "")).strip()
-        if not sample or not image or not prompt:
-            raise ValueError("sample, image, and prompt are required")
-        args = [
-            sys.executable,
-            str(self.provider),
-            "--root",
-            str(self.root),
-            "--image",
-            image,
-            "--sample",
-            sample,
-            "--prompt",
-            prompt,
-        ]
-        # The browser/Qt client may select a compatible gateway without ever
-        # sending a secret.  Keys stay in the provider's configured env var.
-        for flag in ("model", "provider", "api-base", "api-url", "api-key-env", "size", "out-dir", "source", "generation-id", "timeout"):
-            key = flag.replace("-", "_")
-            value = body.get(key)
-            if value:
-                args.extend([f"--{flag}", str(value)])
-        if body.get("dry_run"):
-            args.append("--dry-run")
-        if self.embedded:
-            import reference_provider
-            stdout, stderr = io.StringIO(), io.StringIO()
-            try:
-                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    code = reference_provider.main(args[2:])
-            except Exception as exc:
-                stderr.write(str(exc))
-                code = 2
-            return {"ok": code == 0, "exit_code": int(code or 0), "stdout": stdout.getvalue(), "stderr": stderr.getvalue()}
-        proc = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
-                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+    @staticmethod
+    def _safe_workflow_error(result: dict[str, Any] | None = None, exc: Exception | None = None) -> dict[str, Any]:
+        """Keep actionable CLI failures in the job record without secrets."""
+        result = result if isinstance(result, dict) else {}
+        saved_error = (result.get('run') or {}).get('error') or {}
+        detail = saved_error.get('message') if isinstance(saved_error, dict) else None
+        raw = str(result.get('stderr') or detail or exc or '').strip()
+        # Provider adapters may echo a URL or an Authorization header.  The
+        # job detail is durable, so redact those before exposing a tail.
+        raw = re.sub(r'(?i)(authorization\s*[:=]\s*bearer\s+)[^\s]+', r'\1[redacted]', raw)
+        raw = re.sub(r'(?i)(api[_-]?key|token|secret)\s*[:=]\s*[^\s,;]+', r'\1=[redacted]', raw)
+        raw = raw[-1200:] if raw else '未返回错误详情。请查看任务日志或检查模型/Provider 配置。'
+        return {'exit_code': result.get('exit_code'), 'message': raw,
+                'source': 'workflow_stderr' if result.get('stderr') else 'workflow_error' if detail else 'exception'}
 
     def provider_health(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         """Return registry-backed provider readiness without a network call."""
@@ -143,7 +154,7 @@ class Backend:
         return {"ok": bool(report.get("ready")), "health": report}
 
     def recognize_character(self, body: dict[str, Any]) -> dict[str, Any]:
-        self._check_task_vision_policy(body)
+        self._checked_assistance_task(body, allowed_modes={'existing_reference', 'create_reference'})
         import uuid
         from character_profile import analyze_character
         from single_source_workflow import sha256
@@ -158,7 +169,7 @@ class Backend:
         return {"ok": True, "profile": profile}
 
     def prepare_generation(self, body: dict[str, Any]) -> dict[str, Any]:
-        self._check_task_vision_policy(body)
+        self._checked_assistance_task(body, allowed_modes={'existing_reference', 'create_reference'})
         import uuid
         import single_source_workflow as workflow
         source = Path(str(body.get("source") or ""))
@@ -191,6 +202,34 @@ class Backend:
             if not intent['services']['text_vision']:
                 raise ValueError('当前制作任务未允许外部文本/视觉服务；请选择允许服务的任务后再研究或识别。')
 
+    def _checked_assistance_task(self, body: dict[str, Any], *, allowed_modes: set[str]) -> dict[str, Any]:
+        """Require advisory research/design work to belong to a checked task.
+
+        Character research and design preparation may write staging receipts and
+        call the configured vision service and therefore require the checked
+        task boundary even though they do not create a run.
+        Recheck the plan identity before allowing either operation.
+        """
+        from creative_task import REQUEST_FIELDS, plan_task, validate_task_plan
+        if not isinstance(body, dict):
+            raise ValueError('Creative assistance requires a checked task plan')
+        intent = body.get('task_intent') or body.get('creative_task')
+        plan = body.get('task_plan')
+        if not isinstance(intent, dict) or not isinstance(plan, dict):
+            raise ValueError('character research/design preparation requires /api/tasks/plan first')
+        validate_task_plan(plan, intent)
+        if intent.get('mode') not in allowed_modes:
+            raise ValueError('This assistance route is unavailable for the selected creative task mode')
+        if not (intent.get('services') or {}).get('text_vision'):
+            raise ValueError('当前制作任务未允许外部文本/视觉服务；请选择允许服务的任务后再研究或识别。')
+        public = {key: copy.deepcopy(body[key]) for key in REQUEST_FIELDS
+                  if key in body and key not in {'plan_id', 'creative_task'}}
+        public['creative_task'] = copy.deepcopy(intent)
+        checked = plan_task(self.root, public)
+        if checked['plan'].get('plan_id') != plan.get('plan_id'):
+            raise ValueError('Task inputs or configuration changed; check the task plan again')
+        return checked
+
     def provider_settings(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         import provider_settings
         if body is not None:
@@ -202,12 +241,17 @@ class Backend:
         from source_relight import source_render_plan_for_run
         from source_color import source_color_plan_for_run
         _path, run = load_run(self.root, run_id)
+        if not isinstance(run.get('task_plan'), dict) or not isinstance(run.get('task_intent'), dict):
+            raise RuntimeError('Current checked task required; create a new current run before planning.')
         options = run.get('options') or {}
         previous = run.get('generation_design') or options.get('generation_design') or {}
         request = {key: options[key] for key in ('provider', 'vision_model', 'api_base', 'api_url', 'api_key_env',
                    'character_name', 'character_notes', 'input_prompt') if options.get(key)}
         request.update({key: body[key] for key in ('provider', 'vision_model', 'character_name', 'character_notes') if body.get(key)})
         request['source'] = run['source']['path']
+        # Advisory design preparation belongs to the run's current checked task.
+        request['task_intent'] = copy.deepcopy(run.get('task_intent') or options.get('task_intent'))
+        request['task_plan'] = copy.deepcopy(run.get('task_plan') or options.get('task_plan'))
         request['character_profile'] = run.get('character_profile') or options.get('character_profile')
         request['character_research'] = previous.get('character_research')
         request['style_id'] = previous.get('selected_style_id')
@@ -232,6 +276,130 @@ class Backend:
         result = prepare_local_appearance(self.root, source, source_hash=run['source'].get('sha256'),
             registry_path=run.get('options', {}).get('model_registry'))
         return {**result, 'run_id': run_id}
+
+    def prepare_portrait_beauty(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Prepare an owned generated face layer, leaving the saved run intact."""
+        from current_contract import validate_current_request
+        from design_reconstruction import is_native_run
+        from display_transform import source_transform_for_run
+        from revision_state import appearance_revision_patch
+        from single_source_workflow import load_run
+        from source_preview import _edited_run
+        from session_draft import digest
+        validate_current_request(body)
+        _path, run = load_run(self.root, run_id)
+        if not is_native_run(run):
+            raise ValueError('人像美化需要当前原片工程')
+        edits = {}
+        revision = appearance_revision_patch(body)
+        if revision is not None:
+            edits['appearance_revision'] = revision
+        if isinstance(body.get('manual_layers'), dict):
+            edits['manual_layers'] = body['manual_layers']
+        edits = json.loads(json.dumps(edits, allow_nan=False))
+        edited_run = _edited_run(run, edits)
+        source_transform_for_run(edited_run)
+        model_options = body.get('beauty_options') or {}
+        if not isinstance(model_options, dict):
+            raise ValueError('Beauty preparation options must be an object')
+        model_options = json.loads(json.dumps(model_options, allow_nan=False))
+        with self._job_lock:
+            job_payload = {'kind': 'prepare_portrait_beauty', 'run_id': run_id,
+                'preparation_kind': 'portrait_beauty', 'source': run['source']['path'], 'sample': run['sample'],
+                'input_sha256': digest(edits), 'edited_run': edited_run, 'beauty_options': model_options,
+                'cancel_mode': 'cooperative_subprocess', 'project_pointer_updated': False,
+                'preparation_contract': 'portrait_beauty_layer.v1', 'generates_reference': False}
+            job_payload['execution_binding'] = _execution_binding(job_payload, kind='prepare_portrait_beauty')
+            job = self.jobs.create(job_payload)
+            job_id = str(job['job_id'])
+            worker = threading.Thread(target=self._run_portrait_beauty_job, args=(job_id,),
+                daemon=True, name=f'portrait-beauty-{job_id[-8:]}')
+            self._job_workers[job_id] = worker
+        worker.start()
+        return {'ok': True, 'async': True, 'job_id': job_id, 'run_id': run_id, 'job': self.jobs.get(job_id)}
+
+    def _run_portrait_beauty_job(self, job_id: str) -> None:
+        """Use the shared worker limit and durable prepare/cancel boundary."""
+        acquired = False
+        try:
+            while not self.jobs.is_cancel_requested(job_id):
+                acquired = self._worker_slots.acquire(timeout=.1)
+                if acquired:
+                    break
+            if self.jobs.is_cancel_requested(job_id):
+                self.jobs.update(job_id, status='cancelled', stage='cancelled',
+                    message='人像美化准备已取消；已有画面和编辑保留。')
+                return
+            snapshot = self.jobs.get(job_id)
+            self.jobs.update(job_id, status='running', stage='portrait_beauty_preparation', progress=0.02,
+                message='正在准备人像美化；已有画面和编辑保留。')
+
+            def report(stage, message=None, progress=None, **_details):
+                if isinstance(stage, dict):
+                    event = stage
+                    stage, message, progress = event.get('stage'), event.get('message'), event.get('progress')
+                if self.jobs.get(job_id).get('status') in {'running', 'cancelling'}:
+                    self.jobs.update(job_id, stage=stage, message=message, progress=progress)
+
+            from beautygrpo_prepare import prepare_for_workbench
+            result = prepare_for_workbench(snapshot['edited_run'], self.root,
+                self.jobs.path(job_id)/'portrait-beauty-preparation', options=snapshot['beauty_options'],
+                cancel=lambda: self.jobs.is_cancel_requested(job_id), progress=report)
+            if self.jobs.is_cancel_requested(job_id):
+                self.jobs.update(job_id, status='cancelled', stage='cancelled',
+                    message='人像美化准备已取消；结果未应用，未保存新版本。')
+                return
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                raise RuntimeError(str((result.get('error') if isinstance(result, dict) else None) or '人像美化准备未完成'))
+            no_change = bool(result.get('no_change'))
+            if no_change:
+                if result.get('result') is not None or result.get('layer') is not None:
+                    raise ValueError('No-change beauty preparation must not replace the current layer')
+                control, faces, result_hash = None, [], None
+            else:
+                result_path = Path(result['result'])
+                if not result_path.is_absolute():
+                    raise ValueError('Prepared beauty result must be an absolute frozen JSON path')
+                control = {'result': str(result_path.resolve()), 'strength': 1.0, 'disabled_faces': []}
+                candidate = copy.deepcopy(snapshot['edited_run'])
+                candidate.setdefault('options', {}).setdefault('appearance_revision', {})['portrait_beauty'] = control
+                from portable_project import validate_portrait_beauty
+                layer, result_path = validate_portrait_beauty(candidate)
+                if layer != result.get('layer'):
+                    raise ValueError('Prepared beauty result differs from its frozen JSON')
+                faces = [{'id': face['id'], 'native_box': face['native_box']} for face in layer['faces']]
+                result_hash = sha256_file(result_path)
+            receipt = {'schema': 'portrait_beauty_job_result.v1', 'preparation_contract': 'portrait_beauty_layer.v1',
+                'job_id': job_id, 'preparation_kind': 'portrait_beauty', 'run_id': snapshot['run_id'],
+                'input_sha256': snapshot['input_sha256'], 'source_sha256': snapshot['edited_run']['source']['sha256'],
+                'appearance_revision': {'portrait_beauty': control} if control else {}, 'result_sha256': result_hash,
+                'faces': faces, 'cache_hit': bool(result.get('cache_hit')), 'no_change': no_change,
+                'reason': result.get('reason'), 'generation_inferences_this_attempt': result.get('generation_inferences_this_attempt')}
+            target = self.jobs.path(job_id)/'prepared-portrait-beauty.json'
+            data = _json_bytes(receipt)
+            temporary = target.with_suffix('.json.tmp')
+            temporary.write_bytes(data)
+            os.replace(temporary, target)
+            if self.jobs.is_cancel_requested(job_id):
+                self.jobs.update(job_id, status='cancelled', stage='cancelled',
+                    message='人像美化准备已取消；结果未应用，未保存新版本。')
+                return
+            self.jobs.update(job_id, status='succeeded', stage='prepared', progress=1,
+                message=('未找到可用的可见脸部；原画面与编辑保留，未新增图层。' if no_change else
+                    '人像美化已准备，尚未保存；预览后保存高清新版本。'),
+                result_summary={'prepared_beauty_sha256': hashlib.sha256(data).hexdigest(),
+                    'new_rendered_revision': False, 'project_pointer_updated': False, 'visual_acceptance': False,
+                    'cache_hit': receipt['cache_hit'], 'no_change': receipt['no_change'], 'preparation_kind': 'portrait_beauty'})
+        except Exception as exc:
+            cancelled = self.jobs.is_cancel_requested(job_id)
+            self.jobs.update(job_id, status='cancelled' if cancelled else 'failed',
+                stage='cancelled' if cancelled else self.jobs.get(job_id).get('stage', 'portrait_beauty_preparation'),
+                message='人像美化未应用；已有画面和编辑保留，可本地重试。', error=None if cancelled else str(exc))
+        finally:
+            if acquired:
+                self._worker_slots.release()
+            with self._job_lock:
+                self._job_workers.pop(job_id, None)
 
     def reconstruct_source_design(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         from current_contract import validate_current_request
@@ -283,7 +451,7 @@ class Backend:
             edited_run.setdefault('options', {})['model_registry'] = str(registry)
             edits['model_registry'] = str(registry)
         with self._job_lock:
-            job = self.jobs.create({'kind': 'native_design_reconstruction', 'run_id': run_id,
+            job_payload = {'kind': 'native_design_reconstruction', 'run_id': run_id,
                 'preparation_kind': preparation_kind,
                 'source': run['source']['path'], 'sample': run['sample'],
                 'input_sha256': digest(edits), 'edited_run': edited_run,
@@ -291,7 +459,9 @@ class Backend:
                 'preparation_contract': {'hair_boundary_light': 'source_boundary_light.v1',
                     'cloth_boundary_light': 'source_cloth_boundary_light.v1',
                     'boundary_light_coordination': 'source_boundary_light_coordination.v1'}.get(preparation_kind, 'reference_appearance_stack.v2'),
-                'generates_reference': False})
+                'generates_reference': False}
+            job_payload['execution_binding'] = _execution_binding(job_payload, kind='native_design_reconstruction')
+            job = self.jobs.create(job_payload)
             job_id = str(job['job_id'])
             worker = threading.Thread(target=self._run_reconstruction_job, args=(job_id,),
                 daemon=True, name=f'native-reconstruction-{job_id[-8:]}')
@@ -320,7 +490,7 @@ class Backend:
                     message=f'{preparation_name}准备已取消；已有画面和编辑保留，未保存新版本。')
                 return
             snapshot = self.jobs.get(job_id)
-            self.jobs.update(job_id, status='running', stage=preparation_kind+'_preparation' if boundary_preparation else 'reference_preparation',
+            self.jobs.update(job_id, status='running', stage=preparation_kind+'_preparation' if boundary_preparation else 'reference_preparation', progress=0.02,
                 message=f'正在准备{preparation_name}；原有画面与编辑保留，不新增生图。')
 
             def report(stage, message=None, progress=None, **_details):
@@ -428,10 +598,38 @@ class Backend:
                     'no_change': no_change, 'preparation_kind': snapshot.get('preparation_kind', 'reference_appearance')})
         except Exception as exc:
             cancelled = self.jobs.is_cancel_requested(job_id)
+            failure_receipt = None
+            if boundary_preparation:
+                preparation_dir = self.jobs.path(job_id) / (
+                    'boundary-coordination-preparation' if coordinated_boundary else
+                    'cloth-boundary-preparation' if cloth_boundary else
+                    'hair-boundary-preparation')
+                qualification = preparation_dir / 'qualification.json'
+                try:
+                    value = json.loads(qualification.read_text(encoding='utf8'))
+                    if isinstance(value, dict) and value.get('schema') == 'source_boundary_light_coordination.v1':
+                        failure_receipt = value
+                except (OSError, ValueError, TypeError):
+                    failure_receipt = None
+            error = None if cancelled else str(exc)
+            summary = None
+            if failure_receipt is not None and not cancelled:
+                # Keep the string message for existing clients, while adding
+                # a durable stage receipt for the job API.  No prepared plan
+                # is published and a cloth-only partial is explicitly marked
+                # discarded.
+                error = {'message': error, 'boundary_receipt': failure_receipt,
+                         'failed_stage': failure_receipt.get('failed_stage'),
+                         'partial_plan_discarded': True}
+                summary = {'preparation_kind': preparation_kind,
+                           'boundary_failure': failure_receipt,
+                           'prepared_plan_published': False,
+                           'partial_plan_discarded': True,
+                           'visual_acceptance': False}
             self.jobs.update(job_id, status='cancelled' if cancelled else 'failed',
                 stage='cancelled' if cancelled else self.jobs.get(job_id).get('stage', 'reference_preparation'),
                 message=f'{preparation_name}准备未应用；已有画面和编辑保留，可本地重试。',
-                error=None if cancelled else str(exc))
+                error=error, **({'result_summary': summary} if summary is not None else {}))
         finally:
             if acquired:
                 self._worker_slots.release()
@@ -460,7 +658,8 @@ class Backend:
 
     def recent_projects(self) -> dict[str, Any]:
         import workbench_store
-        return {"ok": True, "recent": workbench_store.list_recent(self.root)}
+        return {"ok": True, "recent": workbench_store.list_recent(self.root),
+                'selection': workbench_store.saved_result_state(self.root)}
 
     def save_template(self, body: dict[str, Any]) -> dict[str, Any]:
         import workbench_store
@@ -474,20 +673,15 @@ class Backend:
         return {"ok": True, **result, "templates": workbench_store.list_templates(self.root)}
 
     def cleanup(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        # This is a source-checkout maintenance endpoint only.  It is kept so
-        # archived projects can be inspected/cleaned by an operator, but it is
-        # deliberately excluded from both frozen specs and product capability
-        # declarations; it must never be treated as part of the native run.
-        if getattr(sys, "frozen", False):
-            return {"ok": False, "available": False,
-                    "archive_only": True,
-                    "reason": "project_cleanup.py is archive-only and unavailable in the native release"}
-        import project_cleanup
-        result = project_cleanup.cleanup(self.root, apply=bool((body or {}).get("apply")))
-        if isinstance(result, dict):
-            result.setdefault("archive_only", True)
-            result.setdefault("scope", "source_checkout_maintenance")
-        return result
+        import workspace_cleanup
+        with self._job_lock, self.jobs.mutation():
+            if any(job.get('status') in {'queued', 'running', 'cancelling'} for job in self.jobs.list()):
+                return {'ok': False, 'blocked': True, 'available': True, 'scope': 'workspace_history',
+                        'reason': '请先等待或取消处理任务，再清理历史记录。',
+                        'file_count': 0, 'bytes': 0, 'removed_files': 0, 'deleted_bytes': 0}
+            result = workspace_cleanup.cleanup(self.root, apply=bool((body or {}).get('apply')),
+                min_age_seconds=(body or {}).get('min_age_seconds', 0))
+            return {**result, 'available': True, 'scope': 'workspace_history'}
 
 
     def batch_status(self, batch_id: str) -> dict[str, Any]:
@@ -641,11 +835,11 @@ class Backend:
                 continue
             if value not in (None, ""):
                 args.extend([flag, str(value)])
-        settings = {key: body[key] for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "native_source_retouch", "task_intent", "task_plan") if isinstance(body.get(key), dict)}
-        for key in ("prompt_template_version", "effective_prompt", "input_prompt", "character_name", "character_notes", "vision_model", "cancel_request_path"):
+        settings = {key: body[key] for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "creative_direction", "regional_resume_authorization", "regional_candidate_reuse_authorization", "native_source_retouch", "task_intent", "task_plan") if isinstance(body.get(key), dict)}
+        for key in ("prompt_template_version", "effective_prompt", "input_prompt", "character_name", "character_notes", "vision_model", "cancel_request_path", "execution_strategy", "preparation_policy"):
             if isinstance(body.get(key), str):
                 settings[key] = body[key]
-        for key in ("variant_count", "variant_styles", "cosplay_correction_budget"):
+        for key in ("variant_count", "variant_styles", "cosplay_correction_budget", "defer_reference_selection"):
             if key in body:
                 settings[key] = body[key]
         if body.get("preserve_effective_prompt") is True:
@@ -697,10 +891,20 @@ class Backend:
             return {}
 
     def _one_click_sync(self, body: dict[str, Any], *, job_id: str | None = None) -> dict[str, Any]:
-        """Run one-click in the caller, retaining the historical response."""
+        """Run one-click in the caller and return its current result."""
         source = str(body.get("source", "")).strip()
         if not source:
             raise ValueError("source is required")
+        # Reserve the run identity before entering the workflow so a failure
+        # during the final manifest publication can still point to its private
+        # draft. The CLI receives this exact id instead of generating a second
+        # timestamped identity internally.
+        if not body.get('run_id'):
+            from single_source_workflow import resolve, run_id_for, source_facts
+            source_path = resolve(Path(source), self.root)
+            expected_sha = (((body.get('task_plan') or {}).get('inputs') or {}).get('source') or {}).get('sha256')
+            facts = source_facts(source_path, self.root, known_sha256=expected_sha)
+            body = {**body, 'run_id': run_id_for(source_path, facts['sha256'])}
         if job_id is None:
             job = self.jobs.create(self._one_click_payload(body, source))
             job_id = str(job["job_id"])
@@ -709,19 +913,24 @@ class Backend:
         try:
             result = self.command(*args)
         except Exception as exc:
-            self.jobs.update(job_id, status="failed", stage="workflow", message="one-click failed", error=str(exc))
+            self.jobs.update(job_id, status="failed", stage="workflow", message="one-click failed",
+                             error=self._safe_workflow_error(exc=exc), run_id=body.get('run_id'),
+                             initial_run_id=body.get('run_id'))
             raise
         manifest = self._parse_manifest(str(result.get("stdout", "")))
-        run_id = manifest.get("run_id") if isinstance(manifest, dict) else None
+        run_id = (manifest.get("run_id") if isinstance(manifest, dict) else None) or body.get('run_id')
         if result.get("ok") and run_id:
             import workbench_store
             workbench_store.record_recent(self.root, sample=str(manifest.get("sample") or Path(source).stem), run_id=str(run_id), source=source)
         status = "succeeded" if result.get("ok") else ("blocked" if manifest.get("status") == "blocked" else "failed")
         product_summary, stage_report = self._workflow_product_result(manifest)
+        failure = self._safe_workflow_error({**result, 'run': manifest}) if not result.get('ok') else None
         self.jobs.update(job_id, status=status, stage=("awaiting_reference" if manifest.get("status") == "awaiting_reference" else "complete") if result.get("ok") else "workflow",
-                         progress=1 if result.get("ok") else 0.95,
-                         message="处理执行结束；作品质量与缺项见结果。" if result.get("ok") else "one-click failed",
-                         run_id=run_id, result_summary={"ok": result.get("ok"), "exit_code": result.get("exit_code"), "workflow_status": manifest.get("status"), **product_summary})
+                         progress=(0.40 if manifest.get('status') == 'awaiting_reference' else 1) if result.get("ok") else 0.95,
+                         message=self._workflow_completion_message(manifest, product_summary) if result.get("ok") else "制作未完成；请查看失败原因后重试。",
+                         error=failure,
+                         run_id=run_id, product_state=product_summary['product_state'], result_summary={"ok": result.get("ok"), "exit_code": result.get("exit_code"), "workflow_status": manifest.get("status"),
+                             **({'failure_detail': failure} if failure else {}), **product_summary})
         return {**result, "job_id": job_id, "run_id": run_id, "run": manifest, 'stage_report':stage_report}
 
     def _workflow_product_result(self, manifest: dict[str, Any]) -> tuple[dict, dict | None]:
@@ -730,19 +939,35 @@ class Backend:
             report = read_stage_report(self.root, manifest,
                 self.root/'outputs/runs'/manifest['run_id']/'manifest.json') if manifest.get('run_id') else None
         except (ValueError, KeyError, TypeError, OSError):
-            return ({'result_state':'unavailable', 'report_unavailable':True,
+            return ({'result_state':'unavailable', 'product_state':'unavailable', 'report_unavailable':True,
                      'quality_inferred_from_worker_success':False}, None)
         whole = (report or {}).get('whole_work') or {}
-        return ({'result_state':whole.get('result_state', 'unavailable'),
+        approved = bool(whole.get('current_revision_visual_approved'))
+        product_state = ('delivered' if approved and manifest.get('delivery_status') == 'delivered'
+                         else whole.get('result_state', 'unavailable'))
+        return ({'result_state':whole.get('result_state', 'unavailable'), 'product_state':product_state,
             'open_findings_count':len(whole.get('open_findings') or []),
             'required_effect_fulfillment':(whole.get('required_effects') or {}).get('fulfillment', 'unknown'),
-            'current_revision_visual_approved':bool(whole.get('current_revision_visual_approved')),
+            'current_revision_visual_approved':approved,
             'quality_inferred_from_worker_success':False}, report)
+
+    @staticmethod
+    def _workflow_completion_message(manifest: dict, summary: dict) -> str:
+        if manifest.get('status') == 'awaiting_reference':
+            return '已生成候选，等待选择后继续；尚未交付。'
+        return {
+            'needs_visual_review': '高清版本已保存，等待人工审片与批准；尚未交付。',
+            'needs_evidence': '高清版本已保存，仍需核对证据并人工审片；尚未交付。',
+            'needs_repair': '高清版本已保存，仍有待修问题；尚未交付。',
+            'pending_save': '处理已完成，当前修改仍需保存；尚未交付。',
+            'accepted': '当前保存版本已记录人工批准。',
+            'delivered': '人工审片已批准，交付包已保存。',
+        }.get(summary.get('product_state'), '处理执行结束；请查看作品状态与下一步，尚未确认交付。')
 
     def _update_live_one_click_job(self, job_id: str, **changes) -> dict:
         """Serialize observer/final callbacks with cancellation and terminal state."""
         from job_store import TERMINAL
-        with self.jobs._lock:
+        with self.jobs.mutation():
             current = self.jobs.get(job_id)
             if current.get('status') in TERMINAL:
                 return current
@@ -765,13 +990,43 @@ class Backend:
         for observation in observations:
             self._update_live_one_click_job(job_id, event_type='workflow_stage', **observation)
 
+    def _desktop_workflow_process_spec(self, body):
+        """Resolve the installed model interpreter without re-entering the frozen EXE."""
+        from current_model_registry import load_registry
+        from runtime_resources import isolated_python_environment
+        python = Path(load_registry(self.root, registry_path=body.get('model_registry'))['python']).resolve()
+        cli = code_path('project_cli.py').resolve()
+        if not python.is_file() or python == Path(sys.executable).resolve():
+            raise ValueError('Desktop workflow requires an existing external Python runtime')
+        if not cli.is_file():
+            raise ValueError('Installed project_cli.py is unavailable; workflow was not started')
+        environment = isolated_python_environment()
+        environment.setdefault('COSPLAY_PACKAGE_ROOT', str(Path(sys.executable).resolve().parent))
+        environment['PYTHONFAULTHANDLER'] = '1'
+        return python, cli, environment
+
+    def _stop_owned_desktop_workflow(self, job_id, process):
+        """Only this backend's retained Popen and matching creation stamp own a tree."""
+        if process.poll() is not None:
+            return
+        from job_store import process_stamp
+        with self._job_lock:
+            retained = self._job_processes.get(job_id) is process
+        child = self.jobs.get(job_id).get('child_process') or {}
+        if (not retained or child.get('pid') != process.pid or not child.get('stamp')
+                or child['stamp'] != process_stamp(process.pid)
+                or child.get('owner_pid') != os.getpid()
+                or child.get('owner_stamp') != process_stamp(os.getpid())):
+            raise RuntimeError('Workflow process ownership changed; no process tree was terminated')
+        from beautygrpo_prepare import _stop_process
+        _stop_process(process)
+
     def _run_one_click_job(self, job_id: str, body: dict[str, Any]) -> None:
         """Worker for the non-blocking one-click API.
 
         The external CLI is polled so a cancellation request can terminate it
-        promptly.  The embedded backend has no safe thread-stop primitive;
-        there cancellation is checked before and after the operation and the
-        persisted job is still converted to ``cancelled`` without delivery.
+        promptly, including the frozen embedded desktop. Source-mode embedded
+        callers retain their in-process CLI behavior and cooperative cancellation.
         """
         source = str(body.get("source", "")).strip()
         process: subprocess.Popen[str] | None = None
@@ -780,8 +1035,11 @@ class Backend:
         monitor_thread = None
         observer = None
         run_id = None
+        beauty_capability = None
+        isolated_desktop = self.embedded and bool(getattr(sys, 'frozen', False))
         body = {**body, "cancel_request_path": str(self.jobs.path(job_id) / "cancel.requested")}
         try:
+            desktop_spec = self._desktop_workflow_process_spec(body) if isolated_desktop else None
             while not self.jobs.is_cancel_requested(job_id):
                 slot_acquired = self._worker_slots.acquire(timeout=0.1)
                 if slot_acquired:
@@ -797,21 +1055,30 @@ class Backend:
             observer = SourceJobProgress(self.root, run_id, source,
                 source_sha256=(((body.get('task_plan') or {}).get('inputs') or {}).get('source') or {}).get('sha256'),
                 owns_new_run=not bool(requested_run_id))
-            self._update_live_one_click_job(job_id, status="running", stage="prepare", run_id=run_id,
-                             initial_run_id=run_id, message="one-click worker started", event_type="worker_started")
+            # These are real worker milestones.  Without an initial value the
+            # desktop has no evidence to show until the workflow writes its
+            # first manifest event, which looks like a hung request.
+            self._update_live_one_click_job(job_id, status="running", stage="prepare", progress=0.02,
+                             run_id=run_id, initial_run_id=run_id, message="正在准备制作任务。", event_type="worker_started")
             args = self._one_click_args(body, source, options_path=self.jobs.path(job_id)/'workflow-options.json')
             if self.jobs.is_cancel_requested(job_id):
                 self._update_live_one_click_job(job_id, status='cancelled', stage='cancelled',
                     message='cancelled before workflow', event_type='cancelled')
                 return
-            self._update_live_one_click_job(job_id, stage="workflow", message="running source workflow")
-            if self.embedded:
-                # Embedded mode is used by the frozen desktop shell.  Keep all
-                # business logic in project_cli while retaining cancellation
-                # semantics at the job boundary.
+            self._update_live_one_click_job(job_id, stage="workflow", progress=0.05, message="已开始执行原片与候选流程。")
+            if self.embedded and not isolated_desktop:
+                # Preserve source-mode embedded callers/tests. Frozen desktops
+                # run the same project_cli production chain in an owned process.
                 def monitor():
                     last_heartbeat = time.monotonic()
                     while not monitor_stop.wait(0.15):
+                        if self.jobs.is_cancel_requested(job_id):
+                            # The provider call can block this embedded worker.
+                            # Reuse this existing monitor only to stop its exact
+                            # run/marker-owned Beauty request; it writes no run state.
+                            from beautygrpo_prepare import cancel_pending_for_run
+                            cancel_pending_for_run(self.root, run_id,
+                                cancel_request_path=body['cancel_request_path'])
                         self._observe_source_job(job_id, observer)
                         if time.monotonic() - last_heartbeat >= 10:
                             self._update_live_one_click_job(job_id, event_type='heartbeat')
@@ -823,17 +1090,36 @@ class Backend:
                 monitor_stop.set()
                 monitor_thread.join(timeout=1)
             else:
-                cli_args = [sys.executable, str(self.cli), "--root", str(self.root), *args]
+                python, cli, environment = desktop_spec or (sys.executable, self.cli, {**os.environ, "PYTHONIOENCODING": "utf-8"})
+                if isolated_desktop:
+                    from beautygrpo_broker import BeautyBroker
+                    with self._job_lock:
+                        if self._beauty_broker is None:
+                            self._beauty_broker = BeautyBroker(self.root)
+                        checked_source = ((body.get('task_plan') or {}).get('inputs') or {}).get('source') or {}
+                        beauty_capability, broker_environment = self._beauty_broker.issue(job_id, run_id, checked_source.get('sha256'))
+                    environment = {**environment, **broker_environment}
+                cli_args = [str(python), str(cli), "--root", str(self.root), *args]
                 process = subprocess.Popen(
-                    cli_args, cwd=str(ROOT), stdout=subprocess.PIPE,
+                    cli_args, cwd=str(cli.parent if isolated_desktop else ROOT), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                    env=environment,
+                    start_new_session=os.name != 'nt',
+                    **({'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)} if isolated_desktop else {}),
                 )
+                with self._job_lock:
+                    self._job_processes[job_id] = process
+                if isolated_desktop:
+                    from job_store import process_stamp
+                    self._update_live_one_click_job(job_id, child_process={
+                        'pid': process.pid, 'stamp': process_stamp(process.pid),
+                        'owner_pid': os.getpid(), 'owner_stamp': process_stamp(os.getpid()),
+                        'interpreter': str(python), 'cli': str(cli)}, execution_process_isolation='external_python')
+                    if process.poll() is None:
+                        self._beauty_broker.register(beauty_capability, process.pid, process_stamp(process.pid))
                 self._update_live_one_click_job(job_id,
                                  message="workflow process started", pid=process.pid,
                                  event_type="process_started")
-                with self._job_lock:
-                    self._job_processes[job_id] = process
                 # ``communicate(timeout=...)`` drains both pipes while the
                 # process runs.  A plain poll loop would eventually deadlock
                 # when a pretty-printed manifest fills stdout's pipe.
@@ -841,12 +1127,14 @@ class Backend:
                 last_heartbeat = time.monotonic()
                 while process.poll() is None:
                     if self.jobs.is_cancel_requested(job_id):
-                        process.terminate()
-                        try:
-                            stdout, stderr = process.communicate(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            stdout, stderr = process.communicate(timeout=3)
+                        # Terminating just the CLI bypasses its atexit handlers
+                        # and leaves CUDA children running. Reuse owned tree cleanup.
+                        if isolated_desktop:
+                            self._stop_owned_desktop_workflow(job_id, process)
+                        else:
+                            from beautygrpo_prepare import _stop_process
+                            _stop_process(process)
+                        stdout, stderr = process.communicate(timeout=3)
                         self._update_live_one_click_job(job_id, status="cancelled", stage="cancelled",
                                          message="one-click cancelled; no delivery created", event_type="cancelled",
                                          result_summary={"exit_code": process.returncode})
@@ -864,6 +1152,8 @@ class Backend:
                 stdout, stderr = process.communicate()
                 result = {"ok": process.returncode == 0, "exit_code": process.returncode,
                           "stdout": stdout or "", "stderr": stderr or ""}
+                if isolated_desktop and process.returncode and (process.returncode & 0xffffffff) == 0xc0000409:
+                    result['stderr'] = '制作子进程发生原生异常终止（0xc0000409）；桌面仍可用，未自动重试。\n' + result['stderr']
             manifest = self._parse_manifest(str(result.get("stdout", "")))
             if monitor_thread is None or not monitor_thread.is_alive():
                 self._observe_source_job(job_id, observer, manifest)
@@ -879,25 +1169,44 @@ class Backend:
             ok = bool(result.get("ok"))
             status = "succeeded" if ok else ("blocked" if manifest.get("status") == "blocked" else "failed")
             product_summary, _ = self._workflow_product_result(manifest)
+            failure = self._safe_workflow_error({**result, 'run': manifest}) if not ok else None
             self._update_live_one_click_job(
                 job_id, status=status, stage=("awaiting_reference" if manifest.get("status") == "awaiting_reference" else "complete") if ok else "workflow",
-                **({'progress': 1} if ok else {}),
-                message="处理执行结束；作品质量与缺项见结果。" if ok else "one-click failed",
-                run_id=run_id,
+                **({'progress': 0.40 if manifest.get('status') == 'awaiting_reference' else 1} if ok else {}),
+                message=self._workflow_completion_message(manifest, product_summary) if ok else "制作未完成；请查看失败原因后重试。",
+                error=failure,
+                run_id=run_id, product_state=product_summary['product_state'],
                 # Keep provider/CLI stderr out of the durable journal: it can
                 # contain transport details or accidental credential material.
                 result_summary={"ok": ok, "exit_code": result.get("exit_code"), "workflow_status": manifest.get("status"),
-                                **product_summary},
+                                **({'failure_detail': failure} if failure else {}), **product_summary},
                 event_type="completed" if ok else "failed",
             )
         except Exception as exc:
             if self.jobs.is_cancel_requested(job_id):
                 self._update_live_one_click_job(job_id, status="cancelled", stage="cancelled", message="one-click cancelled", event_type="cancelled")
             else:
+                failure = self._safe_workflow_error(exc=exc)
                 self._update_live_one_click_job(job_id, status="failed", stage="workflow", message="one-click failed",
-                                 error=str(exc), event_type="failed")
+                                 error=failure, run_id=run_id,
+                                 initial_run_id=run_id,
+                                 result_summary={'failure_detail': failure}, event_type="failed")
         finally:
             monitor_stop.set()
+            if isolated_desktop and process is not None and process.poll() is None:
+                try:
+                    self._stop_owned_desktop_workflow(job_id, process)
+                except Exception as cleanup_error:
+                    # Never broaden cleanup to an unverified PID, and still
+                    # release the slot even if durable ownership is unavailable.
+                    with contextlib.suppress(Exception):
+                        self.jobs.update(job_id, process_cleanup_error=str(cleanup_error))
+            if beauty_capability is not None:
+                try:
+                    self._beauty_broker.revoke(beauty_capability)
+                except Exception as cleanup_error:
+                    with contextlib.suppress(Exception):
+                        self.jobs.update(job_id, beauty_cleanup_error=str(cleanup_error))
             if monitor_thread is not None:
                 monitor_thread.join(timeout=1)
             if slot_acquired:
@@ -910,7 +1219,6 @@ class Backend:
         """Explicit completion creates a fresh child and preserves the saved parent."""
         import single_source_workflow as workflow
         from design_reconstruction import is_native_run
-        from generation_design import DESIGN_VERSION
         _, parent = workflow.load_run(self.root, run_id)
         if not is_native_run(parent) or not parent.get('reference') or not parent.get('auto_draft'):
             raise ValueError('请先打开已有原片和设计参考的高清版本。')
@@ -918,19 +1226,29 @@ class Backend:
         if continuation and continuation.get('render_state') != 'saved':
             raise ValueError('请先完成或恢复当前版本的保存。')
         design = parent.get('generation_design') or {}
-        if design.get('schema_version') != DESIGN_VERSION or design.get('status') != 'ready':
-            raise ValueError('该版本缺少完整 Cos 计划；请先完成创作规划。')
+        if body.get('generate') is True:
+            raise ValueError('Saved-reference completion forbids new image generation')
         options = parent.get('options') or {}
         edits = copy.deepcopy(options.get('appearance_revision') or {})
         plan = edits.get('design_reconstruction_plan') or {}
-        same_analysis = all(body.get(key, options.get(key)) == options.get(key)
-                            for key in ('algorithm_profile', 'model_registry'))
+        same_analysis = body.get('algorithm_profile', options.get('algorithm_profile')) == options.get('algorithm_profile')
+        selected_registry = body.get('model_registry', options.get('model_registry'))
+        if same_analysis and selected_registry != options.get('model_registry'):
+            from current_model_registry import load_registry
+            # Model management saves a user-owned copy of the same registry.
+            # Its location is not a change to the installed algorithms/models.
+            configurations = [load_registry(self.root, registry_path=value)
+                              for value in (selected_registry, options.get('model_registry'))]
+            same_analysis = ({key: value for key, value in configurations[0].items() if key != 'registry_path'}
+                             == {key: value for key, value in configurations[1].items() if key != 'registry_path'})
         saved_stack = (plan.get('source_sha256') == parent['source']['sha256']
             and plan.get('candidate_sha256') == parent['reference']['sha256']
             and any(row.get('kind') == 'reference_appearance_stack' for row in plan.get('layers', [])))
-        # Completing saved layers should start from those pixels. Only an
-        # explicitly changed analysis configuration requests fresh preparation;
-        # a material/effect update owns its new layer and leaves T/B/S intact.
+        # Retain source-bound scene inputs and user controls. The checked
+        # preparation policy below distinguishes full current-algorithm redo
+        # from a local final repair that keeps its frozen upstream pixels.
+        if not same_analysis and edits.get('portrait_beauty'):
+            raise ValueError('分析模型配置已改变；请先重新准备仿色融合，再继续完整后期。已有美化和保存版本保留。')
         if not same_analysis or not saved_stack:
             edits.pop('design_reconstruction_plan', None)
         request = {key: copy.deepcopy(options[key]) for key in
@@ -952,9 +1270,10 @@ class Backend:
         return self._continue_checked_task(parent, request,
             final_repair_only=body.get('final_repair_only') is True)
 
-    def _continue_checked_task(self, previous, request, *, final_repair_only=False):
+    def _continue_checked_task(self, previous, request, *, final_repair_only=False, resume_unsubmitted_region=False,
+                               regional_reuse_core_box=None):
         """Saved-reference continuation retains its task constraints and zero image budget."""
-        from creative_task import REQUEST_FIELDS, INTENT_SCHEMA, plan_task, execution_request, sha
+        from creative_task import REQUEST_FIELDS, plan_task, execution_request, sha, saved_task_intent_for_replanning
         options = previous.get('options') or {}
         source = Path(request['source'])
         source = source if source.is_absolute() else self.root / source
@@ -966,22 +1285,66 @@ class Backend:
             if not reference.is_file() or sha(reference) != (previous.get('reference') or {}).get('sha256'):
                 raise ValueError('Saved reference pixels changed; check a new creative task for a different reference')
         intent = copy.deepcopy(previous.get('task_intent') or options.get('task_intent'))
-        if not intent:
-            intent = {'schema_version': INTENT_SCHEMA,
-                      'mode': 'local_portrait' if options.get('local_only') and not request.get('reference') else 'existing_reference',
-                      'brief': options.get('input_prompt') or '', 'constraints': {},
-                      'services': {'text_vision': not bool(options.get('local_only'))}}
+        previous_plan = previous.get('task_plan') or options.get('task_plan')
+        if not isinstance(intent, dict) or not isinstance(previous_plan, dict):
+            raise ValueError('Saved version has no current checked task contract; create a new creative task to continue')
+        intent = saved_task_intent_for_replanning(previous_plan, intent,
+            source_sha256=(previous.get('source') or {}).get('sha256'),
+            reference_sha256=(previous.get('reference') or {}).get('sha256'))
         if request.get('reference'):
             intent['mode'] = 'existing_reference'
+            if 'regional_refinement' in intent:
+                # Saved regional pixels may replay, but continuing a saved
+                # reference never renews their generation allowance.
+                regional = intent['regional_refinement']
+                known_candidate = ((previous.get('generation_budget') or {}).get('regional_refinement_outcome')
+                    == 'generated_rejected' or regional.get('reuse_generated_from_run_id'))
+                if (resume_unsubmitted_region and not final_repair_only and known_candidate
+                        and previous.get('status') in {'blocked','failed','cancelled'}):
+                    candidate_id = regional.get('reuse_generated_from_run_id') or previous['run_id']
+                    regions = copy.deepcopy(regional['regions'])
+                    if regional_reuse_core_box is not None:
+                        regions[0]['core_box'] = copy.deepcopy(regional_reuse_core_box)
+                    intent['regional_refinement'] = {'maximum_submissions': 0,
+                        'coordinate_space': 'source_canvas', 'regions': regions,
+                        'reuse_generated_from_run_id': candidate_id}
+                elif (resume_unsubmitted_region and not final_repair_only
+                        and regional.get('maximum_submissions') == 1
+                        and previous.get('status') in {'blocked','failed','cancelled'}):
+                    regional['resume_from_run_id'] = previous['run_id']
+                else:
+                    intent['regional_refinement'] = {'maximum_submissions': 0, 'regions': []}
         elif intent['mode'] != 'local_portrait':
             raise ValueError('No reusable reference is known; check a new creative task before granting image generation')
+        if regional_reuse_core_box is not None and not (
+                intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id'):
+            raise ValueError('A CPU reuse region requires a verified returned regional candidate')
         public = {key: copy.deepcopy(value) for key, value in request.items() if key in REQUEST_FIELDS
-                  and key not in {'generate', 'local_only', 'complete_post', 'plan_id', 'run_id', 'creative_task'}}
+                  and key not in {'generate', 'local_only', 'complete_post', 'plan_id', 'run_id', 'creative_task', 'creative_direction', 'regional_resume_authorization', 'regional_candidate_reuse_authorization'}}
         public['creative_task'] = intent
+        if intent['constraints'].get('refinement_profile') is not None:
+            # Preserve an already checked recommendation, never add a current
+            # default to an old version or silently lose its skin permission.
+            public['parent_run_id'] = previous['run_id']
+            public['preset'] = intent['constraints']['refinement_profile']['id']
+            saved_direction = previous_plan['creative_direction']
+            saved_character = saved_direction.get('character') or {}
+            public.setdefault('character_name', saved_character.get('name', ''))
+            public.setdefault('character_notes', saved_character.get('notes', ''))
+            if 'input_prompt' not in public and 'prompt' not in public:
+                from creative_direction import MARKER
+                public['input_prompt'] = saved_direction['prompt'].split(MARKER, 1)[0]
+        # Saved execution/cache strategy names are normalized to the current
+        # production route before planning.
+        public['execution_strategy'] = 'layered_reference_transfer'
+        public['preparation_policy'] = 'replay_frozen' if final_repair_only else 'prepare_current'
+        if final_repair_only:
+            public['final_repair_only'] = True
         prepared = plan_task(self.root, public)
         checked = execution_request(self.root, {**prepared['request'], 'plan_id': prepared['plan']['plan_id']})
         if final_repair_only:
             checked['final_repair_only'] = True
+        checked[_CHECKED_TASK_KEY] = _CHECKED_TASK_MARKER
         return {**self.one_click(checked), 'task_plan': checked['task_plan']}
 
     def repair_final_run(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -997,15 +1360,58 @@ class Backend:
         return self.complete_source_run(run_id, request)
 
     def one_click(self, body: dict[str, Any]) -> dict[str, Any]:
-        from current_contract import validate_current_request
-        validate_current_request(body)
-        """Start a source-only run.
+        """Start a run from a checked creative task.
 
         HTTP callers are asynchronous by default: they receive a durable job
         id immediately and observe progress via ``GET /api/jobs/<id>`` and
-        ``GET /api/jobs/<id>/events``.  ``{"async": false}`` (or ``sync``)
-        retains the historical blocking response for scripts that need it.
+        ``GET /api/jobs/<id>/events``. The old unplanned one-click request is
+        rejected so this boundary cannot bypass task planning.
         """
+        from current_contract import validate_current_request
+        from creative_task import REQUEST_FIELDS, plan_task, sha, validate_task_plan
+        validate_current_request(body)
+        plan = body.get('task_plan')
+        intent = body.get('task_intent')
+        if not isinstance(intent, dict) or not isinstance(plan, dict):
+            raise ValueError('one-click execution requires a checked task plan and task intent; use /api/tasks/plan then /api/tasks/start')
+        validate_task_plan(plan, intent)
+        if body.get(_CHECKED_TASK_KEY) is _CHECKED_TASK_MARKER:
+            # ``start_task`` has just called execution_request.  Replanning
+            # here repeated model/provider preflight on the generation hot
+            # path, while the immutable plan still gives us the exact input
+            # ownership to verify cheaply before queueing.
+            inputs = plan.get('inputs') or {}
+            for role in ('source', 'reference'):
+                recorded = inputs.get(role)
+                if recorded is None:
+                    if body.get(role) not in (None, ''):
+                        raise ValueError('Task inputs changed; check the task plan again')
+                    continue
+                supplied = body.get(role)
+                path = Path(str(supplied)).expanduser().resolve() if supplied else None
+                expected = Path(str(recorded.get('path'))).expanduser().resolve() if recorded.get('path') else None
+                if (path is None or expected is None or path != expected
+                        or not path.is_file() or sha(path) != recorded.get('sha256')):
+                    raise ValueError('Task inputs changed; check the task plan again')
+        else:
+            # A plan-shaped object is not enough: re-read the request through
+            # the coordinator and compare its content identity before creating
+            # a job.  This closes the direct backend boundary where a caller
+            # could copy a valid-looking plan and change execution inputs.
+            public = {key: copy.deepcopy(body[key]) for key in REQUEST_FIELDS
+                      if key in body and key not in {'plan_id', 'creative_task'}}
+            public['creative_task'] = copy.deepcopy(intent)
+            checked = plan_task(self.root, public)
+            if checked['plan'].get('plan_id') != plan.get('plan_id'):
+                raise ValueError('Task inputs or configuration changed; check the task plan again')
+        requested_strategy = body.get('execution_strategy')
+        if requested_strategy is not None and requested_strategy != plan.get('execution_strategy'):
+            raise ValueError('execution_strategy does not match the checked task plan')
+        from creative_task import normalize_preparation_policy
+        if normalize_preparation_policy(body.get('preparation_policy'), default=plan.get('preparation_policy', 'replay_frozen')) != normalize_preparation_policy(plan.get('preparation_policy')):
+            raise ValueError('preparation_policy does not match the checked task plan')
+        if body.get('final_repair_only', plan.get('final_repair_only', False)) != plan.get('final_repair_only', False):
+            raise ValueError('Final repair scope does not match the checked task plan')
         source = str(body.get("source", "")).strip()
         if not source:
             raise ValueError("source is required")
@@ -1034,8 +1440,14 @@ class Backend:
         return plan_task(self.root, body)
 
     def start_task(self, body):
-        from creative_task import execution_request
-        request = execution_request(self.root, body)
+        from production_coordinator import checked_request
+        request = checked_request(self.root, body)
+        # HTTP/desktop callers queue by default. The CLI explicitly supplies
+        # async=False so its process owns the task until all artifacts exist.
+        # Preserve the full direct-one-click validation for callers that enter
+        # that method themselves, while avoiding a second expensive planner
+        # pass for this already checked route.
+        request[_CHECKED_TASK_KEY] = _CHECKED_TASK_MARKER
         return {**self.one_click(request), 'task_plan': request['task_plan']}
 
     def task_batch_plan(self, body):
@@ -1064,7 +1476,11 @@ class Backend:
         for index, request in enumerate(requests):
             request.update({'async': True, 'preserve_project_selection': True})
             request.setdefault('sample', Path(request['source']).stem)
+            request[_CHECKED_TASK_KEY] = _CHECKED_TASK_MARKER
             result = self.one_click(request)
+            # The marker is process-local and must never enter the durable
+            # batch JSON record (it is intentionally not serializable).
+            request.pop(_CHECKED_TASK_KEY, None)
             record['items'].append({'index': index, 'source': request['source'],
                 'reference': request.get('reference'), 'sample': request['sample'],
                 'job_id': result['job_id'], 'attempts': [result['job_id']],
@@ -1138,21 +1554,53 @@ class Backend:
             "preserve_project_selection", "complete_post", "native_source_retouch",
             "final_repair_only",
             "algorithm_profile", "material_finish_profile", "model_registry",
-            "generation_design", "input_prompt",
+            "generation_design", "creative_direction", "regional_resume_authorization", "regional_candidate_reuse_authorization", "input_prompt",
             "cosplay_correction_budget",
-            "task_intent", "task_plan",
+            "defer_reference_selection",
+            "task_intent", "task_plan", "execution_strategy", "preparation_policy",
         )
-        return {"kind": "one_click", "source": source,
-                **{key: body[key] for key in persisted_keys if key in body}}
+        payload = {"kind": "one_click", "source": source,
+                   **{key: body[key] for key in persisted_keys if key in body}}
+        payload['execution_binding'] = _execution_binding(payload, kind='one_click')
+        return payload
 
     def create_job(self, body: dict[str, Any]) -> dict[str, Any]:
         """Create a queued job record without changing synchronous one-click."""
         payload = {k: body[k] for k in ("kind", "source", "sample", "provider", "model", "prompt") if k in body}
+        payload['execution_binding'] = _execution_binding(payload, kind=payload.get('kind'))
         job = self.jobs.create(payload)
         return {"ok": True, "job_id": job["job_id"], "job": job}
 
     def job(self, job_id: str) -> dict[str, Any]:
         job = self._reconcile_reconstruction_job(self.jobs.get(job_id))
+        if job.get('kind') == 'prepare_portrait_beauty':
+            response = {'ok': True, 'job': job}
+            if job.get('status') == 'succeeded':
+                data = (self.jobs.path(job_id)/'prepared-portrait-beauty.json').read_bytes()
+                if hashlib.sha256(data).hexdigest() != (job.get('result_summary') or {}).get('prepared_beauty_sha256'):
+                    raise ValueError('Saved beauty preparation changed; prepare again')
+                receipt = json.loads(data)
+                if (receipt.get('schema') != 'portrait_beauty_job_result.v1'
+                        or receipt.get('preparation_contract') != 'portrait_beauty_layer.v1'
+                        or receipt.get('job_id') != job_id or receipt.get('run_id') != job.get('run_id')
+                        or receipt.get('input_sha256') != job.get('input_sha256')
+                        or receipt.get('preparation_kind') != 'portrait_beauty'
+                        or receipt.get('source_sha256') != job['edited_run']['source']['sha256']):
+                    raise ValueError('Saved beauty preparation belongs to a different job or source snapshot')
+                if receipt.get('no_change'):
+                    if receipt.get('appearance_revision') != {} or receipt.get('faces') != [] or receipt.get('result_sha256') is not None:
+                        raise ValueError('No-change beauty preparation altered the current layer')
+                else:
+                    candidate = copy.deepcopy(job['edited_run'])
+                    control = receipt['appearance_revision']['portrait_beauty']
+                    candidate.setdefault('options', {}).setdefault('appearance_revision', {})['portrait_beauty'] = control
+                    from portable_project import validate_portrait_beauty
+                    layer, path = validate_portrait_beauty(candidate)
+                    if (sha256_file(path) != receipt.get('result_sha256')
+                            or receipt.get('faces') != [{'id': face['id'], 'native_box': face['native_box']} for face in layer['faces']]):
+                        raise ValueError('Saved beauty pixels or face ownership changed')
+                response['portrait_beauty_result'] = receipt
+            return response
         if job.get('kind') != 'native_design_reconstruction':
             return {'ok': True, 'job': job}
         response = {'ok': True, 'job': job}
@@ -1169,24 +1617,39 @@ class Backend:
                     receipt.get('candidate_sha256') != job['edited_run']['reference']['sha256']):
                 raise ValueError('Saved reconstruction preparation is bound to a different source/design pair')
             response['reconstruction_result'] = receipt
+        elif (job.get('preparation_kind') == 'boundary_light_coordination'
+              and isinstance((job.get('result_summary') or {}).get('boundary_failure'), dict)):
+            # Failed coordination has no reconstruction result. Expose its
+            # stage receipt directly so the UI and API can show the rejected
+            # partial pair without interpreting the job as a success.
+            response['reconstruction_failure'] = (job.get('result_summary') or {}).get('boundary_failure')
         return response
+
+    @staticmethod
+    def _foreign_job_owner_alive(job):
+        from job_store import process_stamp
+        owner = job.get('owner_process') or {}
+        return bool(owner.get('pid') != os.getpid() and owner.get('stamp')
+                    and process_stamp(owner.get('pid')) == owner['stamp'])
 
     def _reconcile_reconstruction_job(self, job: dict[str, Any]) -> dict[str, Any]:
         """A durable snapshot is not a worker; restart needs an explicit retry."""
-        if job.get('kind') not in {'one_click', 'native_design_reconstruction'} or job.get('status') not in {'queued', 'running', 'cancelling'}:
+        if job.get('kind') not in {'one_click', 'native_design_reconstruction', 'prepare_portrait_beauty', 'select_reference_variant'} or job.get('status') not in {'queued', 'running', 'cancelling'}:
             return job
         job_id = str(job['job_id'])
-        with self._job_lock:
+        with self._job_lock, self.jobs.mutation():
             # A list snapshot may predate the worker's completion. Re-read
             # before treating a missing worker as an interrupted operation.
             current = self.jobs.get(job_id)
             if current.get('status') not in {'queued', 'running', 'cancelling'} or job_id in self._job_workers:
                 return current
+            if self._foreign_job_owner_alive(current):
+                return current
             cancelled = self.jobs.is_cancel_requested(job_id)
             message = ('后台已重启，制作任务中断；原片和已保存版本保留。批量失败项可独立重试；'
                        '未知生图结果须重新检查任务。' if job.get('kind') == 'one_click' else
                        '后台已重启，'+{'hair_boundary_light': '发梢受光', 'cloth_boundary_light': '肩袖受光',
-                           'boundary_light_coordination': '发梢与肩袖受光'}.get(job.get('preparation_kind'), '仿色融合')+
+                           'boundary_light_coordination': '发梢与肩袖受光', 'portrait_beauty': '人像美化'}.get(job.get('preparation_kind'), '仿色融合')+
                        '准备中断；编辑快照保留，可本地重试，不新增生图。')
             return self.jobs.update(job_id, status='cancelled' if cancelled else 'failed',
                 stage='interrupted', message=message,
@@ -1228,24 +1691,25 @@ class Backend:
 
     def jobs_list(self) -> dict[str, Any]:
         """List durable jobs so a restarted UI can resume polling."""
-        return {"ok": True, "jobs": [self._reconcile_reconstruction_job(job) for job in self.jobs.recover()]}
+        with self._job_lock, self.jobs.mutation():
+            return {"ok": True, "jobs": [self._reconcile_reconstruction_job(job) for job in self.jobs.recover()]}
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         before = self.jobs.get(job_id)
         job = self.jobs.cancel(job_id)
-        if before.get('kind') == 'native_design_reconstruction' and job.get('status') == 'cancelling':
+        if before.get('kind') in {'native_design_reconstruction', 'prepare_portrait_beauty'} and job.get('status') == 'cancelling':
             name = {'hair_boundary_light': '发梢受光', 'cloth_boundary_light': '肩袖受光',
-                'boundary_light_coordination': '发梢与肩袖受光'}.get(before.get('preparation_kind'), '仿色融合')
+                'boundary_light_coordination': '发梢与肩袖受光', 'portrait_beauty': '人像美化'}.get(before.get('preparation_kind'), '仿色融合')
             job = self.jobs.update(job_id, message=f'正在取消{name}准备；编辑与已保存版本保留。')
         # If this backend was restarted, no in-process worker can observe the
         # marker.  Finalize the durable cancellation so recovery never leaves
         # a job stuck in ``cancelling`` forever.  A previous orphaned CLI may
         # still finish writing a run manifest, but one-click never accepts a
         # delivery and the job remains explicitly cancelled.
-        if (before.get("status") == "running" or before.get('kind') == 'native_design_reconstruction') and job.get("status") == "cancelling":
+        if (before.get("status") == "running" or before.get('kind') in {'native_design_reconstruction', 'prepare_portrait_beauty'}) and job.get("status") == "cancelling":
             with self._job_lock:
                 worker = self._job_workers.get(str(job_id))
-            if worker is None or not worker.is_alive():
+            if (worker is None or not worker.is_alive()) and not self._foreign_job_owner_alive(job):
                 job = self.jobs.update(
                     job_id, status="cancelled", stage="cancelled",
                     message="cancelled after backend restart; no delivery created",
@@ -1256,9 +1720,11 @@ class Backend:
     def source_run(self, run_id: str) -> dict[str, Any]:
         import single_source_workflow
         from pipeline_stage_report import read_stage_report
+        from preparation_currentness import preparation_currentness
         path, run = single_source_workflow.load_run(self.root, run_id)
         return {"ok": True, "run": run, "manifest": str(path),
-                "stage_report": read_stage_report(self.root, run, path)}
+                "stage_report": read_stage_report(self.root, run, path),
+                'preparation_currentness': preparation_currentness(self.root, run)}
 
     def source_run_history(self, run_id: str) -> dict[str, Any]:
         """Return the read-only parent/child history for one source run.
@@ -1364,11 +1830,45 @@ class Backend:
 
     def accept_source_run(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         import single_source_workflow
+        review_kind = body.get('review_kind', 'human')
+        if review_kind not in {'human', 'agent'}:
+            raise ValueError('review_kind must be human or agent')
         reviewer = str(body.get("reviewer") or "").strip()
         notes = str(body.get("visual_notes") or body.get("notes") or "")
+        if review_kind == 'agent':
+            # Agent observations may inform the human review. They cannot
+            # assert the eight human checks or enter the delivery gate.
+            with single_source_workflow._run_id_lock(self.root, str(run_id)):
+                path, run = single_source_workflow.load_run(self.root, run_id)
+                observations = body.get('observations')
+                if observations is not None and not isinstance(observations, (list, dict, str)):
+                    raise ValueError('Agent observations must be text, an object or a list')
+                run['agent_review'] = {'schema_version': 'agent_visual_observations.v1',
+                    'review_kind': 'agent', 'run_id': run_id, 'revision': run.get('revision'),
+                    'reviewer': reviewer, 'notes': notes, 'observations': copy.deepcopy(observations),
+                    'status': 'observations_only', 'human_approval': False,
+                    'recorded_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+                single_source_workflow.write_json(path, run)
+            return {'ok': True, 'run': run, 'review_kind': 'agent', 'product_state': 'pending_review',
+                    'human_approval': False, 'message': '已记录辅助审片观察，仍需人工审片与批准。'}
         checks = body.get("checks") if isinstance(body.get("checks"), dict) else None
         run = single_source_workflow.accept_run(self.root, run_id, reviewer=reviewer, notes=notes, checks=checks)
-        return {"ok": True, "run": run}
+        # Only the ordinary review gate above can grant this product update.
+        # Never convert failed/cancelled execution history into successful work,
+        # and never attach a child's approval to its parent's execution record.
+        summary, report = self._workflow_product_result(run)
+        if summary.get('current_revision_visual_approved'):
+            with self.jobs.mutation():
+                for job in self.jobs.list():
+                    if str(job.get('run_id')) != str(run_id) or job.get('status') != 'succeeded':
+                        continue
+                    self.jobs.update(job['job_id'], product_state=summary['product_state'],
+                        stage='delivered' if summary['product_state'] == 'delivered' else 'accepted',
+                        message=self._workflow_completion_message(run, summary),
+                        result_summary={**(job.get('result_summary') or {}), **summary,
+                                        'workflow_status': run.get('status')},
+                        event_type='product_approved')
+        return {"ok": True, "run": run, 'product_state': summary['product_state'], 'stage_report': report}
 
     def source_deliveries(self, sample: str) -> dict[str, Any]:
         """Return read-only source-only delivery history and active pointer."""
@@ -1429,84 +1929,88 @@ class Backend:
                            preserve_project_selection=True)
             request.setdefault('reference', (previous.get('reference') or {}).get('path'))
             request.setdefault('generation_design', copy.deepcopy(previous.get('generation_design')))
-            return self._continue_checked_task(previous, request)
-        selected_preset = options.get("preset")
-        previous_prompt = options.get("effective_prompt") or options.get("prompt") or single_source_workflow.DEFAULT_PROMPT
-        previous_reference = previous.get("reference") if isinstance(previous.get("reference"), dict) else None
-        previous_error = previous.get("error") if isinstance(previous.get("error"), dict) else {}
-        # A candidate that already exists must be recoverable without another
-        # paid image request. Keep ordinary retries unchanged, but make local
-        # recovery the safe default after a local reconstruction failure.
-        local_recovery = bool(previous_reference and (
-            previous_error.get("kind") == "local_reconstruction_failed" or
-            previous.get("next_action") == "retry_local_processing"))
-        generate_requested = (body.get("generate") if body.get("generate") is not None
-                              else (False if local_recovery else True))
-        request = {"source": source, "parent_run_id": run_id, "sample": str(previous["sample"]),
-                   "generate": generate_requested, "async": body.get("async", True),
-                   "local_only": body.get('local_only', options.get('local_only', False)),
-                   "prompt": body["prompt"] if "prompt" in body else previous_prompt}
-        if isinstance(body.get("effective_prompt"), str):
-            request["effective_prompt"] = body["effective_prompt"]
-        elif "prompt" not in body and "preset" not in body:
-            request["effective_prompt"] = request["prompt"]
-        if body.get("provider") or options.get("provider"):
-            request["provider"] = body.get("provider") or options["provider"]
-        selected_model = body.get("model") or (options.get("model") if not body.get("provider") or body.get("provider") == options.get("provider") else None)
-        if selected_model:
-            request["model"] = selected_model
-        if "preset" in body:
-            request["preset"] = body["preset"]
-        elif isinstance(selected_preset, dict):
-            request["preset_snapshot"] = selected_preset
-        elif selected_preset:
-            request["preset"] = selected_preset
-        for key in ("denoise_strength", "alpha_backend", "residual",
-                    "algorithm_profile", "material_finish_profile", "model_registry",
-                    "appearance_revision", "manual_layers",
-                    "api_base", "api_url", "api_key_env", "size", "character_name", "character_notes",
-                    "character_profile", "vision_model", "variant_count", "variant_styles", "generation_design", "input_prompt"):
-            value = body.get(key, options.get(key))
-            if value is not None:
-                request[key] = value
-        if "prompt" in body and "input_prompt" not in body and "effective_prompt" not in body:
-            request["input_prompt"] = body["prompt"]
-        character_changed = any(key in body and body[key] != options.get(key, "") for key in ("character_name", "character_notes"))
-        if character_changed and "character_profile" not in body:
-            request.pop("character_profile", None)
-        if character_changed:
-            for key in ("prompt", "effective_prompt"):
-                if isinstance(request.get(key), str):
-                    request[key] = request[key].split("\n\nCHARACTER ART DIRECTION\n", 1)[0]
-        else:
-            previous_style = selected_preset.get('id') if isinstance(selected_preset,dict) else selected_preset
-            same_style = 'preset' not in body or (body['preset'] or None) == (previous_style or None)
-            previous_input = options.get('input_prompt') or (options.get('generation_design') or {}).get('input_prompt') or previous_prompt
-            same_input = request.get('input_prompt',previous_input) == previous_input
-            same_profile = ('character_profile' not in body or
-                            body['character_profile'] == options.get('character_profile',previous.get('character_profile')))
-            if same_style and same_input and same_profile and isinstance(request.get('effective_prompt'),str):
-                request['preserve_effective_prompt'] = True
-        actual_prompt = request.get('effective_prompt') or request['prompt']
-        request['prompt_template_version'] = prompt_template_version(actual_prompt,
-            saved_version=options.get('prompt_template_version') if actual_prompt == previous_prompt else None)
-        if body.get("reference"):
-            request["reference"] = body["reference"]
-        elif previous_reference and (local_recovery or body.get("generate") is False):
-            # Reuse the immutable candidate recorded in the failed run; the
-            # child still receives a new manifest and provenance lineage.
-            request["reference"] = previous_reference.get("path")
-        if body.get("sync") is True:
-            request["sync"] = True
-        return self.one_click(request)
+            return self._continue_checked_task(previous, request, resume_unsubmitted_region=True,
+                regional_reuse_core_box=body.get('regional_reuse_core_box'))
+        raise ValueError('Saved version has no current checked task contract; create a new creative task to retry')
 
     def select_source_variant(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         import single_source_workflow
         variant_id = str(body.get("variant_id") or "")
         if not variant_id:
             raise ValueError("variant_id is required")
-        run = single_source_workflow.select_source_variant(self.root, run_id, variant_id)
-        return {"ok": True, "run": run}
+        # Selection includes native model preparation. Return a durable job
+        # immediately instead of timing out the desktop's HTTP request.
+        _, parent = single_source_workflow.load_run(self.root, run_id)
+        if not any(row.get('variant_id') == variant_id for row in parent.get('variants', [])):
+            raise ValueError('unknown variant: ' + variant_id)
+        if body.get('async') is False:
+            run = single_source_workflow.select_source_variant(self.root, run_id, variant_id)
+            return {'ok': True, 'run': run}
+        with self._job_lock:
+            job_payload = {'kind': 'select_reference_variant', 'run_id': None,
+                'parent_run_id': run_id, 'variant_id': variant_id, 'source': parent['source']['path'],
+                'cancel_mode': 'cooperative_checkpoint', 'generates_reference': False}
+            job_payload['execution_binding'] = _execution_binding(job_payload, kind='select_reference_variant')
+            job = self.jobs.create(job_payload)
+            identifier = job['job_id']
+            worker = threading.Thread(target=self._run_variant_selection_job, args=(identifier,),
+                daemon=True, name='select-variant-' + identifier[-8:])
+            self._job_workers[identifier] = worker
+        worker.start()
+        return {'ok': True, 'async': True, 'job_id': identifier, 'job': job}
+
+    def _run_variant_selection_job(self, job_id):
+        import single_source_workflow as workflow
+        acquired = False
+        try:
+            while not self.jobs.is_cancel_requested(job_id):
+                acquired = self._worker_slots.acquire(timeout=.1)
+                if acquired:
+                    break
+            if not acquired:
+                self.jobs.update(job_id, status='cancelled', stage='cancelled', message='候选采用已取消。')
+                return
+            snapshot = self.jobs.get(job_id)
+            self._update_live_one_click_job(job_id, status='running', stage='selecting_reference', progress=.05,
+                message='正在绑定所选候选；不新增生图。')
+
+            def preparing(identifier):
+                self._update_live_one_click_job(job_id, stage='reference_preparation', progress=.25,
+                    run_id=identifier, message='正在准备所选参考的原片高清结果；完成后继续人像美化。')
+
+            run = workflow.select_source_variant(self.root, snapshot['parent_run_id'], snapshot['variant_id'], progress=preparing)
+            if self.jobs.is_cancel_requested(job_id):
+                self.jobs.update(job_id, status='cancelled', stage='cancelled', run_id=run['run_id'],
+                    message='候选采用已停止；已保存的本地版本保留，不自动继续后期。')
+            else:
+                summary, _ = self._workflow_product_result(run)
+                self._update_live_one_click_job(job_id, status='succeeded', stage='complete', progress=1,
+                    run_id=run['run_id'], message='所选参考的高清版本已保存，可继续人像美化。', result_summary=summary)
+        except Exception as exc:
+            cancelled = self.jobs.is_cancel_requested(job_id)
+            failure = None if cancelled else self._safe_workflow_error(exc=exc)
+            child_id = self.jobs.get(job_id).get('run_id')
+            if child_id:
+                try:
+                    child_path, child = workflow.load_run(self.root, child_id)
+                    if child.get('parent_run_id') == snapshot['parent_run_id']:
+                        workflow.append_event(child, 'cancelled' if cancelled else 'blocked',
+                            log_path=child_path.parent / 'logs' / 'run.log.jsonl')
+                        if failure:
+                            child['error'] = {'message': failure['message'], 'retryable': True,
+                                'kind': 'local_reconstruction_failed', 'candidate_retained': True,
+                                'automatic_image_retry': False}
+                        workflow.write_json(child_path, child)
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+            self.jobs.update(job_id, status='cancelled' if cancelled else 'failed', stage='cancelled' if cancelled else 'workflow',
+                message='候选采用已取消。' if cancelled else '所选参考的本地准备未完成；候选保留，可本地重试。',
+                error=failure)
+        finally:
+            if acquired:
+                self._worker_slots.release()
+            with self._job_lock:
+                self._job_workers.pop(job_id, None)
 
     def copy_source_run(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         import single_source_workflow
@@ -1531,17 +2035,25 @@ class Backend:
         return {"ok": run.get("status") != "blocked", "run": run}
 
     def model_setup(self, body=None):
-        from current_model_registry import registry_status, select_registry, save_user_config
+        from current_model_registry import save_user_config
+        from model_setup import setup_status, discover_and_configure, save_beauty_selection
         if body is None:
-            return {'ok': True, 'setup': registry_status(self.root)}
+            return {'ok': True, 'setup': setup_status(self.root)}
         with self._job_lock, self.jobs.configuration_change():
-            if isinstance(body.get('config'), dict):
-                setup = save_user_config(body['config'])
+            if body.get('action') == 'discover':
+                setup = discover_and_configure(self.root, body.get('directory'))
+                return {'ok': True, 'setup': setup}
+            if isinstance(body.get('beauty_config_path'), str):
+                save_beauty_selection(body['beauty_config_path'])
+            elif isinstance(body.get('config'), dict):
+                save_user_config(body['config'])
             elif isinstance(body.get('registry_path'), str) and body['registry_path'].strip():
-                setup = select_registry(body['registry_path'])
+                # Persist a copy so moving the source checkout won't lose the selection.
+                from current_model_registry import load_registry
+                save_user_config(load_registry(registry_path=body['registry_path']))
             else:
                 raise ValueError('Choose an existing model registry or provide model paths')
-        return {'ok': True, 'setup': setup}
+        return {'ok': True, 'setup': setup_status(self.root)}
 
     def status(self) -> dict[str, Any]:
         project_manifest = self.root / "project.json"
@@ -1567,8 +2079,58 @@ class Backend:
             
             "summary": {"selected_samples": 0}}, "stdout": "", "stderr": ""}
 
+    def _recovery_checkpoint_valid(self, run: dict, manifest_path: Path, active_runs: set[str]) -> bool:
+        """Validate a current task/checkpoint without starting inference or repair."""
+        status = run.get('status')
+        run_id = run.get('run_id')
+        if (run_id != manifest_path.parent.name or type(run.get('revision')) is not int
+                or run['revision'] < 1 or status in {'failed', 'blocked', 'cancelled', 'interrupted', 'accepted', 'delivered'}):
+            return False
+        options = run.get('options') or {}
+        try:
+            from creative_task import validate_task_plan
+            plan = validate_task_plan(run.get('task_plan') or options.get('task_plan'),
+                                      run.get('task_intent') or options.get('task_intent'))
+
+            def asset_exists(value):
+                value = value.get('path') if isinstance(value, dict) else value
+                if not isinstance(value, str) or not value:
+                    return False
+                path = Path(value)
+                return (path if path.is_absolute() else self.root / path).is_file()
+
+            source = run.get('source') or {}
+            planned_source = (plan.get('inputs') or {}).get('source') or {}
+            if not asset_exists(source) or not source.get('sha256') or source.get('sha256') != planned_source.get('sha256'):
+                return False
+            source_path = Path(source['path'])
+            source_path = source_path if source_path.is_absolute() else self.root / source_path
+            if sha256_file(source_path) != source['sha256']:
+                return False
+            if run_id in active_runs:
+                return True
+            if status == 'awaiting_reference':
+                return plan.get('mode') == 'create_reference' and any(isinstance(row, dict) and asset_exists(row.get('candidate_path'))
+                           for row in run.get('variants') or [])
+            if status != 'needs_visual_review':
+                return False
+            artifacts = run.get('artifacts') or {}
+            if not all(asset_exists(artifacts.get(key)) for key in ('auto_draft', 'render_master')):
+                return False
+            if run.get('reference') and not asset_exists(run['reference']):
+                return False
+            from pipeline_stage_report import read_stage_report
+            report = read_stage_report(self.root, run, manifest_path)
+            return bool((report.get('whole_work') or {}).get('saved_current_revision'))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return False
+
     def recovery(self) -> dict[str, Any]:
         """Return the resumable file-contract state without running a job."""
+        with self._job_lock, self.jobs.mutation():
+            return self._recovery_locked()
+
+    def _recovery_locked(self) -> dict[str, Any]:
         manifest_path = self.root / "project.json"
         manifest: dict[str, Any] = {}
         if manifest_path.is_file():
@@ -1580,6 +2142,12 @@ class Backend:
                 pass
         state = manifest.get("state") if isinstance(manifest.get("state"), dict) else {}
         source_runs: list[dict[str, Any]] = []
+        jobs = self.jobs_list()['jobs']
+        active_job_runs = {
+            str(job.get('run_id'))
+            for job in jobs
+            if job.get('status') in {'queued', 'running'} and job.get('run_id')
+        }
         source_root = self.root / "outputs" / "runs"
         if source_root.is_dir():
             for source_manifest in sorted(source_root.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -1589,6 +2157,11 @@ class Backend:
                     continue
                 if not isinstance(value, dict) or value.get("kind") != "single_input_run":
                     continue
+                run_status = str(value.get('status', 'unknown'))
+                # A run is resumable only while it has an active owner or a
+                # current, reviewable checkpoint.  Delivered/accepted runs
+                # remain history and must never reappear as recovery actions.
+                recoverable = self._recovery_checkpoint_valid(value, source_manifest, active_job_runs)
                 source_runs.append({
                     "run_id": value.get("run_id", source_manifest.parent.name),
                     "sample": value.get("sample"),
@@ -1597,13 +2170,14 @@ class Backend:
                     "supersedes": value.get("supersedes"),
                     "manifest": str(source_manifest.resolve()),
                     "delivery": str((self.root / "outputs" / "final_delivery" / "source_only" / str(value.get("sample")) / str(value.get("run_id"))).resolve()) if value.get("delivery_status") == "delivered" else None,
-                    "status": value.get("status", "unknown"),
+                    "status": run_status,
                     "review": value.get("review"),
                     "auto_draft": value.get("auto_draft"),
                     "next_action": value.get("next_action"),
-                    "recoverable": True,
+                    "recoverable": recoverable,
                 })
-        source_current = source_runs[0] if source_runs else None
+        recoverable_runs = [item for item in source_runs if item.get('recoverable')]
+        source_current = recoverable_runs[0] if recoverable_runs else None
         source_delivery_state: list[dict[str, Any]] = []
         try:
             import single_source_workflow
@@ -1628,7 +2202,7 @@ class Backend:
             "source_current": source_current,
             "source_runs": source_runs,
             "source_deliveries": source_delivery_state,
-            "jobs": self.jobs_list()['jobs'],
+            "jobs": jobs,
         }
 
 
@@ -1723,6 +2297,11 @@ def make_handler(backend: Backend):
                 self.send_json(backend.provider_settings())
             elif path == '/api/model-setup':
                 self.send_json(backend.model_setup())
+            elif path == '/api/workflow-nodes':
+                from cos_node_registry import catalogue, compile_workflow
+                compiled = compile_workflow('existing_reference')
+                self.send_json({'ok': True, 'nodes': catalogue(), 'editable_connections': False,
+                                'cache_contract': compiled['cache']})
             elif path == "/api/provider-settings/discover":
                 self.send_json(backend.discover_provider_settings())
             elif path == "/api/templates":
@@ -1837,9 +2416,7 @@ def make_handler(backend: Backend):
             path = urlparse(self.path).path
             try:
                 body = self.read_body()
-                if path == "/api/generate-reference":
-                    result = backend.generate_reference(body)
-                elif path == "/api/providers/health":
+                if path == "/api/providers/health":
                     result = backend.provider_health(body)
                 elif path == "/api/providers/dry-run":
                     result = backend.provider_dry_run(body)
@@ -1866,8 +2443,6 @@ def make_handler(backend: Backend):
                     result = backend.retry_task_batch_item(batch_id, body)
                 elif path == '/api/source-runs/export-batch':
                     result = backend.export_source_batch(body)
-                elif path == "/api/one-click":
-                    result = backend.one_click(body)
                 elif path == "/api/character/recognize":
                     result = backend.recognize_character(body)
                 elif path == "/api/generation/prepare":
@@ -1915,6 +2490,11 @@ def make_handler(backend: Backend):
                 elif path.startswith('/api/source-runs/') and path.endswith('/reconstruct-design'):
                     run_id = path.removeprefix('/api/source-runs/').removesuffix('/reconstruct-design').strip('/')
                     result = backend.reconstruct_source_design(run_id, body)
+                elif path.startswith('/api/source-runs/') and path.endswith('/prepare-portrait-beauty'):
+                    run_id = path.removeprefix('/api/source-runs/').removesuffix('/prepare-portrait-beauty').strip('/')
+                    if not run_id or '/' in run_id:
+                        raise ValueError('invalid_run_id')
+                    result = backend.prepare_portrait_beauty(run_id, body)
                 elif path == "/api/jobs":
                     result = backend.create_job(body)
                 elif path.startswith("/api/jobs/") and path.endswith("/cancel"):

@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
+from asset_identity import sha256_file
 
 KIND = 'reference_appearance_stack'
 SCHEMA = 'reference_appearance_stack.v2'
@@ -23,8 +24,9 @@ PREPARED_STAGES = ('reference_colour_match', 'reference_colour_blend',
 
 @lru_cache(maxsize=64)
 def _file_hash(path, modified, size, inode):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    # Preserve the wrapper's stat-keyed replay cache while sharing file
+    # identity with preparation and export validation.
+    return sha256_file(path)
 
 
 def verify_asset(asset):
@@ -52,6 +54,20 @@ def _validate_delta(path, modified, byte_size, digest, native_size):
                 raise ValueError('Appearance delta contains nonfinite values')
 
 
+def _validate_native_delta(values, native_size, *, asset_path=None):
+    """Check the fresh producer's array without unpacking its saved NPZ again."""
+    from native_array_storage import NativeArrayRowWriter
+    if isinstance(values, NativeArrayRowWriter):
+        values.validate_native_delta(asset_path, native_size)
+        return
+    if (not isinstance(values, np.ndarray) or values.dtype != np.float32
+            or values.shape != (native_size[1], native_size[0], 3)):
+        raise ValueError('Appearance delta must be live native float32 HWC RGB on the source canvas')
+    for top in range(0, native_size[1], 256):
+        if not np.isfinite(values[top:top+256]).all():
+            raise ValueError('Appearance delta contains nonfinite values')
+
+
 @lru_cache(maxsize=16)
 def _validate_mask(path, modified, digest, native_size):
     from design_reconstruction import _planes
@@ -65,11 +81,15 @@ def _validate_mask(path, modified, digest, native_size):
             raise ValueError('Appearance coverage/support must contain finite values between zero and one')
 
 
-def _validate_owned_base(layer, plan, run=None, *, require_controls=True):
+def _validate_owned_base(layer, plan, run=None, *, require_controls=True, native_controls=None,
+                         native_inputs=None):
     """Validate executable frozen assets, independent of producer code/paths."""
     params = layer.get('params') or {}
     native = tuple(plan.get('canvas', {}).get('source_oriented_size', ()))
     baseline = (plan.get('source_baseline') or {}).get('assets') or {}
+    if native_inputs is not None and (not isinstance(native_inputs, dict)
+            or set(native_inputs) != {'alpha', 'automatic_delta'}):
+        raise ValueError('Live appearance inputs require this producer\'s complete alpha and delta')
     schema = params.get('schema')
     if (layer.get('kind') != KIND or schema != SCHEMA
             or plan.get('working_domain') != WORKING_DOMAIN
@@ -113,7 +133,18 @@ def _validate_owned_base(layer, plan, run=None, *, require_controls=True):
         raise ValueError('Changed coverage requires explicit appearance reprepare or retained-original applicability')
     verify_asset(current_alpha)
     alpha_path = Path(current_alpha['path']).resolve()
-    _validate_mask(str(alpha_path),alpha_path.stat().st_mtime_ns,current_alpha['sha256'],native)
+    if native_inputs is None:
+        _validate_mask(str(alpha_path),alpha_path.stat().st_mtime_ns,current_alpha['sha256'],native)
+    else:
+        alpha = native_inputs['alpha']
+        if (current_alpha['sha256'] != params['alpha_sha256']
+                or not isinstance(alpha, np.ndarray) or alpha.dtype != np.float32
+                or alpha.shape != (native[1], native[0])):
+            raise ValueError('Live appearance alpha must use the original native float32 coverage')
+        for top in range(0, native[1], 256):
+            band = alpha[top:top+256]
+            if not np.isfinite(band).all() or np.any(band < 0) or np.any(band > 1):
+                raise ValueError('Live appearance alpha must contain finite coverage between zero and one')
     if applicability is not None:
         if tuple(applicability.get('size', ())) != native:
             raise ValueError('Retained appearance applicability must share the native canvas')
@@ -128,9 +159,15 @@ def _validate_owned_base(layer, plan, run=None, *, require_controls=True):
     digest = verify_asset(delta)
     path = Path(delta['path']).resolve()
     stat = path.stat()
-    _validate_delta(str(path), stat.st_mtime_ns, stat.st_size, digest, native)
+    if native_inputs is None:
+        _validate_delta(str(path), stat.st_mtime_ns, stat.st_size, digest, native)
+    else:
+        _validate_native_delta(native_inputs['automatic_delta'], native, asset_path=delta['path'])
     control_assets = {}
     if require_controls:
+        if native_controls is not None and (not isinstance(native_controls, dict)
+                or set(native_controls) != {'colour_delta', 'lightness_delta'}):
+            raise ValueError('Live native controls require this producer\'s complete colour and lightness bank')
         if (params.get('control_recipe') != CONTROL_RECIPE
                 or params.get('control_source_delta_sha256') != digest):
             raise ValueError('Native independent controls must bind the original complete appearance delta')
@@ -146,8 +183,11 @@ def _validate_owned_base(layer, plan, run=None, *, require_controls=True):
                     or asset.get('representation') != 'premultiplied_delta'
                     or asset.get('coordinate_space') != 'source_canvas'):
                 raise ValueError('Independent corner deltas must be native associated RGB on the source canvas')
-            asset_path = Path(asset['path']).resolve(); asset_stat = asset_path.stat()
-            _validate_delta(str(asset_path),asset_stat.st_mtime_ns,asset_stat.st_size,control_assets[role],native)
+            if native_controls is None:
+                asset_path = Path(asset['path']).resolve(); asset_stat = asset_path.stat()
+                _validate_delta(str(asset_path),asset_stat.st_mtime_ns,asset_stat.st_size,control_assets[role],native)
+            else:
+                _validate_native_delta(native_controls[role], native, asset_path=asset['path'])
         import json
         receipt = json.loads(Path(layer['assets']['control_receipt']['path']).read_text(encoding='utf8'))
         from reference_appearance_controls import receipt_identity
@@ -201,14 +241,20 @@ def validate_layer(layer, plan, run=None):
     return checked
 
 
-def validate_controls(layer, plan, run=None):
-    """Producer-stage control check before its support report is published."""
-    return _validate_owned_base(layer, plan, run)
+def validate_controls(layer, plan, run=None, *, native_controls=None, native_inputs=None):
+    """Validate controls; only their fresh producer supplies its live arrays.
+
+    File identity, asset metadata and receipt binding always validate. Default
+    replay/reopen checks the saved array bytes; the immediate producer checks
+    its just-written arrays/row publications with the same shape/finite contract.
+    """
+    return _validate_owned_base(layer, plan, run, native_controls=native_controls,
+                                native_inputs=native_inputs)
 
 
-def validate_preparation(layer, plan, run=None):
+def validate_preparation(layer, plan, run=None, *, native_inputs=None):
     """Validate a fresh v2 producer input before deriving its control bank."""
-    return _validate_owned_base(layer, plan, run, require_controls=False)
+    return _validate_owned_base(layer, plan, run, require_controls=False, native_inputs=native_inputs)
 
 
 def apply_stack(foreground, layer, plan, run=None, *, box=None, canvas_size=None):

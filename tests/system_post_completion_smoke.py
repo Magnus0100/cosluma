@@ -25,6 +25,8 @@ def main():
             'reference': {'path': str(reference), 'sha256': workflow.sha256(reference)},
             'generation_design': {'schema_version': DESIGN_VERSION, 'status': 'ready'},
             'root': str(root), 'artifacts': {'auto_draft': str(reference)},
+            'task_intent': {'schema_version': 'cosplay_task_intent.v1', 'mode': 'create_reference',
+                            'services': {'text_vision': True, 'visual_review': True}},
             'options': {}, 'generation_budget': {'image_submissions': 0}}
         calls = []
         def review(current):
@@ -40,6 +42,15 @@ def main():
         review(run)
         args = SimpleNamespace(cosplay_correction_budget=1, generate=False, complete_post=True,
                                preserve_effective_prompt=False, cancel_request_path=None)
+        disabled = copy.deepcopy(run); disabled['run_id'] = 'review-disabled'
+        disabled['task_intent']['services'].pop('visual_review')
+        with patch('automatic_material_completion.complete_materials_once') as mat, \
+             patch('cosplay_post_completion.continue_cosplay_post') as sc, \
+             patch('automatic_foreground_effects.complete_effects_once') as fx, \
+             patch.object(workflow, 'diagnose_cosplay_post') as qa:
+            assert system.complete_once(root, disabled, args) is disabled
+            for producer in (mat, sc, fx, qa): producer.assert_not_called()
+            assert not (root / workflow.RUNS_DIR / disabled['run_id'] / 'system-post-completion').exists()
         def own(current, name):
             child = copy.deepcopy(current); child['parent_run_id'] = current['run_id']
             child['run_id'] = name; child['revision'] += 1

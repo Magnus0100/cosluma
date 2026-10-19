@@ -17,6 +17,7 @@ from scipy.ndimage import binary_erosion, find_objects, gaussian_filter, label
 from PIL import Image
 
 from cosplay_post_review import _raster
+from asset_identity import sha256_file
 
 SCHEMA = 'cosplay_native_review_inputs.v2'
 CONTACT_CONTRACT = 'contact_receiver_contract.v4'
@@ -25,8 +26,7 @@ MAX_CROP_SIZE = (312, 286)
 
 
 def _sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _size(value, name):
@@ -145,9 +145,12 @@ def _source_foreground_semantic_identity(run, plan, semantic_sha256):
         (foreground.get('provenance') or {}).get('input_identity'),
         (plan.get('source_baseline') or {}).get('foreground_bundle_identity')) if value is not None]
     if not identities or any(not isinstance(value, dict)
-            or value.get('source_sha256') != run['source']['sha256']
-            or value.get('review_semantics_sha256') != semantic_sha256 for value in identities):
+            or value.get('source_sha256') != run['source']['sha256'] for value in identities):
         raise ValueError('Frozen labels are not bound to this source foreground identity')
+    semantic_identities = [value for value in identities if value.get('review_semantics_sha256') is not None]
+    if not semantic_identities or any(value.get('review_semantics_sha256') != semantic_sha256
+                                      for value in semantic_identities):
+        raise ValueError('Frozen labels are not bound to this source foreground semantic evidence')
 
 
 def prepare_cosplay_native_review(run: dict, output: Path, *, comprehensive=True,

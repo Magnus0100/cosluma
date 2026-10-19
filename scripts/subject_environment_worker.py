@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from cache_roots import cache_dir
 
 SCHEMA = 'subject_environment_response.v1'
 RECIPE = 'final_subject_low_frequency_residual_v1'
@@ -26,11 +27,11 @@ OWNERS = (1, 4, 13, 23)
 # grain at a frequency absent from the validated field.  Proxy guidance still
 # gates interpolation across coarse material/semantic edges.
 from subject_environment_field import GUIDANCE_POLICY
+from asset_identity import sha256_file
 
 
 def sha(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def read(path):
@@ -66,6 +67,21 @@ def _verified(asset_record):
     return Path(asset_record['path']).resolve()
 
 
+def appearance_material_owners(labels, feature_domains, role):
+    """Replay the frozen appearance partition before checking map owners.
+
+    Cached semantic observations remain raw. Correspondence was prepared on
+    the derived T/B/S material labels, so its consumers must derive those same
+    labels rather than compare raw observations to appearance owners.
+    """
+    from local_face_protection import prepare_feature_materials
+    if feature_domains['schema'] != 'feature_material_domains.v1':
+        raise ValueError('Environment observations require current feature material domains')
+    labels, _, _ = prepare_feature_materials(
+        labels, np.zeros(labels.shape, np.float32), feature_domains[role+'_regions'])
+    return labels
+
+
 def load_observations(root, run, plan):
     """Reopen exact independent correspondence, labels and RGB by frozen hashes.
 
@@ -85,11 +101,13 @@ def load_observations(root, run, plan):
     stack = next(row for row in plan['layers'] if row['kind'] == 'reference_appearance_stack')
     snapshot_asset = stack['assets']['preparation_snapshot']
     snapshot = read(_verified(snapshot_asset))
+    feature_domains = snapshot['parameters']['feature_material_domains']
     record = snapshot['colour_layer']['local_correspondence']
     expected = record['inputs']
     native, proxy = plan['canvas']['source_oriented_size'], plan['canvas']['source_proxy_size']
     labels, _ = load_source_semantics(plan['mask_roles']['source_semantics'],
         source_sha256=run['source']['sha256'], native_size=native, proxy_size=proxy)
+    labels = appearance_material_owners(labels, feature_domains, 'source')
     if (record.get('schema') != 'automatic_local_correspondence_record.v2'
             or expected['source_sha256'] != run['source']['sha256']
             or expected['reference_sha256'] != run['reference']['sha256']
@@ -127,7 +145,7 @@ def load_observations(root, run, plan):
     for role in ('source', 'reference'):
         digest = expected['cached_rgb_sha256'][role]
         for base in roots:
-            candidates = (base/'outputs/cache/local-analysis'/run[role]['sha256'][:16]).glob('*/source-srgb.png')
+            candidates = (cache_dir(base, 'local-analysis')/run[role]['sha256'][:16]).glob('*/source-srgb.png')
             for path in sorted(candidates):
                 if sha(path) == digest:
                     rgb_assets[role] = asset(path); break
@@ -135,10 +153,11 @@ def load_observations(root, run, plan):
         if role not in rgb_assets:
             raise ValueError('Environment reference observations need the exact bound decoded RGB: '+role)
     for base in roots:
-        candidates = (base/'outputs/cache/local-analysis'/run['reference']['sha256'][:16]).glob('*/semantics/labels.npz')
+        candidates = (cache_dir(base, 'local-analysis')/run['reference']['sha256'][:16]).glob('*/semantics/labels.npz')
         for path in sorted(candidates):
             with np.load(path, allow_pickle=False) as data:
                 candidate = cv2.resize(data['labels'], (rw, rh), interpolation=cv2.INTER_NEAREST)
+            candidate = appearance_material_owners(candidate, feature_domains, 'reference')
             if array_sha(candidate) == expected['reference_labels_sha256']:
                 reference_labels = candidate; label_asset = asset(path); break
         if reference_labels is not None: break
@@ -156,8 +175,14 @@ def load_observations(root, run, plan):
         reference = cv2.resize(reference, (rw, rh), interpolation=cv2.INTER_AREA)
     proof = {'snapshot': asset(snapshot_asset['path']), 'receipt': asset(receipt_path),
         'map': dict(map_record), 'decoded_rgb': rgb_assets, 'reference_labels': label_asset,
+        'feature_material_domains': copy.deepcopy(feature_domains),
         'input_binding': expected, 'independent_geometry_verified': True,
-        'model_inferences': 0, 'reference_texture_imported': False}
+        'model_inferences': 0, 'reference_texture_imported': False,
+        # Retain the independently bound landmark observation for the strict
+        # hair-boundary fallback producer.  It is evidence only; no face
+        # affine is admitted without a fresh alpha/owner contour check.
+        'face_observations': copy.deepcopy(record.get('face_observations', {})),
+        'face_producer_identity_sha256': expected.get('producer_identity_sha256')}
     return labels, reference_labels, reference, maps, proof
 
 

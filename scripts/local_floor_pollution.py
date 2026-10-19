@@ -381,15 +381,27 @@ def prepare_candidate_floor_pollution(root,scene,*,registry_path=None):
     request_path=directory/'candidate-input.json'
     request_path.write_text(json.dumps(inputs,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     log_path=directory/'worker.log'
-    with log_path.open('w',encoding='utf-8') as log:
-        completed=subprocess.run([str(paths['python']),'-X','utf8',
-            str(code_path('sam3_floor_worker.py')),'--candidate-input',str(request_path),
-            '--output-dir',str(directory),'--model-root',str(paths['models'])],
-            stdout=log,stderr=log,timeout=300,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
-            env={**os.environ,'PYTHONIOENCODING':'utf-8'})
+    try:
+        with log_path.open('w',encoding='utf-8') as log:
+            completed=subprocess.run([str(paths['python']),'-X','utf8',
+                str(code_path('sam3_floor_worker.py')),'--candidate-input',str(request_path),
+                '--output-dir',str(directory),'--model-root',str(paths['models'])],
+                stdout=log,stderr=log,timeout=300,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
+                env={**os.environ,'PYTHONIOENCODING':'utf-8'})
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {**base,'reason':'candidate_floor_detector_unavailable',
+                'analysis_status':'unsupported','worker_log':str(log_path.resolve()),
+                'worker_error':str(error),'elapsed_seconds':round(time.perf_counter()-started,3),
+                'provenance':{'candidate_sha256':scene['candidate']['sha256'],
+                    'source_reflection_geometry_unioned':False,'source_registration_required':False}}
     if completed.returncode:
-        raise RuntimeError(f'Candidate floor detector failed; see {log_path}')
+        return {**base,'reason':'candidate_floor_detector_unavailable',
+                'analysis_status':'unsupported','worker_log':str(log_path.resolve()),
+                'worker_returncode':completed.returncode,
+                'elapsed_seconds':round(time.perf_counter()-started,3),
+                'provenance':{'candidate_sha256':scene['candidate']['sha256'],
+                    'source_reflection_geometry_unioned':False,'source_registration_required':False}}
     detected=json.loads((directory/'candidate-floor-pollution.json').read_text(encoding='utf-8'))
     result={**base,**detected,**classify_pollution_result(detected),'identity':identity,
         'analysis_directory':str(directory.resolve()),

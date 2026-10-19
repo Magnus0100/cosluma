@@ -7,7 +7,6 @@ to this deployment. Otherwise the caller keeps the draft with a clear error.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +14,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from installed_resources import resource_path
+from asset_identity import sha256_file
 
 
 def _json(endpoint, name):
@@ -31,10 +31,13 @@ def ensure_effect_runtime(root):
     destination = folder/'ComfyUI/custom_nodes/cosplay_effect_canvas.py'
     if not source.is_file():
         raise RuntimeError('Native Qwen21 effect canvas node is missing from this installation')
-    expected_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    expected_sha = sha256_file(source)
     expected_description = 'Loaded effect canvas implementation SHA256: '+expected_sha
     destination.parent.mkdir(parents=True, exist_ok=True)
-    same = destination.is_file() and source.read_bytes() == destination.read_bytes()
+    # The source identity is stat-bound and persistent; only read the
+    # deployment copy when it exists.  Avoid loading the source twice on every
+    # worker start just to compare equal bytes.
+    same = destination.is_file() and sha256_file(destination) == expected_sha
     if not same:
         shutil.copyfile(source, destination)
     if service.service_status():

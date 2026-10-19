@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from pathlib import Path
+import sys
 import time
+import traceback
 
 import numpy as np
 from PIL import Image
@@ -39,7 +42,7 @@ def instances(output, *, size, concept):
 
 
 
-def run(args):
+def run(args, *, model_bundle=None, model_identity_value=None):
     import torch
     # The official builder eagerly creates CUDA positional buffers. CPU-only
     # installation checks therefore use safe checkpoint inspection, not this run.
@@ -48,11 +51,14 @@ def run(args):
     from scene_geometry import assemble_scene
     directory = Path(args.output_dir); directory.mkdir(parents=True, exist_ok=True)
     model_root = Path(args.model_root)
-    identity = model_identity(model_root)
+    identity = model_identity_value or model_identity(model_root)
     torch.set_num_threads(1)
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    model, processor = load_model(model_root, args.device, identity=identity)
+    if model_bundle is None:
+        model, processor = load_model(model_root, args.device, identity=identity)
+    else:
+        model, processor = model_bundle
     result = {'schema_version': 'local_scene_segmentation.v1', 'roles': {}, 'provenance': {
         'worker_sha256': sha(__file__), 'model_content_sha256': identity['content_sha256'],
         'checkpoint_loading': model._cosplay_strict_checkpoint,
@@ -130,14 +136,83 @@ def run(args):
     return assembled
 
 
+def service_main(args):
+    """Serve multiple scene requests while keeping the isolated SAM model alive.
+
+    The model is moved back to CPU after each request.  This keeps the worker's
+    process/import state warm without reserving VRAM between photos, so the
+    BeautyGRPO and local-generation stages retain their existing memory
+    contract.  stdout is a JSONL control channel; worker diagnostics go to
+    stderr and therefore cannot corrupt a response.
+    """
+    import torch
+    model_root = Path(args.model_root)
+    if args.device != 'cuda' or not torch.cuda.is_available():
+        raise RuntimeError('SAM3.1 persistent service requires the explicit CUDA runtime')
+    identity = model_identity(model_root)
+    model, processor = load_model(model_root, args.device, identity=identity)
+    print(json.dumps({'ready': True, 'profile': identity.get('specification', {}).get('profile'),
+                      'model_content_sha256': identity.get('content_sha256')}, ensure_ascii=False), flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        request_id = None
+        try:
+            request = json.loads(line)
+            request_id = request.get('request_id')
+            if request.get('shutdown') is True:
+                break
+            required = ('source', 'candidate', 'output_dir', 'model_root')
+            if any(key not in request for key in required):
+                raise ValueError('scene service request lacks a required path')
+            if Path(request['model_root']).resolve() != model_root.resolve():
+                raise ValueError('scene service model root changed while the process was running')
+            namespace = argparse.Namespace(
+                source=request['source'], candidate=request['candidate'],
+                output_dir=request['output_dir'], model_root=str(model_root),
+                source_subject_mask=request.get('source_subject_mask'),
+                candidate_subject_mask=request.get('candidate_subject_mask'),
+                device=args.device)
+            # The processor/model is returned to CPU after each request.  Move
+            # only the pinned detector; processor state is rebuilt per image.
+            if next(model.parameters()).device.type != 'cuda':
+                model.to(args.device)
+            with contextlib.redirect_stdout(sys.stderr):
+                run(namespace, model_bundle=(model, processor), model_identity_value=identity)
+            torch.cuda.synchronize()
+            model.to('cpu')
+            torch.cuda.empty_cache()
+            print(json.dumps({'ok': True, 'request_id': request_id}, ensure_ascii=False), flush=True)
+        except BaseException as exc:  # keep the service alive for the next request
+            traceback.print_exc(file=sys.stderr)
+            try:
+                if next(model.parameters()).device.type == 'cuda':
+                    model.to('cpu')
+                    torch.cuda.empty_cache()
+            except BaseException:
+                pass
+            print(json.dumps({'ok': False, 'request_id': request_id,
+                              'error': f'{type(exc).__name__}: {exc}'}, ensure_ascii=False), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'candidate', 'output-dir', 'model-root'):
-        parser.add_argument('--'+name, required=True)
+        # Service mode receives source/candidate/output-dir in JSONL requests;
+        # one-shot mode validates these arguments immediately below.
+        parser.add_argument('--'+name)
     parser.add_argument('--source-subject-mask'); parser.add_argument('--candidate-subject-mask')
     parser.add_argument('--device', default='cuda', choices=('cuda',))
+    parser.add_argument('--service', action='store_true',
+                        help='keep the isolated model process and accept JSONL requests on stdin')
     args = parser.parse_args()
-    run(args)
+    if args.service:
+        service_main(args)
+    else:
+        if not all((args.source, args.candidate, args.output_dir, args.model_root)):
+            parser.error('one-shot mode requires --source, --candidate, --output-dir and --model-root')
+        run(args)
 
 
 if __name__ == '__main__':

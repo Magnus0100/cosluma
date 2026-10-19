@@ -106,9 +106,17 @@ def build_registry_fixture(root, *, name='models'):
     return registry
 
 
-def mocked_task_capability(config, *, mode='existing_reference'):
+def mocked_task_capability(config, *, mode='existing_reference', **kwargs):
     """Explicit model-capability mock for task/API contract tests, not acceptance."""
-    return {'schema_version': preflight.SCHEMA, 'mode': mode, 'ready': True,
+    requested = preflight.required_capabilities(mode,
+        execution_strategy=kwargs.get('execution_strategy', 'layered_reference_transfer'),
+        complete_post=kwargs.get('complete_post'),
+        use_beautygrpo=kwargs.get('use_beautygrpo', False))
+    required_path_keys = sorted({key for name in requested for key in preflight.CAPABILITY_KEYS.get(name, ())})
+    return {'schema_version': preflight.SCHEMA, 'mode': mode,
+        'execution_strategy': kwargs.get('execution_strategy', 'layered_reference_transfer'),
+        'required_capabilities': sorted(requested), 'required_model_groups': [],
+        'required_path_keys': required_path_keys, 'ready': True,
         'blocking_reasons': [], 'checks': [], 'file_structure_verified': False,
         'checked_identity_verified': False, 'recorded_identity_verified': False,
         'small_file_identity_verified': False, 'weight_checks': [], 'weight_content_verified': False,
@@ -165,6 +173,33 @@ def main():
              patch.object(subprocess, 'Popen', side_effect=AssertionError('Runtime launched')):
             local = preflight.inspect_task_models(config, mode='local_portrait')
             assert local['ready'] and local['file_structure_verified']
+            # A local portrait must not be held hostage by full-reference
+            # components that this route never opens.
+            local_unrelated = dict(config)
+            for key in ('dinov3_model_root', 'scene_python', 'scene_model_root',
+                        'lama_checkpoint', 'background_sr_checkpoint',
+                        'face_model_path', 'face_python'):
+                local_unrelated[key] = str(root / 'missing-local-unrelated' / key)
+            local_without_reference_models = preflight.inspect_task_models(
+                local_unrelated, mode='local_portrait')
+            assert local_without_reference_models['ready']
+            assert local_without_reference_models['required_capabilities'] == ['source_silhouette']
+            assert local_without_reference_models['required_model_groups'] == ['alpha_seed']
+            assert not any(row['key'].startswith(('dinov3.', 'sam31.', 'face_runtime',
+                                                   'background_sr_runtime'))
+                           for row in local_without_reference_models['checks'])
+            # The current local route also does not invoke the layered
+            # semantic/matting stack.  Missing Sapiens2 and ViTMatte must not
+            # turn an otherwise runnable silhouette edit into a blocked task.
+            local_without_geometry = dict(local_unrelated)
+            for key in ('python', 'semantics_checkpoint', 'semantics_repo_dir',
+                        'vitmatte_model_root'):
+                local_without_geometry[key] = str(root / 'missing-local-geometry' / key)
+            local_silhouette_only = preflight.inspect_task_models(
+                local_without_geometry, mode='local_portrait')
+            assert local_silhouette_only['ready']
+            assert not any(row['key'].startswith(('sapiens.', 'vitmatte.'))
+                           for row in local_silhouette_only['checks'])
             assert not local['checked_identity_verified'] and not local['recorded_identity_verified']
             assert not local['weight_content_verified'] and not local['inference_verified']
             full = preflight.inspect_task_models(config)
@@ -175,6 +210,16 @@ def main():
             assert _row(full, 'sam31.weight_provenance')['available']
             assert _row(full, 'dinov3.architecture')['available']
             assert preflight.inspect_task_models(config, mode='create_reference')['ready'] is False
+            with patch('model_setup.beauty_status', return_value={'available': False,
+                    'config_path': str(root/'missing-beauty.json'),
+                    'error': 'Beauty installation receipt is missing'}) as beauty:
+                checked = preflight.inspect_task_models(config, mode='create_reference', use_beautygrpo=True)
+                assert not _row(checked, 'portrait_beauty.installation')['available']
+                assert checked['capability_status']['portrait_beauty']['ready'] is False
+                assert 'Beauty installation receipt is missing' in checked['blocking_reasons']
+                beauty.assert_called_once()
+            with patch('model_setup.beauty_status', side_effect=AssertionError('Unused Beauty inspected')):
+                preflight.inspect_task_models(config, mode='local_portrait')
         assert hashed and full['hash_bytes_read'] > 0 and full['large_weight_bytes_hashed'] == 0
         assert not ({'torch', 'transformers', 'numpy', 'onnxruntime', 'mediapipe'} & (set(sys.modules) - modules_before))
         assert _snapshot(root) == before, 'Model preflight mutated installation'
@@ -194,16 +239,16 @@ def main():
         for name in ('config.json', 'preprocessor_config.json', 'model.safetensors'):
             key = {'config.json': 'vitmatte.config', 'preprocessor_config.json': 'vitmatte.preprocessor',
                 'model.safetensors': 'vitmatte.checkpoint'}[name]
-            modify(matting / name, None, key, mode='local_portrait')
+            modify(matting / name, None, key, mode='existing_reference')
         modify(matting / 'config.json', b'{"model_type":"vitmatte","hidden_size":768}',
-            'vitmatte.architecture', mode='local_portrait')
-        modify(matting / 'preprocessor_config.json', b'not json', 'vitmatte.preprocessor.json', mode='local_portrait')
-        modify(config['semantics_checkpoint'], b'', 'sapiens.checkpoint', mode='local_portrait')
+            'vitmatte.architecture', mode='existing_reference')
+        modify(matting / 'preprocessor_config.json', b'not json', 'vitmatte.preprocessor.json', mode='existing_reference')
+        modify(config['semantics_checkpoint'], b'', 'sapiens.checkpoint', mode='existing_reference')
         spec = sapiens_profile(PROFILES['semantics_profile'], 'segmentation')
-        modify(Path(config['semantics_repo_dir']) / spec['config'], None, 'sapiens.' + spec['config'], mode='local_portrait')
+        modify(Path(config['semantics_repo_dir']) / spec['config'], None, 'sapiens.' + spec['config'], mode='existing_reference')
         bad_manifest = Path(config['semantics_checkpoint']).parent / 'model-manifest.json'
         _json(bad_manifest, {'repository': spec['repository'], 'revision': spec['revision'], 'checkpoint_sha256': '0'*64})
-        assert not preflight.inspect_task_models(config, mode='local_portrait')['ready']
+        assert not preflight.inspect_task_models(config, mode='existing_reference')['ready']
         bad_manifest.unlink()
         dino = Path(config['dinov3_model_root'])
         for name in preflight.DINO_FILES:
@@ -223,10 +268,10 @@ def main():
             'sam31.code/sam3/assets/bpe_simple_vocab_16e6.txt.gz')
         modify(Path(config['onnx_runtime_root']) / 'onnxruntime/capi/onnxruntime_pybind11_state.pyd', None, 'onnx.native_module')
         metadata = Path(config['python']).parent.parent / 'Lib/site-packages/torch-fixture-only.dist-info/METADATA'
-        modify(metadata, None, 'human_runtime.torch', mode='local_portrait')
+        modify(metadata, None, 'human_runtime.torch', mode='existing_reference')
         ambiguous = metadata.parent.parent / 'torch-second.dist-info/METADATA'
         _write(ambiguous, b'Name: torch\nVersion: second\n')
-        assert not preflight.inspect_task_models(config, mode='local_portrait')['ready']
+        assert not preflight.inspect_task_models(config, mode='existing_reference')['ready']
         ambiguous.unlink(); ambiguous.parent.rmdir()
         assert _snapshot(root) == before
     print(json.dumps({'ok': True, 'standalone_public_fixture': True,

@@ -115,7 +115,13 @@ def main() -> int:
         _, parent = workflow.load_run(root, "parent")
         child_dir = root / workflow.RUNS_DIR / child["run_id"]
         assert child["parent_run_id"] == "parent" and child["revision"] == 2
-        assert child["options"] == parent["options"]
+        parent_options, child_options = copy.deepcopy(parent['options']), copy.deepcopy(child['options'])
+        parent_geometry = parent_options.pop('source_only_geometry')
+        child_geometry = child_options.pop('source_only_geometry')
+        assert child_options == parent_options
+        assert {k:v for k,v in child_geometry.items() if k != 'path'} == {k:v for k,v in parent_geometry.items() if k != 'path'}
+        assert Path(child_geometry['path']).is_relative_to(child_dir)
+        assert Path(child_geometry['path']).read_bytes() == Path(parent_geometry['path']).read_bytes()
         assert child["source"] == parent["source"]
         assert child['reference'] is None
         assert child["status"] == "needs_visual_review" and "delivered" not in child["artifacts"]

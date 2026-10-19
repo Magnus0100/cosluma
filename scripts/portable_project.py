@@ -5,11 +5,13 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import re
 import shutil
 import zipfile
 from pathlib import Path
 from datetime import datetime, timezone
+from asset_identity import sha256_file
 
 FORMAT = 'cosplay.portable-project.v2'
 ASSET = 'cosplay-asset://'
@@ -29,14 +31,58 @@ def _json(value):
 
 
 def _hash(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(4*1024*1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # All content identities share the stat-bound cache. Extraction still
+    # performs a full SHA-256 on each newly written asset; later validation of
+    # the same immutable bytes reuses that verified identity instead of reading
+    # every large native plane a second time during import.
+    return sha256_file(path)
 
 
-def _validate_current_project(run):
+def validate_portrait_beauty(run, *, verify_assets=True):
+    """Check frozen source identity without a model or absolute-path binding."""
+    control = ((run.get('options') or {}).get('appearance_revision') or {}).get('portrait_beauty')
+    if not control:
+        return None
+    if not isinstance(control, dict) or set(control) - {'result', 'strength', 'disabled_faces'}:
+        raise ValueError('Beauty revision requires result, strength and disabled_faces')
+    strength = control.get('strength', 1.)
+    disabled = control.get('disabled_faces', [])
+    if (isinstance(strength, bool) or not isinstance(strength, (int, float))
+            or not math.isfinite(strength) or not 0 <= strength <= 1
+            or not isinstance(disabled, list) or any(not isinstance(value, str) for value in disabled)
+            or not isinstance(control.get('result'), str) or not control['result']):
+        raise ValueError('Invalid frozen beauty controls')
+    if not verify_assets:
+        return None  # Archive locators are resolved only after extraction.
+    if not Path(control['result']).is_absolute():
+        raise ValueError('Frozen beauty results require an absolute JSON path')
+    from portrait_beauty_layer import load_result
+    from display_transform import source_transform_for_run
+    from native_source_baseline import retouch_identity
+    result, path = load_result(control['result'])
+    plan = ((run.get('options') or {}).get('appearance_revision') or {}).get('design_reconstruction_plan') or {}
+    baseline = plan.get('source_baseline') or (run.get('options') or {}).get('source_only_plan') or {}
+    native_size = baseline.get('native_size') or (plan.get('canvas') or {}).get('source_oriented_size')
+    retouch = retouch_identity(run)
+    stable = {key: retouch[key] for key in ('delta_sha256', 'source_sha256', 'working_domain')} if retouch else None
+    if (result['source_sha256'] != (run.get('source') or {}).get('sha256')
+            or result['source_display'] != source_transform_for_run(run)
+            or result['native_size'] != native_size or result.get('native_source_retouch') != stable
+            or set(disabled) - {face['id'] for face in result['faces']}):
+        raise ValueError('Frozen beauty layer differs from its source, display, retouch or faces')
+    for face in result['faces']:
+        for key in ('pixels', 'model_output'):
+            asset = face.get(key)
+            if not asset:
+                continue
+            target = Path(asset['path'])
+            target = target if target.is_absolute() else path.parent / target
+            if _hash(target) != asset['sha256']:
+                raise ValueError('Frozen beauty asset changed: '+str(target))
+    return result, path
+
+
+def _validate_current_project(run, *, verify_beauty_assets=True):
     from design_reconstruction import render_mode_for_run,plan_for_run,validate_current_native_plan
     from display_transform import plan_for_run as display_plan_for_run
     from raw_support import RGB_DECODE_VERSION
@@ -56,6 +102,7 @@ def _validate_current_project(run):
                 or len(local.get('native_size') or [])!=2):
             raise ValueError('Current source-only project plan is missing or contaminated by a reference')
     display_plan_for_run(run)
+    validate_portrait_beauty(run, verify_assets=verify_beauty_assets)
     return bool(plan)
 
 
@@ -66,6 +113,9 @@ def export_project(root, run_id, archive, *, include_raw=True, include_design=Tr
     root, archive = Path(root).resolve(), Path(archive).resolve()
     manifest, run = load_run(root, run_id)
     _validate_current_project(run)
+    run = copy.deepcopy(run)
+    for key in ('export_receipts', 'reopen_evidence', 'portable_import'):
+        run.pop(key, None)
     if archive.exists():
         raise FileExistsError(f'Project package already exists: {archive}')
     if not include_raw and not enabled(plan_for_run(run)):
@@ -194,7 +244,7 @@ def import_project(root, archive, *, run_id=None):
         package=json.loads(bundle.read('project.json'))
         if package.get('format')!=FORMAT:
             raise ValueError('Unsupported portable project format')
-        _validate_current_project(json.loads(bundle.read('run.json')))
+        _validate_current_project(json.loads(bundle.read('run.json')), verify_beauty_assets=False)
         identifier=run_id or package['run_id']
         if not identifier or '/' in identifier or '\\' in identifier or identifier in {'.','..'}:
             raise ValueError('Invalid imported run ID')
@@ -272,6 +322,8 @@ def import_project(root, archive, *, run_id=None):
             for name in original_json:
                 rewrite_json(name)
             run=relocated(json.loads(bundle.read('run.json')))
+            for key in ('export_receipts', 'reopen_evidence', 'portable_import'):
+                run.pop(key, None)
             native=_validate_current_project(run)
             original_run_id=run['run_id']
             original_render_identity={key:run.get('render',{}).get(key) for key in ('run_id','revision')}
@@ -284,7 +336,7 @@ def import_project(root, archive, *, run_id=None):
                                     'original_render_identity':original_render_identity}
             # Rebind only saved facts that actually belong to this imported
             # version. Stale inherited renders and ancestry remain unchanged.
-            if native and identifier!=original_run_id:
+            if identifier!=original_run_id:
                 render=run.get('render') or {}
                 if render.get('run_id')==original_run_id and render.get('revision')==run.get('revision'):
                     render['run_id']=identifier
@@ -295,17 +347,21 @@ def import_project(root, archive, *, run_id=None):
                 if continuation.get('rendered_run_id')==original_run_id and continuation.get('rendered_revision')==run.get('revision'):
                     continuation['rendered_run_id']=identifier
 
-            complete_inputs=package.get('include_raw') is True and package.get('include_design') is True
+            complete_inputs=(package.get('include_raw') is True and
+                (not run.get('reference') or package.get('include_design') is True))
             (directory/'manifest.json').write_bytes(_json(run))
             (directory/'portable-project.json').write_bytes(_json(package))
-            if native and complete_inputs:
+            if complete_inputs:
                 from project_cli import create_native_project_if_missing, manifest_path
                 from session_draft import binding_for_run
-                if not (run.get('source') or {}).get('sha256') or not (run.get('reference') or {}).get('sha256'):
-                    raise ValueError('Native editable imports require source and design identities')
-                if (plan.get('source_sha256')!=run['source']['sha256']
-                        or plan.get('candidate_sha256')!=run['reference']['sha256']):
-                    raise ValueError('Native editable import does not match its source/design bindings')
+                if not (run.get('source') or {}).get('sha256'):
+                    raise ValueError('Editable imports require a source identity')
+                if native:
+                    if not (run.get('reference') or {}).get('sha256'):
+                        raise ValueError('Native editable imports require a design identity')
+                    if (plan.get('source_sha256')!=run['source']['sha256']
+                            or plan.get('candidate_sha256')!=run['reference']['sha256']):
+                        raise ValueError('Native editable import does not match its source/design bindings')
                 project_created=create_native_project_if_missing(root,default_sample=str(run['sample']))
                 if project_created:
                     created_project_sha=_hash(manifest_path(root))
@@ -315,6 +371,19 @@ def import_project(root, archive, *, run_id=None):
                 for asset in binding['assets']:
                     if verified_hashes.get(str(Path(asset['path']).resolve()))!=asset['sha256']:
                         raise ValueError('Imported editable asset is missing or has a different identity: '+asset['path'])
+            # Extraction verified every asset; record this workspace and saved
+            # revision separately, never as a claim of process-resume testing.
+            from artifact_receipts import file_stamp, write_receipt
+            saved = {}
+            for key in ('auto_draft', 'render_master', 'render_scene_master'):
+                value = (run.get('artifacts') or {}).get(key)
+                if value and str(Path(value).resolve()) in verified_hashes:
+                    target = Path(value).resolve()
+                    saved[key] = {'path': str(target), 'sha256': verified_hashes[str(target)], 'stamp': file_stamp(target)}
+            if len(saved) == 3:
+                write_receipt(root, run, {'schema_version': 'portable_import_receipt.v1',
+                    'asset_checksums_verified': True, 'asset_count': len(verified_hashes),
+                    'saved_render_artifacts': saved, 'created_at': datetime.now(timezone.utc).isoformat()})
             import workbench_store
             workbench_store.record_recent(root,sample=str(run['sample']),run_id=identifier,source=run['source']['path'])
         except BaseException:

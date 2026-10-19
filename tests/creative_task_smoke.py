@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import creative_task as task
 import task_model_preflight
 from backend_server import Backend, LocalHTTPServer, make_handler
 from current_model_registry import DIRECTORY_KEYS, PATH_KEYS, PROFILES, SCHEMA
+from task_model_preflight_smoke import mocked_task_capability
 
 
 def rejected(fn):
@@ -58,13 +60,15 @@ def fixture(root):
 def intent(mode):
     return {'schema_version': task.INTENT_SCHEMA, 'mode': mode, 'brief': '统一暗调、保持妆造',
             'constraints': {'preserve_background': mode == 'local_portrait', 'no_effects': mode == 'local_portrait'},
-            'services': {'text_vision': mode != 'local_portrait'}}
+            'services': {'text_vision': False, 'visual_review': False}}
 
 
 def main():
     with tempfile.TemporaryDirectory(prefix='cosplay-creative-task-') as folder:
         root = Path(folder).resolve()
         registry, sources, reference = fixture(root)
+        from project_cli import _checked_one_click_args
+        rejected(lambda: _checked_one_click_args(argparse.Namespace(source=sources[0]), root))
         env = {'COSPLAY_PROVIDER_SETTINGS': str(root / 'provider-settings.json'),
                'COSPLAY_MODEL_SETTINGS': str(root / 'model-selection.json'),
                'COSPLAY_MODEL_REGISTRY': str(registry), 'TASK_TEST_KEY': 'local-test-only',
@@ -74,9 +78,8 @@ def main():
                   'algorithm_profile': 'dinov3_vitl16',
                   'material_finish_profile': 'owner_adaptive_multiscale_skin_v2'}
         with patch.dict(os.environ, env):
-            capability_patch = patch.object(task_model_preflight, 'inspect_task_models', return_value={
-                'schema_version': task_model_preflight.SCHEMA, 'ready': True, 'blocking_reasons': [],
-                'inference_verified': False, 'test_model_capability_mocked': True})
+            capability_patch = patch.object(task_model_preflight, 'inspect_task_models',
+                                            side_effect=mocked_task_capability)
             capability_patch.start()
             before = snapshot(root)
             with patch.object(urllib.request, 'urlopen', side_effect=AssertionError('Preflight requested network')):
@@ -87,10 +90,41 @@ def main():
                                               'creative_task': intent('create_reference')})
             assert snapshot(root) == before, 'Planning wrote project files'
             assert all(item['plan']['ready'] for item in (local, imported, created))
+            from cos_node_registry import compile_workflow
+            for item in (local, imported, created):
+                assert item['plan']['layer_workflow'] == compile_workflow(item['plan']['mode'])
+                task.validate_task_plan(item['plan'],item['plan']['intent'])
             assert local['plan']['services']['offline'] and not local['request']['complete_post']
             assert imported['plan']['image_budget'] == dict.fromkeys(task.image_budget(intent('existing_reference')), 0)
             assert imported['request']['complete_post'] and not imported['request']['generate']
             assert created['plan']['generation_submissions_upper_bound'] == 5
+            omitted = intent('create_reference'); omitted['services'].pop('visual_review')
+            omitted['services'].pop('text_vision')
+            assert task.normalize_task_intent(omitted)['services']['visual_review'] is False
+            assert task.normalize_task_intent(omitted)['services']['text_vision'] is False
+            assert created['plan']['services']['image_generation'] is True
+            assert created['plan']['services']['offline'] is False
+            for prepared in (local, imported, created):
+                assert prepared['plan']['intent']['services']['visual_review'] is False
+                assert prepared['plan']['services']['visual_review'] is False
+                assert not any('复审' in row['label'] for row in prepared['plan']['stages'])
+                assert '成片与匹配原尺寸审片窗口' not in prepared['plan']['services']['sent_content']
+            opted_in = copy.deepcopy(imported['request'])
+            opted_in['creative_task']['services']['text_vision'] = True
+            opted_in['creative_task']['services']['visual_review'] = True
+            reviewed_plan = task.plan_task(root, opted_in)
+            assert reviewed_plan['plan']['ready'] and reviewed_plan['request']['complete_post']
+            assert reviewed_plan['plan']['plan_id'] != imported['plan']['plan_id']
+            assert '成片与匹配原尺寸审片窗口' in reviewed_plan['plan']['services']['sent_content']
+            assert any('复审' in row['label'] for row in reviewed_plan['plan']['stages'])
+            assert task.execution_request(root, {**reviewed_plan['request'],
+                'plan_id': reviewed_plan['plan']['plan_id']})['task_intent']['services']['visual_review'] is True
+            for mode, enabled in (('local_portrait', False), ('existing_reference', False)):
+                invalid = intent(mode)
+                invalid['services'].update(text_vision=enabled, visual_review=True)
+                rejected(lambda: task.normalize_task_intent(invalid))
+            invalid = intent('create_reference'); invalid['services']['visual_review'] = 1
+            rejected(lambda: task.normalize_task_intent(invalid))
             for prepared in (local, imported, created):
                 repeated = task.plan_task(root, prepared['request'])
                 assert repeated['plan']['plan_id'] == prepared['plan']['plan_id'], 'Safe request changed plan identity'
@@ -121,9 +155,11 @@ def main():
                 rejected(lambda: task.plan_task(root, {**pending, **extra}))
             offline = copy.deepcopy(pending)
             offline['creative_task']['services']['text_vision'] = False
-            blocked = task.plan_task(root, offline)
-            assert not blocked['plan']['ready']
-            rejected(lambda: task.execution_request(root, {**blocked['request'], 'plan_id': blocked['plan']['plan_id']}))
+            unplanned = task.plan_task(root, offline)
+            assert unplanned['plan']['ready'] and unplanned['request']['complete_post']
+            assert unplanned['plan']['services']['text_vision_requests_upper_bound'] == 0
+            assert not task.execution_request(root, {**unplanned['request'],
+                'plan_id': unplanned['plan']['plan_id']})['task_intent']['services']['text_vision']
             deep = root / ('deep-' + 'a'*90)
             deep_before = snapshot(root)
             long_plan = task.plan_task(deep, imported['request'])
@@ -233,15 +269,18 @@ def main():
                     parent['task_intent'] = saved_intent
                     parent['options'].update({**common, 'task_intent': copy.deepcopy(saved_intent)})
                     parent['options'].pop('source')
+                    parent['task_plan'] = task.plan_task(root, {**common, 'source': parent['source']['path'],
+                        'reference': parent['reference']['path'], 'creative_task': saved_intent})['plan']
                     initial_parent = task.digest(parent)
                     with patch.object(workflow, 'load_run', return_value=(root / 'saved-manifest.json', parent)):
                         backend.complete_source_run(parent['run_id'], {})
                         assert calls[-1]['task_intent']['constraints'] == saved_intent['constraints']
                         assert sum(calls[-1]['task_plan']['image_budget'].values()) == 0
                         assert calls[-1]['cosplay_correction_budget'] == 0 and not calls[-1]['generate']
-                        backend.retry_source_run(parent['run_id'], {})
+                        retried = backend.retry_source_run(parent['run_id'], {})
                         assert calls[-1]['complete_post'] and not calls[-1].get('preserve_effective_prompt')
                         assert calls[-1]['task_intent'] == saved_intent and not calls[-1]['generate']
+                        backend.jobs.update(retried['job_id'],status='succeeded',stage='fixture_complete')
                         rejected(lambda: backend.retry_source_run(parent['run_id'], {'generate': True}))
                     assert task.digest(parent) == initial_parent, 'Continuation changed its saved parent'
                     for action in (backend.recognize_character, backend.prepare_generation):

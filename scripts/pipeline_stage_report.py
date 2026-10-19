@@ -76,7 +76,8 @@ def cosplay_review_state(run, *, current_render):
         and all(copied_hashes.get(key) and copied_hashes[key] == reviewed_hashes.get(key)
                 for key in ('auto_draft', 'render_master', 'render_scene_master'))
         and binding.get('final_sha256') == copied_hashes.get('auto_draft'))
-    binding_state = 'current' if matches else 'inherited_same_pixels' if inherited else 'stale' if review else 'unavailable'
+    binding_state = ('current' if matches else 'inherited_same_pixels' if inherited else
+                     'pending' if review.get('status') == 'pending' else 'stale' if review else 'unavailable')
     rows = []
     if matches or inherited:
         for key, label in COSPLAY_CHECK_LABELS.items():
@@ -86,8 +87,9 @@ def cosplay_review_state(run, *, current_render):
                 'correction_stage':check.get('correction_stage'), 'cause':check.get('cause','unresolved'),
                 'target':'final', 'evidence_scope':'whole_and_cited_native_windows',
                 'binding_state':binding_state})
-    return {'status':'reviewed' if matches else 'inherited' if inherited else 'unavailable' if review.get('status')=='unavailable'
-            else 'stale' if review else 'not_requested', 'current_render_binding_matches':matches,
+    return {'status':'reviewed' if matches else 'inherited' if inherited else 'pending' if review.get('status')=='pending'
+            else 'unavailable' if review.get('status')=='unavailable' else 'stale' if review else 'not_requested',
+            'current_render_binding_matches':matches,
             'checks':rows,'diagnosis_grants_visual_acceptance':False,
             'binding_state':binding_state, 'producer_run_id':binding.get('run_id'),
             'current_repair_authorized':False, 'repair_requires_current_full_qa':True,
@@ -100,9 +102,90 @@ def _record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _export_receipt_state(run: Mapping[str, Any], observations) -> dict[str, Any]:
+    """Pure reduction of current-workspace receipts observed by the reader."""
+    from artifact_receipts import binding_for_run
+    rows = _record(observations.get('artifact_receipts')).get('exports') or []
+    valid: list[dict[str, Any]] = []
+    formats: dict[str, dict[str, Any]] = {}
+    depths = {'PNG': 8, 'JPEG': 8, 'TIFF': 8, 'TIFF16': 16, 'TIFF32_LINEAR': 32}
+    for row in rows:
+        if (not isinstance(row, dict) or row.get('schema_version') != 'source_export_receipt.v2'
+                or row.get('status') != 'succeeded' or row.get('binding') != binding_for_run(run)
+                or row.get('files_unchanged') is not True or row.get('metadata_matches') is not True):
+            continue
+        fmt = row.get('format')
+        hashes = [run.get('source', {}).get('sha256'), _record(row.get('saved_render')).get('sha256'),
+                  _record(row.get('export')).get('sha256')]
+        if (fmt not in depths or row.get('actual_bit_depth') != depths[fmt]
+                or any(not isinstance(value, str) or len(value) != 64
+                       or any(c not in '0123456789abcdef' for c in value) for value in hashes)):
+            continue
+        receipt = dict(row)
+        valid.append(receipt)
+        formats[fmt] = receipt
+    return {
+        'valid': valid,
+        'formats': sorted(formats),
+        'complete': bool(valid),
+        'verification_basis': 'exporter_checksums_and_unchanged_file_stats; no_refresh_pixel_hashing',
+    }
+
+
 def _layers(value: Any) -> dict[str, dict[str, Any]]:
     return {str(item.get("kind")): item for item in value
             if isinstance(item, dict) and item.get("kind")} if isinstance(value, list) else {}
+
+
+def portrait_beauty_reference_fit_state(run, observation=None):
+    """Compare saved fit inputs without granting or refusing frozen replay.
+
+    The identity observation reads only the small Beauty result JSON. Pixel
+    integrity remains the renderer's responsibility; this report does not
+    hash assets, run models, or automatically refit after a control edit.
+    """
+    observation = _record(observation)
+    appearance = _record(_record(run.get('options')).get('appearance_revision'))
+    control = _record(appearance.get('portrait_beauty'))
+    plan = _record(appearance.get('design_reconstruction_plan'))
+    layer = _layers(plan.get('layers')).get('reference_appearance_stack', {})
+    params = _record(layer.get('params'))
+    recorded = bool(layer) and 'fit_beauty_identity' in params
+    observed = not control or observation.get('identity_observed') is True
+    current = observation.get('current_identity') if control else None
+    if control and not isinstance(current, dict):
+        observed = False
+    fit = params.get('fit_beauty_identity')
+    matches = (fit == current) if layer and recorded and observed else None
+    state = ('not_requested' if not layer else 'not_recorded' if not recorded else
+             'unavailable' if not observed else 'matched' if matches else 'changed')
+    reprepare = (None if state == 'unavailable' else
+                 state in {'changed', 'not_recorded'})
+    detail = {
+        'not_requested': '当前没有参考仿色融合层，无需重新准备参考匹配。',
+        'not_recorded': '参考融合层未记录美化拟合来源；建议用当前美化重新准备参考匹配。',
+        'unavailable': '当前美化身份暂不可读取；恢复美化资产后再核对参考匹配来源。',
+        'matched': '参考仿色融合使用的美化来源与当前设置一致。',
+        'changed': '当前美化设置已改变；可继续重放已有融合层，建议重新准备参考匹配以适应新外观。',
+    }[state]
+    strength = (current.get('strength') if observed and control else
+                control.get('strength', 1.) if control else None)
+    disabled = (current.get('disabled_faces', []) if observed and control else
+                control.get('disabled_faces') or [])
+    return {
+        'state': state, 'reference_layer_declared': bool(layer),
+        'fit_identity_recorded': recorded, 'current_identity_observed': observed,
+        'fit_dependency_matches': matches,
+        'current_strength': strength,
+        'disabled_faces': list(disabled) if isinstance(disabled, (list, tuple)) else [],
+        'fit_beauty_identity': fit, 'current_beauty_identity': current,
+        'reference_reprepare_recommended': reprepare, 'detail': detail,
+        'error': observation.get('error'),
+        'frozen_replay_blocked_by_fit_dependency': False,
+        'automatically_refits': False, 'model_inferences': 0,
+        'assets_rehashed': False, 'quality_acceptance_inferred': False,
+        'basis': 'saved_fit_identity_and_current_beauty_json_metadata',
+    }
 
 
 def _required_effect_state(run, diagnosis, *, source_only, visual_approved, fx_status):
@@ -112,6 +195,12 @@ def _required_effect_state(run, diagnosis, *, source_only, visual_approved, fx_s
     constraints = _record(brief.get('user_constraints'))
     required = (False if source_only or constraints.get('no_effects') or constraints.get('no_effects_quote')
                 or primary.get('mode') == 'none' else True if primary.get('mode') == 'scene_effect' else None)
+    direction = _record(run.get('creative_direction') or _record(run.get('options')).get('creative_direction'))
+    main_effect = _record(direction.get('main_effect'))
+    if direction.get('schema_version') == 'cosplay_creative_direction.v1':
+        required = (False if source_only or main_effect.get('mode') == 'none' else
+                    True if main_effect.get('mode') == 'user_described' else None)
+        primary = {'description':main_effect.get('description','')}
     final = next((row for row in diagnosis['checks'] if row['id'] == 'effects_space'), {})
     final_status = final.get('status', 'unknown')
     current = diagnosis['current_render_binding_matches']
@@ -472,12 +561,25 @@ def _product_result(run, diagnosis, *, draft_state, current_render, source_only,
     else:
         state='needs_visual_review'
     actions=[]
-    def action(action_id,label,supported,reason='',ids=(),qa=False):
+    def action(action_id,label,supported,reason='',ids=(),qa=False,generation=False):
         actions.append({'action_id':action_id,'label':label,'supported':bool(supported),
-            'reason':reason,'generation_required':False,'QA_required':qa,'finding_ids':list(ids)})
+            'reason':reason,'generation_required':generation,'QA_required':qa,'finding_ids':list(ids)})
     if state=='needs_local_recovery' and assets.get('source') and assets.get('reference'):
-        action('retry_local_processing','复用参考重试本地处理',bool(run.get('run_id')),
-               '沿用已有参考，不新增生图。')
+        regional_budget = _record(run.get('generation_budget'))
+        resume_region = (regional_budget.get('regional_refinement_outcome') == 'failed_no_submission'
+            and regional_budget.get('regional_refinement_image_budget') == 1
+            and regional_budget.get('regional_refinement_image_submissions') == 0)
+        reuse_candidate = (regional_budget.get('regional_refinement_outcome') == 'generated_rejected'
+            and regional_budget.get('regional_refinement_image_submissions') == 1)
+        action('retry_local_processing',
+               '复用已生成局部结果继续合成（不生图）' if reuse_candidate else
+               '复用参考并恢复未提交局部步骤（上限1次）' if resume_region else '复用参考重试本地处理',
+               bool(run.get('run_id')),
+               '核验已有局部结果及单图输入证据后，仅本地对齐与合成；可调整原模型上下文内的CPU区域，旧提交记录保留。' if reuse_candidate else
+               '严格核验零提交失败证明后，沿用已有参考并恢复原区域，至多一次局部生图。' if resume_region
+               else '沿用已有参考，不新增生图。',generation=resume_region)
+        if reuse_candidate:
+            actions[-1]['regional_candidate_reuse'] = True
     if reconstruction_required and assets.get('source') and assets.get('reference'):
         action('prepare_reconstruction','重新准备仿色融合',bool(run.get('run_id')),
                '准备当前本地图层，不新增生图。')
@@ -511,8 +613,7 @@ def _product_result(run, diagnosis, *, draft_state, current_render, source_only,
                     repair_reason += environment_repair['last_outcome_detail']
             action('repair_final_locally','重新审片并本地修复',
                    current_render and run.get('status')=='needs_visual_review'
-                   and assets.get('source') and assets.get('reference'),
-                   repair_reason,
+                   and assets.get('source') and assets.get('reference'), repair_reason,
                    [row['criterion'] for row in findings],qa=True)
     if current_render and state!='accepted':
         action('review_and_accept','进入人工审片',True,'按证据逐项复核，批准须单独确认。')
@@ -643,6 +744,7 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
     applied_plan = _record(_record(render.get("operator")).get("design_reconstruction_plan"))
     planned = _layers(plan.get("layers"))
     consumed = _layers(applied_plan.get("layers"))
+    beauty_fit = portrait_beauty_reference_fit_state(run, observations.get('portrait_beauty_identity'))
     provenance = _record(plan.get("provenance"))
     continuation = _record(run.get("continuation_edit"))
     run_status = str(run.get("status") or "pending")
@@ -658,7 +760,6 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
     if continuation:
         current_render = (current_render and continuation.get("rendered_run_id") == run.get("run_id")
                           and continuation.get("rendered_revision") == run.get("revision"))
-
     review = _record(observations.get("review"))
     checks = _record(review.get("checks"))
     review_matches = (bool(review) and review.get("run_id") == run.get("run_id")
@@ -725,6 +826,21 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
         identity_binding_matches=retouch_owned, attempt_status=source_attempt.get('status'),
         quality_acceptance_inferred=False))
 
+    beauty = _record(_record(options.get('appearance_revision')).get('portrait_beauty'))
+    beauty_receipt = _record(_record(render.get('operator')).get('portrait_beauty')) or _record(applied_plan.get('portrait_beauty'))
+    beauty_prepared = bool(beauty.get('result') and assets.get('portrait_beauty_layer'))
+    beauty_applied = bool(current_render and beauty_prepared and beauty_receipt.get('applied')
+        and beauty_receipt.get('strength') == beauty.get('strength',1.))
+    stages.append(_stage('portrait_beauty', 'BeautyGRPO 人像美化',
+        'complete' if beauty_applied else 'partial' if beauty_prepared else 'pending',
+        '模型生成外观已进入当前保存图；没有强制恢复原片纹理。' if beauty_applied else
+        '已准备生成脸部图层，可调整强度后保存。' if beauty_prepared else '当前版本尚未准备生成式美化图层。',
+        '比较本人、妆造与遮挡，必要时按人脸恢复原片。',
+        prepared=beauty_prepared,applied=beauty_applied,alpha_changed=False,
+        current_strength=beauty_fit['current_strength'],disabled_faces=beauty_fit['disabled_faces'],
+        reference_fit=beauty_fit,
+        source_texture_restoration=False,quality_acceptance_inferred=False))
+
     reference_complete = assets.get("reference") is True and bool(reference.get("sha256"))
     reference_status = "complete" if reference_complete else "failed" if reference and not assets.get("reference") else "partial" if assets.get("reference") else "pending"
     stages.append(_stage("design_reference", "设计参考", reference_status,
@@ -768,13 +884,19 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
         match_detail = '整体融合层已准备，当前关闭或强度为零；画面使用原人物外观。'
     if stack_declared and not supported_stage('reference_colour_match'):
         match_detail = '缺少可靠同材质颜色锚点；该自动仿色步骤不产生效果，保留原人物颜色并可继续编辑。'
+    if stack_declared and beauty_fit['state'] != 'matched':
+        match_detail += beauty_fit['detail']
     stages.append(_stage('reference_colour_match', '原图与参考图仿色',
         'unsupported' if stack_declared and not supported_stage('reference_colour_match') else
         'complete' if match_used and visual_approved else 'partial' if match_used or stack_prepared else local_status,
         match_detail if stack_declared else
         '按参考图匹配原片人物颜色，保留结构与纹理；已保存结果待审片。' if match_used else '尚未保存仿色结果。',
+        '用当前美化重新准备参考匹配；已有冻结融合层仍可保存和导出。' if beauty_fit['reference_reprepare_recommended'] else
         '检查原图、参考图与仿色结果。', applied=bool(match_used),
-        prepared=stack_prepared if stack_declared else subject_observation['persisted_binding_valid']))
+        prepared=stack_prepared if stack_declared else subject_observation['persisted_binding_valid'],
+        beauty_fit_dependency_matches=beauty_fit['fit_dependency_matches'],
+        reference_reprepare_recommended=beauty_fit['reference_reprepare_recommended'],
+        beauty_fit_dependency_state=beauty_fit['state']))
     if stack_declared:
         for stage_id, label, used_detail in (
                 ('reference_colour_blend', '参考颜色融合', '眼口与同材质参考颜色已随整体融合层应用；轮廓与纹理保留。'),
@@ -855,19 +977,46 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
 
     masters = (current_render and source_complete and (reference_complete or source_only) and assets.get("manifest")
                and assets.get("master") and assets.get("scene_master"))
-    save_status = "partial" if masters else "failed" if stopped else "partial" if current_render else "pending" if native else "unsupported"
+    export_state = _export_receipt_state(run, observations) if current_render else {'valid': [], 'formats': [], 'complete': False}
+    from artifact_receipts import binding_for_run
+    reopen_verified = bool(current_render and any(
+        row.get('schema_version') == 'portable_import_receipt.v1'
+        and row.get('binding') == binding_for_run(run)
+        and row.get('asset_checksums_verified') is True and row.get('files_unchanged') is True
+        for row in _record(observations.get('artifact_receipts')).get('imports') or []
+        if isinstance(row, dict)))
+    journey_complete = bool(masters and reopen_verified and export_state['complete'])
+    save_status = "complete" if journey_complete else "partial" if masters else "failed" if stopped else "partial" if current_render else "pending" if native else "unsupported"
     export_formats = ["PNG"] if current_render else []
     if current_render and assets.get("master"):
         export_formats.append("TIFF16")
     if current_render and assets.get("scene_master"):
         export_formats.append("TIFF32_LINEAR")
+    export_status = ('complete' if export_state['complete'] else
+                     'partial' if export_state['formats'] else 'pending')
+    if journey_complete:
+        save_detail = "工程与高清母版已保存；portable 导入已核验资产校验和，当前版本已导出所选格式。"
+        save_action = "继续编辑会创建新版本；当前版本已完成保存、重开与导出验收。"
+    elif masters:
+        save_detail = "本版本工程与高清母版已保存；保存、重开和导出分别记录，尚未形成完整回执链。"
+        save_action = "导出所需格式；如需迁移工程，可保存 portable 工程并在新工作区重开。"
+    else:
+        save_detail = "需先保存当前版本高清结果；待处理或中断编辑不能导出旧母版。"
+        save_action = "恢复本地处理并保存当前版本，再导出。"
     stages.append(_stage("save_and_export", "工程保存、重开与导出", save_status,
-                         "本版本工程与高清母版已保存，草稿可导出；实际重开、恢复和导出不能仅凭资产存在认定通过。" if masters else "需先保存当前版本高清结果；待处理或中断编辑不能导出旧母版。",
-                         "继续编辑会创建新版本；导出草稿后再检查实际位深与色彩空间。" if masters else "恢复本地处理并保存当前版本，再导出。",
+                         save_detail, save_action,
                          current_render_saved=bool(current_render), native_masters_present=bool(masters),
-                         exportable_formats=export_formats, export_completion="not_inferred_from_stored_masters",
-                         save_status="complete" if masters else "pending", reopen_status="pending", export_status="pending",
-                         process_resume_verified=False))
+                         exportable_formats=export_formats,
+                         export_completion="verified" if export_state['complete'] else
+                         "partial" if export_state['formats'] else "not_verified",
+                         save_status="complete" if masters else "pending",
+                         reopen_status="complete" if reopen_verified else "pending",
+                         export_status=export_status,
+                         export_receipts=export_state['valid'],
+                         verified_export_formats=export_state['formats'],
+                         portable_asset_checksums_verified=reopen_verified,
+                         process_resume_verified=False,
+                         refresh_rehashes_pixels=False))
 
     if source_only:
         for row in stages:
@@ -914,11 +1063,13 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
         'reference_colour_match_applied':bool(match_used),
         'reference_appearance_stack_prepared':stack_prepared,
         'reference_appearance_stack_applied':stack_used,
+        'portrait_beauty_reference_fit':beauty_fit,
         'reference_colour_blend_applied':stage_effect_used('reference_colour_blend') if stack_declared else False,
         'reference_scene_balance_applied':stage_effect_used('reference_scene_balance') if stack_declared else False,
         'current_recipe_render_saved':bool(current_render and (not stack_declared or not stack['enabled'] or stack_used)),
+        'output_strategy':'source_native_layers',
         'composition_applied':bool(background_used),
-        'save_reopen_export_journey_complete':False,
+        'save_reopen_export_journey_complete':journey_complete,
         'system_completion_attempted':bool(orchestration),
         'system_completion_status':orchestration.get('status'),
         'automatic_native_retouch_baseline_consumed':retouch_used,
@@ -945,6 +1096,7 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
             "reconstruction_required": reconstruction_required,
             "paired_subject_observation": subject_observation,
             "source_appearance_responsibility": source_responsibility,
+            "portrait_beauty_reference_fit": beauty_fit,
             "reference_appearance_stack": ({**stack, 'asset_present': bool(assets.get('reference_appearance_delta')),
                 'control_assets_present': not missing_controls, 'missing_control_assets': missing_controls,
                 'prepared': stack_prepared, 'applied': stack_used,
@@ -956,7 +1108,7 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
 
 
 def read_stage_report(root: Path, run: Mapping[str, Any], manifest_path: Path | None = None) -> dict[str, Any]:
-    """Collect only file-presence and the saved review; leave every asset intact."""
+    """Read presence, review and small Beauty identity metadata; preserve assets."""
     root = Path(root)
     artifacts = _record(run.get("artifacts"))
     plan = _record(_record(_record(run.get("options")).get("appearance_revision")).get("design_reconstruction_plan"))
@@ -983,7 +1135,26 @@ def read_stage_report(root: Path, run: Mapping[str, Any], manifest_path: Path | 
              "reference_appearance_control_receipt": path(stack.get('control_receipt')),
              "edge_support": path(applied.get("edge_applicability"))}
     paths['native_retouch_layer'] = path(_record(_record(run.get('options')).get('native_source_retouch')).get('layer'))
-    observations: dict[str, Any] = {"assets": {key: value is not None and value.is_file() for key, value in paths.items()}, "review": {}}
+    paths['portrait_beauty_layer'] = path(_record(_record(_record(run.get('options')).get('appearance_revision')).get('portrait_beauty')).get('result'))
+    from artifact_receipts import observe_receipts
+    observations: dict[str, Any] = {"assets": {key: value is not None and value.is_file() for key, value in paths.items()},
+                                    "review": {}, "artifact_receipts": observe_receipts(root, run)}
+    from portrait_beauty_layer import identity_for_run
+    beauty_run = dict(run)
+    beauty_options = dict(_record(run.get('options')))
+    beauty_appearance = dict(_record(beauty_options.get('appearance_revision')))
+    beauty_control = dict(_record(beauty_appearance.get('portrait_beauty')))
+    if beauty_control and paths['portrait_beauty_layer'] is not None:
+        beauty_control['result'] = str(paths['portrait_beauty_layer'])
+        beauty_appearance['portrait_beauty'] = beauty_control
+        beauty_options['appearance_revision'] = beauty_appearance
+        beauty_run['options'] = beauty_options
+    try:
+        observations['portrait_beauty_identity'] = {
+            'identity_observed': True, 'current_identity': identity_for_run(beauty_run)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        observations['portrait_beauty_identity'] = {
+            'identity_observed': False, 'current_identity': None, 'error': str(exc)}
     review_path = path(artifacts.get("visual_review"))
     if review_path is not None and review_path.is_file():
         try:
@@ -1034,6 +1205,8 @@ def format_stage_report(report: Mapping[str, Any]) -> str:
         for check in diagnosis.get('checks') or []:
             lines.append(f"Cos 成片 · {check['label']} · {states.get(check['status'],'证据不足')}：{check['reason']}")
         lines.append('自动看图诊断用于定位修正阶段；视觉批准仍须单独记录。')
+    elif diagnosis.get('status') == 'pending':
+        lines.append('Cos 成片自动诊断正在进行；当前草稿已保存，尚未产生可用审片证据或批准。')
     elif diagnosis.get('status') == 'unavailable':
         lines.append('Cos 成片自动诊断不可用；当前草稿仍须按六项标准审片。')
     elif diagnosis.get('status') == 'stale':

@@ -9,6 +9,9 @@ not rewritten here.
 from pathlib import Path
 import os
 import sys
+from runtime_resources import configure_cpu_runtime
+
+configure_cpu_runtime()
 
 
 DIRECTORIES = ('.', 'numpy.libs', 'scipy.libs', 'rawpy', 'onnxruntime/capi',

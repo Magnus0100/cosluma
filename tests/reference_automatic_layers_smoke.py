@@ -81,6 +81,30 @@ def main():
     observed,support,_=lowpass(noisy,np.ones((64,64),bool))
     assert float(observed[8:-8,8:-8,1].std())<float(noisy[...,1].std())*.1
     assert np.all(support==1) and np.isfinite(observed).all()
+    # Independently observed face visibility vetoes a wrong hair label without
+    # replacing that label or creating a new skin observation/target. The core
+    # is a disconnected solver domain, so adjacent hair evidence cannot refill it.
+    hair_labels=np.full((48,48),4,np.uint8);saved_labels=hair_labels.copy()
+    hair_base=np.full((48,48,3),[.4,0,0],np.float32)
+    hair_target=hair_base.copy();hair_target[...,0]=.6;hair_target[...,1]=.02
+    yy4,xx4=np.indices((48,48),dtype=np.float32)
+    hair_maps={'ref_x':xx4,'ref_y':yy4,'valid':np.ones((48,48),bool),'confidence':np.ones((48,48),np.float32)}
+    visible=np.zeros((48,48),np.float32);visible[12:36,12:36]=1;visible[:,8:12]=.5
+    coverage=np.ones((48,48),np.float32)
+    guarded_colour,guarded_reports=colour_field(hair_base,hair_target,hair_labels,hair_labels,
+        coverage,hair_maps,record,visible_face_support=visible)
+    guarded_scene,scene_reports,_=scene_field(hair_base,hair_target,hair_labels,hair_labels,
+        coverage,np.zeros_like(coverage),hair_maps,record,visible_face_support=visible)
+    assert np.array_equal(hair_labels,saved_labels)
+    assert not guarded_colour[12:36,12:36,:2].any() and not guarded_scene[12:36,12:36,:3].any()
+    assert guarded_colour[:8,:8,0].min()>.0199 and guarded_scene[:8,:8,0].min()>.7499
+    # Half support changes neither raw field amplitude nor neighbouring faces;
+    # the soft veto belongs to the coordinate sampler, not solver confidence.
+    assert guarded_colour[:8,8:12,0].min()>.0199
+    assert guarded_scene[:8,8:12,0].min()>.7499
+    assert guarded_reports['hair']['visible_face_veto']['blocked_observation_and_solver_pixels']==24*24
+    assert scene_reports['head_hair']['visible_face_veto']['blocked_observation_and_solver_pixels']==24*24
+    assert guarded_reports['face']['eligible_pixels']==0
     print('PASS: partial local support, exact-owner and same-owner colour-edge isolation, independent canvases, source L/detail, identity/zero evidence, protected dose')
 
 

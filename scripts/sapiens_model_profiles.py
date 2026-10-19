@@ -1,8 +1,7 @@
 """Pinned current Sapiens2 segmentation profile; fine alpha uses native ViTMatte."""
 from __future__ import annotations
 
-from pathlib import Path
-import hashlib
+from asset_identity import sha256_file
 
 PROFILES = {
     'sapiens2_seg_0.4b': {
@@ -22,10 +21,15 @@ def profile(name, task):
     return dict(item)
 
 
-def verified_checkpoint(path, name, task):
+def verified_checkpoint(path, name, task, *, force=False):
+    """Verify the pinned identity without re-reading an unchanged checkpoint.
+
+    The shared stat-bound sidecar is invalidated when file metadata changes.
+    Explicit installation or audit callers can request a full byte read with
+    ``force=True``; production workers reuse the unchanged 1.6 GB identity.
+    """
     item = profile(name, task)
-    with Path(path).open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+    actual = sha256_file(path, force=force)
     if actual != item['checkpoint_sha256']:
         raise ValueError('Sapiens2 checkpoint bytes do not match pinned profile: '+name)
     return item, actual

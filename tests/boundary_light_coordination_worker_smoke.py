@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -91,6 +93,53 @@ def run_smoke():
             require(result['receipt']['model_tile_inferences_this_attempt'] == 3 and len(matte_calls) == 2)
             require(matte_calls[0] == matte_calls[1])
             require(coordinator.validate_prepared_pair(prepared, candidate))
+            # The actual consumers use the explicit candidate plan for all
+            # endpoint layers and geometry; the run supplies source/control
+            # bindings. An original run locator cannot accidentally select its
+            # old hair layer when validating the newly prepared cloth endpoint.
+            require(design.plan_for_run(run) != prepared)
+            require(coordinator.validate_prepared_pair(prepared, run))
+            import single_source_workflow as workflow
+            def first_task_boundary(response=None, *, error=None):
+                submitted = copy.deepcopy(run)
+                submitted.update(run_id='first-task-boundary',
+                    task_intent={'mode':'create_reference'},
+                    task_plan={'execution_strategy':'layered_reference_transfer'})
+                before = copy.deepcopy(design.plan_for_run(submitted))
+                def forbidden_gpu(*args, **kwargs):
+                    raise AssertionError('Frozen boundary integration reopened local generation')
+                with (patch.object(workflow, '_refresh_design_plan') as refresh,
+                      patch.object(coordinator, 'prepare_for_workbench',
+                          side_effect=error, return_value=copy.deepcopy(response)) as prepare_once,
+                      patch.object(design, 'materialize_plan', side_effect=lambda root, run, plan: copy.deepcopy(plan)) as own,
+                      patch('start_qwen_image.release_for_run', side_effect=forbidden_gpu)):
+                    workflow._prepare_task_boundary_light(root, submitted, SimpleNamespace(cancel_request_path=None))
+                    cancel = refresh.call_args.kwargs['cancel']
+                    assert callable(cancel) and not cancel()
+                require(refresh.call_count == prepare_once.call_count == 1)
+                require((parent.read_bytes(), pointer.read_bytes(), run) == retained)
+                return submitted, before, own.call_count
+            complete, before, owned = first_task_boundary(result)
+            require(complete['boundary_light_preparation']['status'] == 'prepared' and owned == 1)
+            require(design.plan_for_run(complete) == prepared)
+            no_change = {'ok':True, 'no_change':True, 'receipt':{'schema':coordinator.CONTRACT},
+                'design_reconstruction_plan':copy.deepcopy(plan)}
+            unchanged, before, owned = first_task_boundary(no_change)
+            require(unchanged['boundary_light_preparation']['status'] == 'no_change' and owned == 0)
+            require(design.plan_for_run(unchanged) == before)
+            bad_no_change = copy.deepcopy(no_change)
+            bad_no_change['design_reconstruction_plan']['layers'][0]['strength'] = .17
+            incomplete = copy.deepcopy(result)
+            incomplete['design_reconstruction_plan']['layers'] = [row for row in prepared['layers']
+                if row['kind'] != cloth.KIND]
+            for response, error in ((bad_no_change,None), (incomplete,None),
+                                    (None,ValueError('synthetic coordinated worker failure'))):
+                rejected_run, before, owned = first_task_boundary(response, error=error)
+                failure = rejected_run['boundary_light_preparation']
+                require(failure['status'] == 'failed_submitted_plan_retained' and owned == 0)
+                require(failure['error'] and failure['partial_plan_discarded'])
+                require(design.plan_for_run(rejected_run) == before)
+                require(not failure['source_alpha_changed'] and not failure['source_geometry_changed'])
             for kind in coordinator.KINDS:
                 old = next(row for row in plan['layers'] if row['kind'] == kind)
                 new = next(row for row in prepared['layers'] if row['kind'] == kind)
@@ -132,6 +181,11 @@ def run_smoke():
                     if layer['kind'] in coordinator.KINDS: require(layer['enabled'] is enabled and layer['strength'] == dose)
             def failed_cloth(*a, **kw): raise ValueError('synthetic cloth stage failed')
             rejects(lambda: prepare(run, 'cloth-failure', cloth_callback=failed_cloth))
+            failure_receipt = json.loads((root/'cloth-failure'/'qualification.json').read_text('utf8'))
+            require(failure_receipt['schema'] == coordinator.CONTRACT)
+            require(failure_receipt['state'] == 'failed' and failure_receipt['failed_stage'] == coordinator.STAGES[1])
+            require(failure_receipt['partial_plan_discarded'] and not failure_receipt['atomic_commit'])
+            require(failure_receipt['stages'][-1]['status'] == 'failed')
             def zero_cloth(p, *a, **kw): return {'delta_p': np.zeros_like(p), 'receipt': {'state': 'no_change'}}
             rejects(lambda: prepare(run, 'stale-retention', cloth_callback=zero_cloth))
             flag = {'cancel': False}
@@ -147,56 +201,61 @@ def run_smoke():
                 rejects(lambda: coordinator.prepare(root, duplicate, root/'duplicate'))
             # Save only the complete pair, and preserve current edited options.
             snapshot = root/'input.json'; write(snapshot, run)
-            argv = ['coordinator', '--root', str(root), '--run-json', str(snapshot), '--output', str(root/'prepared'), '--save-child']
+            argv = ['coordinator', '--root', str(root), '--run-json', str(snapshot), '--output', str(root/'prepared')]
             with patch.object(coordinator, 'prepare', return_value=result), patch.object(sys, 'argv', argv): coordinator.main()
             saved = json.loads((root/'prepared/result.json').read_text('utf8'))
-            child = json.loads(Path(saved['child_manifest']).read_text('utf8')); child_plan = design.plan_for_run(child)
-            require(child['parent_run_id'] == run['run_id'] and child['revision'] == 2)
-            require(child['options']['appearance_revision']['params'] == run['options']['appearance_revision']['params'])
-            require(child['options']['preserve_project_selection'] and coordinator.validate_prepared_pair(child_plan, child))
-            require(closure(child_plan) > 20)
-            require(all(Path(next(row for row in child_plan['layers'] if row['kind'] == kind)['assets']['frozen_delta']['path']).is_relative_to(
-                Path(saved['child_manifest']).parent) for kind in coordinator.KINDS))
+            prepared_plan = saved['design_reconstruction_plan']
+            candidate = copy.deepcopy(run)
+            candidate['options']['appearance_revision']['design_reconstruction_plan'] = prepared_plan
+            require('child_manifest' not in saved and coordinator.validate_prepared_pair(prepared_plan, candidate))
+            require(closure(prepared_plan) > 20)
+            require(all(Path(next(row for row in prepared_plan['layers'] if row['kind'] == kind)['assets']['frozen_delta']['path']).is_file()
+                for kind in coordinator.KINDS))
             count = len(list((root/'outputs/runs').iterdir()))
             argv[argv.index('--output')+1] = str(root/'identical')
             with patch.object(coordinator, 'prepare', return_value=identical), patch.object(sys, 'argv', argv): coordinator.main()
             require(len(list((root/'outputs/runs').iterdir())) == count)
             require('child_run_id' not in json.loads((root/'identical/result.json').read_text('utf8')))
             require((parent.read_bytes(), pointer.read_bytes(), run) == retained)
-            # Real wrapper: one process, both stages, and no --save-child flag.
+            # The wrapper submits both stages once to the shared native worker.
             events.clear(); wrapped = root/'wrapped'
-            class Process:
-                pid = 123456789; returncode = None
-                def poll(self): return self.returncode
-                def terminate(self): self.returncode = -15
-                def wait(self, timeout=None): return self.returncode
-                def kill(self): self.returncode = -9
-            process = Process()
-            def completed(command, **kw):
-                require(Path(command[4]).name == 'boundary_light_coordination_worker.py' and '--save-child' not in command)
+            def completed(python, project_root, command, directory, cancel, **kw):
+                require(python == sys.executable and project_root == root and directory == root)
+                require(Path(command[0]).name == 'boundary_light_coordination_worker.py' and '--save-child' not in command)
+                require(kw['stage'] == 'boundary_coordination' and kw['log_path'] == root/'wrapped-worker.log')
                 wrapped.mkdir(); write(wrapped/'result.json', identical)
                 for index, stage in enumerate(coordinator.STAGES):
-                    kw['stdout'].write((json.dumps({'type': 'boundary_coordination_progress', 'stage': stage,
-                        'message': stage, 'progress': .1+.45*index})+'\n').encode('utf8'))
-                kw['stdout'].flush(); process.returncode = 0; return process
+                    kw['progress'](stage, stage, .1+.45*index)
+                return {'worker_pid': 123456789, 'wall_seconds': .1}
             with patch('current_model_registry.load_registry', return_value={'python': sys.executable}), \
-                 patch.object(coordinator.subprocess, 'Popen', side_effect=completed):
+                 patch('reference_stage_worker.execute_stage', side_effect=completed):
                 require(coordinator.prepare_for_workbench(root, run, wrapped, progress=lambda *e: events.append(e))['no_change'])
             require([e[0] for e in events][-2:] == list(coordinator.STAGES))
             require(json.loads(wrapped.with_name('wrapped-input.json').read_text('utf8')) == run)
-            process = Process(); cancel_calls = iter((False, True))
-            def kill_tree(*a, **kw): process.returncode = -15
             with patch('current_model_registry.load_registry', return_value={'python': sys.executable}), \
-                 patch.object(coordinator.subprocess, 'Popen', return_value=process), \
-                 patch.object(coordinator.subprocess, 'run', side_effect=kill_tree):
-                rejects(lambda: coordinator.prepare_for_workbench(root, run, root/'wrapper-cancel', cancel=lambda: next(cancel_calls)), InterruptedError)
-            require(process.returncode == -15 and (parent.read_bytes(), pointer.read_bytes(), run) == retained)
+                 patch('reference_stage_worker.execute_stage', side_effect=InterruptedError('owned worker stopped')):
+                rejects(lambda: coordinator.prepare_for_workbench(root, run, root/'wrapper-cancel'), InterruptedError)
+            require(json.loads((root/'wrapper-cancel/qualification.json').read_text('utf8'))['state'] == 'cancelled')
+            require((parent.read_bytes(), pointer.read_bytes(), run) == retained)
+            # An impossible relaxed registration avoids both native RGB stages
+            # and retains the exact submitted plan and source assets.
+            with patch.object(cloth_worker, 'registration_upper_bound', return_value={
+                    'rejected': True, 'reason': 'insufficient_opaque_same_owner_registration_anchors',
+                    'reference_matte_cache_hit': True, 'model_tile_inferences_this_attempt': 0}), \
+                 patch.object(hair_worker, 'prepare', side_effect=AssertionError('unqualified pair computed RGB')), \
+                 patch.object(cloth_worker, 'prepare', side_effect=AssertionError('unqualified pair computed RGB')):
+                declined = coordinator.prepare(root, run, root/'registration-declined')
+            require(declined['no_change'] and declined['design_reconstruction_plan'] == plan)
+            require(declined['receipt']['atomic_commit'] and not declined['receipt']['stages'])
+            require((parent.read_bytes(), pointer.read_bytes(), run) == retained)
     return {'ok': True, 'checks': checks, 'actual_two_workers_and_frozen_consumers': True,
         'hair_then_cloth_current_endpoint_bound': True, 'atomic_failure_cancel_and_stale_pair_rejection': True,
         'preserves_ids_switches_doses_and_other_edits': True,
         'identical_pixels_and_repacked_transport_no_change_without_child': True,
         'one_isolated_process_two_progress_stages_observation_cache_reused': True,
-        'save_once_child_owned_frozen_assets_parent_pointer_unchanged': True,
+        'preparation_only_frozen_assets_parent_pointer_unchanged': True,
+        'first_task_boundary_success_and_local_failure_preserve_TBS': True,
+        'actual_pair_consumers_use_explicit_prepared_plan_with_original_run_bindings': True,
         'synthetic_observations_and_producers': True, 'model_inferences': 0,
         'image_generation_submissions': 0, 'visual_acceptance': False}
 

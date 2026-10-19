@@ -59,7 +59,9 @@ def main():
         for x in np.linspace(12, 108, 5):
             spatial_rows.append({'region': 'face', 'xy': [x, y], 'source': [.5, .015, .02],
                 'reference': [.5, .015+.016*(x/120-.5), .02+.012*(y/120-.5)]})
-    local = fit_local_residual(spatial_rows, fit(spatial_rows), (120, 120))
+    local = fit_local_residual(spatial_rows, fit(spatial_rows), (120, 120),
+        source_labels=labels, source_lab=np.full(values.shape, [.5, .015, .02], np.float32),
+        source_alpha=np.ones(labels.shape, np.float32))
     assert 'face' in local['local_chroma_residual'], 'Supported spatial colour trend must be recoverable'
     neutral_skin = np.broadcast_to(from_lab(np.array([.5, .015, .02], np.float32)), values.shape).copy()
     local_weights = np.zeros_like(weights); local_weights[..., 0] = 1
@@ -229,6 +231,28 @@ def main():
     assert np.max(abs(to_lab(lip_output)[40:55,12:30,0]-source_lab[40:55,12:30,0]))<2e-6
     assert np.mean(to_lab(lip_output)[45:50,16:25,1]-source_lab[45:50,16:25,1])>.006
     assert stat['feature_palette_policy']['reference_feature_pixels_used'] is False
+    # Canonical mouth illumination is independent of its pigment/opening. A
+    # strong face exposure cannot stop at a lip label and produce a dark edge.
+    lit_labels=np.full(shape,3,np.uint8);lit_labels[40:55,12:30]=24
+    lit_labels[46:48,18:25]=26
+    lit_lab=np.broadcast_to(np.array([.5,.018,.024],np.float32),(*shape,3)).copy()
+    lit_lab[40:55,12:30]=[.35,.09,.025]
+    lit_lab[46:48,18:25]=[.12,0,0]
+    lit_rgb=from_lab(lit_lab)
+    lit_protection=np.zeros(shape,np.float32);lit_protection[40:55,12:30]=1
+    illumination=copy.deepcopy(stat);illumination['operators']['face']['exposure_ev']=1
+    original_ab=region_weights(lit_labels,lit_protection,illumination,chroma=True)
+    illumination['feature_material_domains']={'source_regions':[
+        {'region':'lips','polygon':[[11,39],[30,39],[30,55],[11,55]],
+         'inner_polygon':[[17,45],[25,45],[25,48],[17,48]]}]}
+    lit_L=region_weights(lit_labels,lit_protection,illumination)
+    lit_ab=region_weights(lit_labels,lit_protection,illumination,chroma=True)
+    assert np.array_equal(lit_ab,original_ab), 'Mouth illumination cannot expand or change chroma weights'
+    assert np.array_equal(lit_L[...,0],np.ones(shape,np.float32)), 'Skin, lip and opening share the face L dose'
+    lit_output=apply(lit_rgb,lit_L,illumination,chroma_weights=lit_ab)
+    assert np.max(abs(to_lab(lit_output)[...,0]-tone(to_lab(lit_rgb)[...,0],1)))<2e-6
+    assert REGIONS['face']==[3] and lit_labels[42,20]==24 and lit_labels[46,20]==26
+    assert lit_protection[42,20]==lit_protection[46,20]==1, 'Input feature masks must remain immutable'
     # Reference geometry and dimensions do not certify or obstruct statistics.
     small=material_reference[::2,::2];small_labels=reference_mask[::2,::2]
     independent=collect_material_distributions(material_source,small,source_mask,small_labels,

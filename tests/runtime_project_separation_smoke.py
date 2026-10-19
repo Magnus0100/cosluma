@@ -49,6 +49,9 @@ def main(output_project=None):
         root=Path(temporary);root.mkdir(parents=True,exist_ok=True)
         fixture=prepare_fixture(root/'inputs');run=fixture['run']
         plan=run['options']['appearance_revision']['design_reconstruction_plan']
+        native=plan['canvas']['source_oriented_size']
+        proxy=[max(1,value//2) for value in native]
+        plan['canvas']['source_proxy_size']=proxy
         protected=root/'protection.npz';np.savez_compressed(protected,values=np.zeros(fixture['source']['labels'].shape,np.float32))
         plan['mask_roles']['identity_protection']={'path':str(protected),'sha256':digest(protected)}
         reference_protection=root/'reference-protection.npz'
@@ -65,15 +68,29 @@ def main(output_project=None):
             'reference_sha256':run['reference']['sha256'],'adjustments':[]}),encoding='utf-8')
         output=root/'outputs/evaluation'
         actual_analysis=lambda unused_root,image,**kwargs:analyses[kwargs['source_hash']]
+        def actual_face(unused_root,image,semantic_result,**kwargs):
+            from local_photo_analysis import file_identity
+            with Image.open(image) as pixels:
+                size=list(pixels.size)
+            return {'field_path':str(reference_protection),'size':size,
+                'protected_regions':[],'landmarks':[],
+                'identity':{'input':file_identity(image),
+                    'labels':file_identity(semantic_result['labels_path']),
+                    'fixture':'bound_empty_face_features_without_inference'}}
         stdout=io.StringIO()
         with patch.object(evaluation,'prepare_local_appearance',actual_analysis), \
-                patch.object(evaluation,'prepare_face_protection',return_value={'field_path':str(reference_protection)}), \
+                patch.object(evaluation,'prepare_face_protection',side_effect=actual_face), \
+                patch.object(evaluation,'apply',wraps=evaluation.apply) as fitted_apply, \
                 patch.object(sys,'argv',['evaluate_reference_colour.py','--root',str(root),'--run',str(run_path),
                     '--output',str(output),'--authored-colour-edit',str(authored)]),contextlib.redirect_stdout(stdout):
             evaluation.main()
         parameters=json.loads((output/'parameters.json').read_text('utf-8'))
         validation=json.loads((output/'validation.json').read_text('utf-8'))
         assert validation['zero_strength_exact'] and validation['finite_and_bounded'],validation
+        assert validation['scope']=='proxy_parameter_diagnostics' and not validation['native_render_executed']
+        assert validation['proxy_size']==proxy and proxy!=native
+        assert all(tuple(call.args[0].shape[:2])==tuple(reversed(proxy)) for call in fitted_apply.call_args_list)
+        assert not list(output.glob('native-*.png'))
         assert not validation['reference_geometry_used_for_output'] and not validation['reference_texture_used_for_output']
         assert parameters['binding']['algorithm_sha256']==digest(code_path('reference_colour_fit.py'))
         assert parameters['binding']['authored_colour_edit']['stroke_algorithm_sha256']==digest(code_path('local_colour_brush.py'))

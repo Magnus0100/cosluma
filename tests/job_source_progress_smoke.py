@@ -1,4 +1,4 @@
-"""Live actual tiny-image work plus external event/cancellation regressions."""
+"""Live tiny-image float rendering with a CPU matte plus external job regressions."""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,7 @@ from backend_server import Backend
 from job_source_progress import SourceJobProgress
 from job_store import TERMINAL
 import single_source_workflow as workflow
+from task_model_preflight_smoke import build_registry_fixture, mocked_task_capability
 
 
 # A real subprocess with ordinary persisted run events, not a model/producer.
@@ -78,18 +79,30 @@ def release(root, run_id, name):
     path.write_text('test gate released\n', encoding='utf8')
 
 
+def checked_start(backend, body):
+    """Enter through the current checked task boundary with CPU metadata only."""
+    registry = build_registry_fixture(backend.root/'CPU-model-fixture')
+    request = {key:value for key,value in body.items() if key not in {'local_only','generate'}}
+    request.update(model_registry=str(registry), creative_task={
+        'schema_version':'cosplay_task_intent.v1','mode':'local_portrait',
+        'services':{'text_vision':False,'visual_review':False}})
+    with patch('task_model_preflight.inspect_task_models', side_effect=mocked_task_capability):
+        checked = backend.task_plan(request)
+        return backend.start_task({**checked['request'], 'plan_id':checked['plan']['plan_id']})
+
+
 def external_live(root, source, *, run_id=None, cancel=False, fail=False):
     backend = Backend(root)
     cli = root / 'fixture_cli.py'
     cli.write_text(CLI_FIXTURE, encoding='utf8')
     backend.cli = cli
-    started = backend.one_click({'source': str(source), 'local_only': True, 'generate': False,
+    started = checked_start(backend, {'source': str(source), 'local_only': True, 'generate': False,
         **({'run_id': run_id} if run_id else {})})
     job_id = started['job_id']
     running = wait_for(backend, job_id, lambda job: job['stage'] == 'source-retouch')
     assigned = running['run_id']
     assert assigned == run_id if run_id else assigned == 'run-' + job_id.removeprefix('job-')
-    assert running['status'] == 'running' and running['progress'] is None
+    assert running['status'] == 'running' and running['progress'] == 0.50
     if cancel:
         backend.cancel_job(job_id)
         ended = terminal(backend, job_id)
@@ -97,10 +110,10 @@ def external_live(root, source, *, run_id=None, cancel=False, fail=False):
         return backend, job_id, assigned
     release(root, assigned, 'allow-retouch')
     rendering = wait_for(backend, job_id, lambda job: job['stage'] == 'rendering')
-    assert rendering['status'] == 'running' and rendering['progress'] is None
+    assert rendering['status'] == 'running' and rendering['progress'] == 0.70
     release(root, assigned, 'allow-render')
     reviewed = wait_for(backend, job_id, lambda job: job['stage'] == 'review')
-    assert reviewed['status'] == 'running' and reviewed['progress'] is None
+    assert reviewed['status'] == 'running' and reviewed['progress'] == 0.85
     if fail:
         release(root, assigned, 'fail')
     release(root, assigned, 'allow-review')
@@ -110,7 +123,7 @@ def external_live(root, source, *, run_id=None, cancel=False, fail=False):
     events = backend.jobs.events(job_id)
     for stage in ('source-retouch', 'rendering', 'review'):
         assert any(event['stage'] == stage and event['status'] == 'running' for event in events)
-    assert all(event['progress'] is None for event in events if event['type'] != 'completed')
+    assert all(event['progress'] is None or 0 <= event['progress'] <= 1 for event in events if event['type'] != 'completed')
     identities = [json.dumps(event.get('data', {}).get('workflow_event'), sort_keys=True)
         for event in events if event.get('data', {}).get('workflow_event')]
     assert len(identities) == len(set(identities)), 'Manifest/log milestones duplicated'
@@ -140,6 +153,7 @@ def main():
         source_bytes = source.read_bytes()
         # Actual production local image rendering, held before CLI completion.
         embedded = Backend(root / 'actual-image', embedded=True)
+        project_identity = (embedded.root / 'project.json').read_bytes()
         rendered, resume = threading.Event(), threading.Event()
         actual_render = workflow.render_local_source
         def gated_render(project, run):
@@ -147,14 +161,17 @@ def main():
             rendered.set()
             assert resume.wait(10), 'Actual render gate was not released'
             return result
-        with patch.object(workflow, 'render_local_source', side_effect=gated_render):
-            started = embedded.one_click({'source': str(source), 'local_only': True, 'generate': False,
+        with patch.object(workflow, 'render_local_source', side_effect=gated_render), \
+                patch('runtime_preflight.preflight_for_run', return_value={'status':'ready','CPU_fixture':True}), \
+                patch('source_alpha.source_silhouette', side_effect=lambda _root,_source,image,**kw:
+                    (Image.new('L',image.size,255),{'backend':'CPU_contract_matte_not_model_inference'})):
+            started = checked_start(embedded, {'source': str(source), 'local_only': True, 'generate': False,
                 'preserve_project_selection': True})
             job_id = started['job_id']
             try:
                 assert rendered.wait(15), 'Actual small-image rendering did not execute'
                 live = wait_for(embedded, job_id, lambda job: job['stage'] == 'rendering')
-                assert live['run_id'] and live['status'] == 'running' and live['progress'] is None
+                assert live['run_id'] and live['status'] == 'running' and live['progress'] == 0.70
             finally:
                 resume.set()
             finished = terminal(embedded, job_id)
@@ -164,7 +181,7 @@ def main():
         artifact = artifact if artifact.is_absolute() else embedded.root / artifact
         with Image.open(artifact) as image:
             assert image.size == (64, 48)
-        assert not (embedded.root / 'project.json').exists()
+        assert (embedded.root / 'project.json').read_bytes() == project_identity
         success, success_id, assigned = external_live(root / 'external', source)
         late_events_preserved(success, success_id, assigned, source)
         explicit, explicit_id, assigned = external_live(root / 'explicit', source, run_id='user-chosen-run')
@@ -177,7 +194,7 @@ def main():
         queued = Backend(root / 'queued', embedded=True)
         queued._worker_slots.acquire()
         try:
-            requested = queued.one_click({'source': str(source), 'local_only': True, 'generate': False,
+            requested = checked_start(queued, {'source': str(source), 'local_only': True, 'generate': False,
                 'run_id': 'requested-but-never-started'})
             queued_id = requested['job_id']
             assert queued.jobs.get(queued_id)['run_id'] is None
@@ -213,6 +230,21 @@ def main():
         # Existing explicit IDs cannot replay pre-job files on a failed open.
         stale = SourceJobProgress(bound_root, 'owned', source)
         assert stale.poll() == []
+        # Candidate progress comes from actual persisted submission outcomes,
+        # never from elapsed time or arbitrary log detail strings.
+        candidates_root = root / 'candidate-progress'
+        candidate_observer = SourceJobProgress(candidates_root, 'candidate-run', source, owns_new_run=True)
+        candidate_manifest = candidates_root / 'outputs/runs/candidate-run/manifest.json'
+        candidate_manifest.parent.mkdir(parents=True)
+        candidate_run = {'run_id': 'candidate-run', 'source': {'path': str(source),
+            'sha256': hashlib.sha256(source_bytes).hexdigest()}, 'status': 'generating',
+            'generation_budget': {'requested_variants': 4, 'submissions': [{'status': 'succeeded'},
+                {'status': 'submitted_outcome_unknown'}]}, 'events': []}
+        candidate_manifest.write_text(json.dumps(candidate_run), 'utf8')
+        observed = candidate_observer.poll()
+        assert len(observed) == 1 and observed[0]['candidate_counts'] == {'completed': 1, 'submitted': 2, 'requested': 4}
+        assert observed[0]['progress'] == .2875 and '1/4' in observed[0]['message']
+        assert candidate_observer.poll() == []
         # Completion markers provide honest later stages without following or
         # reading unrelated child jobs. Observation never writes these files.
         completion = manifest_path.parent / 'system-post-completion/attempt.json'
@@ -243,7 +275,7 @@ def main():
         'external_stages_before_stdout_completion': True, 'short_owned_run_id': True,
         'explicit_run_id_preserved': True, 'queued_cancel_run_id_null': True,
         'active_cancel_preserved': True, 'late_terminal_events_ignored': True,
-        'partial_unrelated_records_rejected': True, 'guessed_stage_percentages': False,
+        'partial_unrelated_records_rejected': True, 'stage_milestone_percentages': True,
         'model_inferences': 0, 'network_requests': 0}))
 
 

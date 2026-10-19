@@ -10,8 +10,8 @@ from float_appearance import srgb_to_linear
 from colour_space import from_lab
 from local_semantics_worker import CLASS_NAMES
 from sapiens_model_profiles import PROFILES
-import reference_material_targets as evidence
-import reference_material_targets_v2 as targets
+import reference_material_evidence as evidence
+import reference_material_solver as targets
 from cosplay_native_review_smoke import make_native_fixture
 from cosplay_native_review import prepare_cosplay_native_review
 from reference_appearance_controls import prepare_owned_controls

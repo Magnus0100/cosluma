@@ -1,5 +1,7 @@
 # 开发与Windows构建
 
+Agent 开发的英文入口见 [AGENTS.md](../AGENTS.md) 和 [Agent development guide](AGENT_GUIDE.md)，包含可执行上手步骤、模块导航和验证选择。
+
 使用Windows x64和Python 3.12。先按 [安装指南](INSTALLATION.md) 建立 `.venv` 并配置本地文件。桌面依赖位于 `scripts/requirements-desktop.txt`；GPU模型使用模型注册表指定的独立运行时。
 
 ## 仓库结构
@@ -22,7 +24,7 @@
 导出使用 `prepare_source_release.py`，选择仓库之外尚不存在的目录：
 
 ```powershell
-$sourceExport = Join-Path $env:TEMP 'cosplay-source-0.4.8'
+$sourceExport = Join-Path $env:TEMP 'cosplay-source-current'
 .\.venv\Scripts\python.exe .\scripts\prepare_source_release.py --output "$sourceExport"
 ```
 
@@ -39,7 +41,7 @@ $sourceExport = Join-Path $env:TEMP 'cosplay-source-0.4.8'
 用CLI建立新工作区，并读取状态：
 
 ```powershell
-$workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
+$workspace = Join-Path $env:USERPROFILE 'CosplayWorkbench\workspace'
 .\.venv\Scripts\python.exe .\scripts\project_cli.py init "$workspace"
 .\.venv\Scripts\python.exe .\scripts\project_cli.py --root "$workspace" status
 .\.venv\Scripts\python.exe .\scripts\project_cli.py --root "$workspace" recovery
@@ -61,9 +63,9 @@ $workspace = Join-Path $env:LOCALAPPDATA 'CosplayWorkbench\workspace'
 }
 ```
 
-运行 `project_cli.py --root <工作区> task-plan --request-file <请求JSON>`，将返回的 `request`和 `plan.plan_id`写成执行请求，再用 `task-start --request-file <执行请求JSON>`同步执行。计划不联网、不创建任务；执行重新验证内容身份。三路线为 `local_portrait`、`existing_reference`、`create_reference`。已有参考路线图像生成预算全零；文本/视觉服务单独配置。
+运行 `project_cli.py --root <工作区> task-plan --request-file <请求JSON>`，将返回的 `request`和 `plan.plan_id`写成执行请求，再用 `task-start --request-file <执行请求JSON>`同步执行。计划不联网、不创建任务；执行重新验证内容身份。三路线为 `local_portrait`、`existing_reference`、`create_reference`。已有参考默认图像生成预算全零；显式`background_mode=enhance_source`、本地Qwen与`regional_refinement.maximum_submissions=1`可检查新的独立单区任务，全局参考预算仍为0。普通重试与最终修复不授新额度，见[原景增强](SOURCE_SCENE_ENHANCEMENT.md)；文本/视觉服务单独配置。
 
-底层 `one-click`仍用于生产协调与开发：要求 `--source`，支持 `--reference`、`--model-registry`和 `--options-file`。`--local-only`是本地原片路线，`--complete-post`协调完整后期。`--final-repair-only`同时要求已有参考及 `--complete-post`，禁止生图，并要求完整已保存设计/资产。查看保存版本使用 `source-status <run-id>`；`source-accept`要求明确reviewer和人工checks。
+底层 `one-click`仅用于携带已检查任务合同的内部子进程；缺少 checked plan 会直接拒绝，不再自动建计划。它要求 `--source`，支持 `--reference`、`--model-registry`和 `--options-file`。`--local-only`是本地原片路线，`--complete-post`协调完整后期。`--final-repair-only`同时要求已有参考及 `--complete-post`，禁止生图，并要求完整已保存设计/资产。查看保存版本使用 `source-status <run-id>`；`source-accept`要求明确reviewer和人工checks。
 
 桌面内嵌后台可使用安装指南命令。开发时也可分别启动后台与界面：
 
@@ -105,7 +107,7 @@ Debug带控制台，适合收集脱敏后的启动错误。Release不显示控�
 用已核验的清洁源码目录和Release目录生成完整Windows包、源码包及校验清单：
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\assemble_windows_release.py --source "$sourceExport" --dist ".\dist\cosplay-workbench" --output "..\release-0.4.8"
+.\.venv\Scripts\python.exe .\scripts\assemble_windows_release.py --source "$sourceExport" --dist ".\dist\cosplay-workbench" --output "..\release-current"
 ```
 
 输出目录须不存在。工具复用公开源码检查，核对运行源码、许可清单和源码快照，保留完整EXE依赖目录；源码ZIP排除 `.git`历史与Python缓存。打包后逐一核对ZIP成员、目录文件及大小／SHA-256，拒绝未登记文件，并生成发布说明和不含本机路径的公开验证摘要。发布资产与独立核验见 [RELEASING.md](RELEASING.md)。
@@ -114,13 +116,10 @@ Debug带控制台，适合收集脱敏后的启动错误。Release不显示控�
 
 行为检查统一从 `tests/`运行，不再散落于生产脚本目录。常规CI执行 `python tests/run.py core`，按模块检查可使用 `python tests/run.py reference_appearance_stack boundary_light_coordination_worker`；修改共享导入或测试目录时可执行 `python tests/run.py all --model-python <已安装分析Python>`。桌面依赖和模型依赖不混装；检查使用临时工程，避免写入开发者的真实工作区。
 
+
 ## 当前开发工具
 
-`full_cosplay_review.py`是source-only保存子版的审片CLI，支持`prepare/review/all`，调用现行`cosplay_native_review`与`cosplay_post_review`。它保护源图、父/子母版及工程选择的哈希，保存并验证API证据；不生图、不做GPU推理，也不自动批准作品。它属于开发工具，不进入发行runtime。使用前先查看`--help`，审片模式会使用配置的文本/视觉服务。
-
-`check_raw_api_input.py --raw <原片RAW>`是手工RAW上传边界检查，通过拦截上传确认实际预处理输入；不使用网络或生成额度。它需要明确真实RAW，不属于自动fixture检查。
-
-`install_local_dinov3.py`核验并安装用户提供的当前DINOv3下载；`install_sam3.py`核验当前SAM3.1安装。两者使用模型运行时并保留固定身份。`major_release_evaluation.py`汇总明确提供的多素材保存证据，不能代替人工成片批准。`verify_saved_native_delivery.py`核验保存工程的原生回放与导出；使用前查看 `--help`。
+仅保留源码检查、打包、发布校验和当前模型安装工具。具体入口以 `scripts/` 中的文件和 `scripts/runtime_manifest.json` 为准；实验性审片、历史评估和一次性输入探针已删除。
 
 ## 验证与修改边界
 

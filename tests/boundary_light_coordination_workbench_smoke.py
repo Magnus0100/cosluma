@@ -146,6 +146,25 @@ def run_smoke():
             require(wait_job(backend, identifier)['status'] == 'succeeded')
             require('没有新的可用改动' in backend.jobs.get(identifier)['message'])
             require(backend.job(identifier)['reconstruction_result']['design_reconstruction_plan'] == plan); keep(identifier)
+            def failed_with_receipt(project_root, edited, output, **kwargs):
+                Path(output).mkdir()
+                failure = {'schema': CONTRACT, 'state': 'failed',
+                           'stages': [{'stage': 'hair_boundary_light', 'status': 'complete'},
+                                      {'stage': 'cloth_boundary_light', 'status': 'failed',
+                                       'error': 'synthetic cloth rejection'}],
+                           'atomic_commit': False, 'partial_plan_discarded': True,
+                           'failed_stage': 'cloth_boundary_light', 'reason': 'stage_failed'}
+                (Path(output)/'qualification.json').write_text(json.dumps(failure), encoding='utf8')
+                raise ValueError('synthetic cloth rejection')
+            worker.prepare_for_workbench = failed_with_receipt
+            identifier = backend.reconstruct_source_design(run['run_id'], body)['job_id']
+            failed_job = wait_job(backend, identifier)
+            require(failed_job['status'] == 'failed')
+            require(failed_job['error']['failed_stage'] == 'cloth_boundary_light')
+            require(failed_job['error']['partial_plan_discarded'] is True)
+            require(failed_job['result_summary']['prepared_plan_published'] is False)
+            require(backend.job(identifier)['reconstruction_failure']['state'] == 'failed')
+            keep(identifier)
             valid_result = success(root, {'options': {'appearance_revision': edits['appearance_revision']}}, base/'boundary-coordination-preparation', cancel=lambda: False, progress=lambda *a: None)
             invalid = [None, {'ok': False}]
             for mutation in ('contract', 'missing-hair', 'missing-cloth', 'duplicate-hair', 'source_sha256',

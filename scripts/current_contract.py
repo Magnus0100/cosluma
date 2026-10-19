@@ -20,3 +20,7 @@ def validate_current_request(value):
     revision = value.get('appearance_revision')
     if isinstance(revision, dict) and 'parameters' in revision:
         raise ValueError('Current appearance revisions use params')
+    for component in (value, revision):
+        if isinstance(component, dict) and component.get('workflow_graph') is not None:
+            from cos_workflow_graph import compile_template
+            compile_template(component['workflow_graph'], 'existing_reference')

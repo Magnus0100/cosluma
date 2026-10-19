@@ -11,6 +11,20 @@ SCHEMA = 'source_boundary_light.v1'
 RECIPE = 'reference_hair_boundary_observed_response_v2'
 
 
+def sanitize_endpoint(values):
+    """Bound numerical reconstruction excursions for boundary observation.
+
+    Bilinear native reconstruction can produce small negative or over-range
+    associated RGB values. Boundary transfer consumes bounded display-linear
+    RGB; clip only this observation input, leaving source pixels and endpoint
+    bindings unchanged.
+    """
+    values = np.asarray(values, np.float32)
+    if values.ndim != 3 or values.shape[-1] != 3 or not np.isfinite(values).all():
+        raise ValueError('Boundary endpoint must be finite HWC RGB')
+    return np.clip(values, 0., 1.), int(np.count_nonzero((values < 0.) | (values > 1.)))
+
+
 def source_owners(plan, box):
     """Global pixel-centre categorical sampling, invariant to ROI crop size."""
     record = plan['mask_roles']['source_semantics']; path = _verify(record); stat = path.stat()
@@ -99,7 +113,12 @@ def validate_layer(layer, plan, run=None):
         if protect and np.any(active & (sample_asset(protect, 'protection', box, native) >= .5)):
             raise ValueError('Boundary light crosses protected identity')
         before = endpoint(plan, run, box, native)
-        if array_sha(before) != row['target_patch_sha256'] or np.any(before+delta > a[..., None]+2e-5):
+        # Existing source reconstruction may contain an isolated numerical
+        # excursion outside the associated RGB range. It is not introduced
+        # by this layer; only pixels receiving a non-zero boundary delta must
+        # satisfy the bounded endpoint contract.
+        if (array_sha(before) != row['target_patch_sha256'] or
+                np.any((before+delta > a[..., None]+2e-5) & active[..., None])):
             raise ValueError('Boundary light native endpoint or associated RGB range changed')
     if not layer.get('enabled') or not strength: record['bypass_reason'] = 'boundary_light_disabled'
     return record

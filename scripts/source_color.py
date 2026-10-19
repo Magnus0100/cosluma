@@ -56,16 +56,6 @@ def _selection(selection):
     return normalized
 
 
-def encode_binary_mask(mask) -> dict:
-    """Portable row-major/C binary RLE with alternating 0/1 runs, first 0."""
-    values = np.asarray(mask) > 0
-    height, width = values.shape
-    flat = values.reshape(-1)
-    boundaries = np.concatenate(([0], np.flatnonzero(flat[1:] != flat[:-1]) + 1, [flat.size]))
-    counts = np.diff(boundaries).astype(int).tolist()
-    if flat[0]:
-        counts.insert(0, 0)
-    return {"size": [width, height], "counts": counts}
 
 
 def normalize_source_color_plan(plan: dict | None) -> dict:

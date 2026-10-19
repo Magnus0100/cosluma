@@ -97,6 +97,14 @@ def main():
         assert report(stale)['whole_work']['result_state']=='needs_evidence';checks.append('stale_source_cannot_fulfill_effect')
         invalid=copy.deepcopy(run);invalid['cosplay_post_review']['actual_api_evidence_valid']=False
         assert report(invalid)['whole_work']['required_effects']['fulfillment']=='unknown';checks.append('invalid_actual_qa_is_not_fulfillment')
+        pending=copy.deepcopy(run)
+        pending['cosplay_post_review']={'status':'pending','actual_api_evidence_valid':False,
+            'visual_acceptance':False,'automatic_accepted':False}
+        pending_report=report(pending)
+        assert pending_report['cosplay_post_diagnosis']['status']=='pending'
+        assert pending_report['cosplay_post_diagnosis']['binding_state']=='pending'
+        assert '正在进行' in format_stage_report(pending_report)
+        checks.append('pending_visual_diagnosis_is_displayed_without_review_authority')
         none=copy.deepcopy(run);none['generation_design']['design_brief']['primary_effect_plan']['mode']='none'
         assert report(none)['whole_work']['required_effects']['fulfillment']=='not_required';checks.append('explicit_no_effects_needs_no_added_effect')
         dirty=copy.deepcopy(run);dirty['continuation_edit']={'render_state':'pending'}

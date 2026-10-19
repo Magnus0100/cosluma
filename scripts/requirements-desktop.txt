@@ -3,8 +3,11 @@
 # Resolved wheel hashes are retained in .cache/desktop-runtime-install.json.
 altgraph==0.17.5
 flatbuffers==25.12.19
+llvmlite==0.50.0
 numpy==2.5.3
+numba==0.68.0
 onnxruntime==1.30.0
+opencv-python-headless==5.0.0.93
 packaging==26.3
 pefile==2024.8.26
 Pillow==12.3.0
@@ -14,9 +17,12 @@ pyinstaller-hooks-contrib==2026.8
 PySide6==6.11.2
 PySide6_Addons==6.11.2
 PySide6_Essentials==6.11.2
+pymatting==1.1.16
 pywin32-ctypes==0.2.3
 rawpy==0.27.1
 scipy==1.18.1
 setuptools==84.0.0
 shiboken6==6.11.2
 tifffile==2026.9.20
+tbb==2023.1.0
+tcmlib==1.5.0

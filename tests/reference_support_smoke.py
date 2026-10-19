@@ -8,7 +8,7 @@ from reference_colour_fit import (fit, REGIONS, region_weights, apply,
     collect_anchors, collect_material_distributions, fit_material_distributions)
 from reference_colour_blend import apply_colour_layer
 from render_reference_colour_composite import donor_fields, match_foreground, bounded_edge_extension
-from reference_support import build_reference_support, donor_support_report, report_state, region_correspondence
+from reference_support import build_reference_support, donor_support_report, report_state
 
 
 def rejected(call):
@@ -61,12 +61,6 @@ def main():
     a=np.array([[.98524451]],np.float32)
     evidence={};bounded=bounded_edge_extension(old,a,request,evidence)
     assert np.array_equal(old,bounded) and evidence['maximum_source_excursion']>.007
-    # Background H and common material alone do not certify a person's map.
-    sm=np.ones(alpha.shape,bool)
-    assert not region_correspondence(sm,sm,anchors=0)['allowed']
-    shifted=sm.copy();shifted[:,:18]=False
-    assert not region_correspondence(sm,shifted,anchors=20)['allowed']
-    assert not region_correspondence(sm,sm,anchors=20,face_alignment={'method':'background_H_only'})['allowed']
     binding={'source_sha256':'source','reference_sha256':'reference','alpha_sha256':'alpha',
         'source_fp_sha256':'fp','canvas_size':[24,20],'automatic_delta_sha256':'delta'}
     parameters['support_policy']='reference_support.v1'
@@ -105,7 +99,6 @@ def main():
     assert report['stages']['reference_colour_match']['lightness_effect_nonzero']
     assert report['stages']['reference_colour_blend']['status']=='unsupported'
     assert report['stages']['reference_scene_balance']['status']=='unsupported'
-    assert not region_correspondence(sm,sm,anchors=clothing['anchors'])['allowed']
     assert report_state(report,binding)['valid']
     different=copy.deepcopy(distributions)
     different['operators']['clothing']['evidence']['reference_samples']=91
@@ -165,8 +158,6 @@ def main():
     w=region_weights(source_labels,protect,fitted)
     actual=apply(src,w,fitted)
     assert np.max(abs(actual-src))>.01
-    assert not region_correspondence(source_labels==1,reference_labels==1,
-        anchors=actual_op['anchors'])['allowed']
     real_report=build_reference_support(fitted,receipts,receipts,binding=binding)
     assert real_report['regions']['clothing']['statistics']['status']=='supported'
     assert real_report['regions']['clothing']['geometry']['status']=='unsupported'

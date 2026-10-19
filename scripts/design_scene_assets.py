@@ -9,6 +9,7 @@ import re
 
 import numpy as np
 from PIL import Image
+from asset_identity import sha256_file
 from scipy.ndimage import map_coordinates
 
 from native_sole_contact import build_sole_contact_falloff
@@ -132,8 +133,7 @@ def prepare_native_receivers(root,run,plan,**kwargs):
 
 
 def _digest(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream,'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def _scale(from_size,to_size):

@@ -171,19 +171,8 @@ def apply_theme(app) -> None:
     app.setStyleSheet(theme_stylesheet())
 
 
-def section_title(text: str):
-    from PySide6.QtWidgets import QLabel
-    label = QLabel(text)
-    label.setObjectName("sectionTitle")
-    return label
 
 
-def status_badge(text: str, tone: str = "neutral"):
-    from PySide6.QtWidgets import QLabel
-    label = QLabel(text)
-    label.setObjectName("statusPill")
-    label.setProperty("tone", tone)
-    return label
 
 
 def card():

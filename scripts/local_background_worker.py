@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import time
+
+from asset_identity import sha256_file
 
 
 def main() -> None:
@@ -58,8 +59,7 @@ def main() -> None:
     Image.fromarray(clean).save(clean_path)
     Image.fromarray((removal * 255).astype(np.uint8)).save(args.output_dir / "removal-mask.png")
     np.savez_compressed(arrays_path, rgb_srgb=clean.astype(np.float32) / 255, removal_mask=removal)
-    with args.checkpoint.open("rb") as stream:
-        checkpoint_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    checkpoint_sha = sha256_file(args.checkpoint)
     result = {
         "clean_png": str(clean_path), "clean_npz": str(arrays_path),
         "input": str(args.input.resolve()), "removal_mask_input": str(args.removal_mask.resolve()),

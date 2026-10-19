@@ -70,8 +70,43 @@ def saved_native_detail(root, run_id, body):
         raise ValueError('Saved master and render domains differ')
     image = linear_preview(values,display_transform=display)
     image.save(target,icc_profile=image.info['icc_profile'])
-    return {'ok':True,'run_id':run_id,'revision':run['revision'],'request_id':body.get('request_id'),
+    result = {'ok':True,'run_id':run_id,'revision':run['revision'],'request_id':body.get('request_id'),
             'preview_path':str(target.resolve()),'crop_box':list(box),'crop_size':[cw,ch],
             **precision,'working_domain':working_domain,'display_transform':display,'saved_version_only':True,
             'unsaved_edits_included':False,'resampled':False,'raw_decoded':False,'gpt_calls':0,
             'elapsed_seconds':round(time.perf_counter()-started,3)}
+    if body.get('include_source') is True:
+        plan = (((run.get('options') or {}).get('appearance_revision') or {})
+                .get('design_reconstruction_plan') or {})
+        baseline = plan.get('source_baseline') or {}
+        assets = baseline.get('assets') or {}
+        if (baseline.get('schema') == 'appearance_source_baseline.v1'
+                and baseline.get('working_domain') == 'display_linear_sRGB'
+                and all(name in assets for name in ('foreground_premultiplied', 'foreground_alpha', 'old_environment'))):
+            from design_reconstruction import sample_asset
+            from asset_identity import sha256_file
+            for asset in assets.values():
+                if isinstance(asset, dict) and asset.get('path') and asset.get('sha256'):
+                    source_path = Path(asset['path'])
+                    source_path = source_path if source_path.is_absolute() else root/source_path
+                    if sha256_file(source_path) != asset['sha256']:
+                        raise ValueError('Saved source comparison baseline changed')
+            source = sample_asset(assets['foreground_premultiplied'], 'values', box, (width,height))
+            alpha = sample_asset(assets['foreground_alpha'], 'values', box, (width,height))
+            background = sample_asset(assets['old_environment'], 'values', box, (width,height))
+            source = source + (1-alpha[...,None])*background
+            source_key = hashlib.sha256(json.dumps({'box':box, 'assets':assets,
+                'display':display},sort_keys=True).encode()).hexdigest()[:20]
+            source_target = directory/(source_key+'-source.png')
+            source_image = linear_preview(source, display_transform=display)
+            source_image.save(source_target, icc_profile=source_image.info['icc_profile'])
+            result.update(source_preview_path=str(source_target.resolve()),
+                source_comparison={'basis':'saved_pre_beauty_native_baseline',
+                    'crop_box':list(box),'native_size':[width,height],
+                    'resampled':False,'raw_decoded':False,
+                    'native_source_retouch_included':bool(baseline.get('native_source_retouch'))})
+        else:
+            result['source_comparison'] = {'unavailable_reason':
+                '当前保存版本没有可核验的美化前原生配对基线。'}
+        result['elapsed_seconds'] = round(time.perf_counter()-started,3)
+    return result

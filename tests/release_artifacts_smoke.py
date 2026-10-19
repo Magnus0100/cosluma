@@ -5,6 +5,7 @@ import zipfile
 
 from verify_desktop_dependencies import VerificationError
 from verify_windows_release import digest, local_links, validate_package_path, verify_archive
+from assemble_windows_release import WINDOWS_USER_DOCS, copy_windows_documentation
 
 
 def rejected(action):
@@ -62,6 +63,35 @@ def main():
         outside.write_text('Outside export\n', encoding='utf8')
         document.write_text('[external](../outside.md)\n', encoding='utf8')
         rejected(lambda: local_links(source))
+        # The executable bundle carries user help; agent/development material
+        # stays in the corresponding source archive. No dangling source links.
+        source_docs = root/'documentation-source'
+        (source_docs/'docs').mkdir(parents=True)
+        for name in WINDOWS_USER_DOCS:
+            (source_docs/'docs'/name).write_text(
+                '[developer](DEVELOPMENT.md) [agent](../AGENTS.md) '
+                '[module](../scripts/runtime.py) [home](https://example.invalid/)\n', encoding='utf8')
+        (source_docs/'docs/AGENT_GUIDE.md').write_text('Developer-only\n', encoding='utf8')
+        (source_docs/'docs/DEVELOPMENT.md').write_text('Developer-only\n', encoding='utf8')
+        (source_docs/'AGENTS.md').write_text('Agent instructions\n', encoding='utf8')
+        package = root/'package'
+        (package/'_internal').mkdir(parents=True)
+        (package/'_internal/runtime.py').write_text('value = 1\n', encoding='utf8')
+        (package/'LICENSE').write_text('License fixture\n', encoding='utf8')
+        (package/'README.md').write_text('[scene](SOURCE_SCENE_ENHANCEMENT.md)\n', encoding='utf8')
+        copy_windows_documentation(source_docs, package, ['runtime.py'], '1.2.3')
+        assert not (package/'docs/AGENT_GUIDE.md').exists()
+        assert not (package/'docs/DEVELOPMENT.md').exists()
+        assert (package/'SOURCE_CODE.md').is_file()
+        assert '](docs/SOURCE_SCENE_ENHANCEMENT.md)' in (package/'README.md').read_text('utf8')
+        help_text = (package/'docs/INSTALLATION.md').read_text('utf8')
+        assert '](../SOURCE_CODE.md)' in help_text and '](../_internal/runtime.py)' in help_text
+        assert 'https://example.invalid/' in help_text
+        assert local_links(package) > 0
+        (source_docs/'docs/INSTALLATION.md').write_text('[broken](missing-user-help.md)\n', encoding='utf8')
+        invalid_package = root/'invalid-package'
+        invalid_package.mkdir()
+        rejected(lambda: copy_windows_documentation(source_docs, invalid_package, [], '1.2.3'))
     print('OK: release member identities, missing/extra/duplicate members, traversal, corruption and local links')
 
 

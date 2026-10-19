@@ -19,6 +19,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, label
 
 from clone_retouch import apply_clone_retouch, empty_clone_layer
 from raw_support import RGB_DECODE_VERSION, linear_preview, open_linear
+from asset_identity import sha256_file
 
 
 RECIPE = 'source-native-compact-outlier-two-crop-approval-v1'
@@ -53,8 +54,7 @@ VISION_SUFFIX = ('\nReturn only one JSON object, without markdown. Follow the re
 
 
 def sha256(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    return sha256_file(path)
 
 
 def array_sha(values):

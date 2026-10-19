@@ -1,18 +1,16 @@
 """Shared, editable photographic reference brief for local and remote editors."""
 from __future__ import annotations
 
-PROMPT_VERSION = 'cosplay-post-v4'
+PROMPT_VERSION = 'cosplay-post-v6'
 STYLE_MARKER = '\n\nART DIRECTION\n'
 DESIGN_MARKER = '\n\nIMAGE-SPECIFIC ART DIRECTION\n'
 CHARACTER_MARKER = '\n\nCHARACTER ART DIRECTION\n'
 
-DEFAULT_PROMPT = """Create a finished cosplay photograph with a coherent character-led concept and a clear visual hierarchy. Develop the selected art direction through portrait refinement, scene design, lighting, material colour relationships and purposeful effects. Make the character the focal point of a complete photographic composition.
+DEFAULT_PROMPT = """Finish this cosplay photograph as a polished, character-led portrait. Make the face and deliberate makeup the visual focus, with luminous skin, expressive eyes, sculpted light and distinct costume colours. Choose the mood from the character, outfit, setting and user's brief; dark themes still need beautiful, readable portrait lighting.
 
-Retain the photographed person's identity, facial proportions and asymmetry, deliberate makeup contours, expression, gaze, pose, hands and finger arrangement, body proportions, hair silhouette, costume construction, accessories and signature props. Refine transient blemishes and distractions while retaining skin texture, individual strands, seams, patterns and material detail. Keep the original camera viewpoint, perspective, framing, aspect ratio, subject position and scale.
+Keep identity, expression, pose, anatomy, costume, props and camera composition. Refine skin transitions and makeup without erasing texture. Match light on face, hands, clothes, surroundings and reflections. Give shadows depth and highlights shape instead of a flat colour wash.
 
-Redesign or enrich the surroundings as the concept requires, maintaining perspective, scale and believable ground contact. For dramatic, stage or fantasy styles, realize a visible primary scene effect with depth, occlusion and localized illumination. Prefer effects behind or beside the person, keeping facial features, hands and defining costume details clear. Photographic portrait styles can use refined background depth and light shaping without fantasy effects. Use visible costume and setting evidence when the fictional character is unknown.
-
-Unify the person and environment through consistent local light colour, direction, softness, shadows and exposure. Replace distracting source casts with coherent scene colour and continuous skin transitions. Keep lip pigment, restrained scleral whites, iris/contact-lens patterns, cloth, leather and metal distinct. Give luminous effects corresponding selective reflections and nearby colour spill, with material response and falloff. Keep readable facial detail, textured highlights and dimensional shadows. Preserve genuine reflection geometry; do not invent a mirror floor or reflected duplicate. Deliver one complete, detailed photographic image, without extra people, altered anatomy, a uniform glowing outline, text, watermark or comparison panels. Explicit user instructions determine effect intensity and take priority over style defaults."""
+Develop the existing setting with selective local changes and atmospheric accents that support the person. Keep its location and spatial layout recognizable unless replacement is requested. Subordinate background contrast and effects to the portrait. Follow user restrictions; choose effects purposefully rather than automatically adding fog or magic. Return one finished photograph without extra people, text or comparison panels."""
 
 
 def strip_generated_direction(prompt: str) -> str:
@@ -51,3 +49,11 @@ def prompt_template_version(prompt: str | None, *, saved_version: str | None = N
     if saved_version:
         return saved_version
     return PROMPT_VERSION if (prompt or '').strip().startswith(DEFAULT_PROMPT) else 'custom'
+
+
+def prompt_for_new_task(saved_prompt: str | None, *, saved_version: str | None = None,
+                        style_prompt: str | None = None) -> str:
+    """Keep custom prose; a retired managed template cannot seed a new task."""
+    if saved_version is not None and saved_version not in {PROMPT_VERSION, 'custom'}:
+        return compose_generation_prompt(style_prompt=style_prompt)
+    return saved_prompt or compose_generation_prompt(style_prompt=style_prompt)
