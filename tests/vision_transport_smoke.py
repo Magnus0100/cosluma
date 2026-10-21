@@ -412,8 +412,13 @@ with patch.object(vision,'_connection',return_value=({'registry_id':'loopback'},
                             break
                         observed = attempt/'observation.json'
                         if observed.is_file():
-                            current = json.loads(observed.read_text(encoding='utf-8'))
-                            if (mode == 'headers' and current['stage'] == 'headers_received'
+                            try:
+                                current = json.loads(observed.read_text(encoding='utf-8'))
+                            except (FileNotFoundError, PermissionError):
+                                # Windows may briefly deny reads during atomic replacement.
+                                current = None
+                            if current is not None and (
+                                    mode == 'headers' and current['stage'] == 'headers_received'
                                     or mode == 'progress' and current.get('event_type') == 'response.in_progress'):
                                 break
                         assert process.poll() is None, process.communicate()
