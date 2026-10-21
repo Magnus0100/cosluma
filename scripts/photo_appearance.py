@@ -497,14 +497,16 @@ def freeze_candidate(directory, *, kind, master, source_sha256, scope, design_id
             if not np.array_equal(master[top:top+128][outside], prior['master'][top:top+128][outside]):
                 raise ValueError('Regional candidate changed float pixels outside permitted coverage')
         if kind=='photographic_adjustment':
-            from photo_development import operator_for,producer_identity,iter_development_bands
+            from photo_development import (operator_for,producer_identity,iter_development_bands,
+                DETAIL,CHROMATICITY)
             if (not isinstance(photographic_operation,dict) or set(photographic_operation)!={'operator','stats','producer'}
                     or photographic_operation['producer']!=producer_identity()
                     or photographic_operation['operator']!=operator_for(photographic_operation['operator'].get('parameters'))
                     or generation is not None):
                 raise ValueError('Photographic appearance requires the actual checked CPU operation, not generation claims')
             counts={'changed_pixels':0,'covered_pixels':0,'unrecoverable_black_pixels':0,
-                'linear_gain_would_exceed_sdr_pixels':0,'gamut_compressed_pixels':0}
+                'linear_gain_would_exceed_sdr_pixels':0,'gamut_compressed_pixels':0,
+                'chromaticity_guarded_pixels':0,'detail_held_pixels':0}
             for top,expected,expected_coverage,stats in iter_development_bands(prior['master'],
                     photographic_operation['operator']['parameters'],cancel=cancel):
                 actual_coverage=edit if type(edit) is int else edit[top:top+len(expected)]
@@ -515,7 +517,8 @@ def freeze_candidate(directory, *, kind, master, source_sha256, scope, design_id
             actual_stats=photographic_operation['stats']
             expected_stats={**counts,'native_pixels':size[0]*size[1],
                 'band_rows':actual_stats.get('band_rows'),'physical_relighting_verified':False,
-                'no_change':counts['changed_pixels']==0}
+                'no_change':counts['changed_pixels']==0,
+                'detail_policy':dict(DETAIL),'chromaticity_policy':dict(CHROMATICITY)}
             if (actual_stats!=expected_stats or type(actual_stats.get('band_rows')) is not int
                     or not 1<=actual_stats['band_rows']<=512):
                 raise ValueError('Photographic pixel statistics differ from actual computation')

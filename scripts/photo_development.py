@@ -27,6 +27,76 @@ PARAMETERS={'adjustments':{'type':'photographic_adjustments','min_items':1,'max_
         'feather':{'minimum':0.,'maximum':.5,'unit':'region_short_edge'},
         'focus_sigma':{'minimum':0.,'maximum':.02,'unit':'native_short_edge','optional':True}}}}
 _LUMA=np.asarray([.2126,.7152,.0722],np.float32)
+DETAIL={'schema':'photographic_detail_hold.v1','sigma_px':1.6,'dose':.8,'gain_bounds':(.6,1.4)}
+CHROMATICITY={'schema':'photographic_chromaticity_guard.v1','drift_limit_uv':.012,'dose':.75}
+_XYZ=np.asarray([[.4124,.3576,.1805],[.2126,.7152,.0722],[.0193,.1192,.9505]],np.float32)
+
+
+def _chromaticity(rgb):
+    """CIE 1976 u'v' chromaticity of linear sRGB, one value per pixel."""
+    xyz=np.asarray(rgb,np.float32)@_XYZ.T
+    denominator=np.maximum(xyz[...,0]+15*xyz[...,1]+3*xyz[...,2],np.float32(1e-6))
+    return 4*xyz[...,0]/denominator,9*xyz[...,1]/denominator
+
+
+def _hold_detail(result,focused,slope,active):
+    """Hold delivered micro-detail energy against the parent's own energy.
+
+    A bounded EV gain also multiplies grain and micro-detail by the tone
+    curve's local slope, so an ordinary +0.65 EV lift raised whole-canvas
+    texture by 17-53%. The delivered high band is divided back by that slope,
+    partially and inside bounds, so the photograph gains light rather than
+    noise. Only the sigma=1.6 detail band is rescaled; tone is untouched.
+    """
+    from scipy.ndimage import gaussian_filter
+    sigma=float(DETAIL['sigma_px'])
+    low=gaussian_filter(result,(sigma,sigma,0),mode='nearest')
+    high=result-low
+    low_bound,high_bound=DETAIL['gain_bounds']
+    hold=np.clip(np.divide(1,np.maximum(slope,np.float32(1e-3))),low_bound,high_bound)
+    hold=np.float32(1.)+(hold-np.float32(1.))*np.float32(DETAIL['dose'])
+    held=np.clip(low+high*hold[...,None],0,1).astype(np.float32)
+    # An unrecoverable black stays exactly black: the high band reads real
+    # neighbours and must never lift a pixel the photograph itself has none of.
+    visible=active&np.any(focused>0,axis=2)
+    return np.where(visible[...,None],held,result).astype(np.float32)
+
+
+def _guard_chromaticity(balanced,focused,mapped,luminance):
+    """Limit how far one development may move a pixel's chromaticity.
+
+    Exposure itself is chromaticity-neutral: a pure gain moves luminance only.
+    Warmth and tint are executed literally, so a strong tint turned skin
+    magenta far beyond the photographed relation between subject and scene.
+    Where the delivered chromaticity leaves the parent's by more than the
+    recorded u'v' limit the cast is proportionally returned with its hue
+    direction and its delivered luminance kept. Pixels that only brightened
+    are untouched.
+    """
+    limit=float(CHROMATICITY['drift_limit_uv']);dose=float(CHROMATICITY['dose'])
+    drift=None
+    if not limit>0 or not dose>0:
+        return balanced,drift
+    delivered_u,delivered_v=_chromaticity(balanced);parent_u,parent_v=_chromaticity(focused)
+    drift=np.hypot(delivered_u-parent_u,delivered_v-parent_v)
+    pull=np.where(drift>limit,(drift-limit)/np.maximum(drift,np.float32(1e-6))*dose,0.)
+    pull=pull.astype(np.float32)
+    if not np.any(pull>0):
+        return balanced,drift
+    safe_mapped=np.maximum(mapped,np.float32(1e-6))
+    safe_luminance=np.maximum(luminance,np.float32(1e-6))
+    delivered=np.divide(balanced,safe_mapped[...,None],out=np.zeros_like(balanced),
+        where=mapped[...,None]>0)
+    parent=np.divide(focused,safe_luminance[...,None],out=np.zeros_like(focused),
+        where=luminance[...,None]>0)
+    guarded=(delivered+(parent-delivered)*pull[...,None])*mapped[...,None]
+    return guarded.astype(np.float32),drift
+
+
+def _json_policy(values):
+    """Policy dict in the exact form a receipt round trip keeps it."""
+    return {key:(list(value) if type(value) is tuple else value)
+        for key,value in values.items()}
 
 
 def producer_identity():
@@ -37,9 +107,22 @@ def producer_identity():
 def operator_for(parameters):
     from photo_edit_session import validate_parameters
     parameters=validate_parameters(parameters,PARAMETERS)
-    return {'name':'photographic_exposure_balance.v2','working_domain':'display_linear_sRGB',
+    import hashlib
+    # Comparable operator revision: the frozen-asset identity must distinguish
+    # this implementation from the one that had no detail hold and no drift
+    # guard, so a stale receipt can never be revalidated as current work.
+    revision=hashlib.sha256(json.dumps({'detail':DETAIL,'chromaticity':CHROMATICITY},
+        sort_keys=True,separators=(',',':')).encode()).hexdigest()[:16]
+    return {'name':'photographic_exposure_balance.v3','working_domain':'display_linear_sRGB',
         'parameters':parameters,'field_composition':'ordered_soft_overrides',
-        'processing_order':['gaussian_current_parent_and_soft_region_blend','exposure_and_relative_colour_balance'],
+        'operator_revision':revision,
+        'processing_order':['gaussian_current_parent_and_soft_region_blend',
+            'exposure_and_relative_colour_balance','detail_energy_hold_with_band_halo',
+            'chromaticity_drift_guard'],
+        'detail_method':'bounded_slope_inverse_high_frequency_hold',
+        'detail_policy':_json_policy(DETAIL),
+        'chromaticity_method':'bounded_cie_uv_drift_pull_toward_parent',
+        'chromaticity_policy':_json_policy(CHROMATICITY),
         'focus_method':'gaussian_of_all_current_parent_RGB_in_selected_regions',
         'focus_composition':'ordered_soft_overrides_from_same_immutable_parent',
         'focus_boundary':'reflect_at_canvas_edge','focus_radius':'ceil(4*sigma_pixels)',
@@ -90,27 +173,40 @@ def _focused_band(master,sigma,mask,top,bottom,*,cancel=None):
 
 
 def iter_development_bands(master,parameters,*,cancel=None,band_rows=128):
-    """Yield (top, float RGB, permitted coverage, statistics) in bounded bands."""
+    """Yield (top, float RGB, permitted coverage, statistics) in bounded bands.
+
+    Each yielded band is computed from a span extended by the detail hold's own
+    Gaussian support, so the detail policy reads real neighbouring pixels
+    instead of an artificial tile edge and the result agrees across band_rows
+    to within float32 rounding (measured 0 ULP on real and synthetic masters,
+    see tests/photo_development_smoke.py). Frozen assets are re-derived with
+    the default 128-row span by photo_appearance.validate_asset, and the
+    workspace replay reproduces the delivered master inside that same bound,
+    so band partitioning cannot make a frozen asset disagree with itself.
+    """
     parameters=operator_for(parameters)['parameters']
     if (not isinstance(master,np.ndarray) or master.dtype!=np.float32 or master.ndim!=3
             or master.shape[2]!=3 or min(master.shape[:2])<1 or type(band_rows) is not int or not 1<=band_rows<=512):
         raise ValueError('Photographic development requires a native float32 RGB master and bounded bands')
     height,width=master.shape[:2]
+    span=int(math.ceil(4*float(DETAIL['sigma_px']))) if float(DETAIL['dose'])>0 else 0
     for top in range(0,height,band_rows):
-        _cancel(cancel);bottom=min(height,top+band_rows);source=np.asarray(master[top:bottom])
+        _cancel(cancel);bottom=min(height,top+band_rows)
+        first=max(0,top-span);last=min(height,bottom+span)
+        source=np.asarray(master[first:last])
         if not np.isfinite(source).all() or np.any(source<0) or np.any(source>1):
             raise ValueError('Photographic input must be finite normalized display-linear sRGB')
-        fields=np.zeros((bottom-top,width,3),np.float32)
-        coverage=np.zeros((bottom-top,width),np.float32)
+        fields=np.zeros((last-first,width,3),np.float32)
+        coverage=np.zeros((last-first,width),np.float32)
         focused=source.copy();has_focus=False
         for item in parameters['adjustments']:
-            mask=_mask_band(item,width,height,top,bottom)
+            mask=_mask_band(item,width,height,first,last)
             settings=np.asarray([item['exposure_ev'],item['warmth_ev'],item['tint_ev']],np.float32)
             fields*=1-mask[...,None];fields+=mask[...,None]*settings
             coverage=coverage+mask*(1-coverage)
             sigma=float(item.get('focus_sigma',0))*min(width,height)
             if sigma>0:
-                filtered=_focused_band(master,sigma,mask,top,bottom,cancel=cancel)
+                filtered=_focused_band(master,sigma,mask,first,last,cancel=cancel)
                 if filtered is not None:
                     left,right,blurred=filtered;weight=mask[:,left:right,None]
                     current=focused[:,left:right]
@@ -120,9 +216,9 @@ def iter_development_bands(master,parameters,*,cancel=None,band_rows=128):
                 # A later zero setting overrides earlier focus, as it does EV.
                 focused[:]=focused*(1-mask[...,None])+source*mask[...,None]
         active=np.any(fields!=0,axis=2)&(coverage>0)
-        result=focused;stats={'changed_pixels':0,'covered_pixels':int(np.count_nonzero(coverage)),
-            'unrecoverable_black_pixels':int(np.count_nonzero(np.all(focused==0,axis=2)&active)),
-            'linear_gain_would_exceed_sdr_pixels':0,'gamut_compressed_pixels':0}
+        result=focused
+        exceed=np.zeros(active.shape,bool);gamut=np.zeros(active.shape,bool)
+        guarded=np.zeros(active.shape,bool)
         if np.any(active):
             ev,warm,tint=(fields[...,i] for i in range(3))
             colour_ev=np.stack((warm+tint*.5,-tint,-warm+tint*.5),axis=-1)
@@ -135,19 +231,32 @@ def iter_development_bands(master,parameters,*,cancel=None,band_rows=128):
             mapped=gain*luminance/(1+(gain-1)*luminance)
             exposure=np.divide(mapped,luminance,out=np.ones_like(luminance),where=luminance>0)
             balanced*=exposure[...,None]
+            balanced,drift=_guard_chromaticity(balanced,focused,mapped,luminance)
+            if drift is not None:
+                guarded=(drift>float(CHROMATICITY['drift_limit_uv']))&active
             peak=np.max(balanced,axis=2)
             amount=np.divide(1-mapped,peak-mapped,out=np.ones_like(mapped),where=peak>mapped)
             amount=np.clip(amount,0,1)
             compressed=mapped[...,None]+(balanced-mapped[...,None])*amount[...,None]
             compressed=np.clip(compressed,0,1).astype(np.float32)
+            slope=gain/np.maximum(1+(gain-1)*luminance,np.float32(1e-3))**2
+            compressed=_hold_detail(compressed,focused,slope,active)
             result[active]=compressed[active]
-            stats['linear_gain_would_exceed_sdr_pixels']=int(np.count_nonzero((gain*luminance>1)&active))
-            stats['gamut_compressed_pixels']=int(np.count_nonzero((peak>1)&active))
+            exceed=(gain*luminance>1)&active
+            gamut=(peak>1)&active
         # Preserve the parent exactly outside authorized coverage, independently
         # of filtering and floating-point arithmetic in feathered regions.
         result[coverage==0]=source[coverage==0]
-        stats['changed_pixels']=int(np.count_nonzero(np.any(result!=source,axis=2)))
-        yield top,result,coverage,stats
+        band=result[top-first:bottom-first];band_coverage=coverage[top-first:bottom-first]
+        band_source=source[top-first:bottom-first];band_active=active[top-first:bottom-first]
+        stats={'changed_pixels':int(np.count_nonzero(np.any(band!=band_source,axis=2))),
+            'covered_pixels':int(np.count_nonzero(band_coverage)),
+            'unrecoverable_black_pixels':int(np.count_nonzero(np.all(band==0,axis=2)&band_active)),
+            'linear_gain_would_exceed_sdr_pixels':int(np.count_nonzero(exceed[top-first:bottom-first])),
+            'gamut_compressed_pixels':int(np.count_nonzero(gamut[top-first:bottom-first])),
+            'chromaticity_guarded_pixels':int(np.count_nonzero(guarded[top-first:bottom-first])),
+            'detail_held_pixels':int(np.count_nonzero(band_active))}
+        yield top,band,band_coverage,stats
 
 
 def develop_float(master,parameters,*,cancel=None,band_rows=128):
@@ -155,6 +264,8 @@ def develop_float(master,parameters,*,cancel=None,band_rows=128):
     result=np.empty_like(master);coverage=np.empty(master.shape[:2],np.float32)
     stats={'native_pixels':int(master.shape[0]*master.shape[1]),'changed_pixels':0,'covered_pixels':0,
         'unrecoverable_black_pixels':0,'linear_gain_would_exceed_sdr_pixels':0,'gamut_compressed_pixels':0,
+        'chromaticity_guarded_pixels':0,'detail_held_pixels':0,
+        'detail_policy':dict(DETAIL),'chromaticity_policy':dict(CHROMATICITY),
         'band_rows':band_rows,'physical_relighting_verified':False}
     for top,band,mask,counts in iter_development_bands(master,parameters,cancel=cancel,band_rows=band_rows):
         result[top:top+len(band)]=band;coverage[top:top+len(band)]=mask

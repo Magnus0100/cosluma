@@ -201,12 +201,397 @@ def _provider_aspect(resolved):
     return explicit[0][0]/explicit[0][1] if explicit else None
 
 
+FUSION={'schema':'cosluma_photographic_join.v3','minimum_region_short_edge':256,
+    'minimum_region_pixels':131072,'maximum_taper_px':24.,'minimum_taper_px':2.,
+    # Restored to the reviewed 2px floor: the level is carried by the
+    # registration, so the taper only has to cover the content transition and
+    # goes back to 2px where the retained photograph has real contrast there,
+    # widening towards 24px only where the scene is flat (what a matte would
+    # supply). Measured on the three real products, widening this floor from 2
+    # to 6 px moved 672's halo from 18 px to 13 px and 662's tonal excess from
+    # -0.0085 to -0.0086, i.e. it bought nothing and it was this round's own
+    # regression, so the floor is back where it was.
+    'structure_sigma':2.,'structure_reference_quantile':.95,
+    # Region-scale registration: the join used to be right only inside an
+    # 8-36px membrane, so the region core kept whatever exposure and colour
+    # temperature the provider chose (measured up to 3.7x and 231 mired away
+    # from the photograph it replaced). One robust per-channel gain now takes
+    # the provider's low frequency level and white point onto the photographed
+    # level of the very core being replaced: the provider supplies appearance,
+    # not a new exposure. The retained ring is measured as well and recorded,
+    # so the receipt shows both sides of the cut.
+    'registration_sigma_px':18.,'registration_ring_px':96.,
+    # Constant over the whole authorized core, never a function of the taper.
+    'registration_field':'constant_over_authorized_core',
+    # Unchanged from the reviewed state: measured open (see the receipt's
+    # clamped flag) 685 needs about 8x and clamps at -3 EV, which is accounted
+    # for rather than papered over by widening the bound.
+    'registration_gain_ev_bounds':(-3.,3.),
+    'tone_depth_fraction':.012,
+    'tone_depth_bounds':(8,36),'tone_bound':.35,'detail_sigma':1.6,'detail_fine_sigma':.6,
+    'detail_window_px':64.,'noise_ratio_bounds':(.4,4.),
+    # A provider patch can carry a third of the photograph's own detail energy.
+    # The bound has to reach that far or the region stays visibly smoother than
+    # the scene around it; the measured gains are recorded either way.
+    'band_inner_px':8,'band_interior_px':64,
+    # The provider's own residue is rescaled, never synthesised. Measured on
+    # the real 662 patch (about 1/6 of the photograph's own detail energy) the
+    # bound has to reach that far or the region stays visibly smoother than the
+    # scene around it, and the join band then reads as a blur. Both gains are
+    # recorded with their measured achievement, so a clamped case is visible.
+    'detail_ratio_bounds':(.2,6.),
+    # The join band is judged against the parent's own band, not against a
+    # constant: content that is genuinely smoother than the ring must not force
+    # texture to be invented.
+    'join_detail_relative_limit':1.3}
+_LUMA=np.asarray([.2126,.7152,.0722],np.float32)
+
+
 def _mask(size):
     w,h=size;feather=max(1,min(64,math.ceil(min(w,h)*.08)))
     x=np.minimum(np.arange(w),np.arange(w)[::-1])/feather
     y=np.minimum(np.arange(h),np.arange(h)[::-1])/feather
     value=np.clip(np.minimum(y[:,None],x[None,:]),0,1).astype(np.float32)
     return value*value*(3-2*value)
+
+
+def _join_analysis_ready(size):
+    """A photographic join needs enough native support to estimate its own field."""
+    width,height=size
+    return (min(width,height)>=FUSION['minimum_region_short_edge']
+        and width*height>=FUSION['minimum_region_pixels'])
+
+
+def _edge_distance(size):
+    """Distance in pixels to the nearest edge of the authorized write."""
+    w,h=size
+    x=np.minimum(np.arange(w,dtype=np.float32),np.arange(w,dtype=np.float32)[::-1])+1
+    y=np.minimum(np.arange(h,dtype=np.float32),np.arange(h,dtype=np.float32)[::-1])+1
+    return np.minimum(x[None,:],y[:,None]).astype(np.float32)
+
+
+def _structure_taper(prior):
+    """Per-pixel join width: tight across measured structure, wider where it is flat.
+
+    The former composite used one fixed short-edge fraction for every pixel, so a
+    53 px straight ramp cut through hair, arms and props and cross-faded two
+    contents. The taper now follows the retained content's own structure, which
+    is what a matte would otherwise supply; registered provider alpha, when the
+    provider returns it, still owns the join and is applied exactly.
+    """
+    from scipy.ndimage import gaussian_filter
+    grey=np.asarray(prior,np.float32)@_LUMA
+    smooth=gaussian_filter(grey,float(FUSION['structure_sigma']),mode='nearest')
+    vertical,horizontal=np.gradient(smooth)
+    strength=np.hypot(horizontal,vertical)
+    reference=float(np.quantile(strength,float(FUSION['structure_reference_quantile'])))
+    normalised=np.clip(strength/max(reference,1e-6),0.,1.)
+    wide,narrow=float(FUSION['maximum_taper_px']),float(FUSION['minimum_taper_px'])
+    return (wide+(narrow-wide)*normalised).astype(np.float32)
+
+
+def _join_ramp(distance,taper):
+    """Taper-only source weight of the join, straight from the core geometry."""
+    value=np.clip(distance/np.maximum(taper,np.float32(1.)),0.,1.)
+    return (value*value*(3.-2.*value)).astype(np.float32)
+
+
+def _registration_scale(native,core,box,patch,prior,distance=None,*,weight=None):
+    """Region-scale registration onto the exposure the photograph had there.
+
+    The first moment of the patch's own core interior is compared with the
+    first moment of the photographed master at the same place: their
+    per-channel ratio is one gain that carries both the region's luminance and
+    its colour temperature back onto the exposure and white point the
+    photograph actually had there, and it is measured on the same statistic the
+    retained ring is compared against. The local membrane then only has to
+    close the remaining few pixels at the cut. The retained ring is measured as
+    well and reported, so the receipt shows the region against both references.
+    The estimate is taken over every written pixel of the authorized core, so
+    the resulting field is one constant per channel over the whole region and
+    does not vary with the taper: the taper then only has to carry the content
+    transition, and the membrane only the residual the constant field leaves.
+    A registered provider alpha restricts the estimate to the pixels it actually
+    covers; the patch is expected unpremultiplied (see `_unpremultiply`).
+    Only the core is written, and the gain is bounded, flagged and recorded.
+    """
+    x0,y0,x1,y1=core;bx0,by0,bx1,by1=box
+    sigma=float(FUSION['registration_sigma_px']);pad=int(FUSION['registration_ring_px'])
+    rx0=max(bx0,x0-pad);ry0=max(by0,y0-pad);rx1=min(bx1,x1+pad);ry1=min(by1,y1+pad)
+    window=np.asarray(native[ry0:ry1,rx0:rx1],np.float32)
+    ring=np.ones(window.shape[:2],bool)
+    ring[y0-ry0:y1-ry0,x0-rx0:x1-rx0]=False
+    inside=np.ones((y1-y0,x1-x0),bool)
+    if weight is not None:
+        inside=(np.asarray(weight,np.float32)>np.float32(0)).reshape(inside.shape)
+    if not np.any(inside):
+        inside=np.ones(inside.shape,bool)
+    # The first moment of the region is what an exposure and white point mean,
+    # and it is the statistic the retained ring is compared against, so the
+    # registration is estimated on exactly that quantity.
+    target_level=np.asarray(prior,np.float32)[inside].mean(0)
+    region_level=np.asarray(patch,np.float32)[inside].mean(0)
+    ring_level=target_level
+    if ring.any():
+        ring_level=window[ring].mean(0)
+    low_ev,high_ev=FUSION['registration_gain_ev_bounds']
+    wanted=target_level/np.maximum(region_level,np.float32(1e-6))
+    scale=np.clip(wanted,np.float32(2.**low_ev),np.float32(2.**high_ev)).astype(np.float32)
+    applied=(region_level*scale).astype(np.float32)
+    residual=applied/np.maximum(target_level,np.float32(1e-6))
+    return {'field':FUSION['registration_field'],
+        'scale':[round(float(v),6) for v in scale],
+        'target_level':[round(float(v),6) for v in target_level],
+        'region_level':[round(float(v),6) for v in region_level],
+        'ring_level':[round(float(v),6) for v in ring_level],
+
+        'ring_pixels':int(np.count_nonzero(ring)),
+        'clamped':bool(np.any(np.abs(wanted-scale)>np.float32(1e-6))),
+        'residual_ev':[round(float(v),4) for v in np.log2(np.maximum(residual,1e-6))],
+        'sigma_px':float(sigma)}
+
+
+def _band_field(values,sigma,window,*,grey=None):
+    """Local RMS of one band, as a per-pixel field instead of one global scalar."""
+    from scipy.ndimage import gaussian_filter
+    source=np.asarray(values,np.float32)
+    if grey is None:
+        band=source-gaussian_filter(source,sigma,mode='nearest')
+    else:
+        band=source
+    luma=(band@_LUMA) if band.ndim==3 else band
+    energy=gaussian_filter(luma*luma,window,mode='nearest')
+    return band,np.sqrt(np.maximum(energy,0.)).astype(np.float32)
+
+
+def _immerman_noise(grey):
+    """Immerkaer's 3x3 noise estimate, the same operator the metric uses."""
+    from scipy.ndimage import convolve
+    kernel=np.asarray([[1.,-2.,1.],[-2.,4.,-2.],[1.,-2.,1.]],np.float32)/np.float32(6.)
+    return np.abs(convolve(np.asarray(grey,np.float32),kernel,mode='nearest')).astype(np.float32)
+
+
+def _match_texture(patch,prior):
+    """Match delivered texture and grain energy to the retained photograph's.
+
+    One global high-frequency gain left the region either too smooth or too
+    noisy wherever the provider's content varied. Two local (64 px window)
+    energy fields now do the work: the 0.6-1.6 px structure band against the
+    parent's own band, and the sub-0.6 px fine band against the parent's own
+    fine energy. Both gains are bounded and recorded, and the achieved band and
+    Immerkaer noise ratios of the result are measured afterwards and recorded
+    too: the estimator that is reported is never a different estimator from the
+    one being corrected. No texel is synthesised, only the provider's own
+    residue is rescaled.
+    """
+    from scipy.ndimage import gaussian_filter
+    window=float(FUSION['detail_window_px'])
+    sigma=float(FUSION['detail_sigma']);fine_sigma=float(FUSION['detail_fine_sigma'])
+    low_bound,high_bound=FUSION['detail_ratio_bounds']
+    noise_bound_low,noise_bound_high=FUSION['noise_ratio_bounds']
+    patch_low=gaussian_filter(patch,(sigma,sigma,0),mode='nearest')
+    prior_low=gaussian_filter(prior,(sigma,sigma,0),mode='nearest')
+    patch_fine=gaussian_filter(patch,(fine_sigma,fine_sigma,0),mode='nearest')
+    prior_fine=gaussian_filter(prior,(fine_sigma,fine_sigma,0),mode='nearest')
+    patch_fine_band=(patch-patch_fine).astype(np.float32)
+    prior_fine_band=(prior-prior_fine).astype(np.float32)
+    patch_coarse=((patch-patch_low)-patch_fine_band).astype(np.float32)
+    prior_coarse=((prior-prior_low)-prior_fine_band).astype(np.float32)
+    _,patch_structure=_band_field(patch_coarse,sigma,window,grey=True)
+    _,prior_structure=_band_field(prior_coarse,sigma,window,grey=True)
+    _,patch_fine_energy=_band_field(patch_fine_band,sigma,window,grey=True)
+    _,prior_fine_energy=_band_field(prior_fine_band,sigma,window,grey=True)
+    structure_gain=np.clip(prior_structure/np.maximum(patch_structure,np.float32(1e-6)),
+        low_bound,high_bound).astype(np.float32)
+    fine_gain=np.clip(prior_fine_energy/np.maximum(patch_fine_energy,np.float32(1e-6)),
+        noise_bound_low,noise_bound_high).astype(np.float32)
+    structure_gain=gaussian_filter(structure_gain,window*.25,mode='nearest')
+    fine_gain=gaussian_filter(fine_gain,window*.25,mode='nearest')
+    gain=np.clip(fine_gain,noise_bound_low,noise_bound_high).astype(np.float32)
+    matched=(patch_low+patch_coarse*structure_gain[...,None]
+        +patch_fine_band*gain[...,None]).astype(np.float32)
+    return matched,{'structure_gain_median':round(float(np.median(structure_gain)),6),
+        'noise_gain_median':round(float(np.median(gain)),6),
+        'structure_gain_bounds':[low_bound,high_bound],
+        'noise_gain_bounds':[noise_bound_low,noise_bound_high]}
+
+
+def _bounded_tone(patch,correction):
+    """Reduce one scalar dose so the joined tone stays inside display SDR."""
+    upper=np.float32(1.);dose=np.ones_like(patch)
+    positive,negative=correction>0,correction<0
+    np.divide(upper-patch,correction,out=dose,where=positive)
+    np.divide(-patch,correction,out=dose,where=negative)
+    return (correction*np.clip(dose.min(-1),0.,1.)[...,None]).astype(np.float32)
+
+
+def _unpremultiply(associated,weight):
+    """Provider colour as itself, so alpha cannot steer the measurements.
+
+    A generated patch is composited on its own alpha, and production hands the
+    join associated (premultiplied) colour. Estimating a level or a texture
+    energy on that would divide every statistic by the matte: a soft hole in the
+    provider's alpha would drag the region level towards black. The analysis
+    therefore runs on the unpremultiplied content and alpha stays where it
+    belongs, in the destination decay and the single premultiplication of the
+    source; an alpha of zero writes nothing and keeps no content.
+    """
+    values=np.asarray(associated,np.float32)
+    mask=np.asarray(weight,np.float32)
+    safe=np.maximum(mask,np.float32(1e-6))
+    return np.where(mask[...,None]>np.float32(0),
+        values/safe[...,None],np.float32(0.)).astype(np.float32)
+
+
+def _register_patch(patch,scale):
+    """Apply the regional gain to the region's low band only.
+
+    Scaling the whole patch would rescale its texture too, and a wrong exposure
+    must not do that: the provider's detail is right at its own amplitude and
+    only the level is wrong. The scale therefore multiplies the 1.6px low band
+    while the high band keeps its amplitude; the region mean still lands on the
+    photographed level because that band has zero mean.
+    """
+    from scipy.ndimage import gaussian_filter
+    sigma=float(FUSION['detail_sigma'])
+    values=np.asarray(patch,np.float32)
+    low=gaussian_filter(values,(sigma,sigma,0),mode='nearest')
+    high=values-low
+    return np.clip(low*np.asarray(scale,np.float32)+high,0.,np.float32(1.)).astype(np.float32)
+
+
+def _tone_depth(distance):
+    """Recorded membrane depth in pixels, from the authorized core geometry."""
+    depth=int(round(min(distance.shape)*float(FUSION['tone_depth_fraction'])))
+    low,high=FUSION['tone_depth_bounds']
+    return max(int(low),min(int(high),depth))
+
+
+def _tone_correction(prior,patch,distance):
+    """Membrane that closes the last few pixels between region and ring.
+
+    The region scale is already registered onto the ring, so this term only
+    has to remove what the patch's own content does near the cut. Its dose is
+    driven by the distance to the authorized core boundary (never by a blended
+    weight, which alpha would contaminate) and it reaches exactly zero inside
+    the recorded depth, leaving the provider's own lighting there.
+    """
+    from scipy.ndimage import gaussian_filter
+    depth=_tone_depth(distance)
+    sigma=max(1.,depth*.5)
+    residual=np.asarray(prior,np.float32)-np.asarray(patch,np.float32)
+    lowpass=gaussian_filter(residual,(sigma,sigma,0),mode='nearest')
+    dose=np.clip(1.-(distance-np.float32(1.))/np.float32(depth),0.,1.)
+    bound=float(FUSION['tone_bound'])
+    return _bounded_tone(patch,np.clip(lowpass,-bound,bound)*dose[...,None].astype(np.float32)),depth
+
+
+def _join_detail(prior,delivered,distance):
+    """Recomputable band/interior detail, the definition the audit measured.
+
+    Band is the first 8 px inside the authorized core edge and interior is
+    everything deeper than 64 px, both scored by the median absolute 1.6 px
+    high-pass of the delivered luma. Reporting the same number for the
+    retained parent makes the ratio self-checking inside the receipt.
+    """
+    from scipy.ndimage import gaussian_filter
+    band=(distance>np.float32(1.))&(distance<=np.float32(1.+FUSION['band_inner_px']))
+    interior=distance>np.float32(1.+FUSION['band_interior_px'])
+    def ratio(values):
+        if not (band.any() and interior.any()):return None
+        grey=np.asarray(values,np.float32)@_LUMA
+        highpass=grey-gaussian_filter(grey,float(FUSION['detail_sigma']),mode='nearest')
+        reference=float(np.median(np.abs(highpass[interior])))
+        return round(float(np.median(np.abs(highpass[band])))/max(reference,1e-9),6)
+    measured=ratio(delivered);retained=ratio(prior)
+    limit=float(FUSION['join_detail_relative_limit'])
+    relative=(None if measured is None or not retained
+        else round(float(measured)/float(retained),6))
+    return {'band_px':int(FUSION['band_inner_px']),'interior_px':int(FUSION['band_interior_px']),
+        'delivered':measured,'parent':retained,'relative_limit':limit,
+        'delivered_over_parent':relative,
+        'relative_ok':None if relative is None else bool(relative<=limit)}
+
+
+def fuse_region(native,patch,alpha,*,core,box):
+    """Compose one regional generated patch into the current canvas.
+
+    The authorized core and its generation context are exactly the ones the
+    reservation checked. Untouched pixels keep the parent's own bytes, and the
+    returned coverage is the real written join weight, not a fetched permission.
+    """
+    x0,y0,x1,y1=core
+    local=patch[y0-box[1]:y1-box[1],x0-box[0]:x1-box[0]]
+    registered=None if alpha is None else alpha[y0-box[1]:y1-box[1],x0-box[0]:x1-box[0]]
+    # Every measurement below runs on the provider's own colour; alpha is only
+    # ever applied once, in `source` and in the premultiplied term.
+    content=local if registered is None else _unpremultiply(local,registered)
+    prior=np.asarray(native[y0:y1,x0:x1],np.float32)
+    result=np.array(native,np.float32,copy=True)
+    view=result[y0:y1,x0:x1]
+    record={'schema':FUSION['schema'],'policy':dict(FUSION),'working_domain':'display_linear_sRGB',
+        'alpha_modified':False,'coordinates_changed':False,'generated_texture_added':False,
+        'provider_alpha_registered':registered is not None,'visual_acceptance':False}
+    if not _join_analysis_ready((x1-x0,y1-y0)):
+        weight=_mask((x1-x0,y1-y0))
+        actual=weight if registered is None else weight*registered
+        coverage=np.zeros(native.shape[:2],np.float32)
+        coverage[y0:y1,x0:x1]=actual
+        mixed=prior*(1-actual[...,None])+local*weight[...,None]
+        view[actual>0]=mixed[actual>0]
+        record.update(mode='bounded_rectangular_crossfade',
+            bypass_reason='edit_region_below_photographic_join_support')
+        return result,coverage,record
+    from scipy.ndimage import gaussian_filter
+    distance=_edge_distance((x1-x0,y1-y0))
+    taper=_structure_taper(prior)
+    ramp=_join_ramp(distance,taper)
+    # alpha belongs to the destination decay only: the source is the
+    # premultiplied patch weighted by the taper, so semi-transparent provider
+    # pixels compose as source-over instead of silently darkening the region.
+    source=ramp if registered is None else (ramp*registered).astype(np.float32)
+    registration=_registration_scale(native,core,box,content,prior,weight=registered)
+    registration['unpremultiplied_estimate']=True
+    registered_patch=_register_patch(content,registration['scale'])
+    registration['clipped_pixels']=int(np.count_nonzero(np.any(registered_patch
+        >=np.float32(1.),axis=-1)))
+    matched,gains=_match_texture(registered_patch,prior)
+    correction,depth=_tone_correction(prior,matched,distance)
+    aligned=np.clip(matched+correction,0.,1.).astype(np.float32)
+    premult=aligned if registered is None else (aligned*registered[...,None]).astype(np.float32)
+    mixed=(prior*(1.-source[...,None])+ramp[...,None]*premult).astype(np.float32)
+    coverage=np.zeros(native.shape[:2],np.float32)
+    coverage[y0:y1,x0:x1]=source
+    view[source>0]=mixed[source>0]
+    interior=distance>np.float32(1.+float(FUSION['band_interior_px']))
+    deep=distance>np.float32(1.+depth)
+    def band_rms(values):
+        grey=np.asarray(values,np.float32)@_LUMA
+        band=grey-gaussian_filter(grey,float(FUSION['detail_sigma']),mode='nearest')
+        return float(np.sqrt(np.mean(np.square(band[interior])))) if interior.any() else 0.
+    def noise_mean(values):
+        field=_immerman_noise(np.asarray(values,np.float32)@_LUMA)
+        return float(np.mean(field[interior])) if interior.any() else 0.
+    reference=band_rms(prior)
+    record.update(mode='registered_photographic_join',
+        registration=registration,
+        registration_gain_ev=round(float(np.log2(np.max(registration['scale'])
+            /np.min(registration['scale']))),6),
+        detail=gains,
+        achieved_high_frequency_ratio=round(band_rms(aligned)/max(reference,1e-9),6),
+        achieved_noise_ratio=round(noise_mean(aligned)/max(noise_mean(prior),1e-9),6),
+        join_detail=_join_detail(prior,mixed,distance),
+        tone_correction_max=round(float(np.abs(correction).max(initial=0.)),6),
+        tone_correction_interior_max=round(float(np.abs(correction[deep]).max(initial=0.))
+            if deep.any() else 0.,6),
+        tone_correction_pixels=int(np.count_nonzero(np.any(correction!=0,axis=-1))),
+        tone_depth_px=int(depth),
+        boundary_pixels=int(np.count_nonzero((ramp>0)&(ramp<1))),
+        joined_fraction=round(float(np.count_nonzero(source>0)/source.size),6),
+        alpha_in_destination_only=True,
+        analysis_domain='unpremultiplied_provider_colour',
+        coverage_semantics='written_join_weight_inside_the_authorized_core')
+    return result,coverage,record
 
 
 def _resample(rgb,size):
@@ -375,6 +760,7 @@ def _execute(context,config,kind):
         for item in (source,best):
             if _asset(item['path'])!={key:item[key] for key in ('path','sha256')}:raise ValueError('Tool input changed during generation')
         validate_asset(parent,**asset_binding)
+        fusion=None
         if core is None and alpha is None:
             result=patch;coverage=None;fraction=1.
         elif core is None:
@@ -383,15 +769,7 @@ def _execute(context,config,kind):
             result[coverage>0]=mixed[coverage>0]
             fraction=float(np.count_nonzero(coverage)/(size[0]*size[1]))
         else:
-            x0,y0,x1,y1=core
-            local=patch[y0-box[1]:y1-box[1],x0-box[0]:x1-box[0]]
-            mask=_mask((x1-x0,y1-y0))
-            coverage=np.zeros(native.shape[:2],np.float32)
-            actual=mask if alpha is None else mask*alpha[y0-box[1]:y1-box[1],x0-box[0]:x1-box[0]]
-            coverage[y0:y1,x0:x1]=actual;result=native.copy()
-            prior=native[y0:y1,x0:x1]
-            mixed=prior*(1-actual[...,None])+local*mask[...,None]
-            result[y0:y1,x0:x1][actual>0]=mixed[actual>0]
+            result,coverage,fusion=fuse_region(native,patch,alpha,core=core,box=box)
             fraction=float(np.count_nonzero(coverage)/(size[0]*size[1]))
         if coverage is not None and not np.any(coverage>0):
             raise ValueError('Generated image has no visible coverage inside its permitted edit')
@@ -409,7 +787,7 @@ def _execute(context,config,kind):
         composition={'schema':SCHEMA,'binding':binding,'working_domain':'display_linear_sRGB',
             'output_encoding':'float32_master_with_matching_RGB8_sRGB_preview','core_box':core,'context_box':box,
             'coverage':loaded['receipt']['edit_coverage'],
-            'coverage_semantics':'current_canvas_edit_coverage_not_source_subject_alpha',
+            'coverage_semantics':'current_canvas_edit_coverage_not_source_subject_alpha','join':fusion,
             'edit_permission':'full_canvas' if kind=='joint_edit' else 'bounded_region',
             'composition_mode':'opaque_replacement' if coverage is None else 'linear_premultiplied_rgba_over_parent',
             'generated_opacity':'opaque' if alpha is None else 'registered_alpha',

@@ -35,6 +35,7 @@
     "cloth_boundary_worker.py",
     "colour_space.py",
     "comfyui_adapter.py",
+    "composite_quality.py",
     "cos_node_registry.py",
     "cos_workflow_cache.py",
     "cos_workflow_canvas.py",
