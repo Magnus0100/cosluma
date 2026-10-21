@@ -20,3 +20,9 @@ scripts/local_photo_analysis.py -text
 scripts/local_semantics_worker.py -text
 scripts/sapiens_model_profiles.py -text
 scripts/native_subject_detail.py -text
+
+# Runtime code and public model/workflow identities are byte-bound.
+scripts/*.py -text
+scripts/*.json -text
+providers/** -text
+presets/** -text

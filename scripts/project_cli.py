@@ -214,6 +214,14 @@ def _checked_one_click_args(args: argparse.Namespace, root: Path) -> dict[str, A
         # does not contain every parser default, so re-planning the raw CLI
         # namespace would manufacture a different request identity.
         validate_task_plan(plan, intent)
+        if plan.get('editing_request') is not None and request.get('editing_request') != plan['editing_request']:
+            raise ValueError('Editing request differs from the checked task plan')
+        if request.get('editing_iteration') != plan.get('editing_iteration'):
+            raise ValueError('Editing iteration differs from the checked task plan')
+        if request.get('shaping_request') != plan.get('shaping_request'):
+            raise ValueError('Shaping request differs from the checked task plan')
+        if request.get('editing_autofinish') != plan.get('editing_autofinish'):
+            raise ValueError('Automatic finishing differs from the checked task plan')
         from creative_task import sha
         for role, supplied in (("source", request.get("source")),
                                ("reference", request.get("reference"))):
@@ -224,8 +232,11 @@ def _checked_one_click_args(args: argparse.Namespace, root: Path) -> dict[str, A
                 continue
             path = Path(str(supplied)).expanduser().resolve() if supplied else None
             recorded_path = Path(str(recorded.get("path"))).expanduser().resolve() if recorded.get("path") else None
-            if (path is None or not path.is_file() or recorded_path is None
-                    or path != recorded_path or sha(path) != recorded.get("sha256")):
+            frozen_restore=(role=='source' and (plan.get('shaping_request') or {}).get('action')=='restore'
+                and sum(plan['image_budget'].values())==0
+                and recorded.get('sha256')==(plan.get('shaping_authorization') or {}).get('source_sha256'))
+            if (path is None or recorded_path is None or path != recorded_path
+                    or not frozen_restore and (not path.is_file() or sha(path) != recorded.get("sha256"))):
                 raise ValueError("Task inputs changed; check the task plan again")
         mode = intent.get("mode")
         if bool(getattr(args, "local_only", False)) != (mode == "local_portrait"):
@@ -305,7 +316,7 @@ def one_click_cmd(args: argparse.Namespace, root: Path) -> int:
     checked_settings = {key: checked[key] for key in (
         "task_intent", "task_plan", "execution_strategy", "model_registry",
         "appearance_revision", "manual_layers", "generation_design",
-        "character_profile", "preset_snapshot", "variant_count",
+        "character_profile", "preset_snapshot", "editing_request", "editing_iteration", "editing_autofinish", "shaping_request", "variant_count",
         "variant_styles", "cosplay_correction_budget", "preserve_project_selection",
     ) if key in checked}
     single_source_workflow.apply_workflow_settings(workflow_args, checked_settings)
@@ -468,7 +479,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get('ok') else 2
     if args.command == "one-click":
-        return one_click_cmd(args, root)
+        from appearance_read_scope import parent_operation
+        with parent_operation(root, args):
+            return one_click_cmd(args, root)
     if args.command == "source-status":
         return source_status_cmd(args, root)
     if args.command == "source-accept":

@@ -150,12 +150,13 @@ class PromptCacheContracts(unittest.TestCase):
         self.assertEqual(result['generated_images'], 0)
 
     def test_runtime_loader_omits_all_encoders_and_preserves_official_lora(self):
-        from diffusers import FluxKontextPipeline
+        from diffusers import AutoencoderKL, FluxKontextPipeline
         import beautygrpo_nunchaku
         self.publish(); config = self.installed()
         pipe = SimpleNamespace(vae=SimpleNamespace(enable_slicing=Mock(), enable_tiling=Mock()),
             to=Mock())
         pipe.to.return_value = pipe
+        config['vae_model_root'] = str(self.root/'ssd'/'vae')
         transformer = object()
         with patch.dict(worker._PIPELINE_CACHE, {}, clear=True), \
                 patch.object(torch.cuda, 'is_available', return_value=True), \
@@ -166,6 +167,7 @@ class PromptCacheContracts(unittest.TestCase):
                 patch.object(beautygrpo_nunchaku, 'installed_model', return_value=(self.root/'int4.safetensors', {'fixture': True})), \
                 patch.object(beautygrpo_nunchaku, 'bind_lora', return_value={'consumed_source_tensors': 684}) as bind, \
                 patch.object(beautygrpo_nunchaku, 'load_transformer', return_value=transformer) as transformer_load, \
+                patch.object(AutoencoderKL, 'from_pretrained', return_value=pipe.vae) as vae_load, \
                 patch.object(FluxKontextPipeline, 'from_pretrained', return_value=pipe) as load:
             actual, evidence = worker.load_pipeline(config)
         self.assertIs(actual, pipe)
@@ -173,6 +175,10 @@ class PromptCacheContracts(unittest.TestCase):
             self.assertIsNone(load.call_args.kwargs[name])
         self.assertEqual(load.call_args.kwargs['torch_dtype'], torch.bfloat16)
         self.assertIs(load.call_args.kwargs['transformer'], transformer)
+        self.assertIs(load.call_args.kwargs['vae'], pipe.vae)
+        self.assertEqual(vae_load.call_args.args, (str((self.root/'ssd'/'vae').resolve()),))
+        self.assertEqual(vae_load.call_args.kwargs['torch_dtype'], torch.bfloat16)
+        self.assertEqual(evidence['loaded_model_locations']['vae'], str((self.root/'ssd'/'vae').resolve()))
         self.assertEqual(evidence['lora_verified']['consumed_source_tensors'], 684)
         self.assertEqual(bind.call_args.args[0], transformer)
         self.assertEqual(transformer_load.call_args.args, (self.root/'int4.safetensors',))

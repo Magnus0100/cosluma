@@ -70,12 +70,15 @@ def main():
              patch('reference_provider.provider_health', return_value={'ready': True}):
             window = Window(root, 'http://127.0.0.1:1'); pool = Pool(); window.pool = pool
             assert window.variant_count.value() == 1
-            assert window.creative_task_mode.currentData() == 'local_portrait'
+            assert window.creative_task_mode.currentData() == 'create_reference'
+            assert window.creative_text_vision.isChecked() and not window.creative_text_vision.isEnabled()
+            window.creative_task_mode.setCurrentIndex(window.creative_task_mode.findData('local_portrait'))
             assert not window.creative_text_vision.isChecked() and not window.creative_text_vision.isEnabled()
             assert not window.creative_visual_review.isChecked() and not window.creative_visual_review.isEnabled()
             assert window.creative_plan_summary.isReadOnly() and not window.creative_start_button.isEnabled()
-            assert not window.character_recognize.isEnabled() and not window.prepare_design_button.isEnabled()
-            count = len(pool.tasks); window.recognize_character(); window.prepare_generation_design()
+            assert not window.character_recognize.isEnabled() and not hasattr(window,'prepare_design_button')
+            assert not hasattr(window,'prepare_generation_design')
+            count = len(pool.tasks); window.recognize_character()
             assert len(pool.tasks) == count and '未提交' in window.operation_state.text()
             assert not hasattr(window, 'resume_btn') and not hasattr(window, 'promote') and not hasattr(window, 'samples')
             window.source_edit.setText(sources[0]); window.creative_task_brief.setPlainText('保留眼线和金色细边，柔和夜景。')
@@ -124,13 +127,23 @@ def main():
             window.set_background_mode('replace')
             window.creative_text_vision.setChecked(True)
             assert window.creative_visual_review.isEnabled()
+            count=len(pool.tasks);window.recognize_character()
+            assert len(pool.tasks)==count and '检查制作计划' in window.operation_state.text()
+            window.check_creative_task_plan();recognition_plan_task=pool.tasks[-1]
+            recognition_checked=contract.plan_task(root,recognition_plan_task.body)
+            recognition_plan_task.signals.result.emit(recognition_checked)
+            window.recognize_character();recognition=pool.tasks[-1]
+            assert recognition.path=='/api/character/recognize'
+            assert recognition.body['task_plan']['plan_id']==recognition_checked['plan']['plan_id']
+            assert recognition.body['task_intent']==recognition_checked['plan']['intent']
+            assert recognition.body['reference']==str(reference.resolve())
             window.creative_visual_review.setChecked(True)
             assert window.creative_task_plan is None
             assert window.creative_task_payload()['services']['visual_review'] is True
             window.creative_text_vision.setChecked(False); window.check_creative_task_plan()
             assert not window.creative_visual_review.isChecked() and not window.creative_visual_review.isEnabled()
             assert window.creative_task_payload()['services']['visual_review'] is False
-            count = len(pool.tasks); window.recognize_character(); window.prepare_generation_design()
+            count = len(pool.tasks); window.recognize_character()
             assert len(pool.tasks) == count and not window.character_recognize.isEnabled()
             pending = pool.tasks[-1]; unplanned = contract.plan_task(root, pending.body); pending.signals.result.emit(unplanned)
             assert window.creative_start_button.isEnabled() and '不使用' in window.creative_plan_summary.toPlainText()
@@ -152,17 +165,19 @@ def main():
             assert contract.execution_request(root, started.body)['complete_post'] is True
             started.signals.error.emit('mocked submission failure')
 
-            window.set_background_mode('replace')
+            controls = window.editing_scope_panels[-1]
+            controls['work_type'].setCurrentIndex(controls['work_type'].findData('full_composite'))
             window.variant_count.setValue(2); window.run_source_only(); pending = pool.tasks[-1]
             generated = contract.plan_task(root, pending.body); pending.signals.result.emit(generated)
             assert generated['plan']['mode'] == 'create_reference' and generated['plan']['image_budget']['initial_reference'] == 2
             assert generated['plan']['candidate_selection']['required'] is True
-            assert pending.body['defer_reference_selection'] is True and len(pending.body['variant_styles']) == 2
+            assert pending.body['defer_reference_selection'] is True and 'variant_styles' not in pending.body
             authored_settings = window.generation_request_options()
             authored_settings['variant_styles'] = ['night_scene', 'stage_light']
             with patch.object(window, 'generation_request_options', return_value=authored_settings):
                 authored = window.creative_task_request_options('create_reference')
-            assert contract.plan_task(root, {**authored, 'source': sources[1]})['request']['variant_styles'] == ['night_scene', 'stage_light']
+            # Candidate count does not silently authorize different artistic targets.
+            assert 'variant_styles' not in contract.plan_task(root, {**authored, 'source': sources[1]})['request']
             window.creative_start_button.click(); started = pool.tasks[-1]
             assert started.label == 'one-click' and contract.execution_request(root, started.body)['generate'] is True
             started.signals.error.emit('mocked submission failure')

@@ -127,8 +127,31 @@ def main():
         except ValueError: pass
         else: raise AssertionError('Invalid guidance accepted')
     root = path.parents[2]
+    # Retain the current shipped sampling profile after the bounded comparison;
+    # the official CFG1 recommendation is not a demonstrated quality win here.
+    for name in ('edit', 'fast-edit', 'uncensored-edit', 'uncensored-fast-edit',
+                 'effect-rgba', 'effect-rgba-text-only'):
+        document = adapter.load_workflow(root/f'providers/workflows/qwen-image-2.1-{name}.json')
+        graph = adapter.prepare_workflow(document, 'source.png', 'new prompt')
+        encoder, sampler = graph['5']['inputs'], graph['6']['inputs']
+        cfg = sampler['cfg']
+        if isinstance(cfg, list):
+            assert cfg == ['5', 3]
+            cfg = encoder['cfg']
+        assert cfg == 3.0 and encoder['negative_prompt'] == ''
+        assert sampler['steps'] == 40 and sampler['sampler_name'] == 'euler'
+        assert sampler['scheduler'] == 'simple' and sampler['denoise'] == 1.0
     for name in ('edit', 'fast-edit', 'uncensored-edit', 'uncensored-fast-edit'):
         document = adapter.load_workflow(root/f'providers/workflows/qwen-image-2.1-{name}.json')
+        # An explicit custom workflow remains explicit; a recommended default
+        # must not silently rewrite its guidance or negative instruction.
+        for custom_cfg, negative in ((1.0, ''), (1.0, 'unwanted colour cast'),
+                                     (3.0, 'unwanted colour cast')):
+            custom = copy.deepcopy(document)
+            custom['workflow']['5']['inputs'].update(cfg=custom_cfg, negative_prompt=negative)
+            custom_graph = adapter.prepare_workflow(custom, 'source.png', 'custom light')
+            assert custom_graph['5']['inputs']['cfg'] == custom_cfg
+            assert custom_graph['5']['inputs']['negative_prompt'] == negative
         graph = adapter.prepare_condition_workflow(document, ['source.png', 'ref.png'], 'new prompt')
         assert graph['6']['inputs']['cfg'] == ['5',3] and graph['5']['inputs']['images.image_2']
         assert graph['9']['inputs']['device'] == 'off'
@@ -140,7 +163,8 @@ def main():
             else: raise AssertionError('Detached CFG or custom hook path accepted')
     print(json.dumps({'ok': True, 'official_execute_source': str(official_source) if official_source else 'mock',
         'cfg1_empty_encodes': 1, 'other_cfg_or_negative_encodes': 2, 'positive_vae_latent_unchanged': True,
-        'input_rgba_unchanged': True, 'guidance_bound_to_sampler': True, 'gpu_operations': 0}))
+        'input_rgba_unchanged': True, 'guidance_bound_to_sampler': True,
+        'retained_sampling_profiles': 6, 'explicit_custom_guidance_preserved': True, 'gpu_operations': 0}))
 
 
 if __name__ == '__main__': main()

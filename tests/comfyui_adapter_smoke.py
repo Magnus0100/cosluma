@@ -107,25 +107,21 @@ def main() -> int:
             wrapper = {"workflow": graph, "bindings": {"source": {"node": "1", "input": "image"},
                                                        "prompt": {"node": "2", "input": "text"}}}
             assert comfyui_adapter.prepare_workflow(wrapper, "bound.png", "bound prompt")["1"]["inputs"]["image"] == "bound.png"
-            # Exercise provider defaults through the actual single-source
-            # generation/render path, without supplying model or key flags.
-            os.environ["COSPLAY_COMFYUI_API_BASE"] = endpoint
-            os.environ["COSPLAY_COMFYUI_WORKFLOW"] = str(workflow)
-            state.update(mode="success", polls=0)
-            run = single_source_workflow.create_run(single_source_workflow.parse_args([
-                "--root", str(root), "--source", str(image), "--provider", "comfyui",
-                "--generate", "--run-id", "comfy-source",
-            ]))
-            assert run["status"] == "needs_visual_review" and run.get("error") is None
-            assert run["reference"] is not None and run["delivery_status"] == "auto_draft"
-            reference = Path(run["reference"]["path"])
-            assert reference.is_relative_to(root / "outputs/runs/comfy-source")
-            run_provenance = json.loads(Path(run["reference"]["provenance"]).read_text(encoding="utf-8"))
-            assert run_provenance["generation_id"] == "actual-job-id"
-            assert run_provenance["provider_contract"]["protocol"] == "comfyui-api"
-            assert run_provenance["provider_contract"]["comfyui"]["prompt_id"] == "actual-job-id"
-            manifest = json.loads((root / "outputs/runs/comfy-source/manifest.json").read_text(encoding="utf-8"))
-            assert manifest["status"] == "needs_visual_review" and not manifest.get("delivery")
+            # The low-level worker must reject unchecked generation before
+            # model preparation or adapter transport. Provider protocol coverage
+            # above and below uses only this isolated HTTP fixture.
+            calls_before = list(state['calls'])
+            try:
+                single_source_workflow.create_run(single_source_workflow.parse_args([
+                    "--root", str(root), "--source", str(image), "--provider", "comfyui",
+                    "--generate", "--run-id", "comfy-source",
+                ]))
+            except ValueError as exc:
+                assert 'checked scoped task' in str(exc)
+            else:
+                raise AssertionError('Unchecked generation entered production')
+            assert state['calls'] == calls_before
+            assert not (root/'outputs/runs/comfy-source').exists()
             for mode in ("error", "timeout"):
                 state.update(mode=mode, polls=0)
                 failed_out = root / "outputs/runs" / mode / "reference"
@@ -138,7 +134,7 @@ def main() -> int:
                     raise AssertionError(f"{mode} must not register a candidate")
                 assert not (failed_out/'COMFY.png').exists()
             print(json.dumps({"ok": True, "protocol": "upload/prompt/history/view", "generation_id": "actual-job-id",
-                              "run_local": True, "single_source_default_configuration": True,
+                              "run_local": True, "unchecked_generation_rejected": True,
                               "failure_and_timeout_no_candidate": True}, indent=2))
     finally:
         server.shutdown()

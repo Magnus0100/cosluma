@@ -123,7 +123,7 @@ def exercise(root, mode, caller, native):
             'semantics_profile': 'sapiens2_seg_0.4b', 'matting_profile': 'vitmatte_small_distinctions'}))
         stack.enter_context(patch.object(foreground, 'local_runtime_paths', return_value=runtime))
         stack.enter_context(patch.object(workflow, '_prepare_task_portrait_beauty', side_effect=beauty_completed))
-        stack.enter_context(patch.object(workflow, 'generate_candidate', side_effect=forbidden))
+        stack.enter_context(patch('reference_provider.request_edit', side_effect=forbidden))
         stack.enter_context(patch.object(workflow, 'render_candidate', side_effect=forbidden))
         stack.enter_context(patch('boundary_light_coordination_worker.prepare_for_workbench', side_effect=forbidden))
         stack.enter_context(patch('urllib.request.urlopen', side_effect=forbidden))

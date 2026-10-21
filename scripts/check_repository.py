@@ -82,6 +82,9 @@ def validate_tracked_files(root, selected):
     result = subprocess.run(['git', '-C', str(root), 'ls-files', '-z'],
                             check=True, capture_output=True)
     tracked = set(result.stdout.decode('utf8').split('\0')) - {''}
+    # The index retains a deleted path until commit/staging. It is no longer
+    # an export input. Surviving symlinks remain subject to the strict gate.
+    tracked = {name for name in tracked if (root/name).exists() or (root/name).is_symlink()}
     public = {path.relative_to(root).as_posix() for path in selected}
     unexpected = tracked - public
     if unexpected:

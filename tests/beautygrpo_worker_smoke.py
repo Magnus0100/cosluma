@@ -162,9 +162,13 @@ class BeautyWorkerContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);base=root/'base';base.mkdir();regions=root/'regions';regions.mkdir()
             rows=[]
+            replaced = sorted(worker.REPLACED_BASE_WEIGHTS)
             for index in range(25):
-                name='model_index.json' if index==0 else 'weight.safetensors' if index==1 else f'config-{index}.json'
-                path=base/name;path.write_bytes(b'x')
+                name=('model_index.json' if index==0 else 'weight.safetensors' if index==1
+                      else 'vae/diffusion_pytorch_model.safetensors' if index==2
+                      else 'vae/config.json' if index==3
+                      else replaced[index-4] if 4<=index<7 else f'config-{index}.json')
+                path=base/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'x')
                 rows.append({'path':name,'bytes':1,'local_sha256':worker.sha(path),'verified':True})
             catalog=root/'manifest.json';worker.write_json(catalog,{'status':'ready_for_local_inference',
                 'hf_repo':worker.BASE_ID,'hf_revision':worker.BASE_REVISION,'completed_files':rows})
@@ -176,12 +180,19 @@ class BeautyWorkerContracts(unittest.TestCase):
                     'face_registry':str(registry),'base_manifest':str(catalog),'base_manifest_sha256':worker.sha(catalog),
                     'offload':'sequential_cpu_offload','recipe':dict(worker.RECIPE)}
             installation=root/'installation.json';worker.write_json(installation,config)
+            # A real INT4 installation never loads these BF16 shards. Its
+            # original download evidence still describes all official files.
+            for name in replaced:
+                (base/name).unlink()
             with patch.dict(worker.BASE_WEIGHT_HASHES,{'weight.safetensors':worker.sha(base/'weight.safetensors')},clear=True):
                 keys = [f'transformer.layer{index}.lora_{kind}.weight'
                         for index in range(342) for kind in ('A','B')]
                 with patch.object(worker,'verify_lora_file',return_value=keys):
-                    worker.verify_installation(installation,
+                    receipt=worker.verify_installation(installation,
                         receipt_path=installation.with_suffix('.verification.json'))
+                self.assertEqual(receipt['base']['inventory_scope'],worker.BASE_INVENTORY_SCOPE)
+                self.assertEqual(receipt['base']['file_count'],22)
+                self.assertFalse(set(replaced)&{row['path'] for row in receipt['base']['files']})
                 observed=[]
                 original_sha=worker.sha
                 def track(path):
@@ -210,7 +221,12 @@ class BeautyWorkerContracts(unittest.TestCase):
                         {**runtime_identity(c), 'gpu_id': 7}):
                     self.assertRaises(ValueError, worker.load_installation, installation)
                 evidence=worker.verify_base(loaded)
-                self.assertEqual(evidence['verified_file_count'],25)
+                self.assertEqual(evidence['verified_file_count'],22)
+                original_receipt=copy.deepcopy(receipt)
+                receipt['base'].pop('inventory_scope')
+                worker.write_json(installation.with_suffix('.verification.json'),receipt)
+                self.assertRaises(ValueError,worker.load_installation,installation)
+                worker.write_json(installation.with_suffix('.verification.json'),original_receipt)
                 (base/'weight.safetensors').write_bytes(b'y')  # Same size is not hash identity.
                 self.assertRaises(ValueError,worker.load_installation,installation)
                 with patch.object(worker,'load_pipeline') as load:

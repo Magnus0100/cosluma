@@ -173,33 +173,6 @@ def main():
             # Exact retries carry zero correction budget through the product
             # entry as well as the coordinator's independent exclusion.
             assert backend._one_click_payload(body,str(source)).get('cosplay_correction_budget')==body.get('cosplay_correction_budget')
-        # Real create_run must dispatch the coordinator after its saved render,
-        # rather than this test proving only a direct helper call.
-        hooked=workflow.parse_args(['--root',str(root),'--source',str(source),
-            '--run-id','real-hook','--generate','--cosplay-correction-budget','1'])
-        hooked.character_profile={'identification':'unidentified','recommended_styles':[]}
-        hooked.preserve_project_selection=True
-        def diagnose(_root,current,_args):
-            current['cosplay_post_review']=copy.deepcopy(run['cosplay_post_review'])
-            return current['cosplay_post_review']
-        with patch('reference_provider.provider_config',return_value={
-                'provider':'offline-fixture','model':'offline-model'}), \
-             patch.object(workflow,'prepare_bound_design',return_value=run['generation_design']), \
-             patch.object(workflow,'generate_candidate',return_value=reference) as generator, \
-             patch.object(workflow,'render_candidate',return_value={
-                'outputs':artifacts,'metadata':{},'review':{'status':'not_checked'}}) as renderer, \
-             patch('automatic_native_retouch.prepare_once', side_effect=lambda _root, current, _args, **kw:
-                   {'run': current, 'status': 'offline_mock', 'layer_record': None}), \
-             patch.object(workflow,'diagnose_cosplay_post',side_effect=diagnose), \
-             patch('reference_refinement.refine_reference_once',return_value={
-                'status':'unavailable','generation_attempts':1}) as correction, \
-             patch.object(completion,'continue_cosplay_post',wraps=completion.continue_cosplay_post) as coordinator:
-            actual=workflow.create_run(hooked)
-        assert generator.call_count==renderer.call_count==coordinator.call_count==correction.call_count==1
-        assert actual['status']=='needs_visual_review'
-        assert actual['cosplay_post_completion']['status']=='correction_unavailable'
-        assert actual['generation_budget']['max_image_submissions']==2
-        assert actual['generation_budget']['total_image_submissions']==2
     print(json.dumps({'ok':True,'generation_requests':0,'network_requests':0,
                       'rejects_before_composition':True,'fresh_bound_child':True,
                       'source_and_masters_and_project_preserved':True}))

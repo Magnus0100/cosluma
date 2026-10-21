@@ -21,6 +21,8 @@ from current_model_registry import PROFILES, SCHEMA
 from sapiens_model_profiles import profile as sapiens_profile
 import task_model_preflight as preflight
 
+ACTUAL_FACE_INSPECT = preflight.inspect_task_models
+
 
 def _write(path, data=b'Public offline fixture; never an executable model/runtime.\n'):
     path = Path(path)
@@ -108,6 +110,19 @@ def build_registry_fixture(root, *, name='models'):
 
 def mocked_task_capability(config, *, mode='existing_reference', **kwargs):
     """Explicit model-capability mock for task/API contract tests, not acceptance."""
+    if kwargs.get('shaping_request') is not None:
+        requested_shaping = preflight.required_capabilities(mode,
+            execution_strategy=kwargs.get('execution_strategy', 'layered_reference_transfer'),
+            complete_post=kwargs.get('complete_post'), use_beautygrpo=kwargs.get('use_beautygrpo', False),
+            editing_scope=kwargs.get('editing_scope'), shaping_request=kwargs['shaping_request'])
+        if 'portrait_regions' in requested_shaping:
+            # A face-shaping fixture must really bind its tiny model/Python/
+            # MediaPipe metadata bytes. Capture the real inspector before the
+            # enclosing public fixture replaces its entry point with this mock.
+            return ACTUAL_FACE_INSPECT(config, mode=mode,
+                execution_strategy=kwargs.get('execution_strategy', 'layered_reference_transfer'),
+                complete_post=kwargs.get('complete_post'), use_beautygrpo=kwargs.get('use_beautygrpo', False),
+                editing_scope=kwargs.get('editing_scope'), shaping_request=kwargs['shaping_request'])
     requested = preflight.required_capabilities(mode,
         execution_strategy=kwargs.get('execution_strategy', 'layered_reference_transfer'),
         complete_post=kwargs.get('complete_post'),

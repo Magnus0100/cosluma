@@ -15,6 +15,7 @@ from typing import Any
 
 import workflow_timing
 from reference_stage_worker import stage_session
+from appearance_read_scope import saved_parent_reads
 
 
 SCHEMA = "cosplay_production_contract.v1"
@@ -61,6 +62,19 @@ def route_contract(body: dict[str, Any]) -> dict[str, Any]:
         "source_sha256": ((checked.get("inputs") or {}).get("source") or {}).get("sha256"),
         "reference_sha256": ((checked.get("inputs") or {}).get("reference") or {}).get("sha256"),
     }
+    if checked.get('editing_scope') is not None:
+        contract['editing_scope_id'] = checked['editing_scope']['scope_id']
+        contract['work_type'] = checked['editing_scope']['work_type']
+    if checked.get('editing_iteration') is not None:
+        contract['editing_refinement_authorization_sha256']=hashlib.sha256(json.dumps(
+            checked['editing_refinement_authorization'],sort_keys=True,separators=(',',':'),
+            ensure_ascii=False).encode('utf8')).hexdigest()
+    if checked.get('shaping_request') is not None:
+        if body.get('shaping_request',checked['shaping_request'])!=checked['shaping_request']:
+            raise ValueError('Shaping differs from the checked task plan')
+        contract['shaping_authorization_sha256']=hashlib.sha256(json.dumps(
+            checked['shaping_authorization'],sort_keys=True,separators=(',',':'),
+            ensure_ascii=False).encode('utf8')).hexdigest()
     if checked.get('creative_direction') is not None:
         direction = checked['creative_direction']
         if body.get('creative_direction', direction) != direction:
@@ -80,6 +94,7 @@ def route_contract(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @workflow_timing.entry('production_workflow', lambda root, workflow_args: root)
+@saved_parent_reads
 @stage_session
 def execute_workflow(root: Path | str, workflow_args: Any) -> dict[str, Any]:
     """Execute the existing native worker path under the checked contract."""
@@ -113,13 +128,51 @@ def execute_workflow(root: Path | str, workflow_args: Any) -> dict[str, Any]:
                             raise ValueError('Saved run source or checked task plan changed before contract save')
                         single_source_workflow._begin_result_publication(saved, operation='checked_production')
                         saved["production_contract"] = copy.deepcopy(contract)
-                        saved['result_publication'].update(state='committed',
-                            committed_at=single_source_workflow.now(),
-                            contract_sha256=hashlib.sha256(json.dumps(contract, sort_keys=True,
-                                separators=(',', ':'), ensure_ascii=False).encode('utf8')).hexdigest())
+                        cancel_path=getattr(workflow_args,'cancel_request_path',None)
+                        if saved.get('status')=='cancelled' or (cancel_path and Path(cancel_path).is_file()):
+                            # A late cancellation may return a complete fallback
+                            # for audit, but must not publish this task as a new
+                            # selectable saved result.
+                            saved['status']='cancelled'
+                        elif checked_shaping_incomplete(root,saved):
+                            saved['result_publication'].update(state='failed',
+                                reason='No complete checked shaping pixels were saved')
+                        else:
+                            saved['result_publication'].update(state='committed',
+                                committed_at=single_source_workflow.now(),
+                                contract_sha256=hashlib.sha256(json.dumps(contract, sort_keys=True,
+                                    separators=(',', ':'), ensure_ascii=False).encode('utf8')).hexdigest())
                         single_source_workflow.write_json(manifest, saved)
                         run = saved
             except (OSError, ValueError, TypeError) as exc:
                 raise RuntimeError("unable to persist production contract receipt: " + str(exc)) from exc
     single_source_workflow._record_saved_result(root, run)
     return run
+
+
+def checked_shaping_incomplete(root, run):
+    """A failed/unknown shaping attempt is history, never a saved result."""
+    plan=run.get('task_plan') or {}
+    request=plan.get('shaping_request')
+    if request is None:
+        return False
+    result=run.get('shaping_result') or {}
+    asset=(run.get('options') or {}).get('photo_appearance') or {}
+    if (run.get('status')!='needs_visual_review'
+            or result.get('authorization_id')!=(plan.get('shaping_authorization') or {}).get('authorization_id')
+            or result.get('selected_asset_id')!=asset.get('asset_id')
+            or not (result.get('completed') is True if request['action']=='apply'
+                    else result.get('exact_frozen_reuse') is True)):
+        return True
+    from asset_identity import sha256_file
+    directory=Path(root)/'outputs/runs'/run['run_id']
+    outputs=run.get('artifacts') or {}
+    saved=(run.get('render') or {}).get('saved_artifact_sha256') or {}
+    for name in ('auto_draft','render_master','render_scene_master'):
+        value=outputs.get(name)
+        if not value or not saved.get(name):return True
+        path=Path(value);path=(path if path.is_absolute() else Path(root)/path).resolve()
+        if not path.is_relative_to(directory.resolve()) or not path.is_file() or sha256_file(path)!=saved[name]:
+            return True
+    return False
+

@@ -35,7 +35,7 @@ def main() -> int:
         parent_directory = root / single_source_workflow.RUNS_DIR / 'run-parent'
         parent_bytes = {path.relative_to(parent_directory):path.read_bytes()
                         for path in parent_directory.rglob('*') if path.is_file()}
-        with patch.object(single_source_workflow,'generate_candidate',side_effect=AssertionError('History copy generated a candidate')):
+        with patch('reference_provider.request_edit',side_effect=AssertionError('History copy generated a candidate')):
             child = single_source_workflow.copy_source_run(root,'run-parent')
         child_id = child['run_id']
         assert child["revision"] == 2

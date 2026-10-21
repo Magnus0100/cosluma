@@ -21,6 +21,6 @@
 
 五官、妆造、美瞳、姿态、服装和相机保持，颜色可适应场景。用户禁特效/保背景优先，研究事实与创意分记。切换风格保留 brief，只改受管理段及旧自动设计；精确重试保留文本、版本和快照。“恢复默认”才重置文字。
 
-整体/颜色/明暗消费 `reference_appearance_stack.v2`，与生图风格分别记录。背景效果随合格背景消费，跨人物效果走独立 RGBA 并审核。轮廓响应、投影及发光要求需真实资产和作品证明。
+原片和普通导入参考的源域整体/颜色/明暗控制消费 `reference_appearance_stack.v2`，与生图风格分别记录。背景效果随合格背景消费，跨人物效果走独立 RGBA 并审核。轮廓响应、投影及发光要求需真实资产和作品证明。
 
 见 [GENERATION_PROMPT.md](GENERATION_PROMPT.md) 与 [COSPLAY_POST_STANDARD.md](COSPLAY_POST_STANDARD.md)。

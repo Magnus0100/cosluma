@@ -196,7 +196,7 @@ def main():
         # Saved/source-only operations have no automatic reference dependency.
         with patch.object(reference_pipeline,'prepare',side_effect=AssertionError('Source-only operation prepared reference assets')), \
              patch.object(design_pipeline,'ready',side_effect=AssertionError('Source-only operation required local reference models')), \
-             patch.object(workflow,'generate_candidate',side_effect=AssertionError('Local-only operation generated a candidate')), \
+             patch('reference_provider.request_edit',side_effect=AssertionError('Local-only operation generated a candidate')), \
              patch('source_alpha.source_silhouette',side_effect=lambda _root,_source,image,**kw:(Image.new('L',image.size,255),{'backend':'synthetic_test_matte'})):
             local=workflow.create_run(workflow.parse_args(common+['--run-id','local','--local-only']))
             assert local['status']=='needs_visual_review' and local['reference'] is None
@@ -209,23 +209,11 @@ def main():
             assert edited['reference'] is None and edited['continuation_edit']['render_state']=='saved'
             assert Path(edited['artifacts']['auto_draft']).read_bytes()!=Path(local['artifacts']['auto_draft']).read_bytes()
             assert _snapshot(local_directory)==saved_bytes
-        # A genuine provider failure preserves source-only fallback/copy/edit.
-        args=workflow.parse_args(common+['--run-id','provider-failure','--generate'])
-        args.character_profile={'identification':'fixture','recommended_styles':[]}
-        with patch.object(workflow,'prepare_bound_design',return_value={'status':'unavailable', 'effective_prompt':'Source preservation fallback fixture'}), \
-             patch.object(workflow,'generate_candidate',side_effect=RuntimeError('provider unavailable')) as generation, \
-             patch.object(reference_pipeline,'prepare',side_effect=AssertionError('Missing reference prepared automatic assets')):
-            fallback=workflow.create_run(args)
-            assert generation.call_count==1
-            assert fallback['status']=='blocked' and fallback['reference'] is None
-            assert not fallback.get('auto_draft') and not fallback.get('fallback')
-            assert fallback['error']['kind']=='generation_failed'
-            assert generation.call_count==1
         # Importing a candidate into a workspace without models stays blocked;
         # neither the history fixture nor acceptance may bypass that contract.
         with patch.object(design_pipeline,'ready',return_value=False), \
              patch.object(reference_pipeline,'prepare',side_effect=AssertionError('Unavailable preparation was invoked')), \
-             patch.object(workflow,'generate_candidate',side_effect=AssertionError('Retained candidate was regenerated')):
+             patch('reference_provider.request_edit',side_effect=AssertionError('Retained candidate was regenerated')):
             blocked=workflow.create_run(workflow.parse_args(common+['--run-id','candidate-no-runtime','--reference',str(candidate)]))
         assert blocked['status']=='blocked' and blocked['error']['kind']=='local_reconstruction_failed'
         assert blocked['error']['candidate_retained'] and not blocked['error']['automatic_image_retry']

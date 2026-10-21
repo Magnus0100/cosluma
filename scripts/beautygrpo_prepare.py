@@ -7,6 +7,8 @@ needs neither installed weights nor a GPU.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_popen, external_python_run
+
 import argparse
 import atexit
 import copy
@@ -467,7 +469,7 @@ def _run_regions(config,record,root,output,max_faces):
                        'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'})
         log = output.parent/'regions.log'
         with log.open('wb') as stream:
-            process = subprocess.run(command,cwd=str(root),env=environment,stdout=stream,stderr=subprocess.STDOUT,
+            process = external_python_run(command,cwd=str(root),env=environment,stdout=stream,stderr=subprocess.STDOUT,
                                      creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         if process.returncode:
             raise RuntimeError('Automatic portrait region parsing failed: '+log.read_text('utf8',errors='replace')[-2200:])
@@ -811,7 +813,7 @@ def _start_beauty_service(config, root):
     environment = isolated_python_environment({'PYTHONDONTWRITEBYTECODE': '1',
                    'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
                    OFFLOAD_ENV: profile['offload']})
-    process = subprocess.Popen(command, cwd=str(root), env=environment, stdin=subprocess.PIPE,
+    process = external_python_popen(command, cwd=str(root), env=environment, stdin=subprocess.PIPE,
                                stdout=stream, stderr=subprocess.STDOUT, text=True, encoding='utf8',
                                bufsize=1, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                                start_new_session=os.name != 'nt')

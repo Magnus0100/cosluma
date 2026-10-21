@@ -300,21 +300,7 @@ if ($Describe) {
     [pscustomobject]@{ program = $Program; arguments = $LaunchArgs; workspace = $Workspace; installation_health = $StartupHealth } | ConvertTo-Json -Depth 6
     return
 }
-# Start the configured local Qwen server while the Qt window opens. Server
-# availability does not imply that image-model weights have been loaded.
-if ($DesktopExe -and $env:COSPLAY_QWEN_DEPLOY_ROOT) {
-    $QwenPython = Join-Path $env:COSPLAY_QWEN_DEPLOY_ROOT 'runtime\Scripts\python.exe'
-    $QwenScript = Join-Path $InstallRoot '_internal\start_qwen_image.py'
-    if ((Test-Path -LiteralPath $QwenPython -PathType Leaf) -and (Test-Path -LiteralPath $QwenScript -PathType Leaf)) {
-        $QwenLogDir = Join-Path $Workspace 'outputs\runtime'
-        [System.IO.Directory]::CreateDirectory($QwenLogDir) | Out-Null
-        $QwenStdout = Join-Path $QwenLogDir 'qwen-startup.stdout.log'
-        $QwenStderr = Join-Path $QwenLogDir 'qwen-startup.stderr.log'
-        $QwenArgs = @('-B', '-X', 'utf8', $QwenScript, '--provider', 'qwen_image_2_1_uncensored_fast')
-        $QwenCommandLine = ($QwenArgs | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
-        Start-Process -FilePath $QwenPython -ArgumentList $QwenCommandLine -WorkingDirectory $InstallRoot -WindowStyle Hidden -RedirectStandardOutput $QwenStdout -RedirectStandardError $QwenStderr | Out-Null
-    }
-}
+# Qt restores the selected task/provider and owns service initialization.
 # This is the user-facing Qt application.  Hiding the process window here
 # leaves the executable alive with no visible main window, which makes the
 # desktop shortcut appear broken.  Keep the application window visible.

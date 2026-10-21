@@ -29,7 +29,7 @@ from scipy.ndimage import binary_propagation, distance_transform_edt
 from portrait_regions_worker import FACE_OVAL
 
 CONFIG_SCHEMA = 'beautygrpo_models.v1'
-VERIFICATION_SCHEMA = 'beautygrpo_verification.v1'
+VERIFICATION_SCHEMA = 'beautygrpo_verification.v2'
 SCHEMA = 'beautygrpo_model_output.v1'
 ROI_POLICY = 'complete_face_oval_support_union_square_1p5.v1'
 COMPOSITION_POLICY = 'visible_complete_face_upward_forehead_inward_feather.v2'
@@ -45,6 +45,8 @@ BASE_WEIGHT_HASHES = {
     'transformer/diffusion_pytorch_model-00003-of-00003.safetensors': '464f5343b6b06a2337d8c34b72ebec38219ebbfb7aafecbc9b342dc031417e7a',
     'vae/diffusion_pytorch_model.safetensors': 'f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3',
 }
+BASE_INVENTORY_SCOPE = 'nunchaku_override_without_bf16_transformer.v1'
+REPLACED_BASE_WEIGHTS = frozenset(name for name in BASE_WEIGHT_HASHES if name.startswith('transformer/'))
 RECIPE = {
     'prompt': "Beautify this person's face while maintaining a natural and realistic appearance.",
     'size': 1024, 'steps': 28, 'guidance': 2.5, 'seed': 42, 'lora_scale': 1.0,
@@ -349,10 +351,20 @@ def _vae_component(config, *, verify_hash=False):
     return {'root':str(root), 'files':files}
 
 
+def _runtime_base_files(catalog):
+    """The pinned INT4 transformer replaces these three official BF16 shards.
+
+    Keep the original download manifest intact as provenance. Installation
+    verification proves all remaining base files and the separately pinned
+    Nunchaku model; no runtime path falls back to the omitted transformer.
+    """
+    return [row for row in catalog['completed_files'] if row['path'] not in REPLACED_BASE_WEIGHTS]
+
+
 def _validate_verification_receipt(config, receipt, *, receipt_path):
     """Validate the installation receipt without reading model weight bytes."""
     if not isinstance(receipt, dict) or receipt.get('schema') != VERIFICATION_SCHEMA or receipt.get('ready') is not True:
-        raise ValueError('A ready beautygrpo_verification.v1 receipt is required')
+        raise ValueError('A ready '+VERIFICATION_SCHEMA+' receipt is required; run installation verification')
     config_path = Path(config['config_path']).resolve()
     if receipt.get('config_sha256') != config['config_sha256']:
         raise ValueError('BeautyGRPO installation config differs from its verification receipt')
@@ -368,13 +380,13 @@ def _validate_verification_receipt(config, receipt, *, receipt_path):
     catalog = config['_manifest_catalog']
     expected_files = [{'path': row['path'], 'bytes': row['bytes'], 'sha256': row['local_sha256'],
                        'verified': row.get('verified') is True}
-                      for row in catalog['completed_files']]
+                      for row in _runtime_base_files(catalog)]
     receipt_files = manifest_record.get('files') or []
     if len(receipt_files) != len(expected_files):
         raise ValueError('BeautyGRPO verification receipt has an incomplete base inventory')
     # Runtime validation deliberately performs cheap filesystem identity
     # checks only.  The receipt's full content hashes are produced by the
-    # installation command; re-reading 31 GB on every portrait would defeat
+    # installation command; re-reading large weights on every portrait defeats
     # the purpose of an installed, immutable model.  A size/mtime change
     # invalidates the receipt and requires explicit re-verification.
     base_root = Path(config['base_model_root']).resolve()
@@ -391,7 +403,8 @@ def _validate_verification_receipt(config, receipt, *, receipt_path):
         raise ValueError('BeautyGRPO base file inventory differs from its verification receipt')
     base_record = receipt.get('base') or {}
     if (base_record.get('root') != str(Path(config['base_model_root']).resolve())
-            or base_record.get('file_count') != 25
+            or base_record.get('inventory_scope') != BASE_INVENTORY_SCOPE
+            or base_record.get('file_count') != len(expected_files)
             or [{key: row[key] for key in ('path', 'bytes', 'sha256', 'verified')}
                 for row in base_record.get('files', [])] != expected_files):
         raise ValueError('BeautyGRPO base installation identity differs from its verification receipt')
@@ -429,7 +442,7 @@ def _validate_verification_receipt(config, receipt, *, receipt_path):
 def verify_installation(path, *, receipt_path=None, progress=None):
     """Perform the full installation-time verification and return a receipt.
 
-    This is the only routine that hashes all 25 base files and the LoRA.  The
+    This hashes every required base component, the INT4 model and the LoRA. The
     runtime loader consumes the resulting receipt and deliberately does not
     repeat those large reads.
     """
@@ -441,7 +454,8 @@ def verify_installation(path, *, receipt_path=None, progress=None):
     # This is the one explicit, installation-time full scan.  Runtime loading
     # consumes the resulting receipt and performs only stat/identity checks.
     verified_files = []
-    for index, row in enumerate(catalog['completed_files']):
+    required_files = _runtime_base_files(catalog)
+    for index, row in enumerate(required_files):
         name = row['path']
         target = (Path(config['base_model_root']) / name).resolve()
         if (not target.is_file() or not target.is_relative_to(Path(config['base_model_root']).resolve())
@@ -449,13 +463,14 @@ def verify_installation(path, *, receipt_path=None, progress=None):
             raise ValueError('Installed BeautyGRPO base file is missing or has an unexpected size: '+name)
         if progress:
             progress('beauty_model_verification', '正在安装期完整核验本地人像模型文件。',
-                     .16 + .08*index/len(catalog['completed_files']))
+                     .16 + .08*index/len(required_files))
         digest = sha(target)
         if digest != row['local_sha256'] or (row.get('expected_sha256') and row['expected_sha256'] != digest):
             raise ValueError('Local BeautyGRPO base bytes differ from the pinned manifest: '+name)
         verified_files.append({'path': name, 'bytes': row['bytes'], 'sha256': digest,
                                'verified': True, 'mtime_ns': target.stat().st_mtime_ns})
     base_evidence = {'base_manifest_sha256': config['base_manifest_sha256'],
+                     'inventory_scope': BASE_INVENTORY_SCOPE,
                      'all_files_hash_verified': True, 'verified_file_count': len(verified_files),
                      'verification_schema': VERIFICATION_SCHEMA,
                      'verification_stage': 'installation'}
@@ -757,6 +772,7 @@ def model_identity(config):
     """The installation identity, including its originally audited policy."""
     return {'method': 'BeautyGRPO_original_generated_appearance', 'base_model_id': BASE_ID,
             'base_revision': BASE_REVISION, 'base_manifest_sha256': config['base_manifest_sha256'],
+            'base_inventory_scope': BASE_INVENTORY_SCOPE,
             'lora_sha256': EXPECTED_LORA_SHA, 'recipe': dict(RECIPE),
             'roi_policy': ROI_POLICY, 'composition_policy': COMPOSITION_POLICY,
             'offload': config['offload'], 'quantization': None,
@@ -780,21 +796,24 @@ def verify_base(config, *, progress=None, installation=False):
     if not installation:
         receipt = config.get('verification_receipt')
         base = receipt.get('base') if isinstance(receipt, dict) else None
-        if not isinstance(base, dict) or base.get('file_count') != 25:
+        if (not isinstance(base, dict) or base.get('inventory_scope') != BASE_INVENTORY_SCOPE
+                or not base.get('files') or base.get('file_count') != len(base['files'])):
             raise ValueError('BeautyGRPO installation verification receipt is required')
         return {'base_manifest_sha256': config['base_manifest_sha256'],
+                'inventory_scope': BASE_INVENTORY_SCOPE,
                 'all_files_hash_verified': True, 'verified_file_count': base['file_count'],
                 'verification_schema': VERIFICATION_SCHEMA,
                 'verification_receipt_path': config.get('verification_receipt_path'),
                 'verification_stage': 'installation'}
     catalog = json.loads(Path(config['base_manifest']).read_text(encoding='utf8'))
-    rows = catalog['completed_files']
+    rows = _runtime_base_files(catalog)
     for index, row in enumerate(rows):
         if progress:
             progress('beauty_model_verification', '正在核验本地人像模型文件。', .16+.08*index/len(rows))
         if sha(Path(config['base_model_root'])/row['path']) != row['local_sha256']:
             raise ValueError('Local BeautyGRPO base bytes changed: '+row['path'])
     return {'base_manifest_sha256': config['base_manifest_sha256'], 'all_files_hash_verified': True,
+            'inventory_scope': BASE_INVENTORY_SCOPE,
             'verified_file_count': len(rows)}
 
 
@@ -909,6 +928,7 @@ def load_pipeline(config, *, progress=None):
     pipe._beauty_prompt_embeddings=prompt_tensors
     load_stages.append(_timing_record('vae_and_conditioning_loading', started, before))
     evidence={'model_identity':identity, 'base_verified':base_evidence,
+        'loaded_model_locations':{'transformer':str(quantized_path), 'vae':str(vae_root), 'lora':config['lora_path']},
         'quantized_transformer_verified':quantized_evidence, 'lora_verified':lora_evidence,
         'versions':{'torch':torch.__version__, 'diffusers':diffusers.__version__, 'nunchaku':PACKAGE_VERSION},
         'pipeline_reused':False, 'verification_reused':False,

@@ -63,21 +63,24 @@ def main():
             # must not submit a generation request.
             window.result('provider-settings', {'default_provider':None, 'providers':{}})
             assert selector.currentData() == 'qwen_image_2_1'
-            assert window.creative_task_payload('create_reference')['constraints'].get('reference_role') == 'source_conditioned_design'
+            assert 'reference_role' not in window.creative_task_payload('create_reference')['constraints']
+            assert window.editing_request_payload('create_reference')['work_type'] == 'partial_composite'
             assert not pool.tasks
 
             window.set_simple_source(str(source))
             before_choice = len(pool.tasks)
             window.creative_task_plan = {'plan':{'ready':True, 'plan_id':'old-plan'}}
-            window.prepared_design = {'effective_prompt':'old design'}
+            window.final_prompt.setPlainText('Saved design is display only')
             selector.setCurrentIndex(selector.findData('qwen_image_2_1_fast'))
             assert window.provider.currentText() == 'qwen_image_2_1_fast'
-            assert window.creative_task_plan is None and window.prepared_design is None
+            assert window.creative_task_plan is None and not window.final_prompt.toPlainText()
+            assert not hasattr(window,'prepared_design')
             request = window.creative_task_request_options('create_reference', source=str(source))
             resolved = reference_provider.provider_config(provider=request['provider'], model=request['model'])
             workflow = json.loads(Path(resolved['workflow_path']).read_text('utf8'))
             assert workflow['model_name'] == 'Qwen-Image-2.1 INT8 ConvRot'
-            assert window.generation_design_context()[5:7] == (request['provider'], request['model'])
+            assert (window.provider.currentText(),window.model.text().strip()) == (request['provider'],request['model'])
+            assert 'generation_design' not in request and 'character_profile' not in request
             assert len(pool.tasks) == before_choice, 'Choosing a model must not generate images'
 
             # A late initial preferences response cannot undo a user's explicit choice.

@@ -1,6 +1,8 @@
 """Reuse one isolated interpreter for the checked native preparation stages."""
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 from contextvars import ContextVar
 from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 import functools
@@ -140,7 +142,7 @@ class NativeStageSession:
         for key in ('COSPLAY_REFERENCE_SOURCE_CACHE', 'COSPLAY_STAGE_PROFILE_PATH'):
             environment.pop(key, None)
         try:
-            self.process = subprocess.Popen([str(python), '-B', '-X', 'utf8',
+            self.process = external_python_popen([str(python), '-B', '-X', 'utf8',
                 str(code_path('reference_stage_worker.py')), '--serve'], cwd=str(root),
                 stdin=subprocess.PIPE, stdout=self.stream, stderr=subprocess.STDOUT,
                 env=environment, text=True, encoding='utf8',

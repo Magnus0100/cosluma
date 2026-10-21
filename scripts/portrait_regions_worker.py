@@ -1,6 +1,8 @@
 """Offline SegFace face parsing; masks describe regions, never edit source pixels."""
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import argparse
 import hashlib
 import importlib
@@ -441,7 +443,7 @@ def run(input_path: Path, repo: Path, checkpoint: Path, output_dir: Path, regist
         landmarker = Path(settings["face_model_path"])
         if not detector_python.is_file():
             raise FileNotFoundError(f"CPU MediaPipe runtime is missing: {detector_python}")
-        process = subprocess.run([str(detector_python), str(Path(__file__).resolve()), "--detect-only",
+        process = external_python_run([str(detector_python), str(Path(__file__).resolve()), "--detect-only",
                                   "--input", str(input_path), "--output-dir", str(output_dir),
                                   "--landmarker-model", str(landmarker), "--max-faces", str(max_faces)],
                                  timeout=180, capture_output=True, text=True)

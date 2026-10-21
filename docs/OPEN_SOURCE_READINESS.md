@@ -30,3 +30,5 @@ $sourceExport = Join-Path (Split-Path (Get-Location) -Parent) 'cosplay-open-sour
 维护者在 GitHub 中确认目标仓库、分支、可见性和私密漏洞报告设置，运行 CI 后再开放协作。源码可运行的验证与桌面二进制验收分别完成；Windows 包需要按 [发布指南](RELEASING.md) 构建 Debug/Release、验证资产并同时提供对应源码。未构建的候选源码不代表已发布程序包。
 
 文档入口：[安装](INSTALLATION.md)、[开发](DEVELOPMENT.md)、[仓库边界](REPOSITORY_LAYOUT.md)、[第三方声明](THIRD_PARTY_NOTICES.md)、[安全与隐私](../SECURITY.md)。
+
+正式发布前执行显式 `tests/run.py full` 和相关发行检查；日常文档清理不启动完整回归或模型检查。

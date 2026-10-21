@@ -14,6 +14,8 @@ Model weights are left to the existing installation and execution adapters.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import importlib.util
 import os
 import subprocess
@@ -30,6 +32,7 @@ class RuntimePreflightError(RuntimeError):
 HOST_IMPORTS = ("scipy",)
 MODEL_RUNTIME_IMPORTS = ("numpy", "scipy", "PIL", "torch", "transformers", "cv2", "safetensors")
 LOCAL_SILHOUETTE_HOST_IMPORTS = ("numpy", "PIL")
+GENERATED_APPEARANCE_HOST_IMPORTS = ('numpy','PIL','scipy','tifffile')
 
 # Resolve top-level import specs in an isolated interpreter, without loading
 # Torch/OpenCV or their native libraries. The actual worker owns ABI validation.
@@ -78,7 +81,7 @@ def _probe_runtime(python: Path, names: Iterable[str]) -> str | None:
                   "sys.exit(bool(missing))")
     environment = isolated_python_environment()
     try:
-        result = subprocess.run(
+        result = external_python_run(
             [str(python), "-I", "-c", expression],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -101,7 +104,7 @@ def _probe_runtime(python: Path, names: Iterable[str]) -> str | None:
 
 def preflight_for_run(root: Path, *, registry_path=None, require_local_models: bool = False,
                       check_host: bool = True, mode: str | None = None,
-                      execution_strategy: str | None = None) -> dict:
+                      execution_strategy: str | None = None, editing_scope=None) -> dict:
     """Validate the runtimes needed by the current source workflow.
 
     The route determines the smallest runtime contract.  ``local_portrait``
@@ -114,6 +117,8 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         raise ValueError('Unsupported runtime preflight mode: ' + str(mode))
     if execution_strategy is not None and execution_strategy != 'layered_reference_transfer':
         raise ValueError('Unsupported runtime preflight execution strategy: ' + str(execution_strategy))
+    from task_model_preflight import uses_generated_appearance,generated_registry_status
+    generated=uses_generated_appearance(mode,editing_scope)
     local_silhouette = mode == 'local_portrait'
     if local_silhouette:
         required_keys = ('birefnet_model_path', 'onnx_runtime_root')
@@ -125,7 +130,7 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         required_profiles = None
         route = 'layered_reference_transfer'
         model_imports = MODEL_RUNTIME_IMPORTS
-    host_imports = tuple(HOST_IMPORTS) + (LOCAL_SILHOUETTE_HOST_IMPORTS if local_silhouette else ())
+    host_imports = GENERATED_APPEARANCE_HOST_IMPORTS if generated else tuple(HOST_IMPORTS) + (LOCAL_SILHOUETTE_HOST_IMPORTS if local_silhouette else ())
     receipt = {
         "schema_version": "cosplay_runtime_preflight.v1",
         "host_python": str(Path(sys.executable).resolve()),
@@ -144,6 +149,17 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
                 "Desktop renderer dependencies are missing before rendering: "
                 + ", ".join(missing) + ". Run the workflow with the project desktop Python."
             )
+
+    if generated:
+        selection=generated_registry_status(root,registry_path)
+        if selection.get('error'):
+            raise RuntimePreflightError('Explicit unused native registry metadata is invalid: '+selection['error'])
+        receipt.update(route='scoped_generated_appearance',status='ready',native_models_required=False,
+            model_registry=selection['registry_path'],model_registry_origin=selection['origin'],
+            native_registry_configured=selection['configured'],native_registry_metadata_valid=selection['configuration_valid'],
+            required_registry_keys=[],required_model_imports=[],model_python=None,
+            model_inferences=0,inference_verified=False,provider_validation='separate_checked_provider_health')
+        return receipt
 
     try:
         from current_model_registry import load_registry, registry_location
@@ -220,3 +236,4 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
             )
     receipt["status"] = "ready"
     return receipt
+

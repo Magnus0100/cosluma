@@ -1,0 +1,160 @@
+{
+  "schema": "cosluma_engineering_state.v1",
+  "goal": "PRODUCT_GOAL.md",
+  "active_task": "next_major_generation_finishing",
+  "tasks": [
+    {
+      "id": "next_major_generation_finishing",
+      "objective": "One production harness supports retouching, partial compositing and full compositing, preserving permitted generative appearance and coherent lighting.",
+      "state": "in_progress",
+      "modules": [
+        "creative_task.py",
+        "photo_editing.py",
+        "photo_shaping.py",
+        "photo_shaping_geometry.py",
+        "face_contour_deform.py",
+        "geometric_appearance.py",
+        "appearance_assets.py",
+        "appearance_read_scope.py",
+        "shaping_inspection.py",
+        "photo_shaping_tool.py",
+        "photo_art_direction.py",
+        "photo_edit_session.py",
+        "photo_edit_iteration.py",
+        "photo_edit_tools.py",
+        "photo_development.py",
+        "photo_focus_integration.py",
+        "photo_edit_finish.py",
+        "photo_request_budget.py",
+        "photo_session_review.py",
+        "photo_session_decision.py",
+        "photo_appearance.py",
+        "photo_session_evidence.py",
+        "generated_appearance_render.py",
+        "scoped_workflow.py",
+        "production_coordinator.py",
+        "single_source_workflow.py"
+      ],
+      "feedback": [
+        "PRODUCT_GOAL.md",
+        "editing scope versus style",
+        "source / generated edit / final",
+        "identity and naturalness",
+        "visible creative benefit",
+        "cross-image observations"
+      ],
+      "next_action": "Finish one reversible-editing acceptance: use an existing saved result for one current checked zero-model restore, verify U, save/reopen/export and record actual latency. Current offline checks do not substitute for this real check. Do not start further cache, parser or shaping redesign before reporting that result. Preserve parent edits, original request budgets and unknown outcomes. Naturalness, real strength changes, HD, series consistency and current installation remain separate acceptance items. Existing user instructions and action restrictions govern any continuation."
+    },
+    {
+      "id": "model_specific_prompting",
+      "objective": "Ground each model's edit prompt in actual image observation and shared creative intent, then validate its effect.",
+      "state": "in_progress",
+      "modules": [
+        "photo_editing.py",
+        "photo_art_direction.py",
+        "photo_edit_tools.py",
+        "generation_prompt.py",
+        "reference_provider.py",
+        "comfyui_adapter.py"
+      ],
+      "feedback": [
+        "exact submitted prompts and model settings",
+        "official edit prompting guidance",
+        "controlled within-model comparisons",
+        "reference versus final"
+      ],
+      "next_action": "Keep the selected model/workflow configuration fixed. Change prompting only to address an observed current defect, using one representative existing input and a bounded comparison. Actual prompts, model responses, request budgets and unresolved outcomes stay in private evidence."
+    },
+    {
+      "id": "runtime_and_installation",
+      "objective": "Direct standalone startup, model placement, GPU loading and prewarming remain usable.",
+      "state": "verify_when_changed",
+      "modules": [
+        "runtime_resources.py",
+        "windows_installation.py",
+        "start_qwen_image.py",
+        "beautygrpo_prepare.py"
+      ],
+      "feedback": [
+        "direct EXE startup",
+        "actual model loading",
+        "resource observations"
+      ],
+      "next_action": "Verify frozen external Python DLL/PATH isolation and explicit workspace cwd, including the Qwen launch-policy lifecycle. Package and install the current source with no active image job, preserve model/config/runtime directories, and verify the one desktop entry and all installed software bytes. Check service readiness separately from warm model weights. Record any retained installation transaction or blocked cleanup in private observations; do not claim complete cleanup without inspecting the actual installation."
+    },
+    {
+      "id": "default_end_to_end_quality",
+      "objective": "An original photo reaches a visibly improved character portrait through the default checked production route.",
+      "state": "in_progress",
+      "modules": [
+        "creative_task.py",
+        "production_coordinator.py",
+        "single_source_workflow.py",
+        "generation_prompt.py",
+        "creative_direction.py",
+        "reference_provider.py"
+      ],
+      "feedback": [
+        "source and generated reference",
+        "actual saved final",
+        "whole composition",
+        "matched native details",
+        "phase timing"
+      ],
+      "next_action": "Exercise the actual installed public route on different originals using the same default implementation. Keep Qwen and GPT evidence separate and compare source, raw provider response, reviewed best and export. Locate defects at their earliest actual layer, distinguish execution from artistic acceptance, and avoid mandatory post-generation restoration of source portrait RGB."
+    },
+    {
+      "id": "subject_scene_coherence",
+      "objective": "Preserve useful generated lighting and character mood through coherent subject, scene and local effects.",
+      "state": "open",
+      "modules": [
+        "reference_pipeline.py",
+        "design_reconstruction_pipeline.py",
+        "reference_appearance_stack.py",
+        "pipeline_stage_report.py"
+      ],
+      "feedback": [
+        "light direction and brightness",
+        "skin and hair transitions",
+        "indoor scene logic",
+        "effect hierarchy"
+      ],
+      "next_action": "Use the current end-to-end observation to choose the responsible production layer; avoid fixing unrelated hair details."
+    },
+    {
+      "id": "cross_image_generalization",
+      "objective": "The same shared defaults improve different photos without image-specific source edits.",
+      "state": "open",
+      "modules": [
+        "creative_direction.py",
+        "generation_design.py",
+        "preset_store.py",
+        "cosplay_post_review.py"
+      ],
+      "feedback": [
+        "multiple sources",
+        "same-session style consistency",
+        "different framing and occlusion"
+      ],
+      "next_action": "Apply the same final implementation serially to different originals and retain failures as feedback."
+    },
+    {
+      "id": "release_and_performance",
+      "objective": "Ship one usable current desktop entry with measured initialization, generation, finishing and export costs.",
+      "state": "open",
+      "modules": [
+        "workflow_timing.py",
+        "export_artifact.py",
+        "portable_project.py",
+        "windows_installation.py"
+      ],
+      "feedback": [
+        "native save and reopen",
+        "exported pixels",
+        "whole-task and module timing",
+        "single installed entry"
+      ],
+      "next_action": "Promote the improved source only after real output review and affected installation checks."
+    }
+  ]
+}

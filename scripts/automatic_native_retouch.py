@@ -5,6 +5,8 @@ All recognition/producer dependencies run in the selected model interpreter.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 import argparse
 import copy
 import hashlib
@@ -195,7 +197,7 @@ def prepare_once(root,run,args=None,*,source_analysis_path=None,cancel=None,reus
             if value:command += [flag,str(value)]
         if reuse_only:command+=['--reuse-only']
         with (directory/'worker.log').open('w',encoding='utf8') as log:
-            process=subprocess.Popen(command,cwd=root,stdout=log,stderr=subprocess.STDOUT,
+            process=external_python_popen(command,cwd=root,stdout=log,stderr=subprocess.STDOUT,
                 env={**os.environ,'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1','PYTHONIOENCODING':'utf8'},
                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             try:

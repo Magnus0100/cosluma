@@ -53,7 +53,7 @@ def check_saved_continuation(root, base, reference):
     run['continuation_edit']={'render_state':'saved','rendered_run_id':run['run_id'],'rendered_revision':7}
     path=directory/'manifest.json';workflow.write_json(path,run);before=snapshot(directory)
     with patch.object(workflow,'render_candidate',side_effect=AssertionError('Saved copy rerendered')), \
-         patch.object(workflow,'generate_candidate',side_effect=AssertionError('Saved copy generated')):
+         patch('reference_provider.request_edit',side_effect=AssertionError('Saved copy generated')):
         saved=workflow.copy_source_run(root,run['run_id'])
         assert saved['reference']['generation_id']=='real-request'
         assert Path(saved['reference']['provenance']).read_bytes()==reference.with_suffix('.provenance.json').read_bytes()
@@ -107,7 +107,7 @@ def main() -> int:
         try:
             request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/source-runs/parent/copy",
                                              data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
-            with patch.object(workflow, "generate_candidate", side_effect=AssertionError("copy generated")):
+            with patch('reference_provider.request_edit', side_effect=AssertionError("copy generated")):
                 with urllib.request.urlopen(request, timeout=10) as response:
                     child = json.load(response)["run"]
         finally:

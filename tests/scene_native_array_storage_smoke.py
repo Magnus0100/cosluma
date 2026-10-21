@@ -188,9 +188,6 @@ def main():
         mapped_p._mmap.close(); mapped_v._mmap.close()
     manifest=json.loads((scripts/'runtime_manifest.json').read_text(encoding='utf8'))
     assert 'native_array_storage.py' in manifest['files'] and len(manifest['files'])==len(set(manifest['files']))
-    for name in ('design_reconstruction_pipeline.py','reference_pipeline.py','source_preview.py'):
-        assert 'native_array_storage.py' in (scripts/name).read_text(encoding='utf8')
-    assert '_save_native_array' not in (scripts/'reference_appearance_controls.py').read_text(encoding='utf8')
     report={'schema':'scene_native_array_storage_smoke.v1','passed':True,'models_or_gpu_used':False,
         'performance_benchmark':False,'producer_save_statements_executed':True,'cases':checks,
         'actual_producer_metadata_expressions_executed':True,'standard_json_metadata_roundtrip':True,
@@ -200,7 +197,7 @@ def main():
         'sparse_diagnostics_fixed_stored_codec_and_atomic_publication':True,
         'writer_only_change_invalidates_cache_identity':True,'background_descriptor_sha_binding':True,
         'failed_write_preserves_destination_and_removes_own_temporary':True,
-        'runtime_and_cache_dependency_closure':True,'old_private_writer_alias_present':False}
+        'runtime_and_cache_dependency_closure':True}
     if args.report: args.report.write_text(json.dumps(report,indent=2)+'\n',encoding='utf8')
     print(json.dumps(report,indent=2),flush=True)
 

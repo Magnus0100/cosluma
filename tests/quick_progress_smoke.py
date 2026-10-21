@@ -12,6 +12,7 @@ import qt_workbench as qt
 import creative_task
 from creative_direction_smoke import enhanced, legacy
 from creative_task_smoke import fixture
+from creative_task_ui_smoke import service_fixture
 from task_model_preflight_smoke import mocked_task_capability
 from simple_cos_workspace import SimpleCosWorkspace
 from design_reconstruction_ui_smoke import Window, Pool
@@ -27,16 +28,23 @@ def checked_routes(window):
         root=Path(folder);registry,sources,reference=fixture(root)
         base={'source':sources[0],'model_registry':str(registry),
             'provider':'qwen_image_2_1_uncensored_fast','input_prompt':'Keep source.'}
-        cases=[('local-source-first',enhanced(),{},'comfyui'),
+        scoped_stages=None
+        cases=[('local-generation',legacy(),{},'comfyui'),
             ('remote',legacy(),{},'openai-compatible'),
             ('multiple',legacy(),{'variant_count':2,'defer_reference_selection':True},'comfyui'),
             ('existing',enhanced('existing_reference'),{'reference':reference},'comfyui'),
             ('portrait',legacy('local_portrait'),{},'comfyui')]
         with patch('task_model_preflight.inspect_task_models',side_effect=mocked_task_capability), \
+                patch.object(creative_task,'_services',side_effect=service_fixture), \
                 patch('urllib.request.urlopen',side_effect=AssertionError('No network in UI progress')):
             for name,intent,extra,kind in cases:
+                intent=copy.deepcopy(intent)
+                if intent['mode']=='create_reference':
+                    intent['services']={'text_vision':True,'visual_review':True}
+                    extra={**extra,'editing_request':{}}
                 with patch('reference_provider.provider_health',return_value={'ready':True,'kind':kind}):
                     checked=creative_task.plan_task(root,{**base,**extra,'creative_task':intent})
+                assert checked['plan']['ready'],checked['plan']['blocking_reasons']
                 stages=checked['plan']['stages'];labels=[row['label'] for row in stages]
                 window.active_checked_task={'progress_stages':copy.deepcopy(stages)}
                 window.creative_task_plan=None
@@ -46,18 +54,33 @@ def checked_routes(window):
                 quick.set_progress_stages(window._quick_progress_stages())
                 assert f'共 {len(stages)} 项' in quick.progress.toolTip()
                 assert quick.progress.toolTip().index(labels[0])<quick.progress.toolTip().index(labels[-1])
-                if name=='local-source-first':
-                    assert labels.index('原片人像美化并冻结（本地生图前）')<labels.index('创作风格参考')
-                else:
-                    assert not any('本地生图前' in label for label in labels)
+                assert not any('本地生图前' in label for label in labels)
+                scoped=intent['mode']=='create_reference'
+                if scoped:
+                    scoped_stages=copy.deepcopy(stages)
+                    assert checked['plan']['editing_scope']
+                    order=checked['plan']['layer_workflow']['order']
+                    assert order.index('observe_design')<order.index('source_native_baseline')<order.index('decide_edit')
+                    assert not any('Beauty' in label or '人像美化' in label for label in labels)
+                    loop=checked['plan']['layer_workflow']['bounded_dynamic_loop']
+                    assert loop['maximum_improvements']==2 and loop['stop_allowed']
+                    assert loop['initial_operations_per_candidate']==1
+                    assert loop['improvements_shared_across_variants']
+                    assert loop['body']==['selected_edit_tool','independent_recheck']
+                    count=checked['plan']['image_budget']['initial_reference']
+                    assert checked['plan']['generation_submissions_upper_bound']==count+2
+                    assert loop['maximum_zero_image_finishes']==1
+                    assert checked['plan']['services']['text_vision_requests_upper_bound']==2+2*count+6
                 if name=='existing':assert '复用已有参考' in labels
                 if name=='portrait':assert len(stages)==3 and not any('参考' in label for label in labels)
+                module_label='执行选定编辑工具' if scoped else '原片人像美化'
                 actual=window._quick_progress(.25,'generating','one_click',timing={
-                    'module':'portrait_beauty','module_label':'原片人像美化','elapsed_seconds':12})
-                assert actual[1]=='原片人像美化' and actual[3] is None and actual[4] is None
+                    'module':'editing_selected_tool' if scoped else 'portrait_beauty',
+                    'module_label':module_label,'elapsed_seconds':12})
+                assert actual[1]==module_label and actual[3] is None and actual[4] is None
                 quick.set_job_progress(actual[0],actual[1],local_progress=actual[3],stage_index=actual[4])
                 assert f'本次路线 {len(stages)} 项' in quick.progress_detail.text()
-                assert '当前：原片人像美化' in quick.progress_detail.text()
+                assert '当前：'+module_label in quick.progress_detail.text()
                 assert '本步骤' not in quick.progress_detail.text(), 'whole-job percent is not a phase fraction'
                 newer=window._quick_progress(.7,'rendering','one_click',timing={'module_label':'原尺寸渲染','elapsed_seconds':100})
                 older=window._quick_progress(.4,'generating','one_click',timing={'module_label':'创作参考','elapsed_seconds':80})
@@ -77,21 +100,20 @@ def checked_routes(window):
         observed=Window(Path(folder),'http://127.0.0.1:1');observed.pool=Pool()
         observed.simple_creation={'source':'source.png','mode':'create_cos','stage':'production'}
         observed.active_job_id='progress-job'
-        observed.active_checked_task={'callback':'one-click','job_id':'progress-job','progress_stages':[
-            {'id':'1','label':'源Beauty先行'},{'id':'2','label':'创作风格参考'},
-            {'id':'3','label':'原生保存'},{'id':'4','label':'人工审片'}]}
+        observed.active_checked_task={'callback':'one-click','job_id':'progress-job',
+            'progress_stages':copy.deepcopy(scoped_stages)}
         job={'job_id':'progress-job','kind':'one_click','status':'running','stage':'generating',
-            'progress':.25,'timing':{'request_id':'timing','module_label':'原片人像美化','elapsed_seconds':20}}
+            'progress':.25,'timing':{'request_id':'timing','module_label':'观察原图并形成具体编辑设计','elapsed_seconds':20}}
         observed.result('job-status',{'job':job})
-        assert '当前：原片人像美化' in observed.simple_workspace.progress_detail.text()
-        job.update(progress=.4,timing={'request_id':'timing','module_label':'创作参考','elapsed_seconds':50})
+        assert '当前：观察原图并形成具体编辑设计' in observed.simple_workspace.progress_detail.text()
+        job.update(progress=.4,timing={'request_id':'timing','module_label':'执行选定编辑工具','elapsed_seconds':50})
         observed.result('job-stream',{'data':job})
-        assert '当前：创作参考' in observed.simple_workspace.progress_detail.text()
+        assert '当前：执行选定编辑工具' in observed.simple_workspace.progress_detail.text()
         assert '本步骤' not in observed.simple_workspace.progress_detail.text()
-        assert '源Beauty先行 → 创作风格参考' in observed.simple_workspace.progress.toolTip()
-        job.update(progress=.25,timing={'request_id':'timing','module_label':'原片人像美化','elapsed_seconds':20})
+        assert scoped_stages[0]['label']+' → '+scoped_stages[1]['label'] in observed.simple_workspace.progress.toolTip()
+        job.update(progress=.25,timing={'request_id':'timing','module_label':'观察原图并形成具体编辑设计','elapsed_seconds':20})
         observed.result('job-status',{'job':job})
-        assert '当前：创作参考' in observed.simple_workspace.progress_detail.text()
+        assert '当前：执行选定编辑工具' in observed.simple_workspace.progress_detail.text()
         observed.job_poll_timer.stop();observed.simple_creation=None;observed.active_checked_task=None;observed.close()
     quick.close();app.processEvents()
 
@@ -131,7 +153,8 @@ def main():
     checked_routes(window)
     print({'ok': True, 'monotonic_overall': True, 'local_percent_available': True,
            'boundary_light_stage': True, 'fusion_to_post_no_regression': True,
-           'checked_routes_source_first_remote_multiple_existing_portrait':True,
+           'checked_routes_scoped_remote_multiple_existing_portrait':True,
+           'conditional_bounded_tool_selection':True,
            'actual_module_not_whole_job_phase_percent':True,'no_fixed_four_stages':True})
 
 

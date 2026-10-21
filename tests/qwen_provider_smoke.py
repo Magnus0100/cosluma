@@ -127,8 +127,11 @@ def main() -> None:
                     assert graph["5"]["inputs"]["prompt"] == submitted_prompt
                     assert graph['5']['class_type'] == 'CosplayTextEncodeQwenImage21'
                     assert graph['5']['inputs']['cfg'] == 3.0
+                    assert graph['5']['inputs']['negative_prompt'] == ''
                     assert graph['5']['inputs']['resolution'] == 2048
                     assert graph['6']['inputs']['steps'] == 40
+                    assert graph['6']['inputs']['sampler_name'] == 'euler'
+                    assert graph['6']['inputs']['scheduler'] == 'simple'
                     assert graph['6']['inputs']['cfg'] == ['5',3]
                     assert graph["5"]["inputs"]["images.image_1"] == ["4", 0]
                     assert graph["6"]["inputs"]["seed"] != 42

@@ -104,7 +104,12 @@ def real_launch_cases():
             assert qwen._launch_policy_current(saved)
             assert qwen.start_service(folder)['already_running'] and len(calls)==1
             # Missing/stale policy cannot be added retroactively to a live launch.
-            for policy in (None, {**qwen.launch_policy(),'pinned_memory':'unverified'}):
+            legacy_policy = {key:value for key,value in qwen.launch_policy().items()
+                             if key != 'external_runtime_isolation'}
+            legacy_policy['schema'] = 'cosplay_qwen_launch_policy.v3'
+            for policy in (None, {**qwen.launch_policy(),'pinned_memory':'unverified'},
+                           legacy_policy,
+                           {**qwen.launch_policy(),'external_runtime_isolation':'unverified'}):
                 old=dict(saved)
                 if policy is None:old.pop('launch_policy')
                 else:old['launch_policy']=policy
@@ -112,9 +117,11 @@ def real_launch_cases():
                 assert qwen._owned_service_record(folder,qwen.service_status())==old
                 with patch.object(qwen,'_stop_owned_idle_service',side_effect=RuntimeError('policy restart required')):
                     rejected(lambda:qwen.start_service(folder),'policy restart required')
+                assert qwen._read_owner(folder) == old, 'A live launch must never be re-signed'
                 (folder/'busy').touch()
                 rejected(lambda:qwen.start_service(folder),'still generating')
                 assert qwen.process_alive(saved['pid']) and len(calls)==1
+                assert qwen._read_owner(folder) == old, 'Busy legacy policy must remain unchanged'
                 (folder/'busy').unlink()
             qwen._write_owner(folder/'server-process.json',saved)
             # A matching HTTP deployment path alone cannot claim the endpoint.
@@ -187,16 +194,24 @@ def simulated_wrapper_cases():
         assert qwen._owned_process_record(folder)[0]==record
         # Even a new-looking v2 record cannot claim a policy absent from OS argv.
         record['launch_policy']=qwen.launch_policy()
+        # This process-chain fixture models the Windows venv launcher.
+        stack.enter_context(patch.object(qwen,'launch_policy',return_value={
+            'schema':'cosplay_qwen_launch_policy.v4',
+            'external_runtime_isolation':'frozen_bundle_dll_directory_and_path_v1',
+            'pinned_memory':'disabled',
+            'required_arguments':['--disable-pinned-memory'],
+            'forbidden_arguments':['--disable-fast-disk']}))
+        record['launch_policy']=qwen.launch_policy()
         assert not qwen._launch_policy_current(record)
-        args[101][1:1]=['-X','--disable-fast-disk']
+        args[101][1:1]=['-X','--disable-pinned-memory']
         assert not qwen._launch_policy_current(record), 'Python option is not a ComfyUI flag'
         del args[101][1:3]
-        args[100].append('--disable-fast-disk')
+        args[100].append('--disable-pinned-memory')
         assert not qwen._launch_policy_current(record), 'Only the launcher had the flag'
-        args[101].append('--disable-fast-disk')
-        assert qwen._launch_policy_current(record)
         args[101].append('--disable-pinned-memory')
-        assert not qwen._launch_policy_current(record), 'Retired pinning disable cannot be hidden by a new marker'
+        assert qwen._launch_policy_current(record)
+        args[101].append('--disable-fast-disk')
+        assert not qwen._launch_policy_current(record), 'A stale forced-RAM policy cannot be hidden by a new marker'
         args[101].pop()
         for change in ('parent','nonce','reused','foreign'):
             if change=='parent':parents[101]=999

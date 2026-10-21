@@ -127,43 +127,25 @@ class BeautyPrepareContracts(unittest.TestCase):
             self.assertEqual({key: value for key, value in current.items() if key != 'model_identity'},
                              {key: value for key, value in changed.items() if key != 'model_identity'})
 
-    def test_checked_reference_task_prepares_and_owns_beauty_before_first_render(self):
+    def test_source_native_initialization_does_not_prepare_or_overlay_beauty(self):
         import argparse
         import single_source_workflow as workflow
-        from portrait_beauty_backend_smoke import project, prepared
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)/'project'
-            run, _values = project(root)
-            run['task_intent'] = {'mode': 'create_reference'}
-            run['task_plan'] = {'execution_strategy': 'layered_reference_transfer'}
-            source_before = copy.deepcopy(run['source'])
-            result = prepared(run, root/'prepared')
-            with patch.object(prepare, 'prepare_for_workbench', return_value=result) as model, \
-                    patch.object(prepare, 'prepare_cached_for_workbench', return_value=None), \
-                    patch('start_qwen_image.release_for_run', return_value={'status': 'mocked_no_gpu'}) as release:
-                workflow._prepare_task_portrait_beauty(root, run, argparse.Namespace())
-                control = run['options']['appearance_revision']['portrait_beauty']
-                self.assertTrue(Path(control['result']).is_relative_to(root/'outputs/runs'/run['run_id']))
-                self.assertEqual(control['strength'], 1.0)
-                self.assertEqual(run['portrait_beauty_preparation']['status'], 'prepared')
-                self.assertEqual(run['source'], source_before)
-                workflow._prepare_task_portrait_beauty(root, run, argparse.Namespace())
-                self.assertEqual(run['portrait_beauty_preparation']['status'], 'frozen_layer_reused')
-                self.assertEqual(model.call_count, 1)
-                self.assertEqual(release.call_count, 1)
-            # A genuinely empty face result keeps the source usable without
-            # scheduling another identical attempt on candidate selection.
-            run['options']['appearance_revision'].pop('portrait_beauty')
-            run.pop('portrait_beauty_preparation')
-            no_face = {'ok': True, 'no_change': True, 'result': None, 'layer': None,
-                'reason': 'no_visible_faces_available', 'generation_inferences_this_attempt': 0}
-            with patch.object(prepare, 'prepare_for_workbench', return_value=no_face) as model, \
-                    patch.object(prepare, 'prepare_cached_for_workbench', return_value=None), \
-                    patch('start_qwen_image.release_for_run', return_value={'status': 'mocked_no_gpu'}):
-                workflow._prepare_task_portrait_beauty(root, run, argparse.Namespace())
-                workflow._prepare_task_portrait_beauty(root, run, argparse.Namespace())
-                self.assertEqual(model.call_count, 1)
-                self.assertNotIn('portrait_beauty', run['options']['appearance_revision'])
+        from generated_appearance_render_smoke import ScopedRenderTests
+        fixture=ScopedRenderTests(methodName='runTest');fixture.setUp()
+        try:
+            run=fixture.fixture();before=copy.deepcopy(run)
+            run['task_intent']={'mode':'create_reference'}
+            with patch.object(prepare,'prepare_for_workbench',side_effect=AssertionError('Unused Beauty model')) as model, \
+                    patch.object(prepare,'prepare_cached_for_workbench',side_effect=AssertionError('Unused Beauty cache')) as cache, \
+                    patch('start_qwen_image.release_for_run',side_effect=AssertionError('No Beauty inference transition')) as release:
+                workflow._prepare_task_portrait_beauty(fixture.root,run,argparse.Namespace())
+                rendered=workflow.render_candidate(fixture.root,run,fixture.args)
+            model.assert_not_called();cache.assert_not_called();release.assert_not_called()
+            self.assertEqual(run['options']['photo_appearance'],before['options']['photo_appearance'])
+            self.assertEqual(rendered['metadata']['kind'],'scoped_photo_appearance_render')
+            self.assertFalse(rendered['metadata']['operator']['source_subject_RGB_restored'])
+        finally:fixture.tearDown()
+
     def test_predecode_cache_binding_uses_saved_baseline_without_opening_raw(self):
         """A complete appearance baseline is enough to probe a cache hit."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -605,37 +587,41 @@ class BeautyPrepareContracts(unittest.TestCase):
                 stop.assert_called_once()
 
     def test_generation_releases_beauty_only_for_local_gpu_provider(self):
-        import single_source_workflow as workflow
-        import reference_provider
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for kind in ('comfyui', 'openai-compatible'):
-                output = root / kind
-                output.mkdir()
-                candidate = output / 'photo.png'
-                args = workflow.parse_args(['--root', str(root), '--source', str(root / 'source.jpg'),
-                    '--provider', 'fixture', '--prompt', 'fixture'])
-                args.candidate_out_dir = output
-                run = {'run_id': kind, 'sample': 'photo', 'source': {'path': str(root / 'source.jpg')}}
-                def generate(_arguments):
-                    candidate.write_bytes(b'fixture')
-                    return 0
-                with patch.object(reference_provider, 'provider_config', return_value={'kind': kind}), \
-                        patch.object(reference_provider, 'main', side_effect=generate), \
-                        patch.object(prepare, 'release_idle_for_stage', return_value={'state': 'released'}) as release:
-                    self.assertEqual(workflow.generate_candidate(root, run, args), candidate)
-                if kind == 'comfyui':
-                    release.assert_called_once()
-                    handoff = dict(release.call_args.kwargs); cancel = handoff.pop('cancel')
-                    self.assertEqual(handoff, {'next_stage_cpu_bytes':0, 'next_stage':'generation', 'next_stage_gpu':True})
-                    self.assertIsNone(cancel())
-                    args.cancel_request_path = str(root/'cancel.json')
-                    Path(args.cancel_request_path).write_text('{}', encoding='utf8')
-                    with self.assertRaises(workflow.WorkflowCancelled): cancel()
-                    self.assertEqual(run['options']['portrait_generation_memory_transition']['state'], 'released')
-                else:
-                    release.assert_not_called()
-                    self.assertNotIn('options', run)
+        from contextlib import redirect_stdout
+        import io
+        import photo_edit_tools_smoke as tools_fixture
+        for kind in ('comfyui','openai-compatible'):
+            with self.subTest(kind=kind):
+                fixture=tools_fixture.EditingToolsTests(methodName='runTest');fixture.setUp()
+                try:
+                    fixture.prepare_decision('joint_edit')
+                    import reference_provider
+                    original=reference_provider.provider_config
+                    workflow=fixture.root/'workflow.json';workflow.write_text('{}',encoding='utf8')
+                    def provider(**options):
+                        actual=original(**options);actual['kind']=kind
+                        actual.update(workflow_path=str(workflow),workflow_configured=True)
+                        return actual
+                    def request(endpoint,image,workflow,prompt,timeout,events,**kwargs):
+                        return fixture.transport(endpoint,'fixture',image,'fixture-image',prompt,None,timeout)
+                    with patch.object(reference_provider,'provider_config',side_effect=provider), \
+                            patch.object(reference_provider,'request_edit',side_effect=fixture.transport), \
+                            patch.object(reference_provider.comfyui_adapter,'request_generation',side_effect=request), \
+                            patch.object(prepare,'release_idle_for_stage',return_value={'state':'released'}) as release, \
+                            redirect_stdout(io.StringIO()):
+                        fixture.execute()
+                    record=json.loads(next((fixture.root/'tools').glob('*/tool-attempt.json')).read_text('utf8'))
+                    if kind=='comfyui':
+                        release.assert_called_once()
+                        values=dict(release.call_args.kwargs);cancel=values.pop('cancel')
+                        self.assertEqual(values,{'next_stage_cpu_bytes':0,'next_stage':'generation','next_stage_gpu':True})
+                        self.assertIsNone(cancel());fixture.cancelled=True
+                        with self.assertRaises(InterruptedError):cancel()
+                        self.assertEqual(record['portrait_generation_memory_transition']['state'],'released')
+                    else:
+                        release.assert_not_called()
+                        self.assertNotIn('portrait_generation_memory_transition',record)
+                finally:fixture.tearDown()
 
     def test_gpu_stage_flag_is_explicit_and_cannot_be_an_integer(self):
         self.assertRaisesRegex(ValueError, 'must be a boolean', prepare.release_idle_for_stage,

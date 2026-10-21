@@ -15,10 +15,16 @@ from cos_workflow_graph import (build_graph, template_from_graph, validate_templ
                                 preset, PRESETS)
 
 STATUS = {'complete':'已准备', 'partial':'部分完成', 'pending':'待准备',
-          'failed':'需处理', 'unsupported':'待接入', 'not_requested':'本次无需'}
+          'failed':'需处理', 'needs_attention':'需处理', 'unsupported':'待接入', 'not_requested':'本次无需',
+          'running':'处理中', 'cancelled':'已取消'}
 PORT_LABELS = {'DISPLAY_IMAGE':'显像 RGB', 'SUBJECT_PAIR':'原片人物与 alpha',
     'REFERENCE_IMAGE':'参考图', 'APPEARANCE_LAYER':'仿色图层', 'BACKGROUND_LAYER':'背景图层',
-    'BOUNDARY_LAYER':'边缘受光层', 'EFFECT_LAYER':'前景光效层', 'COMPOSITE_IMAGE':'合成 RGB'}
+    'BOUNDARY_LAYER':'边缘受光层', 'EFFECT_LAYER':'前景光效层', 'COMPOSITE_IMAGE':'合成 RGB',
+    'PHOTO_SOURCE':'原始照片与身份基准','OBSERVED_DESIGN':'观察后的具体设计',
+    'GENERATED_EDIT':'完整生成编辑图','FROZEN_APPEARANCE':'冻结的生成外观',
+    'SAVED_APPEARANCE':'已保存成片与母版','INDEPENDENT_REVIEW':'独立作品审查记录',
+    'REVIEWED_BEST':'当前受审片支持的完整画面','EDIT_DECISION':'模型决定的下一项操作'}
+PORT_LABELS['PHOTO_APPEARANCE']='冻结外观（原生与生成来源）'
 
 
 class _Node(QGraphicsRectItem):
@@ -27,6 +33,8 @@ class _Node(QGraphicsRectItem):
         self.node=node;self.owner=owner
         self.setFlags(QGraphicsItem.ItemIsMovable|QGraphicsItem.ItemIsSelectable|
                       QGraphicsItem.ItemSendsGeometryChanges)
+        if owner.graph.get('readonly'):
+            self.setFlag(QGraphicsItem.ItemIsMovable,False)
         self.setPos(*node['position']); self.setZValue(2)
         self.setToolTip(node['detail'])
 
@@ -81,8 +89,10 @@ class CosWorkflowCanvas(QWidget):
         for key,value in PRESETS.items():self.presets.addItem(value['name'],key)
         toolbar.addWidget(QLabel('Cos 工作流'));toolbar.addWidget(self.presets)
         apply=QPushButton('采用预设');apply.clicked.connect(self._preset);toolbar.addWidget(apply)
+        self.template_buttons=[apply]
         for label,callback in (('打开模板',self._import),('保存模板',self._export),('适合画布',self._fit)):
             button=QPushButton(label);button.clicked.connect(callback);toolbar.addWidget(button)
+            if label!='适合画布':self.template_buttons.append(button)
         toolbar.addStretch();layout.addLayout(toolbar)
         splitter=QSplitter(Qt.Horizontal);layout.addWidget(splitter,1)
         self.scene=QGraphicsScene(self);self.scene.setBackgroundBrush(QBrush(QColor('#17212c')))
@@ -119,6 +129,16 @@ class CosWorkflowCanvas(QWidget):
                 if node['id'] in positions and node['id'] not in (stored.get('layout') or {}):
                     node['position']=positions[node['id']]
         self.loading=True;self.graph=graph;self.scene.blockSignals(True)
+        readonly=bool(graph.get('readonly'))
+        self.presets.setEnabled(not readonly)
+        self.presets.setVisible(not readonly)
+        for button in self.template_buttons:
+            button.setEnabled(not readonly);button.setVisible(not readonly)
+        for control in (self.enabled,self.strength,self.strength_label,self.action):
+            control.setVisible(not readonly)
+        self.note.setText(graph.get('notice') or ('本次按制作范围显示实际生产步骤；只读展示执行事实，不提供旧图层滑条。'+
+            (' 原执行合同按历史签名保留。' if graph.get('historical_execution_graph_id') else '') if readonly else
+            '连接由后台节点契约生成，当前使用预设连线。开关与强度控制已准备图层；没有结果的节点需先准备。'))
         self.connections=[];self.node_items={};self.scene.clear();self.selected_id=None
         for node in self.graph['nodes']:
             item=_Node(node,self);self.node_items[node['id']]=item;self.scene.addItem(item)
@@ -151,18 +171,20 @@ class CosWorkflowCanvas(QWidget):
         self.selected_id=items[0].node['id'] if items else None
         node=items[0].node if items else None;self.loading=True
         self.title.setText(node['label'] if node else '选择节点')
-        self.detail.setText(node['detail'] if node else '点击查看模块，拖动整理画布。Ctrl + 滚轮缩放。')
+        self.detail.setText(node['detail'] if node else self.graph.get('notice') or '点击查看模块，拖动整理画布。Ctrl + 滚轮缩放。')
         contract=node['contract'] if node else None
         if contract:
-            inputs='、'.join(dict.fromkeys(PORT_LABELS[p['type']] for p in contract['inputs'].values())) or '导入文件'
-            outputs='、'.join(dict.fromkeys(PORT_LABELS[p['type']] for p in contract['outputs'].values())) or '保存文件'
-            alpha='生成原片人物 alpha' if contract['alpha_role']=='produce' else '保留原片人物 alpha'
+            inputs='、'.join(dict.fromkeys(PORT_LABELS.get(p['type'],p['type']) for p in contract['inputs'].values())) or '导入文件'
+            outputs='、'.join(dict.fromkeys(PORT_LABELS.get(p['type'],p['type']) for p in contract['outputs'].values())) or '保存文件'
+            alpha=('不使用源人物 alpha；按冻结外观坐标与责任区处理' if contract['alpha_role']=='not_applicable' else
+                '生成原片人物 alpha' if contract['alpha_role']=='produce' else '保留原片人物 alpha')
             self.ports.setText(f'输入：{inputs}\n输出：{outputs}\n{alpha}')
             self.ports.setToolTip(json.dumps(contract,ensure_ascii=False,indent=2))
         else:self.ports.clear()
         self.enabled.setEnabled(bool(node and node['editable']))
         self.strength.setEnabled(bool(node and node['editable']))
-        self.action.setEnabled(bool(node and self.graph.get('run_id')) or bool(node and node['id']=='source'))
+        self.action.setEnabled(not self.graph.get('readonly') and
+            (bool(node and self.graph.get('run_id')) or bool(node and node['id']=='source')))
         if node:
             self.enabled.setChecked(node['parameters']['enabled']);self.strength.setValue(round(node['parameters']['strength']*100))
             self.action.setText(node['action'])
@@ -170,25 +192,27 @@ class CosWorkflowCanvas(QWidget):
 
     def _controls(self,*_):
         self.strength_label.setText(f'强度 {self.strength.value()}%')
-        if self.loading or not self.selected_id:return
+        if self.loading or not self.selected_id or self.graph.get('readonly'):return
         item=self.node_items[self.selected_id]
         item.node['parameters']={'enabled':self.enabled.isChecked(),'strength':self.strength.value()/100}
         item.update();self.templateChanged.emit(self.template())
 
     def _layout_changed(self):
-        if self.graph:self.templateChanged.emit(self.template())
+        if self.graph and not self.graph.get('readonly'):self.templateChanged.emit(self.template())
 
     def template(self):
         return template_from_graph(self.graph)
 
     def _action(self):
-        if self.selected_id:self.actionRequested.emit(self.selected_id)
+        if self.selected_id and not self.graph.get('readonly'):self.actionRequested.emit(self.selected_id)
 
     def _preset(self):
         value=preset(self.presets.currentData());current=self.template()
         value['layout']=current['layout'];self._apply_template(value)
 
     def _apply_template(self,value):
+        if self.graph.get('readonly'):
+            raise ValueError('本次生成外观流程只读，不能采用源图图层模板')
         value=validate_template(value);self.loading=True
         for key,params in value['nodes'].items():
             self.node_items[key].node['parameters']=copy.deepcopy(params);self.node_items[key].update()

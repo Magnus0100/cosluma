@@ -82,6 +82,17 @@ def route_for_run(run):
 
 def build_graph(run, report=None, *, template=None):
     mode = route_for_run(run)
+    from scoped_workflow import selected, build_scoped_graph, SOURCE_NATIVE_INITIALIZATION
+    scope=(run.get('task_plan') or {}).get('editing_scope')
+    iteration=(run.get('task_plan') or {}).get('editing_iteration')
+    if mode=='create_reference' and (run.get('task_plan') or {}).get('editing_initialization')!=SOURCE_NATIVE_INITIALIZATION:
+        raise ValueError('Unsupported retired creation; start a current source-native task')
+    shaping=(run.get('task_plan') or {}).get('shaping_request')
+    if selected(mode,scope,iteration,shaping_request=shaping):
+        intent=run.get('task_intent') or (run.get('options') or {}).get('task_intent') or {}
+        review=bool((intent.get('services') or {}).get('visual_review'))
+        return build_scoped_graph(run,scope,review,editing_iteration=iteration,
+            editing_autofinish=(run.get('task_plan') or {}).get('editing_autofinish'),shaping_request=shaping)
     revision=((run.get('options') or {}).get('appearance_revision') or {})
     stored=template or revision.get('workflow_graph')
     intention=validate_template(stored) if stored else {'nodes':{},'layout':{}}
@@ -127,6 +138,8 @@ def build_graph(run, report=None, *, template=None):
 
 
 def template_from_graph(graph, name='Cos 工作流'):
+    if graph.get('readonly'):
+        return validate_template({'schema':TEMPLATE,'name':'只读任务流程（无可编辑模板）','nodes':{},'layout':{}})
     return validate_template({'schema':TEMPLATE,'name':name,
         'nodes':{node['id']:node['parameters'] for node in graph['nodes'] if node['editable']},
         'layout':{node['id']:node['position'] for node in graph['nodes']}})
@@ -134,6 +147,12 @@ def template_from_graph(graph, name='Cos 工作流'):
 
 def revision_for_template(run, template):
     """Compile editable nodes to production components, preserving frozen data."""
+    from scoped_workflow import selected
+    if route_for_run(run)=='create_reference' and (run.get('task_plan') or {}).get('editing_scope') is None:
+        raise ValueError('Unsupported retired creation; start a current source-native task')
+    if selected(route_for_run(run),(run.get('task_plan') or {}).get('editing_scope'),
+                (run.get('task_plan') or {}).get('editing_iteration'),shaping_request=(run.get('task_plan') or {}).get('shaping_request')):
+        raise ValueError('Scoped appearance workflow is read-only; source-space layer controls are unavailable')
     template=validate_template(template)
     compiled=compile_template(template,route_for_run(run))
     revision=((run.get('options') or {}).get('appearance_revision') or {})

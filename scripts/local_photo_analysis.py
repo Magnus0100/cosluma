@@ -1,6 +1,8 @@
 """Local model orchestration. GPU dependencies stay in an external worker runtime."""
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import hashlib
 import ast
 import json
@@ -129,7 +131,7 @@ def analysis_identity(root, *, role='source', registry_path=None):
 
 def _worker(argv, log_path):
     with Path(log_path).open('w', encoding='utf-8') as log:
-        completed = subprocess.run([str(item) for item in argv], stdout=log, stderr=log,
+        completed = external_python_run([str(item) for item in argv], stdout=log, stderr=log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             timeout=900, env=isolated_python_environment())
     if completed.returncode:

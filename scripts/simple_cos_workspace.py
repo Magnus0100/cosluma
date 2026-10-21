@@ -524,7 +524,7 @@ class SimpleCosWorkspace(QWidget):
         self.progress_detail.setVisible(progress_visible)
         if not result_ready:
             self.set_compare(False)
-        self.state_label.setText('正在初始化后台与模型…' if readiness == 'initializing' else
+        self.state_label.setText('正在初始化本地后台…' if readiness == 'initializing' else
             '模型配置需要处理。' if readiness == 'degraded' and source_ready else
             '正在制作中…' if busy else
             '美化已就绪，可调整强度后查看效果。' if beauty_ready else

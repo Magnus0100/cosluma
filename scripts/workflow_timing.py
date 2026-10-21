@@ -119,7 +119,12 @@ class Ledger:
                 'mode': (run.get('task_intent') or options.get('task_intent') or {}).get('mode'),
                 'strategy': run.get('execution_strategy') or options.get('execution_strategy'),
                 'registry': (plan.get('capabilities') or {}).get('registry_identity'),
-                'image_budget': plan.get('image_budget')}
+                'image_budget': plan.get('image_budget'),
+                'graph_id':(plan.get('layer_workflow') or {}).get('graph_id'),
+                'editing_scope_id':(plan.get('editing_scope') or {}).get('scope_id'),
+                'editing_iteration':plan.get('editing_iteration'),
+                'provider':options.get('provider'),'image_model':options.get('model'),
+                'vision_model':options.get('vision_model')}
             self.workload_key = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
         run['workflow_timing'] = {'schema': SCHEMA, 'request_id': self.request_id,
                                   'path': str(self.path),
@@ -195,6 +200,17 @@ def current():
 
 
 MODULE_LABELS = {
+    'source_native_baseline':'解码并冻结原片浮点基线',
+    'photo_appearance_freeze':'冻结本轮编辑的浮点外观',
+    'photo_appearance_validation':'校验当前浮点外观资产',
+    'photo_appearance_render':'保存浮点母版与审片预览',
+    'photo_appearance_materialize':'复制当前版本的独立外观资产',
+    'visual_art_direction':'观察原片与具体设计','generated_appearance_freeze':'冻结生成外观',
+    'generated_appearance_render':'映射生成外观至输出画布',
+    'independent_review_board':'准备独立审片图板','independent_image_review':'独立评价完整作品',
+    'creative_decision_board':'准备本轮决策图板','creative_tool_decision':'模型选择本轮编辑工具',
+    'photographic_focus_integration':'摄影焦点融合（CPU，无新增生图）',
+    'photographic_development':'摄影曝光与色偏调整（CPU，无新增生图）',
     'portrait_beauty': '原片人像美化', 'generation': '创作设计参考',
     'provider_transport': '生成设计参考', 'model_handoff': '准备生成资源',
     'qwen_memory_release': '回收生成阶段资源',

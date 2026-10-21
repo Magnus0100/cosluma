@@ -60,7 +60,7 @@ def fixture(root):
 def intent(mode):
     return {'schema_version': task.INTENT_SCHEMA, 'mode': mode, 'brief': '统一暗调、保持妆造',
             'constraints': {'preserve_background': mode == 'local_portrait', 'no_effects': mode == 'local_portrait'},
-            'services': {'text_vision': False, 'visual_review': False}}
+            'services': {'text_vision': mode == 'create_reference', 'visual_review': False}}
 
 
 def main():
@@ -92,16 +92,21 @@ def main():
             assert all(item['plan']['ready'] for item in (local, imported, created))
             from cos_node_registry import compile_workflow
             for item in (local, imported, created):
-                assert item['plan']['layer_workflow'] == compile_workflow(item['plan']['mode'])
+                assert item['plan']['layer_workflow'] == compile_workflow(item['plan']['mode'],
+                    editing_scope=item['plan'].get('editing_scope'),
+                    visual_review=item['plan']['intent']['services']['visual_review'],
+                    editing_autofinish=item['plan'].get('editing_autofinish'),
+                    editing_initialization=item['plan'].get('editing_initialization'),
+                    initial_variant_count=item['plan']['image_budget'].get('initial_reference',1))
                 task.validate_task_plan(item['plan'],item['plan']['intent'])
             assert local['plan']['services']['offline'] and not local['request']['complete_post']
             assert imported['plan']['image_budget'] == dict.fromkeys(task.image_budget(intent('existing_reference')), 0)
             assert imported['request']['complete_post'] and not imported['request']['generate']
-            assert created['plan']['generation_submissions_upper_bound'] == 5
+            assert created['plan']['generation_submissions_upper_bound'] == 3
             omitted = intent('create_reference'); omitted['services'].pop('visual_review')
             omitted['services'].pop('text_vision')
-            assert task.normalize_task_intent(omitted)['services']['visual_review'] is False
-            assert task.normalize_task_intent(omitted)['services']['text_vision'] is False
+            assert task.normalize_task_intent(omitted)['services']['visual_review'] is True
+            assert task.normalize_task_intent(omitted)['services']['text_vision'] is True
             assert created['plan']['services']['image_generation'] is True
             assert created['plan']['services']['offline'] is False
             for prepared in (local, imported, created):
@@ -283,18 +288,24 @@ def main():
                         backend.jobs.update(retried['job_id'],status='succeeded',stage='fixture_complete')
                         rejected(lambda: backend.retry_source_run(parent['run_id'], {'generate': True}))
                     assert task.digest(parent) == initial_parent, 'Continuation changed its saved parent'
-                    for action in (backend.recognize_character, backend.prepare_generation):
-                        rejected(lambda: action({'source': sources[0], 'creative_task': intent('local_portrait')}))
+                    assert not hasattr(backend,'prepare_generation')
+                    rejected(lambda: backend.recognize_character({'source':sources[0],'creative_task':intent('local_portrait')}))
+                    allowed={**reviewed_plan['request'],'task_intent':reviewed_plan['plan']['intent'],
+                        'task_plan':reviewed_plan['plan']}
+                    with patch('character_profile.analyze_character',return_value={'identification':'CPU_checked_fixture'}) as recognize:
+                        result=backend.recognize_character(allowed)
+                        assert result['profile']['identification']=='CPU_checked_fixture' and recognize.call_count==1
+                        rejected(lambda: backend.recognize_character({**allowed,'source':sources[1]}))
+                        assert recognize.call_count==1,'Stale recognition scope reached the model'
                 orphan = backend.jobs.create({'kind': 'one_click', 'source': sources[0]})
                 recovered = Backend(root).jobs_list()['jobs']
                 state = next(item for item in recovered if item['job_id'] == orphan['job_id'])
                 assert state['status'] == 'failed' and state['stage'] == 'interrupted'
-                try:
-                    post('/api/run', {})
-                except urllib.error.HTTPError as error:
-                    assert error.code == 404
-                else:
-                    raise AssertionError('Retired dataset route still exists')
+                for retired_route in ('/api/run','/api/generation/prepare',
+                    '/api/source-runs/retired/plan-light','/api/source-runs/retired/plan-color'):
+                    try:post(retired_route,{})
+                    except urllib.error.HTTPError as error:assert error.code==404
+                    else:raise AssertionError('Retired route still exists: '+retired_route)
             finally:
                 capability_patch.stop()
                 server.shutdown()

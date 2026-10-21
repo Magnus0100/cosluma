@@ -1,6 +1,8 @@
 """Scene assets in explicit source/candidate spaces; GPU packages stay in the worker."""
 from __future__ import annotations
 
+from runtime_resources import external_python_popen, external_python_run
+
 import argparse
 import atexit
 import hashlib
@@ -123,7 +125,7 @@ def _start_scene_service(root, paths, *, timeout_seconds=180):
     worker_env = _scene_worker_environment()
     process = None
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        process = external_python_popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=stream, text=True, bufsize=1,
             start_new_session=os.name != 'nt',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
@@ -157,7 +159,7 @@ def _start_scene_service(root, paths, *, timeout_seconds=180):
 
 def _run_scene_worker_once(argv, log):
     with log.open('w', encoding='utf-8') as stream:
-        process = subprocess.run(argv, stdout=stream, stderr=stream, timeout=900,
+        process = external_python_run(argv, stdout=stream, stderr=stream, timeout=900,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             env=_scene_worker_environment())
     if process.returncode:

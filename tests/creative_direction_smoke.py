@@ -1,4 +1,4 @@
-"""CPU counterexamples for explicit source enhancement, direction and ROI budgets."""
+"""Existing-reference direction and ROI budgets; retired creation is rejected."""
 from __future__ import annotations
 
 import copy
@@ -31,25 +31,41 @@ def enhanced(mode='create_reference', *, regional=False):
 
 
 class DirectionTests(unittest.TestCase):
-    def test_legacy_contract_is_unchanged(self):
-        old = legacy()
+    def test_existing_reference_has_no_implicit_generation(self):
+        old = legacy('existing_reference')
         self.assertEqual(task.normalize_task_intent(old), old)
         self.assertEqual(task.image_budget(old), {
-            'initial_reference': 1, 'reference_correction': 1, 'independent_effect': 1})
+            'initial_reference': 0, 'reference_correction': 0, 'independent_effect': 0})
         self.assertNotIn('background_mode', task.normalize_task_intent(old)['constraints'])
 
+    def test_retired_creation_direction_and_native_region_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'Retired creation route'):
+            task.normalize_task_intent(enhanced('create_reference', regional=True))
+        with tempfile.TemporaryDirectory(prefix='retired-direction-') as folder:
+            root = Path(folder)
+            registry, sources, _ = fixture(root)
+            body = {'source': sources[0], 'model_registry': str(registry),
+                'creative_task': enhanced('create_reference')}
+            before = snapshot(root)
+            with patch('urllib.request.urlopen', side_effect=AssertionError('Rejected plan requested network')):
+                for key in ('creative_direction', 'regional_resume_authorization',
+                            'regional_candidate_reuse_authorization'):
+                    with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'Retired creation'):
+                        task.plan_task(root, {**body, key: {}})
+            self.assertEqual(snapshot(root), before)
+
     def test_explicit_regional_budget_and_geometry(self):
-        current = task.normalize_task_intent(enhanced(regional=True))
+        current = task.normalize_task_intent(enhanced('existing_reference', regional=True))
         self.assertEqual(current['regional_refinement']['coordinate_space'], 'source_canvas')
         self.assertEqual(task.image_budget(current)['regional_refinement'], 1)
         for key, value in [('maximum_submissions', True), ('maximum_submissions', 2),
                            ('coordinate_space', 'reference_scene'), ('regions', [])]:
-            changed = enhanced(regional=True)
+            changed = enhanced('existing_reference', regional=True)
             changed['regional_refinement'][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 task.normalize_task_intent(changed)
         for box in ([0, 0, 0, 1], [0, 0, 2, True], [-1, 0, 2, 3], [0, 0, 2.5, 3]):
-            changed = enhanced(regional=True)
+            changed = enhanced('existing_reference', regional=True)
             changed['regional_refinement']['regions'][0]['core_box'] = box
             with self.subTest(box=box), self.assertRaises(ValueError):
                 task.normalize_task_intent(changed)
@@ -58,15 +74,15 @@ class DirectionTests(unittest.TestCase):
         for mode in ('local_portrait',):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 task.normalize_task_intent(enhanced(mode, regional=True))
-        changed = enhanced(regional=True)
+        changed = enhanced('existing_reference', regional=True)
         changed['constraints']['preserve_background'] = True
         with self.assertRaises(ValueError):
             task.normalize_task_intent(changed)
-        changed = enhanced(regional=True)
+        changed = enhanced('existing_reference', regional=True)
         changed['constraints'].pop('background_mode')
         with self.assertRaises(ValueError):
             task.normalize_task_intent(changed)
-        changed = enhanced(regional=True)
+        changed = enhanced('existing_reference', regional=True)
         changed['regional_refinement']['regions'][0]['instruction'] = '增强原有后景灯光，不改变建筑。'
         self.assertIn('instruction', task.normalize_task_intent(changed)['regional_refinement']['regions'][0])
         existing = enhanced('existing_reference')
@@ -80,7 +96,7 @@ class DirectionTests(unittest.TestCase):
         self.assertEqual(sum(task.image_budget(local).values()), 0)
 
     def test_direction_is_user_grounded_and_no_effects_wins(self):
-        intent = task.normalize_task_intent(enhanced())
+        intent = task.normalize_task_intent(enhanced('existing_reference'))
         result = direction.compile_direction(intent, source_sha256='a'*64,
             character_name='祝小红', character_notes='情感意象，不是角色施法。', input_prompt='User prose')
         self.assertEqual(result['origin'], 'offline_user_contract')
@@ -91,19 +107,19 @@ class DirectionTests(unittest.TestCase):
         intent['constraints']['no_effects'] = True
         result = direction.compile_direction(intent, source_sha256='a'*64)
         self.assertEqual(result['main_effect']['mode'], 'none')
-        intent = enhanced()
+        intent = enhanced('existing_reference')
         intent['brief'] += '不要添加特效。'
         self.assertTrue(task.normalize_task_intent(intent)['constraints']['no_effects'])
         self.assertTrue(direction.has_no_effects_veto('Do not add any visual effects.'))
-        result = direction.compile_direction(task.normalize_task_intent(enhanced()),
+        result = direction.compile_direction(task.normalize_task_intent(enhanced('existing_reference')),
             source_sha256='a'*64, input_prompt='Do not add any visual effects.')
         self.assertEqual(result['main_effect']['mode'], 'none')
         self.assertEqual(result, direction.validate_direction(result,
-            task.normalize_task_intent(enhanced()), source_sha256='a'*64))
-        result = direction.compile_direction(task.normalize_task_intent(enhanced()),
+            task.normalize_task_intent(enhanced('existing_reference')), source_sha256='a'*64))
+        result = direction.compile_direction(task.normalize_task_intent(enhanced('existing_reference')),
             source_sha256='a'*64, input_prompt='Keep scene' + direction.MARKER + '不要添加特效。')
         self.assertEqual(result['main_effect']['mode'], 'user_described')
-        intent = task.normalize_task_intent(enhanced())
+        intent = task.normalize_task_intent(enhanced('existing_reference'))
         intent['brief'] = '只调整主光与环境层次'
         result = direction.compile_direction(intent, source_sha256='b'*64)
         self.assertEqual(result['main_effect']['mode'], 'not_specified')
@@ -120,7 +136,8 @@ class DirectionTests(unittest.TestCase):
             body = {'source': sources[0], 'model_registry': str(registry),
                 'provider':'qwen_image_2_1_uncensored_fast',
                 'character_name': '祝小红', 'character_notes': '不发明角色能力',
-                'input_prompt': 'Retain the photograph.', 'creative_task': enhanced(regional=True)}
+                'input_prompt': 'Retain the photograph.', 'reference': reference,
+                'creative_task': enhanced('existing_reference', regional=True)}
             with patch('task_model_preflight.inspect_task_models', side_effect=mocked_task_capability), \
                     patch('reference_provider.provider_health', return_value={'ready': True}), \
                     patch('urllib.request.urlopen', side_effect=AssertionError('Pure planning requested network')):
@@ -128,8 +145,8 @@ class DirectionTests(unittest.TestCase):
                 checked = task.plan_task(root, body)
                 self.assertTrue(checked['plan']['ready'])
                 self.assertEqual(snapshot(root), before)
-                self.assertEqual(checked['plan']['generation_submissions_upper_bound'], 2)
-                self.assertEqual(checked['plan']['image_budget'], {'initial_reference': 1,
+                self.assertEqual(checked['plan']['generation_submissions_upper_bound'], 1)
+                self.assertEqual(checked['plan']['image_budget'], {'initial_reference': 0,
                     'reference_correction': 0, 'independent_effect': 0, 'regional_refinement': 1})
                 self.assertEqual(checked['request']['input_prompt'], body['input_prompt'])
                 self.assertEqual(checked['request']['effective_prompt'], checked['plan']['creative_direction']['prompt'])

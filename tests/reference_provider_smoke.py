@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+from email.parser import BytesParser
+from email.policy import default
 import io
 import json
 import os
@@ -13,6 +16,7 @@ from pathlib import Path
 from threading import Thread
 
 from PIL import Image
+import numpy as np
 
 import reference_provider
 import provider_settings
@@ -74,6 +78,11 @@ def main() -> int:
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"error":"transient offline smoke offline-smoke-key"}')
+                return
+            if self.path.endswith('/reject'):
+                self.send_response(400)
+                self.send_header('Content-Type','application/json');self.end_headers()
+                self.wfile.write(b'{"error":{"code":"invalid_image_file","message":"fixture input rejection"}}')
                 return
             payload = {"id": "offline-smoke-generation", "created": 1, "data": [{"b64_json": base64.b64encode(output).decode("ascii")}]}
             encoded = json.dumps(payload).encode("utf-8")
@@ -155,6 +164,43 @@ def main() -> int:
                 raise AssertionError('Registered candidates must still prevent a new submission')
             assert attempts['count'] == 3
             assert provenance["status"] == "reference_candidate"
+            # An actual HTTP multipart request uses the bounded API copy, not
+            # the native raster that a checked editing tool owns locally.
+            large=root/'native-large.png'
+            Image.fromarray(np.random.default_rng(72).integers(0,256,(2401,1733,3),np.uint8)).save(large)
+            original=large.read_bytes();destination=root/'bounded'
+            bounded=['--root',str(root),'--image',str(large),'--sample','BOUNDED','--prompt','bounded native input',
+                '--provider','openai-compatible','--api-url',endpoint,'--model','fixture-image','--out-dir',str(destination)]
+            assert reference_provider.main(bounded)==0 and attempts['count']==4
+            record=json.loads((destination/'BOUNDED.provenance.json').read_text('utf8'))
+            api=record['provider_contract']['request']['api_input']
+            message=BytesParser(policy=default).parsebytes(
+                ('Content-Type: '+observed['content_type']+'\r\n\r\n').encode()+observed['body'].encode('latin1'))
+            uploaded=next(part.get_payload(decode=True) for part in message.iter_parts()
+                if part.get_param('name',header='content-disposition')=='image')
+            assert hashlib.sha256(uploaded).hexdigest()==api['sha256']
+            assert uploaded==Path(api['path']).read_bytes() and uploaded!=original
+            assert api['derived'] and max(api['size'])==2048 and api['source']['sha256']==hashlib.sha256(original).hexdigest()
+            assert api['source']['path']==str(large.resolve()) and large.read_bytes()==original
+            assert record['provider_contract']['request']['input_sha256']==api['sha256']
+            assert record['provider_contract']['response']['output_sha256']==hashlib.sha256(output).hexdigest()
+            sent=next(event for event in record['provider_contract']['transport']['events'] if event['event']=='provider_request')
+            assert sent['image_bytes']==len(uploaded) and sent['image_sha256']==api['sha256']
+            assert len(uploaded)<len(original)
+            # A known HTTP rejection remains one paid boundary and retains
+            # the prepared input evidence; it does not retry or register output.
+            rejected=root/'bounded-rejected'
+            bounded[bounded.index('--api-url')+1]=endpoint+'/reject'
+            bounded[bounded.index('--out-dir')+1]=str(rejected)
+            try:reference_provider.main(bounded)
+            except RuntimeError as error:assert '400' in str(error)
+            else:raise AssertionError('The synthetic HTTP400 must remain a failure')
+            assert attempts['count']==5 and not (rejected/'BOUNDED.png').exists()
+            failure=json.loads((rejected/'BOUNDED.transport-failure.json').read_text('utf8'))
+            assert failure['api_input']['derived'] and failure['automatic_retry'] is False
+            assert failure['candidate_registered'] is False
+            assert sum(event['event']=='provider_request' for event in failure['events'])==1
+            assert failure['events'][-1]['http_status']==400 and large.read_bytes()==original
             print(json.dumps({"ok": True, "candidate": str(out_dir / "SMOKE.png"), "provenance": str(out_dir / "SMOKE.provenance.json")}, ensure_ascii=False, indent=2))
     finally:
         server.shutdown()

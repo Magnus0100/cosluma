@@ -47,6 +47,11 @@ def saved_native_detail(root, run_id, body):
     path = Path(value)
     if not path.is_absolute():
         path = root/path
+    if (run.get('options') or {}).get('photo_appearance'):
+        from asset_identity import sha256_file
+        expected=((run.get('render') or {}).get('saved_artifact_sha256') or {}).get('render_scene_master')
+        if not expected or sha256_file(path)!=expected:
+            raise ValueError('Saved native master changed after the selected appearance was rendered')
     with tifffile.TiffFile(path) as file:
         height,width = file.pages[0].shape[:2]
     center = body.get('center', [.5,.5])
@@ -55,7 +60,11 @@ def saved_native_detail(root, run_id, body):
     left = max(0,min(width-cw,round(float(center[0])*width-cw/2)))
     top = max(0,min(height-ch,round(float(center[1])*height-ch/2)))
     box = (left,top,left+cw,top+ch)
-    display = plan_for_run(run)
+    if (run.get('options') or {}).get('photo_appearance'):
+        from generated_appearance_render import saved_display_transform
+        display=saved_display_transform(root,run)
+    else:
+        display=plan_for_run(run,root=root)
     if ((run.get('render') or {}).get('operator') or {}).get('working_domain')!='display_linear_sRGB':
         raise ValueError('Saved version does not declare a current display-linear render')
     working_domain='display_linear_sRGB'
@@ -76,6 +85,32 @@ def saved_native_detail(root, run_id, body):
             'unsaved_edits_included':False,'resampled':False,'raw_decoded':False,'gpt_calls':0,
             'elapsed_seconds':round(time.perf_counter()-started,3)}
     if body.get('include_source') is True:
+        if (run.get('options') or {}).get('photo_appearance'):
+            from appearance_assets import load_asset
+            scope=(run.get('task_plan') or {})['editing_scope']
+            design=run.get('generation_design') or (run.get('options') or {}).get('generation_design') or {}
+            source_asset=run.get('initial_source_appearance')
+            baseline=load_asset(source_asset,source_sha256=run['source']['sha256'],scope=scope,
+                design_id=design['observed_design']['design_id'])
+            try:
+                if (baseline['receipt']['kind']!='source_baseline'
+                        or baseline['receipt']['canvas_size']!=[width,height]):
+                    raise ValueError('Saved original appearance is not the matching native source baseline')
+                source=np.array(baseline['master'][top:top+ch,left:left+cw],copy=True)
+            finally:
+                for array in baseline.values():
+                    if isinstance(array,np.memmap) and getattr(array,'_mmap',None) is not None:
+                        array._mmap.close()
+            source_key=hashlib.sha256(json.dumps({'box':box,'asset_id':source_asset['asset_id'],
+                'display':display},sort_keys=True).encode()).hexdigest()[:20]
+            source_target=directory/(source_key+'-source.png')
+            source_image=linear_preview(source,display_transform=display)
+            source_image.save(source_target,icc_profile=source_image.info['icc_profile'])
+            result.update(source_preview_path=str(source_target.resolve()),
+                source_comparison={'basis':'saved_source_native_float_baseline','asset_id':source_asset['asset_id'],
+                    'crop_box':list(box),'native_size':[width,height],'resampled':False,'raw_decoded':False},
+                elapsed_seconds=round(time.perf_counter()-started,3))
+            return result
         plan = (((run.get('options') or {}).get('appearance_revision') or {})
                 .get('design_reconstruction_plan') or {})
         baseline = plan.get('source_baseline') or {}

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+from pathlib import PureWindowsPath
 import re
 
 from current_model_registry import (CAPABILITY_KEYS, CAPABILITY_LABELS,
@@ -42,7 +44,8 @@ DINO_FILES = ('config.json', 'preprocessor_config.json', 'model.safetensors', 'R
 
 
 def required_capabilities(mode, *, execution_strategy='layered_reference_transfer',
-                          complete_post=None, use_beautygrpo=False):
+                          complete_post=None, use_beautygrpo=False, editing_scope=None,
+                          shaping_request=None):
     """Return the model capabilities consumed by one checked task route.
 
     This is deliberately a route contract rather than a list of everything
@@ -57,6 +60,19 @@ def required_capabilities(mode, *, execution_strategy='layered_reference_transfe
         complete_post = mode != 'local_portrait'
     if type(complete_post) is not bool:
         raise ValueError('complete_post must be a boolean')
+    if uses_generated_appearance(mode,editing_scope):
+        if use_beautygrpo:
+            raise ValueError('Generated appearance does not consume a source-space beauty worker')
+        if shaping_request is not None:
+            from photo_shaping import normalize_request
+            request = normalize_request(shaping_request)
+            if mode != 'existing_reference':
+                raise ValueError('Shaping model capabilities require a checked existing-reference task')
+            if request['action'] == 'apply' and 'face' in request['parts']:
+                return frozenset({'portrait_regions'})
+        return frozenset()
+    if shaping_request is not None:
+        raise ValueError('Shaping model capabilities require the saved generated-appearance scope')
     required = set()
     if mode == 'local_portrait':
         # The local portrait route currently renders the source with the
@@ -73,6 +89,57 @@ def required_capabilities(mode, *, execution_strategy='layered_reference_transfe
         # its files belong to the analysis registry.
         required.add('portrait_beauty')
     return frozenset(required)
+
+
+def uses_generated_appearance(mode,editing_scope=None):
+    """Scope selects actual pixels; existing-reference includes checked iteration."""
+    if editing_scope is None:return False
+    from photo_editing import validate_scope
+    validate_scope(editing_scope)
+    return mode in {'create_reference','existing_reference'}
+
+
+def _safe_path_text(value):
+    if (not isinstance(value,str) or not value or any(ord(c)<32 for c in value)
+            or '://' in value or value.startswith(('\\\\','//'))
+            or PureWindowsPath(value).drive and not PureWindowsPath(value).is_absolute()):
+        raise ValueError('Explicit registry contains invalid or unsafe local path syntax')
+    tail=value[2:] if len(value)>1 and value[1]==':' else value
+    if any(c in tail for c in '<>:"|?*'):
+        raise ValueError('Explicit registry contains invalid or unsafe local path syntax')
+    return value
+
+
+def generated_registry_status(root,registry_path=None):
+    """Validate explicit unused registry metadata, preserving ready:false honestly.
+
+    No default analysis installation is discovered and no native path is probed.
+    An explicit disabled/unconfigured registry is valid metadata for a task that
+    does not consume it. Missing/malformed explicit files remain real blockers.
+    """
+    from current_model_registry import SCHEMA as REGISTRY_SCHEMA, resolve_config_paths
+    selected=registry_path if registry_path is not None else os.environ.get('COSPLAY_MODEL_REGISTRY')
+    result={'registry_path':None,'origin':'not_requested','config':{},'configured':False,
+        'paths':[],'error':None,'native_models_required':False,'configuration_valid':None,
+        'verification_scope':'unused_native_registry_not_inspected','inference_verified':False}
+    if selected is None:return result
+    try:
+        text=_safe_path_text(str(selected))
+        path=Path(text).expanduser()
+        path=(path if path.is_absolute() else Path(root)/path).resolve()
+        result.update(registry_path=str(path),origin='explicit' if registry_path is not None else 'environment')
+        if not path.is_file():raise ValueError('Explicit analysis registry file is unavailable: '+str(path))
+        if path.stat().st_size>SMALL_FILE_LIMIT:raise ValueError('Explicit analysis registry JSON exceeds the metadata read limit')
+        config=json.loads(path.read_text(encoding='utf-8-sig'))
+        if not isinstance(config,dict) or config.get('schema')!=REGISTRY_SCHEMA or type(config.get('ready')) is not bool:
+            raise ValueError('Explicit analysis registry requires current schema and boolean readiness')
+        for key in PATH_KEYS:
+            if key in config and config[key] not in (None,''):_safe_path_text(config[key])
+        result.update(config=resolve_config_paths(config,path.parent),configured=config['ready'],
+            configuration_valid=True,verification_scope='explicit_unused_registry_schema_only')
+    except (OSError,ValueError,TypeError,RuntimeError) as error:
+        result.update(error=str(error),configuration_valid=False)
+    return result
 
 
 def _digest(value):
@@ -166,7 +233,7 @@ class _Inspection:
                 path=path, recorded_sha256=recorded_sha256, expected_sha256=expected_sha256,
                 detail='' if compatible else 'Recorded weight identity differs from current profile: ' + str(path))
 
-    def packages(self, key, python, names, *, pinned=None, extra_sites=()):
+    def packages(self, key, python, names, *, pinned=None, extra_sites=(), strict_name=False):
         sites = [Path(python).parent.parent / 'Lib/site-packages', *extra_sites]
         versions = {}
         for name in names:
@@ -184,6 +251,10 @@ class _Inspection:
                 if metadata.stat().st_size > SMALL_FILE_LIMIT:
                     raise ValueError('oversized package metadata')
                 lines = metadata.read_text(encoding='utf8').splitlines()
+                if strict_name:
+                    names_found = [line[6:].strip().lower().replace('_', '-') for line in lines if line.startswith('Name: ')]
+                    if names_found != [name.lower().replace('_', '-')]:
+                        raise ValueError('missing/ambiguous or mismatched package name')
                 versions_found = [line[9:].strip() for line in lines if line.startswith('Version: ')]
                 if len(versions_found) != 1 or not versions_found[0]:
                     raise ValueError('missing/ambiguous package version')
@@ -324,7 +395,8 @@ def _sam31(check, config):
 
 def inspect_task_models(config, *, mode='existing_reference',
                         execution_strategy='layered_reference_transfer',
-                        complete_post=None, use_beautygrpo=False):
+                        complete_post=None, use_beautygrpo=False, editing_scope=None,
+                        shaping_request=None):
     """Return route-scoped model evidence with zero inference/network work.
 
     Only the capabilities consumed by this route are inspected.  A model
@@ -332,7 +404,9 @@ def inspect_task_models(config, *, mode='existing_reference',
     cannot block this task.
     """
     requested = required_capabilities(mode, execution_strategy=execution_strategy,
-        complete_post=complete_post, use_beautygrpo=use_beautygrpo)
+        complete_post=complete_post, use_beautygrpo=use_beautygrpo,editing_scope=editing_scope,
+        shaping_request=shaping_request)
+    face_shaping = shaping_request is not None and requested == frozenset({'portrait_regions'})
     group_for = {
         'source_silhouette': ('alpha_seed',),
         'source_geometry': ('human_matting', 'alpha_seed'),
@@ -361,9 +435,10 @@ def inspect_task_models(config, *, mode='existing_reference',
     try:
         # Validate only the route's paths.  In particular source-bound finish
         # must remain runnable with a registry containing just its SR runtime.
-        validate_config(config, required_keys=required, required_profiles=required_profiles)
-        check.check('registry.configuration', 'configuration', config['ready'],
-            detail='' if config['ready'] else 'Installed-model registry is not enabled')
+        if requested:
+            validate_config(config, required_keys=required, required_profiles=required_profiles)
+            check.check('registry.configuration', 'configuration', config['ready'],
+                detail='' if config['ready'] else 'Installed-model registry is not enabled')
     except (OSError, ValueError) as exc:
         check.check('registry.configuration', 'configuration', False, detail=str(exc))
         config = config if isinstance(config, dict) else {}
@@ -377,7 +452,17 @@ def inspect_task_models(config, *, mode='existing_reference',
             check.check(key, 'file_structure', okay, path=path,
                 detail='' if okay else 'Missing installed-model directory: ' + PATH_LABELS[key])
         elif path and path.is_absolute():
-            if key in {'python', 'scene_python', 'face_python', 'semantics_checkpoint'}:
+            if face_shaping and key in {'face_model_path', 'face_python'}:
+                if check.file(key, path):
+                    try:
+                        actual = check.small_sha(path)
+                        check.check(key+'.observed_identity', 'observed_small_file_identity', True,
+                            path=path, sha256=actual, actual_sha256=actual, bytes=path.stat().st_size,
+                            content_verified_against_profile=False)
+                    except (OSError, ValueError) as exc:
+                        check.check(key+'.observed_identity', 'observed_small_file_identity', False,
+                            path=path, detail=str(exc))
+            elif key in {'python', 'scene_python', 'face_python', 'semantics_checkpoint'}:
                 check.file(key, path)
             else:
                 check.weight(key, path)
@@ -407,7 +492,11 @@ def inspect_task_models(config, *, mode='existing_reference',
                 check.check('onnx.native_module', 'file_structure', len(native) == 1 and native[0].stat().st_size > 0,
                     detail='' if len(native) == 1 and native[0].stat().st_size > 0 else 'ONNX runtime native module is missing/ambiguous')
             if 'face_localization' in capabilities:
-                check.packages('face_runtime', config['face_python'], ('mediapipe',))
+                check.packages('face_runtime', config['face_python'], ('mediapipe',), strict_name=face_shaping)
+                if face_shaping:
+                    for row in check.checks:
+                        if row['key']=='face_runtime.mediapipe' and row['available']:
+                            row['actual_sha256']=row['metadata_sha256']
         except (OSError, ValueError, TypeError, KeyError) as exc:
             check.check('auxiliary_runtime.inspection', 'configuration', False, detail=str(exc))
     beauty = None
@@ -417,9 +506,11 @@ def inspect_task_models(config, *, mode='existing_reference',
         check.check('portrait_beauty.installation', 'recorded_identity', beauty['available'],
             path=beauty.get('config_path'), detail=beauty.get('error') or '')
     structure = [row for row in check.checks if row['scope'] == 'file_structure']
-    identities = [row for row in check.checks if row['scope'] in {'recorded_identity', 'small_file_content_identity'}]
+    identity_scopes = {'recorded_identity', 'small_file_content_identity'} | ({'observed_small_file_identity', 'runtime_metadata'} if face_shaping else set())
+    identities = [row for row in check.checks if row['scope'] in identity_scopes]
     recorded = [row for row in check.checks if row['scope'] == 'recorded_identity']
-    small = [row for row in check.checks if row['scope'] == 'small_file_content_identity']
+    small = [row for row in check.checks if row['scope'] in (
+        {'small_file_content_identity', 'observed_small_file_identity', 'runtime_metadata'} if face_shaping else {'small_file_content_identity'})]
     # Keep conceptual capability names in plans and expose the worker groups
     # used to produce the evidence.
     capability_status = {}
@@ -451,8 +542,10 @@ def inspect_task_models(config, *, mode='existing_reference',
         'recorded_identity_verified': bool(recorded) and all(row['available'] for row in recorded),
         'small_file_identity_verified': bool(small) and all(row['available'] for row in small),
         'weight_checks': check.weights, 'weight_content_verified': False,
-        'inference_verified': False, 'verification_scope': 'file_structure_small_file_hashes_recorded_identity',
+        'inference_verified': False, 'native_registry_required':bool(requested),
+        'verification_scope': 'file_structure_small_file_hashes_recorded_identity' if requested else 'native_models_not_requested',
         'hash_bytes_read': check.hash_bytes_read, 'large_weight_bytes_hashed': 0,
         'network_requests': 0, 'model_inferences': 0,
-        'limitations': ['Weight contents are not hashed by preflight; execution adapters verify their full identities.',
+        'limitations': [('Only the selected bounded face-model bytes, Python and package metadata are hashed; this does not prove inference.'
+            if face_shaping else 'Weight contents are not hashed by preflight; execution adapters verify their full identities.'),
             'File/runtime metadata does not prove that packages execute, GPU memory is sufficient, or inference succeeds.']}

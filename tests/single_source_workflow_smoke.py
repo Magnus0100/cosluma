@@ -56,7 +56,7 @@ def check_draft_during_diagnosis(root,common,candidate,local):
             except Exception as exc:errors.append(exc)
         with patch.object(workflow,'render_candidate',side_effect=render), \
              patch.object(workflow,'diagnose_cosplay_post',side_effect=diagnosis), \
-             patch.object(workflow,'generate_candidate',side_effect=AssertionError('QA fixture generated an image')), \
+             patch('reference_provider.request_edit',side_effect=AssertionError('QA fixture generated an image')), \
              patch('runtime_preflight.preflight_for_run',return_value={'status':'ready'}):
             worker=threading.Thread(target=execute);worker.start()
             try:
@@ -97,7 +97,7 @@ def main() -> int:
             return {'schema_version':'cosplay_runtime_preflight.v1','status':'ready',
                     'route':'local_portrait_source_silhouette',
                     'required_registry_keys':['birefnet_model_path','onnx_runtime_root']}
-        with patch.object(workflow,'generate_candidate',side_effect=AssertionError('Local entry generated a candidate')), \
+        with patch('reference_provider.request_edit',side_effect=AssertionError('Local entry generated a candidate')), \
              patch.object(reference_pipeline,'prepare',side_effect=AssertionError('Unavailable reference preparation was invoked')), \
              patch.object(design_pipeline,'ready',return_value=False), \
              patch('runtime_preflight.preflight_for_run', side_effect=runtime_gate), \

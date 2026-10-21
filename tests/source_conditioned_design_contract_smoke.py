@@ -19,7 +19,7 @@ def asset(path):
     return {'path':str(path), 'sha256':task.sha(path)}
 
 
-class SourceConditionedDesignTests(unittest.TestCase):
+class SourceConditionedDesignFixture:
     def setUp(self):
         temporary=tempfile.TemporaryDirectory(prefix='scd-');self.addCleanup(temporary.cleanup)
         self.root=Path(temporary.name);registry,sources,reference=fixture(self.root)
@@ -27,10 +27,10 @@ class SourceConditionedDesignTests(unittest.TestCase):
         self.common={'source':str(self.source),'model_registry':str(registry),
             'provider':'qwen_image_2_1_uncensored_fast','character_name':'用户提供角色',
             'input_prompt':'Create coherent cold cinematic light from this original photograph.'}
-        self.intent=enhanced()
+        self.intent=enhanced('existing_reference')
         self.intent['brief']='冷蓝环境、干净脸肤、发丝冷rim，薄雾和虚化红叶；保留人物和原景结构。'
         self.intent['constraints']['reference_role']='source_conditioned_design'
-        self.body={**self.common,'creative_task':self.intent}
+        self.body={**self.common,'reference':str(self.reference),'creative_task':self.intent}
         self.enterContext(patch('task_model_preflight.inspect_task_models',side_effect=mocked_task_capability))
         self.health=self.enterContext(patch('reference_provider.provider_health',return_value={'ready':True}))
         self.enterContext(patch('urllib.request.urlopen',side_effect=AssertionError('No network allowed')))
@@ -57,34 +57,16 @@ class SourceConditionedDesignTests(unittest.TestCase):
         intent=copy.deepcopy(self.intent);intent['mode']='existing_reference'
         return {**self.common,'reference':str(self.reference),'creative_task':intent}
 
-    def test_create_freezes_no_target_then_binds_real_returned_reference(self):
-        before=snapshot(self.root);checked=task.plan_task(self.root,self.body)
+
+class SourceConditionedDesignTests(SourceConditionedDesignFixture, unittest.TestCase):
+    def test_retired_source_conditioned_creation_is_rejected_without_writes(self):
+        body=copy.deepcopy(self.body)
+        body.pop('reference');body['creative_task']['mode']='create_reference'
+        before=snapshot(self.root)
+        with self.assertRaisesRegex(ValueError,'Retired creation route'):
+            task.plan_task(self.root,body)
         self.assertEqual(before,snapshot(self.root))
-        self.assertTrue(checked['plan']['ready'])
-        self.assertNotIn('reference',checked['plan']['inputs'])
-        self.assertNotIn('reference',checked['request'])
-        self.assertEqual(checked['plan']['image_budget'],{'initial_reference':1,'reference_correction':0,'independent_effect':0})
-        descriptor=checked['plan']['reference_contract']
-        self.assertEqual(descriptor['schema'],'source_conditioned_design_reference.v1')
-        self.assertEqual(descriptor['reference_binding'],'after_generation')
-        self.assertIsNone(descriptor['reference_sha256'])
-        self.assertIsNone(descriptor['reference_provenance_sha256'])
-        self.assertIsNone(descriptor['provider_prompt_id'])
-        self.assertEqual(descriptor['registration_status'],'not_checked')
-        self.assertFalse(descriptor['reference_rgb_compositing_allowed'])
-        self.assertTrue(checked['plan']['services']['local_image_inference'])
-        from qt_workbench import creative_task_plan_text
-        self.assertIn('不需要人工精修图作为输入',creative_task_plan_text(checked['plan']))
-        frozen=copy.deepcopy(checked['plan'])
-        bound=direction.bind_source_conditioned_reference(self.root,checked['plan'],asset(self.reference))
-        self.assertEqual(bound['reference_binding'],'generated_source_verified')
-        self.assertEqual(bound['reference_sha256'],task.sha(self.reference))
-        self.assertEqual(bound['reference_provenance_sha256'],task.sha(self.provenance_path))
-        self.assertEqual(bound['provider_prompt_id'],'actual-prompt-id')
-        self.assertEqual(bound['registration_status'],'not_checked')
-        self.assertEqual(checked['plan'],frozen)
-        self.assertEqual(checked['plan']['plan_id'],task.plan_task(self.root,checked['request'])['plan']['plan_id'])
-        task.execution_request(self.root,{**checked['request'],'plan_id':checked['plan']['plan_id']})
+        self.health.assert_not_called()
 
     def test_existing_requires_actual_same_source_provenance_and_new_budget_zero(self):
         body=self.existing_body();before=snapshot(self.root)
@@ -123,8 +105,7 @@ class SourceConditionedDesignTests(unittest.TestCase):
         self.write_provenance(self.provenance)
 
     def test_conflicts_and_descriptor_tampering_rejected(self):
-        for extra in ({'reference':str(self.reference)}, {'provider':'openai-compatible'},
-                      {'variant_count':2},{'variant_styles':['night_scene']},{'defer_reference_selection':True},
+        for extra in ({'variant_count':2},{'variant_styles':['night_scene']},{'defer_reference_selection':True},
                       {'regional_resume_authorization':{}},{'regional_candidate_reuse_authorization':{}}):
             with self.subTest(extra=extra),self.assertRaises(ValueError):task.plan_task(self.root,{**self.body,**extra})
         for regional in ({},{'maximum_submissions':0,'regions':[]}):
@@ -134,7 +115,7 @@ class SourceConditionedDesignTests(unittest.TestCase):
         with self.assertRaises(ValueError):task.plan_task(self.root,local)
         checked=task.plan_task(self.root,self.body)
         for field,value in (('reference_sha256','f'*64),('registration_status','registered'),
-                            ('reference_binding','generated_source_verified'),('texture_owner','reference'),
+                            ('reference_binding','after_generation'),('texture_owner','reference'),
                             ('reference_rgb_compositing_allowed',0)):
             bad=copy.deepcopy(checked['plan']);bad['reference_contract'][field]=value
             with self.assertRaises(ValueError):task.validate_task_plan(bad,bad['intent'])
@@ -176,7 +157,7 @@ class SourceConditionedDesignTests(unittest.TestCase):
                 source_sha256=checked['plan']['inputs']['source']['sha256'])
         self.assertEqual(checked['plan']['reference_contract']['transfer_scope'],
             'tone_and_source_guided_local_colour_coefficients')
-        self.assertEqual(checked['plan']['image_budget'],{'initial_reference':1,'reference_correction':0,'independent_effect':0})
+        self.assertEqual(checked['plan']['image_budget'],{'initial_reference':0,'reference_correction':0,'independent_effect':0})
 
     def test_warm_minimal_and_intentional_colour_are_not_overridden(self):
         body=copy.deepcopy(self.body);body['input_prompt']='Warm sunset portrait.'

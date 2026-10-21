@@ -12,6 +12,9 @@ from pathlib import Path
 
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 STAGES = {
+    'preparing': ('preparing', '正在准备本次编辑的原图基线。'),
+    'no_edited_candidate': ('no_edited_candidate', '原图基线已保留，尚无获准的实际修改。'),
+    'needs_attention': ('needs_attention', '现有请求或保存证据需要核查；不会自动重发。'),
     'imported': ('imported', '原片已导入。'),
     'generating': ('generating', '正在创作参考。'),
     'candidate_ready': ('candidate_ready', '参考图已绑定。'),
@@ -22,6 +25,7 @@ STAGES = {
     'local_reconstruction_failed': ('local_processing_failed', '本地处理失败，输入与已有参考保留。'),
     'blocked': ('blocked', '制作流程已阻断。'),
     'cancelled': ('cancelled', '制作流程已收到取消。'),
+    'finishing': ('finishing', '正在按独立审片完成当前作品。'),
 }
 COMPLETION_STAGES = {
     'reserved': ('completion', '完整后期已开始。'),
@@ -100,6 +104,11 @@ class SourceJobProgress:
         self.timing_snapshot = None
         self.timing_history = []
         self.last_timing_emit = None
+        self.scoped_mode = False
+        self.editing_iteration = False
+        self.autofinish_mode = False
+        self.source_native_mode = False
+        self.default_editing_phase = None
 
     def _changed_json(self, path):
         signature = _signature(path)
@@ -131,6 +140,13 @@ class SourceJobProgress:
             return False
         self.source_sha256 = digest
         self.bound = True
+        plan=value.get('task_plan') or {}
+        scope=plan.get('editing_scope') or {}
+        self.editing_iteration=bool(plan.get('editing_iteration'))
+        self.autofinish_mode=bool((plan.get('editing_autofinish') or {}).get('maximum_improvements'))
+        from scoped_workflow import SOURCE_NATIVE_INITIALIZATION
+        self.source_native_mode=plan.get('editing_initialization')==SOURCE_NATIVE_INITIALIZATION
+        self.scoped_mode=self.source_native_mode or self.editing_iteration
         timing = value.get('workflow_timing') or {}
         if isinstance(timing, dict) and timing.get('path'):
             target = Path(timing['path'])
@@ -162,6 +178,7 @@ class SourceJobProgress:
         self.seen.add(key)
         result = {'stage': stage, 'message': message, 'observed_run_id': self.run_id,
             'evidence_path': str(path), **evidence}
+        if self.scoped_mode:result['progress_basis']='indeterminate_scoped_workflow'
         if progress is not None:
             self.highest_progress = max(self.highest_progress, progress)
             result['progress'] = self.highest_progress
@@ -195,21 +212,50 @@ class SourceJobProgress:
             return None
         from workflow_timing import measured_progress, progress_text
         timing = measured_progress(snapshot, self.timing_history)
+        if self.scoped_mode and timing.get('module') in {'provider_transport','generation'}:
+            timing['module_label']='执行选定图像编辑' if self.source_native_mode or self.editing_iteration or self.default_editing_phase=='tool' else '生成完整编辑图'
         self.timing_token = token
         self.last_timing_emit = now
         return self._observation(('timing', token, timing['elapsed_seconds']), self.latest_stage,
-            progress_text(timing), self.timing_path, progress=self.highest_progress, timing=timing)
+            progress_text(timing), self.timing_path, progress=None if self.scoped_mode else self.highest_progress, timing=timing)
 
     def _workflow_event(self, item, path):
         if not isinstance(item, dict) or item.get('status') not in STAGES:
             return None
         status = item['status']
+        detail=item.get('detail') if isinstance(item.get('detail'),str) else ''
         stage, message = STAGES[status]
+        if self.scoped_mode:
+            message={'generating':'正在执行本轮审片改进。' if self.editing_iteration else '正在生成完整人物与场景编辑图。',
+                'rendering':'正在映射和保存生成外观。','needs_visual_review':'作品文件已保存，画质评价与人工批准分别记录。'}.get(status,message)
+            phase={'model_selected_improvement:decide':('editing_decision','根据父审片选择下一项编辑操作。'),
+                'model_selected_improvement:tool':('editing_tool','执行模型选择的编辑工具。'),
+                'model_selected_improvement:evaluate':('editing_review','独立复审本轮新候选。')}.get(detail)
+            if self.editing_iteration and phase:stage,message=phase
+            default_phase={'default_editing:decide':('decide','editing_decision','按初审选择条件纠偏工具。'),
+                'default_editing:tool':('tool','editing_tool','执行所选条件纠偏工具。'),
+                'default_editing:evaluate':('evaluate','editing_review','独立评价当前完整图。')}.get(detail)
+            if self.autofinish_mode and default_phase:
+                self.default_editing_phase,stage,message=default_phase
+            if self.source_native_mode:
+                if detail=='source_native:baseline':stage,message='source_native_baseline','准备原图原生精度基线；尚未编辑。'
+                elif detail=='source_native:baseline:evaluate':stage,message='baseline_review','实际评价原图基线的自然度与创作缺口。'
+                elif detail.startswith(('source_native:initial:','source_native:improvement:')):
+                    initial=detail.startswith('source_native:initial:');phase=detail.rsplit(':',1)[-1]
+                    stage,message={'decide':('editing_decision','模型选择首次编辑工具。' if initial else '模型选择下一项条件改进。'),
+                        'tool':('editing_tool','执行所选首次编辑。' if initial else '执行所选条件改进。'),
+                        'evaluate':('editing_review','独立评价实际编辑候选。')}.get(phase,(stage,message))
+                    self.default_editing_phase=phase
+                elif status=='generating':message='模型正在选择或执行获准编辑；实际图像调用以回执为准。'
+                elif status=='rendering':message='核验并保存选中的原生或生成外观。'
         # Do not forward arbitrary details or transport errors into journals.
         stamp = item.get('at') if isinstance(item.get('at'), str) else None
         event = {'status': status, 'at': stamp[:80] if stamp else None}
+        supported={'source_native:baseline','source_native:baseline:evaluate',
+            *('source_native:'+operation+':'+phase for operation in ('initial','improvement') for phase in ('decide','tool','evaluate'))}
+        if isinstance(detail,str) and detail in supported:event['phase']=detail
         observation = self._observation(('workflow', event), stage, message, path,
-            progress=STAGE_PROGRESS.get(status), workflow_event=event)
+            progress=None if self.scoped_mode else STAGE_PROGRESS.get(status), workflow_event=event)
         if observation:
             self.latest_workflow_status = status
         return observation
@@ -279,7 +325,7 @@ class SourceJobProgress:
                 if 0 <= completed <= submitted <= count:
                     observation = self._observation(('candidates', completed, submitted, count), 'generating',
                         f'候选已生成 {completed}/{count} 张；已提交 {submitted}/{count} 张。', self.manifest,
-                        progress=.25 + .15 * completed / count,
+                        progress=None if self.scoped_mode else .25 + .15 * completed / count,
                         candidate_counts={'completed': completed, 'submitted': submitted, 'requested': count})
                     if observation:
                         result.append(observation)

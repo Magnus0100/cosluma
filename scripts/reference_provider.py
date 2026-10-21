@@ -205,13 +205,19 @@ def prepare_condition_inputs(path: Path, image: Path, root: Path,
     if not isinstance(rows, list) or not 1 <= len(rows) <= 10:
         raise ValueError("--inputs-json requires one to ten ordered inputs")
     allowed = {"scene_reference", "source_identity", "edit_mask", "identity_crop", "source"}
+    ordered_roles = [row.get('role') if isinstance(row, dict) else None for row in rows]
+    regional_support = ordered_roles == ['source', 'edit_mask']
+    if 'edit_mask' in ordered_roles and not regional_support:
+        if ordered_roles[:3] != ['scene_reference', 'source_identity', 'edit_mask']:
+            raise ValueError('Edit mask conditions require source, edit_mask or scene_reference, source_identity, edit_mask order')
     result = []
     roles = set()
     for index, row in enumerate(rows, 1):
-        if not isinstance(row, dict) or row.get("role") not in allowed:
+        if not isinstance(row, dict) or not isinstance(row.get("role"), str) or row["role"] not in allowed:
             raise ValueError("Unknown condition image role")
         role = row["role"]
-        if role in roles or not row.get("path") or not row.get("sha256") or not row.get("coordinate_space"):
+        if (role in roles or not row.get("path") or not row.get("sha256")
+                or not isinstance(row.get("coordinate_space"), str) or not row["coordinate_space"].strip()):
             raise ValueError("Conditions require unique roles, path, SHA and coordinate_space")
         roles.add(role)
         actual = Path(row["path"]).expanduser()
@@ -249,24 +255,28 @@ def prepare_condition_inputs(path: Path, image: Path, root: Path,
                 values = {item[1] for item in opened.getcolors(maxcolors=257) or []}
                 if values != {0, 255}:
                     raise ValueError("Edit mask must have nonempty binary allowed and excluded regions")
-            if result[0]["role"] != "scene_reference" or row["coordinate_space"] != result[0]["coordinate_space"]:
-                raise ValueError("Edit mask must declare the scene_reference coordinate space")
+            if result[0]["role"] != ("source" if regional_support else "scene_reference") or row["coordinate_space"] != result[0]["coordinate_space"]:
+                raise ValueError("Edit mask must declare the actual first image's coordinate space")
             record.update(white_means="edit_allowed", conditioning_only=True,
                           hard_edit_mask_enforced=False)
+            if regional_support:
+                record['purpose'] = 'current_appearance_regional_support'
         result.append(record)
-    if "edit_mask" in roles and "source_identity" not in roles:
+    if "edit_mask" in roles and not regional_support and "source_identity" not in roles:
         raise ValueError("Material correction requires source_identity as a separate condition")
-    if "edit_mask" in roles and [row["role"] for row in result[:3]] != ["scene_reference", "source_identity", "edit_mask"]:
+    if "edit_mask" in roles and not regional_support and [row["role"] for row in result[:3]] != ["scene_reference", "source_identity", "edit_mask"]:
         raise ValueError("Material correction order must be scene_reference, source_identity, edit_mask")
     return result
 
 
-def prepare_api_input(image: Path, out_dir: Path, long_edge: int = 2048) -> tuple[Path, dict[str, Any]]:
-    """Make a camera RAW uploadable without altering or copying the original.
+def prepare_api_input(image: Path, out_dir: Path, long_edge: int = 2048, *,
+                      resize_raster: bool = False) -> tuple[Path, dict[str, Any]]:
+    """Prepare a bounded remote derivative while preserving original input bytes.
 
-    Raster inputs retain their existing request bytes. RAW decoding mirrors
-    the project's camera-WB/no-auto-bright RGB boundary; only the API JPEG is
-    resized. The derivative is an input artifact, never a reference candidate.
+    Raster resizing is explicitly enabled only for the remote single-image
+    transport. Local conditioning keeps its exact raster canvas and bytes.
+    RAW retains the existing displayed JPEG boundary. An API derivative never
+    replaces a native master or the actual returned generation.
     """
     from PIL import Image
     from raw_support import deterministic_srgb_profile
@@ -276,8 +286,51 @@ def prepare_api_input(image: Path, out_dir: Path, long_edge: int = 2048) -> tupl
         with Image.open(image) as opened:
             facts = {"format": opened.format, "mode": opened.mode, "size": list(opened.size),
                      "orientation": opened.getexif().get(274)}
-        return image, {**original, **facts, "derived": False,
-                       "decode": {"decoder": "passthrough", "orientation_applied": False}}
+        if not resize_raster or max(facts['size']) <= long_edge:
+            return image, {**original, **facts, "derived": False,
+                           "decode": {"decoder": "passthrough", "orientation_applied": False}}
+        from PIL import ImageOps
+        decoded = open_rgb(image)
+        oriented_size = list(decoded.size)
+        colour_management = decoded.info.get('color_management')
+        alpha = None
+        with Image.open(image) as opened:
+            oriented = ImageOps.exif_transpose(opened)
+            if 'A' in oriented.getbands() or 'transparency' in oriented.info:
+                alpha = oriented.convert('RGBA').getchannel('A')
+        if alpha is None:
+            decoded.thumbnail((long_edge, long_edge), Image.Resampling.LANCZOS)
+            resampling = 'Lanczos_sRGB'
+        else:
+            import numpy as np
+            from float_appearance import srgb_to_linear, linear_to_srgb
+            ratio = long_edge/max(decoded.size)
+            size = tuple(max(1, round(edge*ratio)) for edge in decoded.size)
+            opacity = np.asarray(alpha, np.float32)/255
+            associated = srgb_to_linear(np.asarray(decoded, np.float32)/255)*opacity[..., None]
+            opacity = np.asarray(Image.fromarray(opacity).resize(size, Image.Resampling.BILINEAR))
+            colour = np.empty((size[1], size[0], 3), np.float32)
+            for channel in range(3):
+                colour[..., channel] = np.asarray(Image.fromarray(associated[..., channel]).resize(size, Image.Resampling.BILINEAR))
+            np.divide(colour, opacity[..., None], out=colour, where=opacity[..., None] > 0)
+            colour[opacity == 0] = 0
+            rgba = np.empty((size[1], size[0], 4), np.uint8)
+            rgba[..., :3] = np.clip(np.rint(linear_to_srgb(colour)*255), 0, 255).astype(np.uint8)
+            rgba[..., 3] = np.clip(np.rint(opacity*255), 0, 255).astype(np.uint8)
+            decoded = Image.fromarray(rgba)
+            resampling = 'bilinear_linear_associated_RGB_and_alpha'
+        target = out_dir.resolve()/'inputs'/'provider-input.png'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        decoded.info.clear()
+        decoded.save(target, format='PNG', compress_level=1, icc_profile=deterministic_srgb_profile())
+        return target, {'path': str(target), 'sha256': sha256(target), 'bytes': target.stat().st_size,
+            'format': 'PNG', 'mode': decoded.mode, 'bits_per_channel': 8, 'size': list(decoded.size), 'orientation': None,
+            'derived': True, 'source': {**original, **facts},
+            'decode': {'decoder': 'oriented_color_managed_raster', 'decode_version': RGB_DECODE_VERSION,
+                'color_management': colour_management, 'output_transfer': 'IEC_sRGB', 'icc_embedded': 'sRGB',
+                'oriented_size': oriented_size, 'orientation_applied': facts['orientation'] not in (None, 1),
+                'orientation_handled_by': 'Pillow ImageOps.exif_transpose', 'long_edge_limit': long_edge,
+                'alpha_preserved': alpha is not None, 'resampling': resampling}}
 
     rawpy = _require_rawpy()
 
@@ -674,9 +727,13 @@ def qwen_quality_gate(image_path: Path, *, content_sha256: str | None = None,
             "reason": "unreadable_image",
             "passed": False,
         }
+    periodicity = periodic_grid_evidence(metrics, threshold=QWEN_GRID_GATE_THRESHOLD)
+    projection = periodicity.get("primary_projection")
+    if projection is not None:
+        metrics = {**metrics, **metrics['visible_projections'][projection],
+                   'primary_projection': projection}
     peak = float(metrics.get("diag_peak_lag_4_16", 0.0))
     threshold_exceeded = peak > QWEN_GRID_GATE_THRESHOLD
-    periodicity = periodic_grid_evidence(metrics, threshold=QWEN_GRID_GATE_THRESHOLD)
     grid_detected = periodicity["corroborated"]
     rejected = context == "generated_output" and grid_detected
     return {
@@ -876,7 +933,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     # Local 2K editing must receive enough source pixels for its portrait and
     # landscape canvases. Keep the remote transport's existing upload bound.
     input_edge = 4096 if config.get('kind') == 'comfyui' and config.get('registry_id', '').startswith('qwen_image') else 2048
-    api_image, api_input = prepare_api_input(image, out_dir, long_edge=input_edge)
+    api_image, api_input = prepare_api_input(image, out_dir, long_edge=input_edge,
+        resize_raster=config.get('kind') == 'openai-compatible')
     source_sha256 = sha256(source)
     conditions = None
     if args.inputs_json:

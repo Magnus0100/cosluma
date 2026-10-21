@@ -65,7 +65,23 @@ def source_transform_for_run(run):
     return transform
 
 
-def plan_for_run(run):
+def plan_for_run(run, *, root=None):
+    if (run.get('options') or {}).get('photo_appearance'):
+        from generated_appearance_render import validate_run
+        from photo_appearance import validate_asset
+        scope,design,_,_=validate_run(root or run.get('root') or '.',run)
+        asset=run['options']['photo_appearance']
+        receipt=validate_asset(asset,source_sha256=run['source']['sha256'],scope=scope,
+            design_id=design['observed_design']['design_id'])
+        render=run.get('render') or {};operator=render.get('operator') or {}
+        display=operator.get('display_transform') or {}
+        if (render.get('photo_appearance')!=asset or operator.get('asset_id')!=receipt['asset_id']
+                or operator.get('working_domain')!='display_linear_sRGB'
+                or display.get('method')!='clip_sdr'):
+            raise ValueError('Saved native appearance has no matching display encoding')
+        return display
+    if (run.get('task_plan') or {}).get('editing_scope'):
+        raise ValueError('A current scoped result requires its native appearance asset')
     revision = (run.get('options') or {}).get('appearance_revision') or {}
     plan = revision.get('design_reconstruction_plan') or {}
     source_only=(run.get('options') or {}).get('source_only_plan') or {}

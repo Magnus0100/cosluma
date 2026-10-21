@@ -46,7 +46,11 @@ def main():
         env.update(PYTHONPATH='Z:/missing/source', PYTHONHOME='Z:/missing/runtime')
         command = [str(shell), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script), '-Describe']
         def describe(extra=()):
-            return subprocess.run([*command,*extra], env=env, capture_output=True, text=True, encoding='utf8', timeout=30)
+            # Windows PowerShell can emit localized non-UTF8 stderr without a
+            # console. Preserve those bytes as escapes; the return code and
+            # required ASCII rejection messages remain strict assertions.
+            return subprocess.run([*command,*extra], env=env, capture_output=True, text=True,
+                encoding='utf8', errors='backslashreplace', timeout=30)
         result = describe()
         assert result.returncode == 0, result.stderr
         report = json.loads(result.stdout)
@@ -84,10 +88,41 @@ def main():
             assert Path(explicit['arguments'][explicit['arguments'].index('--root')+1])==chosen
             assert Path(explicit['installation_health']['package_root'])==root
         assert pointer.read_bytes()==original_bad, 'Launch must never rewrite the selected configuration'
+        # Exercise the normal branch in the actual shell. Capture Start-Process
+        # at the OS boundary so no EXE/service runs; the launcher itself is real.
+        # A valid deployment/runtime must not cause a second implicit provider.
+        deployment=root/'optional local deployment'
+        runtime=deployment/'runtime/Scripts/python.exe'
+        runtime.parent.mkdir(parents=True);runtime.write_bytes(b'never execute a model service')
+        (root/'_internal/start_qwen_image.py').write_text('raise AssertionError("Unused provider launched")',encoding='utf8')
+        env['COSPLAY_QWEN_DEPLOY_ROOT']=str(deployment)
+        calls=root/'launch-calls.json'
+        capture=root/'capture-launch.ps1'
+        capture.write_text('''param([string]$Launcher,[string]$Calls)
+$global:CosLumaCaptured=@()
+function Start-Process {
+    param($FilePath,$ArgumentList,$WorkingDirectory,$WindowStyle,$RedirectStandardOutput,$RedirectStandardError,[switch]$PassThru)
+    $global:CosLumaCaptured+=@([pscustomobject]@{file=[string]$FilePath;arguments=[string]$ArgumentList;working_directory=[string]$WorkingDirectory;window_style=[string]$WindowStyle})
+    if($PassThru){[pscustomobject]@{Id=31415}}
+}
+& $Launcher -PassThru | Out-Null
+ConvertTo-Json -InputObject @($global:CosLumaCaptured) -Depth 5 | Set-Content -LiteralPath $Calls -Encoding utf8
+''',encoding='utf8')
+        normal=subprocess.run([str(shell),'-NoProfile','-ExecutionPolicy','Bypass','-File',str(capture),
+            '-Launcher',str(script),'-Calls',str(calls)],env=env,capture_output=True,text=True,
+            encoding='utf8',errors='backslashreplace',timeout=30)
+        assert normal.returncode==0,normal.stderr
+        launched=json.loads(calls.read_text(encoding='utf-8-sig'))
+        assert len(launched)==1,launched
+        assert Path(launched[0]['file'])==executable
+        assert '--prewarm' in launched[0]['arguments'] and '--embedded-backend' in launched[0]['arguments']
+        assert Path(launched[0]['working_directory'])==root/'preferred env workspace'
+        assert launched[0]['window_style']!='Hidden','The user application must remain visible'
+        assert not (root/'preferred env workspace/outputs/runtime/qwen-startup.stdout.log').exists()
         script.write_text(script.read_text('utf8')+'\n# changed payload\n', encoding='utf8')
         rejected = describe()
         assert rejected.returncode != 0 and 'differs from the complete build' in rejected.stderr
-    print('OK: actual Windows shell, workspace pointer/environment/explicit-root precedence, invalid settings and hash rejection')
+    print('OK: actual Windows shell, workspace precedence, normal visible application only, no implicit provider, invalid settings and hash rejection')
 
 
 if __name__ == '__main__':

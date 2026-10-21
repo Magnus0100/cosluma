@@ -17,7 +17,56 @@ import source_conditioned_design_contract_smoke as baseline
 from generation_prompt import DEFAULT_PROMPT, STYLE_MARKER, compose_generation_prompt
 
 
-class ProfileTests(baseline.SourceConditionedDesignTests):
+def imported_profile_fixture(root, body):
+    """Import a synthetic saved profile contract, never plan retired creation.
+
+    The historical fixture owns real local source/reference/provenance files.
+    Only its already-saved metadata is authored here; the actual continuation
+    still passes the public planner and all inheritance/override validators.
+    """
+    body=copy.deepcopy(body)
+    if body['creative_task']['mode']!='existing_reference':
+        raise AssertionError('Imported profile fixture is only for existing-reference replay')
+    intent=copy.deepcopy(body['creative_task'])
+    selector=intent['constraints']['refinement_profile']
+    selector['overrides']=direction.refinement_overrides(body['input_prompt'],body.get('character_notes',''))
+    intent=task.normalize_task_intent(intent)
+    plain=copy.deepcopy(body);plain['creative_task']['constraints'].pop('refinement_profile')
+    for key in ('preset','preset_snapshot','parent_run_id'):plain.pop(key,None)
+    checked=task.plan_task(root,plain);plan=copy.deepcopy(checked['plan'])
+    plan['intent']=intent
+    plan['creative_direction']=direction.compile_direction(intent,
+        source_sha256=plan['inputs']['source']['sha256'],
+        character_name=body.get('character_name',''),character_notes=body.get('character_notes',''),
+        input_prompt=body['input_prompt'])
+    profile=preset_store.get_refinement_profile(selector)
+    plan['refinement_inheritance']={'schema':'refinement_profile_inheritance.v1',
+        'parent_run_id':'run-imported-older-profile','profile':copy.deepcopy(intent['constraints']['refinement_profile']),
+        'profile_sha256':profile['profile_sha256'],
+        'source_sha256':plan['inputs']['source']['sha256'],'reference_sha256':plan['inputs']['reference']['sha256'],
+        'previous_plan_id':'a'*64,'previous_direction_id':'b'*64,'previous_manifest_sha256':'c'*64}
+    plan['plan_id']=task.digest({'imported_test_contract':plan})
+    task.validate_task_plan(plan,intent)
+    parent='run-imported-profile-'+plan['plan_id'][:16]
+    directory=root/'outputs/runs'/parent;directory.mkdir(parents=True,exist_ok=True)
+    previous={'run_id':parent,'status':'needs_visual_review','source':baseline.asset(Path(body['source'])),
+        'reference':baseline.asset(Path(body['reference'])),'task_intent':intent,'task_plan':plan,
+        'options':{key:copy.deepcopy(body[key]) for key in ('input_prompt','character_notes','character_name') if key in body}}
+    (directory/'manifest.json').write_text(json.dumps(previous),encoding='utf8')
+    body.update(parent_run_id=parent,creative_task=intent)
+    return body
+
+
+class ProfileTests(baseline.SourceConditionedDesignFixture, unittest.TestCase):
+    def test_retired_profile_creation_never_reopens_the_old_route(self):
+        body=self.profile_body('暖光人像。')
+        body['creative_task']['mode']='create_reference'
+        body.pop('reference');body.pop('parent_run_id')
+        before=baseline.snapshot(self.root)
+        with self.assertRaisesRegex(ValueError,'Retired creation route'):
+            task.plan_task(self.root,body)
+        self.assertEqual(before,baseline.snapshot(self.root))
+
     def profile_body(self, brief='', *, prompt=None, notes=''):
         body=copy.deepcopy(self.body)
         body['creative_task']['brief']=brief
@@ -26,7 +75,7 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
         body['input_prompt']=prompt if prompt is not None else compose_generation_prompt(
             DEFAULT_PROMPT,preset_store.get_preset('source_refinement')['prompt'])
         body['character_notes']=notes
-        return body
+        return imported_profile_fixture(self.root,body)
 
     def saved_profile(self, *, notes=''):
         checked=task.plan_task(self.root,self.profile_body('暖金夕照，保持本人肤色。',notes=notes))
@@ -59,7 +108,7 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
         self.assertEqual(goal['target_temperature'],'follow_user_intent')
         self.assertNotIn('冷蓝',record['prompt'])
         self.assertNotIn('米白',record['prompt'])
-        self.assertEqual(plan['image_budget'],{'initial_reference':1,'reference_correction':0,'independent_effect':0})
+        self.assertEqual(plan['image_budget'],{'initial_reference':0,'reference_correction':0,'independent_effect':0})
         self.assertEqual(record['main_effect']['mode'],'none')
         execute=task.execution_request(self.root,{**checked['request'],'plan_id':plan['plan_id']})
         self.assertEqual(execute['task_plan']['creative_direction'],record)
@@ -109,6 +158,8 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
         for field in ('input_prompt','character_notes'):
             body=self.profile_body()
             body[field]=managed+'\n保留手部红光。不要动脸。'
+            with self.assertRaises(ValueError):task.plan_task(self.root,body)
+            body=imported_profile_fixture(self.root,body)
             checked=task.plan_task(self.root,body)
             record=checked['plan']['creative_direction']
             task.validate_task_plan(checked['plan'],checked['plan']['intent'])
@@ -124,6 +175,8 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
             body=self.profile_body()
             if field=='brief':body['creative_task']['brief']='无特效'
             else:body[field]='Generated positive fog direction'+DESIGN_MARKER+'Generated refine skin.\n无特效'
+            with self.assertRaises(ValueError):task.plan_task(self.root,body)
+            body=imported_profile_fixture(self.root,body)
             checked=task.plan_task(self.root,body);record=checked['plan']['creative_direction']
             self.assertTrue(checked['plan']['intent']['constraints']['no_effects'])
             self.assertEqual(record['main_effect']['mode'],'none')
@@ -149,16 +202,18 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
                 self.assertEqual(set((record.get('material_refinement') or {}).get('domains',{})),expected)
 
     def test_no_profile_direction_hashes_bind_the_current_prompt(self):
-        for brief,role,expected in (
-            ('保留原景与妆造。',None,'a61750c9437a6075ccaac1a316fa95afc0072a3e23cfb636fb74f77aa4aef2bf'),
-            ('清除手臂和手的红绿杂光，统一肤色。','source_conditioned_design','bceda9dd93f96c11dd1910d5cbfaa0daece451f490e92e0f579df45c5f26ecb2')):
-            intent={'schema_version':'cosplay_task_intent.v1','mode':'create_reference','brief':brief,
+        for brief,role in (
+            ('保留原景与妆造。',None),
+            ('清除手臂和手的红绿杂光，统一肤色。','source_conditioned_design')):
+            intent={'schema_version':'cosplay_task_intent.v1','mode':'existing_reference','brief':brief,
                 'constraints':{'preserve_background':False,'no_effects':False,'background_mode':'enhance_source'},
                 'services':{'text_vision':False,'visual_review':False}}
             if role:intent['constraints']['reference_role']=role
             record=direction.compile_direction(intent,source_sha256='a'*64,character_name='用户角色',
                 character_notes='保留手部红光。',input_prompt='Original editable prompt')
-            self.assertEqual(record['direction_id'],expected)
+            direction.validate_direction(record,intent,source_sha256='a'*64)
+            changed=copy.deepcopy(record);changed['prompt']+=' changed'
+            with self.assertRaises(ValueError):direction.validate_direction(changed,intent,source_sha256='a'*64)
 
     def test_metadata_is_not_arbitrary_permission_or_generation_budget(self):
         for selector in ({'id':'other','version':1},{'id':'source_refinement','version':True},
@@ -173,7 +228,8 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
             with self.subTest(change=change),self.assertRaises(ValueError):task.plan_task(self.root,{**self.profile_body(),**change})
         for mode in ('local_portrait','existing_reference'):
             body=self.profile_body();body['creative_task']['mode']=mode
-            if mode=='existing_reference':body['reference']=str(self.reference)
+            if mode=='existing_reference':
+                body['reference']=str(self.reference);body.pop('parent_run_id',None)
             with self.subTest(mode=mode),self.assertRaises(ValueError):task.plan_task(self.root,body)
 
     def test_existing_reference_requires_verified_saved_profile_inheritance(self):
@@ -315,6 +371,15 @@ class ProfileTests(baseline.SourceConditionedDesignTests):
         from portable_project import export_project,import_project
         root=self.root/'portable-workspace';run=prepare_fixture(root,native=(224,288))
         body=self.profile_body('暖光人像，保留肤色。');body['source']=run['source']['path']
+        body['reference']=run['reference']['path']
+        # Rebuild an explicit imported parent against this real portable fixture.
+        provenance=copy.deepcopy(self.provenance)
+        provenance['source']=baseline.asset(Path(body['source']));provenance['asset']=baseline.asset(Path(body['reference']))
+        provenance['provider_contract']['request']['input_sha256']=provenance['source']['sha256']
+        provenance['provider_contract']['request']['api_input']={**provenance['source'],'derived':False}
+        provenance['provider_contract']['comfyui']['condition_inputs'][0].update(provenance['source'])
+        Path(body['reference']).with_suffix('.provenance.json').write_text(json.dumps(provenance),encoding='utf8')
+        body=imported_profile_fixture(self.root,body)
         checked=task.plan_task(self.root,body)
         goal=checked['plan']['creative_direction']['material_refinement']
         values,_,_,_,context,assets,evidence,_=fixture(root/'producer',

@@ -127,8 +127,8 @@ def main():
         assert identity['kind'] == 'cosplay_project' and identity['workflow_mode'] == 'single_source'
         scene = Window(root/'scene', 'http://127.0.0.1:1'); scene.pool = Pool()
         scene.set_simple_source(paired['source']['path'])
-        scene.set_background_mode('replace')
-        scene.creative_task_policies['create_reference']['background_mode'] = 'replace'
+        scope_controls = scene.editing_scope_panels[-1]
+        scope_controls['work_type'].setCurrentIndex(scope_controls['work_type'].findData('full_composite'))
         scene.variant_count.setValue(2)  # Explicit candidate selection keeps its local editing chain.
         scene.simple_workspace.brief.setText('暖色逆光与魔法光效')
         scene.simple_workspace.create_cos_button.click()
@@ -178,8 +178,8 @@ def main():
         assert single.active_checked_task['progress_stages']==single.simple_creation['progress_stages']
         assert single._quick_progress_stages()==single.simple_creation['progress_stages']
         assert '等待任务提交' in single.simple_workspace.progress_detail.text()
-        assert single._quick_progress(.5, 'workflow', 'one_click')[0] == .52
-        assert single._quick_progress(.4, 'workflow', 'one_click')[1] == '完整制作'
+        assert single._quick_progress(.5, 'workflow', 'one_click')[0] is None
+        assert single._quick_progress(.4, 'workflow', 'one_click')[1] == 'workflow'
         before = len(single.pool.tasks)
         submission.signals.result.emit({'run': completed})
         single.result('one-click', {'run': completed})  # Duplicate terminal delivery stays read-only.
@@ -229,7 +229,8 @@ def main():
 
         # A success arriving just after cancel may show the result, but never advances to colour.
         cancelled = Window(root/'scene', 'http://127.0.0.1:1'); cancelled.pool = Pool()
-        cancelled.creative_task_policies['create_reference']['background_mode'] = 'replace'
+        scope_controls = cancelled.editing_scope_panels[-1]
+        scope_controls['work_type'].setCurrentIndex(scope_controls['work_type'].findData('full_composite'))
         cancelled.variant_count.setValue(2)
         cancelled.set_simple_source(paired['source']['path']); cancelled.simple_action('create_cos')
         plan_ready(cancelled, cancelled.pool).signals.result.emit({'run': paired})

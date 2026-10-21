@@ -15,15 +15,18 @@ def main():
         qwen.install_conditioning_node(deployment)
         assert conditioning_node.stat().st_mtime_ns == conditioning_stat
         with patch.dict(os.environ, {'PYTHONPATH':'foreign-runtime', 'PYTHONHOME':'foreign-runtime',
-                                    'PYTHONUSERBASE':'foreign-runtime'}, clear=True):
+                                    'PYTHONUSERBASE':'foreign-runtime',
+                                    'COSPLAY_CONFIG_ROOT':str(deployment/'config')}, clear=True):
             command, environment = qwen.service_launch(Path(temporary))
-            assert '--disable-pinned-memory' not in command
-            assert '--disable-fast-disk' in command
+            assert ('--disable-pinned-memory' in command) == (os.name=='nt')
+            assert '--disable-fast-disk' not in command
             assert '--fast-disk' not in command
             assert qwen.launch_policy() == {
-                'schema':'cosplay_qwen_launch_policy.v2','pinned_memory':'upstream_default',
-                'required_arguments':['--disable-fast-disk'],
-                'forbidden_arguments':['--disable-pinned-memory', '--fast-disk']}
+                'schema':'cosplay_qwen_launch_policy.v4',
+                'external_runtime_isolation':'frozen_bundle_dll_directory_and_path_v1',
+                'pinned_memory':'disabled' if os.name=='nt' else 'upstream_default',
+                'required_arguments':['--disable-pinned-memory'] if os.name=='nt' else [],
+                'forbidden_arguments':['--disable-fast-disk']}
             assert not {'--highvram','--lowvram','--novram','--force-fp16','--force-fp32',
                         '--fp16-unet','--fp8_e4m3fn-unet','--disable-mmap'} & set(command)
             assert '--reserve-vram' not in command and '--bf16-text-enc' not in command

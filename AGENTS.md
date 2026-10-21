@@ -25,13 +25,27 @@ desktop / CLI / local HTTP
   -> optional post-completion work, review and export
 ```
 
-The source owns subject geometry and alpha. Reference images guide appearance
-and scene design; BeautyGRPO supplies explicitly selected generated face
-appearance. Generated beauty texture must not be described as camera detail.
+The source anchors identity and observed facts. Source-based portrait and
+imported-reference work retain their native geometry/alpha contracts. Explicit
+composite editing scopes permit generated appearance and joint lighting;
+their full-canvas coverage is not a source subject matte. Preserve requested
+geometry and review actual pixels rather than claiming generation proves it.
+BeautyGRPO supplies explicitly selected generated face appearance. Generated
+texture or an enlarged output canvas must not be described as camera detail.
 The canvas represents the current production pipeline; it is not a generic
 ComfyUI plugin executor or freely wired DAG.
 
 ## Start each task
+
+For product iteration, read [the product goal](docs/PRODUCT_GOAL.md) and
+[the AI harness workflow](docs/AI_HARNESS.md), then run
+`<desktop-python> -B scripts/engineering_context.py`. Use its current task and
+module map; private execution/visual observations stay outside the checkout.
+The existing coding agent owns decisions and tool use. This context helper is
+read-only and is not a second production runner. Persist observations and the
+next concrete action before ending a substantial iteration. Judge whole-image
+quality before pursuing optional local detail; use the same implementation on
+different originals, never image-specific source branches.
 
 1. Inspect `git status --short` and the diff before editing. Keep existing user
    changes intact. Confirm the actual workspace and interpreter; never copy a
@@ -78,11 +92,14 @@ git diff --check
 ```
 
 Use `tests/run.py` for selected behavior checks; it sets production imports,
-offscreen Qt and bytecode policy. `core` is the routine offline CI suite. Run it
-for code changes before handing off; for documentation-only work, verify links,
-commands and the source gate. Run relevant model/frozen-package checks when the
-change requires them. Do not run all model checks or generate images merely to
-validate wording. See the guide for the test selection table.
+offscreen Qt and bytecode policy. Start with affected checks, then run the short
+`core` suite for code changes before handing off. `integration` holds the wider
+offline regressions; `full` combines both and belongs to release validation or
+justified cross-cutting changes, not every iteration. Inspect suites with
+`--list`; the implicit `all` command is removed. Model checks require explicit
+names and `--model-python`. For documentation-only work, verify links, commands
+and the source gate. Do not generate images to validate wording. See the guide
+for the test selection table.
 
 When adding a shipped production module or worker, update the sorted
 `scripts/runtime_manifest.json`. When changing public root files, update

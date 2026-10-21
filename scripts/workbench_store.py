@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import json
+import hashlib
+import math
 import os
 import re
 import time
@@ -33,19 +35,20 @@ def _read(path: Path, default: Any) -> Any:
         return default
 
 
-def _write(path: Path, value: Any) -> None:
+def _write(path: Path, value: Any, *, replace_attempts: int = 5, before_replace=None) -> None:
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         with temporary.open('x', encoding='utf-8', newline='\n') as stream:
             stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
-        for attempt in range(5):
+        for attempt in range(replace_attempts):
             try:
+                if before_replace is not None:before_replace()
                 os.replace(temporary, path)
                 break
             except PermissionError:
-                if attempt == 4:
+                if attempt == replace_attempts-1:
                     raise
                 time.sleep(.02*(attempt+1))
     finally:
@@ -165,7 +168,9 @@ def _saved_item(root: Path, run_id: str) -> dict[str, Any] | None:
             'created_at': str(run.get('created_at') or ''),
             'saved_at': str(continuation.get('saved_at') or run.get('saved_at')
                             or run.get('created_at') or ''),
-            'revision': revision}
+            'revision': revision,
+            'requires_explicit_selection': bool((run.get('task_plan') or {}).get('shaping_request') is not None
+                and (run.get('options') or {}).get('preserve_project_selection') is True)}
 
 
 def _recent_value(root: Path) -> dict[str, Any]:
@@ -174,18 +179,23 @@ def _recent_value(root: Path) -> dict[str, Any]:
         return {}
     if not isinstance(value.get('items', []), list):
         value['items'] = []
+    adopted=value.get('adopted_saved_run_ids') or []
+    value['adopted_saved_run_ids']=[item for item in adopted if isinstance(item,str)] if isinstance(adopted,list) else []
     return value
 
 
-def _saved_rows(root: Path, value: dict[str, Any]) -> list[dict[str, Any]]:
+def _saved_rows(root: Path, value: dict[str, Any], *, startup_only: bool = False) -> list[dict[str, Any]]:
     indexed = {str(row.get('run_id')): row for row in value.get('items', [])
                if isinstance(row, dict) and row.get('run_id')}
     identifiers = set(indexed)
     identifiers.update(path.parent.name for path in (root / 'outputs/runs').glob('*/manifest.json'))
     rows = []
+    adopted=set(value.get('adopted_saved_run_ids') or [])
     for identifier in identifiers:
         item = _saved_item(root, identifier)
         if item is None:
+            continue
+        if startup_only and item['requires_explicit_selection'] and identifier not in adopted:
             continue
         old = indexed.get(identifier, {})
         if old.get('saved_at'):
@@ -206,6 +216,8 @@ def record_recent(root: Path, *, sample: str, run_id: str = "", source: str = ""
         if item is None:
             return {'recorded': False, 'run_id': str(run_id), 'reason': 'no_complete_saved_result'}
         current = _recent_value(root)
+        if item['requires_explicit_selection'] and run_id not in (current.get('adopted_saved_run_ids') or []):
+            return {'recorded': False, 'run_id': str(run_id), 'reason': 'explicit_saved_version_selection_required'}
         rows = _saved_rows(root, current)
         previous = next((row for row in rows if row['run_id'] == run_id), None)
         indexed_before = any(isinstance(row, dict) and row.get('run_id') == run_id
@@ -215,8 +227,10 @@ def record_recent(root: Path, *, sample: str, run_id: str = "", source: str = ""
         rows = [row for row in rows if row['run_id'] != run_id] + [item]
         rows.sort(key=lambda row: (row['saved_at'], row['created_at'], row['revision'], row['run_id']), reverse=True)
         rows = rows[:20]
+        startup=[row for row in rows if not row['requires_explicit_selection']
+            or row['run_id'] in (current.get('adopted_saved_run_ids') or [])]
         current.update(schema_version='recent_projects.v2', items=rows,
-                       latest_saved_run_id=rows[0]['run_id'])
+                       latest_saved_run_id=startup[0]['run_id'] if startup else '')
         _write(path, current)
         return {**item, 'recorded': True}
 
@@ -229,30 +243,63 @@ def list_recent(root: Path) -> list[dict[str, Any]]:
 def saved_result_state(root: Path) -> dict[str, Any]:
     root = Path(root)
     value = _recent_value(root)
-    rows = _saved_rows(root, value)
+    rows = _saved_rows(root, value, startup_only=True)
     selected = str(value.get('selected_saved_run_id') or '')
-    if selected and _saved_item(root, selected) is None:
-        selected = ''
+    if selected:
+        item=_saved_item(root,selected)
+        if item is None or (item['requires_explicit_selection']
+                and selected not in (value.get('adopted_saved_run_ids') or [])):
+            selected=''
     return {'latest_saved_run_id': rows[0]['run_id'] if rows else '',
             'selected_saved_run_id': selected,
             'selection_explicit': bool(selected and value.get('selection_explicit'))}
 
 
-def select_saved_result(root: Path, run_id: str, *, explicit: bool = False) -> dict[str, Any]:
+def select_saved_result(root: Path, run_id: str, *, explicit: bool = False,
+                        lock_timeout: float = 10, expected_manifest_sha256=None, guard=None,
+                        return_state: bool = True) -> dict[str, Any] | None:
     from cache_store import exclusive_file_lock
+    if type(lock_timeout) not in (int,float) or not math.isfinite(lock_timeout) or not 0<=lock_timeout<=10:
+        raise ValueError('Saved-result selection requires a bounded nonnegative lock timeout')
+    if guard is not None and not callable(guard):
+        raise ValueError('Saved-result selection guard must be a local callable')
+    if type(return_state) is not bool:
+        raise ValueError('Saved-result selection return_state must be boolean')
+    if expected_manifest_sha256 is not None and (not isinstance(expected_manifest_sha256,str)
+            or len(expected_manifest_sha256)!=64 or any(c not in '0123456789abcdef' for c in expected_manifest_sha256)):
+        raise ValueError('Saved-result selection requires an exact manifest identity')
     root = Path(root)
     path = _settings_dir(root) / 'recent_projects.json'
-    with exclusive_file_lock(path.with_suffix('.lock'), timeout=10):
-        if _saved_item(root, str(run_id)) is None:
+    def check_current():
+        if guard is not None and guard() is not True:
+            raise ValueError('Saved-result selection context changed before commit')
+        if expected_manifest_sha256 is not None:
+            manifest=root/'outputs/runs'/str(run_id)/'manifest.json'
+            if not run_id or Path(str(run_id)).name!=str(run_id):
+                raise ValueError('Saved-result selection requires its owned run')
+            with manifest.open('rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
+            if actual!=expected_manifest_sha256:
+                raise ValueError('Saved-result manifest changed before selection')
+    with exclusive_file_lock(path.with_suffix('.lock'), timeout=lock_timeout):
+        check_current()
+        item=_saved_item(root, str(run_id))
+        if item is None:
             raise ValueError('Only a complete saved result can be selected for startup')
         current = _recent_value(root)
+        if item['requires_explicit_selection'] and not explicit and run_id not in (current.get('adopted_saved_run_ids') or []):
+            return saved_result_state(root) if return_state else None
         # Loading or completing a candidate must not replace the user's
         # explicitly chosen saved result. Viewing remains independent of the
         # startup selection; another explicit choice may replace it.
         chosen = str(current.get('selected_saved_run_id') or '')
         if (not explicit and current.get('selection_explicit') and chosen
                 and _saved_item(root, chosen) is not None):
-            return saved_result_state(root)
+            return saved_result_state(root) if return_state else None
+        if explicit:
+            adopted={str(value) for value in current.get('adopted_saved_run_ids',[]) if isinstance(value,str)}
+            adopted.add(str(run_id));current['adopted_saved_run_ids']=sorted(adopted)
         current.update(selected_saved_run_id=str(run_id), selection_explicit=bool(explicit))
-        _write(path, current)
-    return saved_result_state(root)
+        _write(path, current,replace_attempts=1 if lock_timeout==0 else 5,before_replace=check_current)
+    # The GUI already has fresh worker facts and needs only the atomic commit.
+    # Rebuilding the full saved-run index here would synchronously scan history.
+    return saved_result_state(root) if return_state else None

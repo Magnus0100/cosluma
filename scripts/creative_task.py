@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from asset_identity import sha256_file
+from appearance_read_scope import saved_parent_reads
 
 INTENT_SCHEMA = 'cosplay_task_intent.v1'
 PLAN_SCHEMA = 'cosplay_task_plan.v2'
@@ -19,12 +20,12 @@ REQUEST_FIELDS = frozenset(('source', 'reference', 'preset', 'provider', 'model'
     'preset_snapshot', 'effective_prompt', 'prompt_template_version', 'size', 'alpha_backend',
     'denoise_strength', 'residual', 'preserve_project_selection', 'defer_reference_selection', 'creative_task',
     'async', 'sync', 'plan_id', 'generate', 'local_only', 'complete_post', 'final_repair_only',
-    'execution_strategy', 'preparation_policy', 'creative_direction', 'regional_resume_authorization',
-    'regional_candidate_reuse_authorization'))
+    'execution_strategy', 'preparation_policy', 'creative_direction', 'editing_request', 'regional_resume_authorization',
+    'regional_candidate_reuse_authorization', 'editing_iteration', 'editing_autofinish', 'shaping_request'))
 SHARED_FIELDS = frozenset(('preset', 'provider', 'model', 'vision_model', 'api_base', 'api_url',
     'api_key_env', 'character_name', 'character_notes', 'prompt', 'input_prompt',
     'variant_count', 'variant_styles', 'model_registry', 'algorithm_profile', 'material_finish_profile',
-    'size', 'defer_reference_selection', 'creative_task', 'execution_strategy', 'preparation_policy'))
+    'size', 'defer_reference_selection', 'creative_task', 'execution_strategy', 'preparation_policy', 'editing_request', 'editing_autofinish'))
 
 EXECUTION_STRATEGIES = frozenset({'layered_reference_transfer'})
 PREPARATION_POLICIES = frozenset({'prepare_current', 'replay_frozen'})
@@ -58,6 +59,10 @@ def normalize_task_intent(value):
     services = value.get('services', {})
     if not isinstance(constraints, dict) or set(constraints) - {'preserve_background', 'no_effects', 'background_mode', 'reference_role', 'refinement_profile'}:
         raise ValueError('Unsupported creative task constraints')
+    create=value['mode']=='create_reference'
+    if create and (any(key in constraints for key in ('reference_role','refinement_profile'))
+            or 'regional_refinement' in value):
+        raise ValueError('Retired creation route: choose a current editing scope instead of reference roles, profiles or native regional generation')
     if not isinstance(services, dict) or set(services) - {'text_vision', 'visual_review'}:
         raise ValueError('Unsupported creative task service policy')
     boolean_options = [(key, item) for key, item in constraints.items() if key not in {'background_mode', 'reference_role', 'refinement_profile'}]
@@ -67,8 +72,8 @@ def normalize_task_intent(value):
     local = value['mode'] == 'local_portrait'
     if local and services.get('text_vision') is True:
         raise ValueError('Local portrait tasks do not call external text/vision services')
-    text_vision = services.get('text_vision', False)
-    visual_review = services.get('visual_review', False)
+    text_vision = services.get('text_vision', create)
+    visual_review = services.get('visual_review', create and text_vision)
     if visual_review and (local or not text_vision):
         raise ValueError('Automatic visual review requires an external text/vision service')
     result = {'schema_version': INTENT_SCHEMA, 'mode': value['mode'], 'brief': brief.strip(),
@@ -85,14 +90,14 @@ def normalize_task_intent(value):
     if 'reference_role' in constraints:
         reference_role = constraints['reference_role']
         if (not isinstance(reference_role, str) or reference_role not in {'same_photo_finish', 'source_conditioned_design'}
-                or value['mode'] not in ({'existing_reference'} if reference_role == 'same_photo_finish' else {'existing_reference', 'create_reference'})
+                or value['mode'] != 'existing_reference'
                 or result['constraints'].get('background_mode') != 'enhance_source'
                 or 'regional_refinement' in value):
             raise ValueError('Explicit reference roles require the supported enhance_source route and no regional requests')
         result['constraints']['reference_role'] = reference_role
     if 'refinement_profile' in constraints:
         from preset_store import normalize_refinement_selector
-        if (value['mode'] not in {'create_reference', 'existing_reference'}
+        if (value['mode'] != 'existing_reference'
                 or result['constraints'].get('reference_role') != 'source_conditioned_design'
                 or result['constraints'].get('background_mode') != 'enhance_source'
                 or 'regional_refinement' in value):
@@ -109,19 +114,61 @@ def normalize_task_intent(value):
     return result
 
 
-def image_budget(intent, variant_count=1):
+def autofinish_policy(value, intent, editing, *, supplied=False):
+    """One canonical source-creation policy; manual iteration stays separate."""
+    available = editing is not None and intent['mode'] == 'create_reference'
+    if not available:
+        if supplied:
+            raise ValueError('Automatic finishing requires a scoped create-reference task')
+        return None
+    if value is None and not supplied:
+        enabled=int(intent['services']['visual_review'])
+        value = {'maximum_improvements': 2*enabled, 'maximum_zero_image_finishes':enabled}
+    if (not isinstance(value, dict) or 'maximum_improvements' not in value
+            or set(value)-{'maximum_improvements','maximum_zero_image_finishes'}):
+        raise ValueError('Automatic finishing requires maximum_improvements')
+    count = value['maximum_improvements']
+    if type(count) is not int or not 0 <= count <= 8:
+        raise ValueError('Automatic improvements must be an integer from zero to eight')
+    if count and not intent['services']['visual_review']:
+        raise ValueError('Automatic improvements require independent visual review')
+    finish=value.get('maximum_zero_image_finishes',0)
+    if type(finish) is not int or not 0<=finish<=1 or (finish and (not count or not intent['services']['visual_review'])):
+        raise ValueError('One zero-image finish requires enabled automatic improvements and independent review')
+    return {'maximum_improvements': count,'maximum_zero_image_finishes':finish}
+
+
+def image_budget(intent, variant_count=1, editing=None, iteration=None, autofinish=None, shaping=None):
     intent = normalize_task_intent(intent)
     count = variant_count
     if type(count) is not int or not 1 <= count <= 8:
         raise ValueError('Candidate count must be an integer from 1 to 8')
     create = intent['mode'] == 'create_reference'
-    enhanced = intent['constraints'].get('background_mode') == 'enhance_source'
+    if create and editing is None:
+        from photo_editing import editing_scope
+        editing = editing_scope(preserve_background=intent['constraints']['preserve_background'],
+                                no_effects=intent['constraints']['no_effects'])
     budget = {'initial_reference': count if create else 0,
-            'reference_correction': 1 if create and not enhanced else 0,
-            'independent_effect': 1 if create and not enhanced else 0}
+            'reference_correction': 0, 'independent_effect': 0}
+    if shaping is not None:
+        from photo_shaping import normalize_request,image_submissions
+        shaping = normalize_request(shaping)
+        if intent['mode'] != 'existing_reference' or editing is None or count != 1 or iteration is not None or autofinish is not None:
+            raise ValueError('Shaping requires one separately checked saved input')
+        return {**budget, 'shaping': image_submissions(shaping)}
+    if editing is not None:
+        # Scoped scene/light/effects are baked into one coherent candidate.
+        # No separate legacy correction or FX submission is implemented here.
+        budget['reference_correction'] = 0
+        budget['independent_effect'] = 0
+        if iteration is not None:
+            budget['editing_refinement']=iteration.get('maximum_image_submissions',iteration['maximum_improvements'])
+        elif create:
+            policy = autofinish_policy(autofinish, intent, editing, supplied=autofinish is not None)
+            budget['editing_refinement'] = policy['maximum_improvements']
     if 'regional_refinement' in intent:
         regional = intent['regional_refinement']
-        budget['regional_refinement'] = regional['maximum_submissions'] if intent['mode'] in {'create_reference', 'existing_reference'} else 0
+        budget['regional_refinement'] = regional['maximum_submissions'] if intent['mode'] == 'existing_reference' else 0
     return budget
 
 
@@ -556,8 +603,71 @@ def validate_task_plan(plan, intent):
     budget = plan.get('image_budget')
     if not isinstance(budget, dict) or any(type(value) is not int or value < 0 for value in budget.values()):
         raise ValueError('Task image budget must contain nonnegative integer limits')
+    scope = plan.get('editing_scope')
+    if intent['mode']=='create_reference' and (scope is None or 'editing_request' not in plan):
+        raise ValueError('Creation requires the current checked editing scope')
+    from scoped_workflow import SOURCE_NATIVE_INITIALIZATION
+    initialization=plan.get('editing_initialization')
+    if intent['mode']=='create_reference':
+        if initialization!=SOURCE_NATIVE_INITIALIZATION:
+            raise ValueError('Creation requires the current source-native initialization policy')
+    elif initialization is not None:
+        raise ValueError('Source-native initialization belongs to a new creation task')
+    if scope is not None or 'editing_request' in plan:
+        from photo_editing import editing_scope
+        expected_scope = editing_scope(plan['editing_request'], local=intent['mode']=='local_portrait',
+            preserve_background=intent['constraints']['preserve_background'],
+            no_effects=intent['constraints']['no_effects'])
+        if scope != expected_scope:
+            raise ValueError('Editing scope differs from the checked task permissions')
+    auto = autofinish_policy(plan.get('editing_autofinish'), intent, scope,
+                            supplied='editing_autofinish' in plan)
+    if scope is not None and intent['mode']=='create_reference' and plan.get('editing_autofinish') != auto:
+        raise ValueError('Scoped source creation requires its canonical automatic finishing policy')
+    if auto is not None and plan.get('editing_iteration') is not None:
+        raise ValueError('Automatic finishing cannot share a manual improvement request')
+    shaping = plan.get('shaping_request')
     expected = image_budget(intent, budget.get('initial_reference', 0)
-                            if intent['mode'] == 'create_reference' else 1)
+                            if intent['mode'] == 'create_reference' else 1, scope,plan.get('editing_iteration'),auto,shaping)
+    if shaping is not None:
+        from photo_shaping import normalize_request, validate_authorization_metadata
+        shaping = normalize_request(shaping)
+        proof = plan.get('shaping_authorization') or {}
+        apply = shaping['action'] == 'apply'
+        if (scope is None or intent['mode'] != 'existing_reference' or plan.get('editing_iteration') is not None
+                or proof.get('request') != shaping
+                or proof.get('base_image_sha256') != plan['inputs']['reference']['sha256']
+                or intent['services'] != {'text_vision': apply, 'visual_review': apply}
+                or (plan.get('services') or {}).get('text_vision_requests_upper_bound') != (3 if apply else 0)):
+            raise ValueError('Shaping differs from its checked input, permission or budget')
+        validate_authorization_metadata(proof, source_sha256=plan['inputs']['source']['sha256'], scope=scope)
+        from task_model_preflight import required_capabilities
+        required = required_capabilities(intent['mode'], execution_strategy=plan.get('execution_strategy'),
+            complete_post=True, editing_scope=scope, shaping_request=shaping)
+        if required:
+            installation = (plan.get('capabilities') or {}).get('model_preflight') or {}
+            if installation.get('required_capabilities') != sorted(required) or installation.get('ready') is not True:
+                raise ValueError('Face shaping requires its checked portrait-region installation')
+        if plan.get('generation_submissions_upper_bound')!=sum(expected.values()):
+            raise ValueError('Shaping image limit differs from its checked permission')
+    elif plan.get('shaping_authorization') is not None:
+        raise ValueError('Unexpected shaping authorization')
+    if auto is not None:
+        expected_vision = (2+2*budget['initial_reference']+2*(auto['maximum_improvements']+auto['maximum_zero_image_finishes'])
+            if intent['services']['visual_review'] else 1+budget['initial_reference'])
+        if (plan.get('services') or {}).get('text_vision_requests_upper_bound') != expected_vision:
+            raise ValueError('Automatic finishing vision budget differs from its checked policy')
+    if plan.get('editing_iteration') is not None:
+        from photo_edit_iteration import iteration_request, SCHEMA as REFINEMENT_SCHEMA
+        iteration=iteration_request(plan['editing_iteration'])
+        proof=plan.get('editing_refinement_authorization') or {}
+        if (scope is None or intent['mode']!='existing_reference'
+                or proof.get('schema')!=REFINEMENT_SCHEMA or proof.get('iteration')!=iteration
+                or proof.get('scope_id')!=scope['scope_id']
+                or proof.get('source_sha256')!=plan['inputs']['source']['sha256']
+                or proof.get('base_image_sha256')!=plan['inputs']['reference']['sha256']
+                or (plan.get('services') or {}).get('text_vision_requests_upper_bound')!=2*iteration['maximum_improvements']):
+            raise ValueError('Editing improvement differs from its checked authorization or budget')
     if plan.get('image_budget') != expected:
         raise ValueError('Task image budget differs from its route')
     _validate_refinement_inheritance(plan.get('refinement_inheritance'), intent, plan.get('inputs') or {})
@@ -578,7 +688,7 @@ def validate_task_plan(plan, intent):
             raise ValueError('Final repair cannot replace frozen upstream pixels with a rejected candidate')
     elif 'regional_candidate_reuse_authorization' in plan:
         raise ValueError('Unexpected generated candidate reuse proof')
-    if intent['constraints'].get('background_mode') == 'enhance_source':
+    if intent['constraints'].get('background_mode') == 'enhance_source' and scope is None:
         from creative_direction import validate_direction
         validate_direction(plan.get('creative_direction'), intent,
             source_sha256=((plan.get('inputs') or {}).get('source') or {}).get('sha256'))
@@ -593,7 +703,10 @@ def validate_task_plan(plan, intent):
     if plan.get('final_repair_only') is True and plan.get('preparation_policy', 'replay_frozen') != 'replay_frozen':
         raise ValueError('Final local repair must keep its frozen upstream preparation')
     from cos_node_registry import compile_workflow
-    if plan.get('layer_workflow') != compile_workflow(intent['mode']):
+    if plan.get('layer_workflow') != compile_workflow(intent['mode'],editing_scope=scope,
+            visual_review=intent['services']['visual_review'],editing_iteration=plan.get('editing_iteration'),
+            editing_autofinish=auto,editing_initialization=initialization,
+            initial_variant_count=budget.get('initial_reference',1),shaping_request=shaping):
         raise ValueError('Task layer workflow differs from the current checked node contracts')
     return copy.deepcopy(plan)
 
@@ -710,6 +823,7 @@ def _storage(root, request, intent):
             'write_performed': False}
 
 
+@saved_parent_reads
 def plan_task(root, body):
     """Read metadata/config/files only. No directories, jobs, inference or network."""
     from current_contract import validate_current_request
@@ -724,11 +838,16 @@ def plan_task(root, body):
         if key in body and body[key] != current:
             raise ValueError('Only the current algorithm is supported: ' + key)
     intent = normalize_task_intent(body.get('creative_task'))
+    if intent['mode']=='create_reference':
+        if any(key in body for key in ('creative_direction','regional_resume_authorization','regional_candidate_reuse_authorization')):
+            raise ValueError('Retired creation direction or regional proof; choose a current editing scope')
+        body=copy.deepcopy(body)
+        body.setdefault('editing_request',{})
     if intent['constraints'].get('reference_role') in {'same_photo_finish', 'source_conditioned_design'} and (
             'regional_resume_authorization' in body or 'regional_candidate_reuse_authorization' in body):
         raise ValueError('Explicit appearance reference roles cannot inherit regional resume or generated-candidate proofs')
     if (intent['constraints'].get('background_mode') == 'enhance_source'
-            and intent['services']['text_vision']):
+            and intent['services']['text_vision'] and 'editing_request' not in body):
         raise ValueError('Source enhancement currently uses a checked offline design; external planning is not enabled on this route')
     strategy = body.get('execution_strategy')
     if strategy is None:
@@ -747,6 +866,42 @@ def plan_task(root, body):
     if final_repair and (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id'):
         raise ValueError('Final local repair must replay its saved upstream pixels')
     local, supplied = intent['mode'] == 'local_portrait', intent['mode'] == 'existing_reference'
+    scope = None
+    if 'editing_request' in body:
+        from photo_editing import editing_scope
+        scope = editing_scope(body['editing_request'], local=local,
+            preserve_background=intent['constraints']['preserve_background'], no_effects=intent['constraints']['no_effects'])
+        if supplied and 'editing_iteration' not in body and 'shaping_request' not in body:
+            raise ValueError('Observed scoped editing currently starts from the original; imported-reference planning is not yet enabled')
+        if intent['constraints'].get('reference_role'):
+            raise ValueError('Scoped generated appearance cannot also use a source-coefficient reference role')
+        if intent.get('regional_refinement'):
+            raise ValueError('Scoped generation cannot inherit the retired source-native regional editing route')
+        if body.get('variant_styles'):
+            raise ValueError('Scoped candidates share one observed design; select the visual style in editing_request')
+        if not local and (body.get('denoise_strength') or body.get('manual_layers')
+                or body.get('native_source_retouch') or body.get('appearance_revision')):
+            raise ValueError('Source-space pixel controls cannot be applied to generated appearance')
+    shaping = None
+    if 'shaping_request' in body:
+        from photo_shaping import normalize_request
+        shaping = normalize_request(body['shaping_request'])
+        apply = shaping['action'] == 'apply'
+        if (scope is None or not supplied or final_repair or 'editing_iteration' in body
+                or 'editing_autofinish' in body or body.get('variant_count',1) != 1
+                or body.get('defer_reference_selection',False)
+                or intent['services'] != {'text_vision':apply,'visual_review':apply}):
+            raise ValueError('Shaping needs one saved typed parent and its separate apply/restore service policy')
+    iteration=None
+    if 'editing_iteration' in body:
+        from photo_edit_iteration import iteration_request
+        if scope is None or not supplied or not intent['services']['text_vision'] or not intent['services']['visual_review']:
+            raise ValueError('Improvement requires a scoped saved reference, visual decisions and independent review')
+        iteration=iteration_request(body['editing_iteration'])
+    autofinish = autofinish_policy(body.get('editing_autofinish'), intent, scope,
+                                  supplied='editing_autofinish' in body)
+    if autofinish is not None and iteration is not None:
+        raise ValueError('Automatic finishing and a manual improvement task are separate budgets')
     if body.get('generate') is True and (local or supplied):
         raise ValueError('This route forbids all image generation')
     if local and body.get('reference'):
@@ -755,7 +910,11 @@ def plan_task(root, body):
         raise ValueError('Use the existing-reference route for a supplied reference')
     request = {key: copy.deepcopy(value) for key, value in body.items()
                if key not in {'creative_task', 'plan_id', 'generate', 'local_only', 'complete_post'}}
-    inputs = {'source': _input(root, body.get('source'), 'source')}
+    if shaping is not None and shaping['action']=='restore':
+        from photo_shaping import frozen_restore_source
+        inputs={'source':frozen_restore_source(root,body.get('parent_run_id'),body.get('source'),scope)}
+    else:
+        inputs = {'source': _input(root, body.get('source'), 'source')}
     request['source'] = inputs['source']['path']
     if ((intent.get('regional_refinement') or {}).get('maximum_submissions')
             or (intent.get('regional_refinement') or {}).get('reuse_generated_from_run_id')):
@@ -772,21 +931,30 @@ def plan_task(root, body):
     if supplied:
         inputs['reference'] = _input(root, body.get('reference'), 'reference')
         request['reference'] = inputs['reference']['path']
+        if shaping is not None:
+            from photo_shaping import authorize,image_submissions
+            from photo_request_budget import manual_provider_target
+            shaping_authorization = authorize(root,parent_run_id=body.get('parent_run_id'),
+                source=inputs['source'],reference=inputs['reference'],scope=scope,request=shaping,
+                provider_target=manual_provider_target(request,image_generation=bool(image_submissions(shaping)))
+                    if shaping['action']=='apply' else None)
+            request['shaping_request'] = copy.deepcopy(shaping)
+        if iteration is not None:
+            from photo_edit_iteration import authorize
+            from photo_request_budget import manual_provider_target
+            refinement_authorization=authorize(root,parent_run_id=body.get('parent_run_id'),
+                source=inputs['source'],reference=inputs['reference'],scope=scope,iteration=iteration,
+                provider_target=manual_provider_target(request,image_generation=
+                    iteration.get('maximum_image_submissions',iteration['maximum_improvements'])>0))
+            request['editing_iteration']=copy.deepcopy(iteration)
         if intent['constraints'].get('reference_role') == 'source_conditioned_design':
             from creative_direction import verify_source_conditioned_reference
             inputs['reference']['source_conditioned_binding'] = verify_source_conditioned_reference(
                 root, inputs['source']['sha256'], inputs['reference'])
-    if (intent['constraints'].get('reference_role') == 'source_conditioned_design'
-            and intent['mode'] == 'create_reference'):
-        from reference_provider import provider_config
-        design_provider = provider_config(**{key: body.get(key) for key in
-            ('provider','model','api_base','api_url','api_key_env')})
-        if design_provider.get('kind') != 'comfyui' or not str(design_provider.get('registry_id','')).startswith('qwen_image'):
-            raise ValueError('Source-conditioned art direction currently requires the local Qwen source-only route')
     from creative_direction import reference_contract_for
     reference_contract = reference_contract_for(intent, inputs)
     count = body.get('variant_count', 1)
-    if intent['constraints'].get('background_mode') == 'enhance_source':
+    if intent['constraints'].get('background_mode') == 'enhance_source' and scope is None:
         if count != 1 or body.get('variant_styles') or body.get('defer_reference_selection', False):
             raise ValueError('Source enhancement supports one checked candidate only; variant styles and deferred selection are unsupported')
     input_prompt = str(body.get('input_prompt') or body.get('prompt') or DEFAULT_PROMPT)
@@ -806,7 +974,7 @@ def plan_task(root, body):
         if 'preset_snapshot' in body and body['preset_snapshot'] != preset:
             raise ValueError('Recommended preset snapshot differs from the bundled product profile')
         request.update(preset=profile['preset_id'], preset_snapshot=copy.deepcopy(preset))
-    budget = image_budget(intent, count)
+    budget = image_budget(intent, count, scope,iteration,autofinish,shaping)
     brief = task_brief(intent)
     request.update(task_intent=intent, creative_task=intent, execution_strategy=strategy, preparation_policy=policy,
         input_prompt=input_prompt, prompt=input_prompt, variant_count=count,
@@ -815,10 +983,14 @@ def plan_task(root, body):
         preserve_project_selection=bool(body.get('preserve_project_selection', True)))
     # Keep the user's editable prompt separate from deterministic task constraints.
     request['task_brief'] = brief
+    if scope is not None:
+        request['editing_request'] = {key:scope[key] for key in ('work_type','style','target_setting','scene_target','language')}
+    if autofinish is not None:
+        request['editing_autofinish'] = copy.deepcopy(autofinish)
     direction = None
     resume_authorization = None
     reuse_authorization = None
-    if intent['constraints'].get('background_mode') == 'enhance_source':
+    if intent['constraints'].get('background_mode') == 'enhance_source' and scope is None:
         from creative_direction import compile_direction
         direction = compile_direction(intent, source_sha256=inputs['source']['sha256'],
             character_name=body.get('character_name', ''), character_notes=body.get('character_notes', ''),
@@ -846,33 +1018,63 @@ def plan_task(root, body):
     if reuse_authorization is None and 'regional_candidate_reuse_authorization' in body:
         raise ValueError('Generated candidate proof requires an explicit zero-generation reuse task')
     # Node-specific checks apply only to enabled production capabilities.
-    models = registry_status(root, registry_path=body.get('model_registry'),
-                             required_keys=(), required_profiles=())
-    from task_model_preflight import inspect_task_models
-    beauty_requested = (bool((body.get('appearance_revision') or {}).get('portrait_beauty'))
-        or (not local and strategy == 'layered_reference_transfer'))
-    installation = inspect_task_models(models.get('config', {}), mode=intent['mode'],
+    from task_model_preflight import inspect_task_models,uses_generated_appearance,generated_registry_status
+    generated_appearance=uses_generated_appearance(intent['mode'],scope)
+    restoring = shaping is not None and shaping['action']=='restore'
+    face_apply = shaping is not None and shaping['action']=='apply' and 'face' in shaping['parts']
+    models = ({'configured':True,'configuration_valid':True,'paths':[],'config':{},'registry_path':None,
+               'scope':'no_model_required_for_frozen_restore'} if restoring else
+        generated_registry_status(root,body.get('model_registry')) if generated_appearance and not face_apply else
+        registry_status(root, registry_path=body.get('model_registry'),required_keys=(), required_profiles=()))
+    beauty_requested = (scope is None and (bool((body.get('appearance_revision') or {}).get('portrait_beauty'))
+        or (not local and strategy == 'layered_reference_transfer')))
+    installation = ({'ready':True,'blocking_reasons':[],'required_path_keys':[],
+        'scope':'frozen_pixel_restore_no_model_requirements','checks':[]} if restoring else
+        inspect_task_models(models.get('config', {}), mode=intent['mode'],
         execution_strategy=strategy, complete_post=not local,
-        use_beautygrpo=beauty_requested)
+        use_beautygrpo=beauty_requested,editing_scope=scope,shaping_request=shaping))
+    if generated_appearance and not restoring:
+        from runtime_preflight import preflight_for_run,RuntimePreflightError
+        try:
+            installation['desktop_runtime']=preflight_for_run(root,registry_path=body.get('model_registry'),
+                mode=intent['mode'],execution_strategy=strategy,editing_scope=scope,require_local_models=False)
+        except RuntimePreflightError as error:
+            installation['ready']=False
+            installation['blocking_reasons']=[*installation['blocking_reasons'],str(error)]
     required_keys = set(installation.get('required_path_keys') or ())
     paths = [{key: row[key] for key in ('key', 'label', 'kind', 'available', 'status')}
              for row in models['paths'] if row['key'] in required_keys]
     blockers = []
+    if scope is not None and not local and not restoring and not intent['services']['text_vision']:
+        blockers.append('当前图像编辑设计需要启用视觉观察与规划；不能把离线模板称为已观察原图。')
     storage = _storage(root, request, intent)
     if not storage['ready']:
         blockers.append('工作区或任务名称过长，无法安全保存完整工程；请使用较短的工作区路径或任务名称。')
-    if not models['configured']:
+    if ((generated_appearance and models.get('error')) or
+            ((not generated_appearance or face_apply) and not models['configured'])):
         blockers.append('当前分析模型配置不可用：' + str(models.get('error') or '尚未配置'))
     blockers.extend('缺少 ' + row['label'] for row in paths if not row['available'])
     blockers.extend(installation['blocking_reasons'])
     services = _services(request, intent)
+    if scope is not None:
+        services['text_vision_requests_upper_bound'] = (2*iteration['maximum_improvements'] if iteration is not None else
+            0 if local else 2+2*count+2*sum((autofinish or {}).get(key,0) for key in ('maximum_improvements','maximum_zero_image_finishes'))
+            if intent['services']['visual_review'] else 1+count)
+        services['text_vision_budget_basis'] = ('separate_checked_iteration_decision_and_review_reservations'
+            if iteration is not None else 'shared_design_and_source_baseline_review_then_bounded_initial_and_improvement_operations')
+    if shaping is not None:
+        services['text_vision_requests_upper_bound'] = 0 if restoring else 3
+        services['text_vision_budget_basis'] = ('exact_frozen_restore' if restoring else
+            'checked_unshaped_input_review_decision_and_candidate_review')
     if not services['configured']:
         blockers.append('文本/视觉服务配置不可用：' + str(services.get('reason') or '尚未配置'))
-    if intent['mode'] == 'create_reference':
+    if (shaping is not None and budget['shaping']>0) or intent['mode'] == 'create_reference' or (iteration is not None and
+            iteration.get('maximum_image_submissions',iteration['maximum_improvements'])>0):
         from reference_provider import provider_health
         health = provider_health(**{key: request.get(key) for key in
             ('provider', 'api_base', 'api_url', 'model', 'api_key_env')})
         services['generation_configured'] = bool(health.get('ready'))
+        services['image_generation']=True
         if not health.get('ready'):
             blockers.append('生图服务未就绪：' + str(health.get('reason') or health.get('status')))
     defer_selection = body.get('defer_reference_selection', False)
@@ -882,6 +1084,8 @@ def plan_task(root, body):
     config_identity = {'path': str(registry_file) if registry_file else None,
         'sha256': sha(registry_file) if registry_file and registry_file.is_file() else None}
     capabilities = {'models': paths, 'configuration_verified': models['configured'],
+        'native_models_required':not generated_appearance or face_apply,
+        'native_registry_metadata_valid':models.get('configuration_valid'),
         'model_preflight': installation,
         'storage_preflight': storage,
         'model_profiles': {k: v for k, v in models.get('config', {}).items() if k.endswith('profile')},
@@ -894,12 +1098,6 @@ def plan_task(root, body):
          '仿色、材质与明暗协调', '背景、接触与已拥有的特效合成',
          *(['整图和匹配原尺寸审片', '有资格的一轮本地修复与复审']
            if intent['services']['visual_review'] else []), '人工审片、重开与导出'])
-    if intent['mode'] == 'create_reference' and defer_selection:
-        stage_names.insert(1, '生成多张角色风格候选并等待选择')
-    if (intent['mode'] == 'create_reference' and health.get('kind') == 'comfyui'
-            and count == 1 and not defer_selection and strategy == 'layered_reference_transfer'):
-        stage_names.insert(stage_names.index('创作风格参考'), '原片人像美化并冻结（本地生图前）')
-        stage_names[stage_names.index('原片精修与原生人物基线')] = '原生人物基线（复用已冻结美化）'
     if direction is not None:
         stage_names[stage_names.index('背景、接触与已拥有的特效合成')] = '保留原景结构、原生背景与有据角色效果合成'
         if budget.get('regional_refinement', 0):
@@ -912,6 +1110,12 @@ def plan_task(root, body):
             else '执行时核验Qwen同源生成来源、配准与有效范围')
         stage_names[index:index+1] = [verification,
             'CPU影调与色彩归一（条件启用）', '源图引导的局部低频色映射系数场校正（条件启用）']
+    if scope is not None and not local:
+        stage_names=['观察原图并形成具体编辑设计','准备原图原生精度基线',
+            *(['评价原片基线：自然可信度与创作缺口'] if intent['services']['visual_review'] else []),
+            '模型选择并执行首次摄影调整或图像编辑',
+            *(['独立审片与有界条件纠偏'] if intent['services']['visual_review'] else []),
+            '保存较好完整版本与母版','人工审片与导出']
     plan = {'schema_version': PLAN_SCHEMA, 'mode': intent['mode'], 'label': MODES[intent['mode']],
         'intent': intent, 'inputs': inputs, 'ready': not blockers, 'blocking_reasons': blockers,
         'stages': [{'id': str(i+1), 'label': label} for i, label in enumerate(stage_names)],
@@ -928,9 +1132,36 @@ def plan_task(root, body):
         'preflight_network_requests': 0, 'preflight_model_inferences': 0, 'preflight_jobs_created': 0}
     from cos_node_registry import compile_workflow
     plan['execution_strategy'] = strategy
+    if scope is not None:
+        plan['editing_scope'] = scope
+        plan['editing_request'] = copy.deepcopy(request['editing_request'])
+    if autofinish is not None:
+        plan['editing_autofinish'] = copy.deepcopy(autofinish)
+    if intent['mode']=='create_reference':
+        from scoped_workflow import SOURCE_NATIVE_INITIALIZATION
+        plan['editing_initialization']=copy.deepcopy(SOURCE_NATIVE_INITIALIZATION)
+    if iteration is not None:
+        plan['label']='按独立审片改进'
+        plan['editing_iteration']=copy.deepcopy(iteration)
+        plan['editing_refinement_authorization']=refinement_authorization
+        plan['stages']=[{'id':str(i+1),'label':label} for i,label in enumerate((
+            '核验已保存成片与独立审片','模型选择主要纠偏工具',
+            '执行模型选择的摄影调整或图像编辑','独立复审并保留较好完整版本','保存子版本与导出'))]
+    if shaping is not None:
+        from photo_shaping import execution_method
+        plan.update(label='恢复形体调整前版本' if restoring else '可撤销形体调整',
+            shaping_request=copy.deepcopy(shaping),shaping_authorization=shaping_authorization)
+        labels = (('核验并拥有调整前母版','原样恢复并保存子版本') if restoring else
+            ('核验并拥有调整前母版','观察调整前成片','定位获准部位并选择局部工具',
+             '从同一母版计算轮廓形变' if execution_method(shaping)=='face_contour_deform' else '生成一次局部调整',
+             '独立审片','保存待采用候选'))
+        plan['stages']=[{'id':str(i+1),'label':label} for i,label in enumerate(labels)]
     plan['preparation_policy'] = policy
     plan['final_repair_only'] = final_repair
-    plan['layer_workflow'] = compile_workflow(intent['mode'])
+    plan['layer_workflow'] = compile_workflow(intent['mode'],editing_scope=scope,
+        visual_review=intent['services']['visual_review'],editing_iteration=iteration,
+        editing_autofinish=autofinish,editing_initialization=plan.get('editing_initialization'),
+        initial_variant_count=count,shaping_request=shaping)
     if direction is not None:
         plan['creative_direction'] = copy.deepcopy(direction)
     if reference_contract is not None:

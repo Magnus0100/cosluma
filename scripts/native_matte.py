@@ -1,4 +1,6 @@
 """Frozen native matte editing with a coherent source-pair worker cache."""
+
+from runtime_resources import external_python_run
 from pathlib import Path
 import copy,hashlib,json,os,subprocess,time
 import numpy as np
@@ -83,7 +85,7 @@ def _prepare(root,run_id,body):
         request_path=directory/'request.json';request_path.write_text(json.dumps(request,ensure_ascii=False,indent=2),'utf8')
         runtime=local_runtime_paths(root)['python']
         with (directory/'worker.log').open('w',encoding='utf8') as log:
-            result=subprocess.run([str(runtime),'-X','utf8',str(code_path('native_matte_worker.py')),'--request',str(request_path)],cwd=root,stdout=log,stderr=subprocess.STDOUT)
+            result=external_python_run([str(runtime),'-X','utf8',str(code_path('native_matte_worker.py')),'--request',str(request_path)],cwd=root,stdout=log,stderr=subprocess.STDOUT)
         if result.returncode:raise RuntimeError('Native matte solver failed; details: '+str(directory/'worker.log'))
     result=_json(result_path);result['cache_hit']=cache_hit;result['cache_key']=key;result['cache_directory']=str(directory)
     bg=next(layer for layer in plan['layers'] if layer['kind']=='background_design')['assets']

@@ -202,3 +202,4 @@ def clear_cache() -> None:
     _CACHE.clear()
     _HITS = 0
     _MISSES = 0
+

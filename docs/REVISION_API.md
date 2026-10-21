@@ -2,7 +2,7 @@
 
 入口为 `scripts/backend_server.py` 和 `scripts/qt_workbench.py`。Qt、后台、CLI 共享当前请求及组件替换规则，以下以源码路由为准。
 
-制作入口已接入 `creative_task` → `production_coordinator.checked_request` → `single_source_workflow`。协调层核验计划、runtime、输入快照和当前 job，同一流程执行现有 worker 与渲染器；编辑、保存和审片路由仍承担各自的操作。不要直接调用 worker 或保存函数跳过制作合同。相同 source/reference/design/runtime/control/input 快照已有 `queued`、`running` 或 `cancelling` job 时，开始请求返回活动 job 或 `duplicate_active_run` 冲突，禁止再创建 attempt、worker 或 revision。只有显式改变输入或建立新 revision 才能重新排队。
+制作入口已接入 `creative_task` → `production_coordinator.checked_request` → `single_source_workflow`。协调层核验计划、runtime、输入快照和当前 job，同一流程执行现有 worker 与渲染器；编辑、保存和审片路由仍承担各自的操作。不要直接调用 worker 或保存函数跳过制作合同。相同 source/reference/design/runtime/control/input 快照已有 `queued`、`running` 或 `cancelling` job 时，开始请求返回活动 job 或 `duplicate_active_run` 冲突，禁止再创建 attempt、worker 或 revision。活动去重不授予重试额度；相同语义的未知请求须核查原回执，换 run 或 revision 不补发额度。
 
 | 接口 | 行为 |
 |---|---|
@@ -26,14 +26,18 @@
 | `POST /api/source-runs/<id>/repair-final` | 取得当前绑定新QA，执行一次有资格的本地修复并复审；参考/独立效果生图预算为零 |
 | `POST /api/source-runs/<id>/accept` | 明确提交当前已保存版本的人工审片、reviewer与checks |
 | `POST /api/source-runs/<id>/export` | 真实母版导出 |
-| `POST /api/source-runs/<id>/export-project` | portable v2 打包 |
-| `POST /api/projects/import` | portable v2 验证导入 |
+| `POST /api/source-runs/<id>/export-project` | portable v3 打包 |
+| `POST /api/projects/import` | portable v3 验证导入 |
+
+`preview`、`native-detail-preview`、`matte-*`、`adjust`、`reconstruct-design`、`complete-post` 和 `repair-final` 等源域操作仅适用于具备对应原生可编辑合同的工程，不代表 typed 生成或几何结果支持源域参数编辑。后者的保存外观、明确改进、塑形与恢复按各自 checked task 合同执行。
 
 `options.appearance_revision` 使用 `params`、`regions`、当前显示变换及显式源/重建计划；笔画位于 `options.manual_layers`。省略组件继承保存值，提供组件整体替换，空对象/关闭也明确处理。`parameters` 等别名、旧 trust/alpha/alignment 升级及 `controls_only` 不受支持。
 
-生产执行策略只有 `layered_reference_transfer`。`existing_reference` 与 `create_reference` 在同一后期管线消费导入或生成的参考；本地原片制作关闭参考及场景节点。仅接受当前任务、发布和资产合同。Continue/Retry 要求当前 task intent/plan，不能从历史 options 推断新任务。
+可撤销形体调整也使用同一 `tasks/plan`、`tasks/start`，以独立 `shaping_request` 绑定实际 U、发布父和额度，不借用 Beauty 或普通反馈。脸部 apply 为零图像、至多三视觉；身体 apply 为至多一图三视觉；脸身组合拒绝，restore 全零；状态位于 `options.shaping_state`，只有明确采用才改变当前选择。完整请求与边界见[形体调整合同](REVERSIBLE_SHAPING.md)。
 
-历史 `portrait_detail`、`source_texture_restoration` 和 guide 回执属于已淘汰的整张参考图后期实验。它们与已保存像素只读保留，不是当前 API 的请求字段、准备入口或可重新计算的功能。当前 Beauty 冻结实际生成 RGB，后续人物仿色、场景与边界受光消费当前分层资产。
+生产执行策略只有 `layered_reference_transfer`。普通 `existing_reference` 消费导入参考的源域工具；scoped `create_reference` 从原片浮点基线经模型选择工具形成冻结外观，二者共用任务与保存入口。本地原片制作关闭参考及场景节点。仅接受当前任务、发布和资产合同。Continue/Retry 要求当前 task intent/plan，不能从历史 options 推断新任务。
+
+当前 Beauty 冻结实际生成 RGB，源域工具中的人物仿色、场景与边界受光消费当前分层资产。已移除的格式与流程不提供兼容读取或升级。
 
 当前制作计划为 `cosplay_task_plan.v2`，其中 `layer_workflow` 保存当前注册节点编译出的依赖、端口和图身份。开始任务时重新生成计划，CLI 消费时再次比较节点契约；旧计划需重新检查。可编辑图层参数仍通过 `workflow_graph` 模板编译成具体组件，模板不接受自定义连线或照片资产。节点契约描述已有生产流水线，后台仍由现有 worker 与渲染器执行。
 
@@ -57,7 +61,7 @@
 ## 批量与后台
 
 - 完整制作使用 `/api/tasks/batch/plan`与 `/api/tasks/batch`：`sources`用于生成或本地路线，`items:[{source,reference}]`用于已有参考；顶层共享 `creative_task`、服务与当前模型配置。
-- 已有参考任务的初始参考、参考纠错、独立效果三项生图预算均为零；显式原景增强＋本地Qwen单区新独立任务可另获`regional_refinement`最多1次预算，普通重试与最终修复不授新额度，见[原景增强](SOURCE_SCENE_ENHANCEMENT.md)。外部文本/视觉规划和审片由 `creative_task.services.text_vision`独立声明。文本/视觉规划与外部审片均为显式可选服务，默认关闭；本地处理可离线执行。
+- 已有参考任务的初始参考、参考纠错、独立效果三项生图预算均为零；显式原景增强＋本地Qwen单区新独立任务可另获`regional_refinement`最多1次预算，普通重试与最终修复不授新额度，见[原景增强](SOURCE_SCENE_ENHANCEMENT.md)。外部文本/视觉规划和审片由 `creative_task.services.text_vision`独立声明。本地原片与普通已有参考的文本/视觉服务默认关闭，可选启用。scoped 创建和塑形 apply 要求所需视觉服务；精确恢复的模型预算全零。
 - `GET /api/batch`、`GET /api/batch/<id>`：批次和逐项状态。
 - `POST /api/tasks/batch/<id>/retry-item`：失败/取消新尝试，保留旧 attempt，禁止重复提交同一活动项。
 - `POST /api/source-runs/export-batch`：逐项指定保存 run id/artifact，单项失败独立。

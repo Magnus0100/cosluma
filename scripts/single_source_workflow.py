@@ -51,7 +51,7 @@ import workflow_timing  # noqa: E402
 
 
 SCHEMA_VERSION = "1.0"
-SOFTWARE_VERSION = "0.5.46"
+SOFTWARE_VERSION = "0.7.0"
 RUNS_DIR = Path("outputs/runs")
 RESULT_PUBLICATION_SCHEMA = 'cosplay_saved_result_publication.v1'
 _RESULT_PUBLICATION = ContextVar('cosplay_result_publication', default=None)
@@ -352,6 +352,11 @@ def _record_saved_result(root: Path, run: dict[str, Any]) -> None:
         run['result_publication'] = {**publication, 'state': 'committed', 'committed_at': now()}
         write_json(Path(root)/RUNS_DIR/run['run_id']/'manifest.json', run)
     update_project_state(root, run)
+    if ((run.get('task_plan') or {}).get('shaping_request') is not None
+            and (run.get('options') or {}).get('preserve_project_selection') is True):
+        # This is an inspectable saved candidate. Only explicit adoption may
+        # move the persisted selection used when the desktop reopens.
+        return
     import workbench_store
     workbench_store.record_recent(root, sample=str(run.get('sample') or ''),
         run_id=str(run['run_id']), source=str((run.get('source') or {}).get('path') or ''))
@@ -413,46 +418,6 @@ def design_binding(source_hash: str, profile: dict[str, Any] | None, *, characte
             "style_id": style_id, "input_prompt": input_prompt}
 
 
-@workflow_timing.timed('planning', model_request=None, http_request=None)
-def prepare_bound_design(source: Path, out_dir: Path, profile: dict[str, Any] | None, *,
-                         source_hash: str, character_name: str = "", character_notes: str = "",
-                         style_id: str | None = None, input_prompt: str = "", provider: str | None = None,
-                         vision_model: str | None = None, api_base: str | None = None,
-                         api_url: str | None = None, api_key_env: str | None = None,
-                         character_research: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Bind one image's researched design to its actual editing inputs."""
-    binding = design_binding(source_hash, profile, character_name=character_name, character_notes=character_notes,
-                             style_id=style_id, input_prompt=input_prompt)
-    try:
-        from generation_design import prepare_generation_design
-        design = prepare_generation_design(source, out_dir, profile or {}, style_id=style_id,
-                                           base_prompt=input_prompt, provider=provider, vision_model=vision_model,
-                                           api_base=api_base, api_url=api_url, api_key_env=api_key_env,
-                                           character_research=character_research)
-        design["generated_effective_prompt"] = design["effective_prompt"]
-        design.setdefault("status", "ready")
-    except Exception as exc:
-        from preset_store import get_preset
-        preset = get_preset(style_id) if style_id else None
-        research_path = out_dir / "research" / "character_research.json"
-        research = character_research or (read_json(research_path) if research_path.is_file() else {"status": "unavailable", "error": str(exc)})
-        design = {"status": "unavailable", "error": str(exc), "selected_style_id": style_id,
-                  "character_research": research,
-                  "design_brief": {"status": "unavailable"},
-                  "effective_prompt": character_prompt(compose_generation_prompt(strip_generated_direction(input_prompt), preset.get("prompt") if preset else None),
-                                                       profile, style_id)}
-    design.update(binding=binding, source_sha256=source_hash, input_prompt=input_prompt)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_json(out_dir / "generation_design.json", design)
-    return design
-
-
-def matching_design(design: dict[str, Any] | None, binding: dict[str, Any]) -> bool:
-    if not design or not design.get("effective_prompt"):
-        return False
-    saved = design.get("binding") or {}
-    return all(saved.get(key) == value for key, value in binding.items() if key != "style_id") and (
-        saved.get("style_id") == binding["style_id"] or binding["style_id"] == design.get("selected_style_id"))
 
 
 def _unrequested_design(binding, input_prompt, effective_prompt, style_id):
@@ -514,6 +479,11 @@ def task_visual_review_allowed(run, args):
         and all(value.get('services', {}).get('visual_review') is True for value in intents))
 
 
+def _source_native_initialization(plan):
+    from scoped_workflow import SOURCE_NATIVE_INITIALIZATION
+    return isinstance(plan,dict) and plan.get('editing_initialization')==SOURCE_NATIVE_INITIALIZATION
+
+
 def _cosplay_diagnosis_requested(run: dict[str, Any], args: argparse.Namespace) -> bool:
     from generation_design import DESIGN_VERSION
     design = run.get('generation_design') or run.get('options', {}).get('generation_design') or {}
@@ -530,6 +500,13 @@ def diagnose_cosplay_post(root: Path, run: dict[str, Any], args: argparse.Namesp
     Only explicitly opted-in complete designs request this additional step.
     Unrequested or unavailable diagnosis retains the saved render assets.
     """
+    if _source_native_initialization(run.get('task_plan')):
+        if run.get('reference'):
+            from photo_edit_finish import finish_saved_run
+            finish_saved_run(root,run,args)
+        return run.get('photo_edit_session') or {}
+    if (run.get('task_plan') or {}).get('editing_scope'):
+        raise ValueError('Unsupported creation format; start a current source-native task')
     design = run.get('generation_design') or run.get('options', {}).get('generation_design') or {}
     unplanned_draft = (design.get('status') == 'not_requested' and run.get('status') == 'needs_visual_review'
                        and bool((run.get('artifacts') or {}).get('auto_draft')))
@@ -661,62 +638,17 @@ def diagnose_cosplay_post(root: Path, run: dict[str, Any], args: argparse.Namesp
     return review
 
 
-@workflow_timing.timed('generation', model_request=None, http_request=None)
-def generate_candidate(root: Path, run: dict[str, Any], args: argparse.Namespace) -> Path:
-    """Call the existing provider adapter and return its registered PNG."""
-    import reference_provider
-
-    if task_image_budget(run, args, 'initial_reference', default=1) < 1:
-        raise ValueError('Task image budget forbids reference generation')
-
-    source = Path(str(run["source"]["path"]))
-    # Keep generated pixels run-local until visual approval.
-    out_dir = Path(getattr(args, "candidate_out_dir", None) or root / RUNS_DIR / str(run["run_id"]))
-    call = [
-        "--root", str(root), "--image", str(source), "--source", str(source),
-        "--sample", str(run["sample"]), "--out-dir", str(out_dir),
-        "--prompt", str(args.prompt),
-        "--provider", str(args.provider),
-    ]
-    strategy = (run.get('execution_strategy') or (run.get('task_plan') or {}).get('execution_strategy'))
-    if strategy == 'layered_reference_transfer':
-        call.extend(['--execution-strategy', strategy])
-    if args.model:
-        call.extend(["--model", str(args.model)])
-    for flag, value in (("--api-base", args.api_base), ("--api-url", args.api_url), ("--api-key-env", args.api_key_env), ("--size", args.size)):
-        if value:
-            call.extend([flag, str(value)])
-    if args.generation_id:
-        call.extend(["--generation-id", str(args.generation_id)])
-    if args.force:
-        call.append("--force")
-    config = reference_provider.provider_config(provider=args.provider, model=args.model,
-        api_base=args.api_base, api_url=args.api_url, api_key_env=args.api_key_env)
-    if config['kind'] == 'comfyui':
-        from beautygrpo_prepare import release_idle_for_stage
-        with workflow_timing.span('model_handoff', model_request=False, http_request=False):
-            run.setdefault('options', {})['portrait_generation_memory_transition'] = release_idle_for_stage(
-                next_stage_cpu_bytes=0, next_stage='generation', next_stage_gpu=True,
-                cancel=lambda: check_generation_cancel(args))
-    try:
-        code = reference_provider.main(call)
-    except reference_provider.QwenInputQualityError:
-        workflow_timing.annotate(model_request=False, http_request=False,
-                                 model_submissions=0, http_submissions=0)
-        raise
-    if code:
-        raise RuntimeError(f"reference provider exited with code {code}")
-    candidate = out_dir / f"{run['sample']}.png"
-    if not candidate.is_file():
-        raise RuntimeError(f"provider completed without candidate: {candidate}")
-    return candidate
 
 
 def _task_portrait_beauty_needed(root: Path, run: dict[str, Any]) -> bool:
     options = run.setdefault('options', {})
+    if (run.get('task_plan') or options.get('task_plan') or {}).get('editing_scope'):
+        # The scoped generation owns its portrait appearance and final light.
+        # Unconditional source-beauty restoration would overwrite that light.
+        return False
     intent = run.get('task_intent') or options.get('task_intent') or {}
     strategy = (run.get('task_plan') or options.get('task_plan') or {}).get('execution_strategy')
-    if intent.get('mode') not in {'create_reference', 'existing_reference'} or strategy != 'layered_reference_transfer':
+    if intent.get('mode') != 'existing_reference' or strategy != 'layered_reference_transfer':
         workflow_timing.annotate(status='not_requested', model_request=False, model_submissions=0)
         return False
     revision = options.setdefault('appearance_revision', {})
@@ -789,35 +721,6 @@ def _cached_task_portrait_beauty(root: Path, run: dict[str, Any], args: argparse
     return True
 
 
-@workflow_timing.timed('portrait_beauty_dispatch', model_request=None, http_request=False)
-def _begin_task_portrait_beauty(root: Path, run: dict[str, Any], args: argparse.Namespace):
-    """Source-only branch on the existing service, before remote image submit."""
-    if not _task_portrait_beauty_needed(root, run):
-        return None
-    check_generation_cancel(args)
-    if _cached_task_portrait_beauty(root, run, args):
-        return None
-    _release_task_beauty_memory(run, args)
-    from beautygrpo_prepare import begin_for_workbench, BeautyServiceBusyError
-    directory = root / RUNS_DIR / run['run_id'] / 'portrait-beauty-preparation'
-    try:
-        pending = begin_for_workbench(run, root, directory, cancel=lambda: _beauty_cancelled(args),
-            cancel_request_path=getattr(args, 'cancel_request_path', None))
-    except BeautyServiceBusyError:
-        # A different run still owns the GPU. Keep remote generation usable;
-        # the original synchronous boundary queues for that service afterward.
-        workflow_timing.annotate(status='deferred_existing_busy_request',
-            model_request=False, model_submissions=0, service_requests=0)
-        return None
-    run['portrait_beauty_preparation'] = {'status': 'running',
-        'source_sha256': run['source']['sha256'], 'request_id': pending.request_id,
-        'request_snapshot': str(pending.snapshot), 'event_log': str(pending.event_log),
-        'service_pid': pending.process.pid, 'generation_inferences_this_attempt': None,
-        'model_submissions': None, 'asynchronous_with_remote_reference': True}
-    workflow_timing.annotate(model_submissions=None, service_requests=1, asynchronous=True)
-    return pending
-
-
 def _apply_task_portrait_beauty_result(root: Path, run: dict[str, Any], result, started) -> None:
     revision = run['options'].setdefault('appearance_revision', {})
     inferences = result.get('generation_inferences_this_attempt')
@@ -851,84 +754,31 @@ def _apply_task_portrait_beauty_result(root: Path, run: dict[str, Any], result, 
         'source_texture_restoration': False}
 
 
-def _record_async_beauty(pending, result=None, cleanup=None):
-    if getattr(pending, 'timing_recorded', False):
-        return
-    pending.timing_recorded = True
-    request_seconds = ((pending.finished or time.perf_counter())-pending.started)
-    ledger = workflow_timing.current()
-    worker_seconds = (result or {}).get('seconds')
-    workflow_timing.record_worker('portrait_beauty_async_request',
-        wall_seconds=worker_seconds if isinstance(worker_seconds, (int, float)) else None,
-        cache_hit=bool((result or {}).get('cache_hit')),
-        duration_scope='worker_prepare_source_through_frozen_result',
-        request_seconds=request_seconds, request_id=pending.request_id,
-        asynchronous_with_remote_reference=True, interval_overlap=True,
-        observed_interval=({'start_offset_seconds': pending.started-ledger.started,
-            'end_offset_seconds': (pending.finished or time.perf_counter())-ledger.started}
-            if ledger is not None else None),
-        join_wait_seconds=((result or {}).get('runtime') or {}).get('wait_seconds'),
-        cleanup=copy.deepcopy(cleanup))
-
-
 @workflow_timing.timed('portrait_beauty', model_request=None, http_request=False)
-def _prepare_task_portrait_beauty(root: Path, run: dict[str, Any], args: argparse.Namespace, *, pending=None) -> None:
-    """Prepare or join Beauty once before a checked task's first layered render."""
-    if pending is None and not _task_portrait_beauty_needed(root, run):
+def _prepare_task_portrait_beauty(root: Path, run: dict[str, Any], args: argparse.Namespace) -> None:
+    """Prepare Beauty once for an explicitly checked imported-reference task."""
+    if not _task_portrait_beauty_needed(root, run):
         return
     check_generation_cancel(args)
-    started = pending.started if pending is not None else time.perf_counter()
-    if pending is None:
-        if _cached_task_portrait_beauty(root, run, args):
-            return
-        _release_task_beauty_memory(run, args)
-        from beautygrpo_prepare import prepare_for_workbench
-        directory = root / RUNS_DIR / run['run_id'] / 'portrait-beauty-preparation'
-        result = prepare_for_workbench(run, root, directory, cancel=lambda: _beauty_cancelled(args))
-    else:
-        from beautygrpo_prepare import join_for_workbench
-        workflow_timing.annotate(duration_scope='join_and_materialize_only', asynchronous=True)
-        try:
-            result = join_for_workbench(pending, cancel=lambda: _beauty_cancelled(args))
-        except InterruptedError:
-            check_generation_cancel(args)
-            raise
-        _record_async_beauty(pending, result=result)
+    started = time.perf_counter()
+    if _cached_task_portrait_beauty(root, run, args):
+        return
+    _release_task_beauty_memory(run, args)
+    from beautygrpo_prepare import prepare_for_workbench
+    directory = root / RUNS_DIR / run['run_id'] / 'portrait-beauty-preparation'
+    result = prepare_for_workbench(run, root, directory, cancel=lambda: _beauty_cancelled(args))
     check_generation_cancel(args)
     _apply_task_portrait_beauty_result(root, run, result, started)
-
-
-def _cleanup_task_portrait_beauty(root, run, args, pending):
-    if pending is None:
-        return
-    from beautygrpo_prepare import cleanup_for_workbench
-    cancelled = _beauty_cancelled(args) or run.get('status') == 'cancelled'
-    receipt = cleanup_for_workbench(pending, reason='cancelled' if cancelled else 'workflow_exit',
-        stop_completed=cancelled or run.get('status') == 'blocked')
-    if receipt['state'] == 'already_joined':
-        return
-    _record_async_beauty(pending, result=pending.result, cleanup=receipt)
-    applied = run.get('portrait_beauty_preparation') or {}
-    if (applied.get('status') in {'prepared', 'no_change'}
-            and (applied.get('runtime') or {}).get('request_id') == pending.request_id):
-        applied['cleanup'] = copy.deepcopy(receipt)
-        return
-    # A finished source-only layer remains useful even if the paid remote
-    # branch failed. Cancellation retains its files without applying the layer.
-    if pending.result is not None and not cancelled:
-        _apply_task_portrait_beauty_result(root, run, pending.result, pending.started)
-    else:
-        run['portrait_beauty_preparation'] = {'status': receipt['state'],
-            'source_sha256': run['source']['sha256'], **copy.deepcopy(receipt),
-            'asynchronous_with_remote_reference': True}
 
 
 def _prepare_task_boundary_light(root: Path, run: dict[str, Any], args: argparse.Namespace) -> bool:
     """Coordinate boundary light once on the first checked layered endpoint."""
     options = run.get('options') or {}
+    if (run.get('task_plan') or options.get('task_plan') or {}).get('editing_scope'):
+        return False
     intent = run.get('task_intent') or options.get('task_intent') or {}
     strategy = (run.get('task_plan') or options.get('task_plan') or {}).get('execution_strategy')
-    if intent.get('mode') not in {'create_reference', 'existing_reference'} or strategy != 'layered_reference_transfer':
+    if intent.get('mode') != 'existing_reference' or strategy != 'layered_reference_transfer':
         return False
     def cancelled():
         marker = getattr(args, 'cancel_request_path', None)
@@ -1081,6 +931,8 @@ def _refresh_design_plan(root: Path, run: dict[str, Any], *, cancel=None,
     """Replay bound assets; explicit reconstruction prepares a new recipe."""
     if cancel and cancel():
         raise WorkflowCancelled('Native design preparation cancelled')
+    if (run.get('task_plan') or {}).get('editing_scope'):
+        return
     from creative_task import normalize_preparation_policy
     policy = normalize_preparation_policy(preparation_policy)
     from design_reconstruction_pipeline import ready
@@ -1189,6 +1041,9 @@ def apply_task_render_constraints(plan, run):
 def render_candidate(root: Path, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     """Render an auto draft from source + candidate through the native recipe."""
     import image_helpers
+    if (run.get('task_plan') or {}).get('editing_scope'):
+        from generated_appearance_render import render_candidate as render_scoped
+        return render_scoped(root,run,args)
     # The normal reference route refreshes the source-bound plan immediately
     # before boundary coordination.  Rendering consumes that exact plan; doing
     # the refresh again here needlessly rebinds receivers and re-reads native
@@ -1561,9 +1416,13 @@ def load_run(root: Path, run_id: str) -> tuple[Path, dict[str, Any]]:
 def _source_revision(root: Path, run_id: str, *, snapshot: bool,
                      design_plan_override: dict[str, Any] | None = None,
                      beauty_override: dict[str, Any] | None = None,
-                     selected_variant_id: str | None = None) -> tuple[Path, dict[str, Any]]:
+                     selected_variant_id: str | None = None, child_run_id: str | None = None) -> tuple[Path, dict[str, Any]]:
     """Fork selected settings and real candidate provenance without generation."""
     _path, parent = load_run(root, run_id)
+    if ((parent.get('task_plan') or {}).get('editing_scope')
+            and not (parent.get('options') or {}).get('photo_appearance')
+            and not _source_native_initialization(parent.get('task_plan'))):
+        raise ValueError('This result does not use the current native appearance format')
     # A deferred creative task intentionally has no draft yet: its parent is
     # the durable owner of several generated candidates.  Selecting one is a
     # legitimate revision boundary and the child will render it below.
@@ -1577,10 +1436,15 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
         raise RuntimeError("revision requires a rendered candidate or appearance-only draft")
     revision = int(parent.get("revision") or 1) + 1
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
-    child_id = f"{parent['sample']}-r{revision}-{stamp}"
+    child_id = child_run_id or f"{parent['sample']}-r{revision}-{stamp}"
+    if not child_id or child_id in {'.','..'} or '/' in child_id or '\\' in child_id:
+        raise ValueError('Invalid child run identifier')
     parent_dir = _path.parent.resolve()
     child_dir = root / RUNS_DIR / child_id
-    child_dir.mkdir(parents=True)
+    if child_run_id and child_dir.exists():
+        if any(item.name!='.run.lock' for item in child_dir.iterdir()):
+            raise FileExistsError('Child version already owns files: '+str(child_dir))
+    child_dir.mkdir(parents=True,exist_ok=bool(child_run_id))
     if snapshot:
         for item in parent_dir.iterdir():
             if item.name in {"manifest.json", "visual_review.json"}:
@@ -1594,6 +1458,23 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
     replacements = [(str(parent_dir), str(child_dir.resolve())),
                     (relative_or_absolute(parent_dir, root), relative_or_absolute(child_dir, root))]
     if reference:
+        asset=((parent.get('options') or {}).get('shaping_state') or {}).get('base_appearance') or (parent.get('options') or {}).get('photo_appearance')
+        if asset:
+            from appearance_assets import validate_asset
+            receipt=validate_asset(asset,source_sha256=parent['source']['sha256'],
+                scope=parent['task_plan']['editing_scope'],
+                design_id=parent['generation_design']['observed_design']['design_id'])
+            if receipt['files']['preview']['sha256']!=reference['sha256']:
+                raise ValueError('Current reference differs from its native appearance')
+            reference['path']=str(Path(asset['path'])/receipt['files']['preview']['file'])
+            processing=reference.get('processing') or {}
+            operation_receipt=processing.get('operation_receipt') or processing.get('composition_receipt')
+            if operation_receipt:
+                from photo_session_evidence import resolve_file
+                state=read_json(resolve(Path(parent['photo_edit_session']['path']),root))
+                reference['provenance']=resolve_file(state,operation_receipt)['path']
+            elif receipt.get('generation'):
+                reference['provenance']=str(Path(asset['path'])/receipt['generation']['provider_receipt']['file'])
         candidate = resolve(Path(reference["path"]), root)
         target = child_dir / "inputs" / candidate.name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1606,9 +1487,15 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
             shutil.copy2(sidecar, target_sidecar)
             replacements.insert(0, (str(sidecar), str(target_sidecar.resolve())))
             reference["provenance"] = str(target_sidecar.resolve())
+            for key in ('operation_receipt','composition_receipt'):
+                record=(reference.get('processing') or {}).get(key)
+                if record:
+                    reference['processing'][key]={**record,'path':str(target_sidecar.resolve())}
 
     def rebase(value: Any) -> Any:
         if isinstance(value, dict):
+            if value.get('schema')=='cosluma_shaping_authorization.v1':
+                return copy.deepcopy(value)
             # Source and candidate can share a path in imported fixtures. Only
             # the candidate moves; source-role metadata retains the camera anchor.
             return {key: copy.deepcopy(item) if key == "source" or (
@@ -1623,6 +1510,46 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
         return value
 
     child = rebase(copy.deepcopy(parent))
+    photo=(parent.get('options') or {}).get('photo_appearance')
+    source_photo=parent.get('initial_source_appearance')
+    owned_photo=None
+    if photo or source_photo:
+        from appearance_assets import materialize_asset,validate_asset
+        photo_binding={'source_sha256':parent['source']['sha256'],
+            'scope':parent['task_plan']['editing_scope'],
+            'design_id':parent['generation_design']['observed_design']['design_id']}
+        def own_photo(asset):
+            original=Path(asset['path']).resolve()
+            destination=child_dir/'inputs/photo-appearances'/asset['asset_id']
+            if snapshot and original.is_relative_to(parent_dir):
+                destination=child_dir/original.relative_to(parent_dir)
+            if destination.exists():
+                copied={**asset,'path':str(destination.resolve())}
+                validate_asset(copied,**photo_binding)
+                return copied
+            return materialize_asset(asset,destination,**photo_binding)
+        if source_photo:
+            child['initial_source_appearance']=own_photo(source_photo)
+        shaping=(parent.get('options') or {}).get('shaping_state')
+        if shaping is not None:
+            from photo_shaping import validate_state
+            validate_state(shaping,current=photo,**photo_binding)
+            child.setdefault('options',{})['shaping_state']=copy.deepcopy(shaping)
+            child['options']['shaping_state']['base_appearance']=own_photo(shaping['base_appearance'])
+        if photo and (selected_variant_id is None or selected_variant_id==parent.get('selected_variant_id')):
+            owned_photo=own_photo(photo)
+            child.setdefault('options',{})['photo_appearance']=owned_photo
+            if child.get('reference'):
+                child['reference']['photo_appearance']=copy.deepcopy(
+                    (child['options'].get('shaping_state') or {}).get('base_appearance') or owned_photo)
+        else:
+            child.setdefault('options',{}).pop('photo_appearance',None)
+            child['options'].pop('photo_appearance_selection',None)
+    different_candidate=selected_variant_id is not None and selected_variant_id!=parent.get('selected_variant_id')
+    if different_candidate:
+        child.setdefault('options',{}).pop('shaping_state',None)
+        for key in ('derived_edit_candidate','editing_autofinish_result','editing_iteration_result','appearance_history'):
+            child.pop(key,None)
     # Historical boundary receipts keep their original preparation facts.
     # Ordinary edits do not copy the parent's whole preparation directory,
     # so a rebased qualification locator must own an actual copied receipt.
@@ -1638,10 +1565,23 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
                 shutil.copy2(inherited, owned)
                 child['boundary_light_preparation']['qualification_path'] = str(owned.resolve())
     # Workspace/revision completion cannot be inherited, even for equal pixels.
-    for key in ('export_receipts', 'reopen_evidence', 'portable_import', 'workflow_timing', 'pipeline_timing'):
+    for key in ('export_receipts', 'reopen_evidence', 'portable_import', 'workflow_timing', 'pipeline_timing', 'photo_edit_session'):
         child.pop(key, None)
+    if snapshot and photo and (parent.get('photo_edit_session') or {}).get('path'):
+        import photo_edit_session as session
+        from photo_session_evidence import freeze_session_evidence
+        original_session=resolve(Path(parent['photo_edit_session']['path']),root).parent
+        owned_session=(child_dir/original_session.relative_to(parent_dir)
+            if original_session.is_relative_to(parent_dir) else child_dir/'editing-session')
+        state=session.snapshot(original_session)
+        state['evidence']=freeze_session_evidence(original_session,child_dir/'saved-session-evidence',state=state)
+        owned_session.mkdir(parents=True,exist_ok=True)
+        write_json(owned_session/'session.json',state)
+        child['photo_edit_session']=copy.deepcopy(parent['photo_edit_session'])
+        child['photo_edit_session'].update(path=str(owned_session/'session.json'),human_approved=False)
     from design_reconstruction import render_mode_for_run
-    child.setdefault('options',{})['render_mode'] = render_mode_for_run(parent)
+    child.setdefault('options',{})['render_mode'] = ('native_source_design'
+        if photo else render_mode_for_run(parent))
     # Unsnapshotted edits must also carry their field before the parent paths
     # are rebased. The cache can be cleared without breaking saved revisions.
     from design_reconstruction import materialize_plan
@@ -1677,6 +1617,9 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
                   "created_at": now(), "updated_at": now(), "events": [],
                   "delivery_status": "appearance_only_draft" if parent.get("fallback") else "auto_draft",
                   "next_action": "open_visual_review_and_accept_or_adjust"})
+    if owned_photo is not None and child.get('reference'):
+        child['reference']['photo_appearance']=copy.deepcopy(
+            (child['options'].get('shaping_state') or {}).get('base_appearance') or owned_photo)
     # A new explicit local save/copy has its own publication lifecycle; it
     # must neither inherit a parent's pending transaction nor claim its commit.
     _begin_result_publication(child, operation='copy_saved_run' if snapshot else 'save_native_revision')
@@ -1724,6 +1667,10 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
         for path in child_dir.rglob("metadata.json"):
             metadata = rebase(read_json(path))
             metadata.update({"run_id": child_id, "revision": revision})
+            if owned_photo is not None and (metadata.get('photo_appearance') or {}).get('asset_id')==owned_photo['asset_id']:
+                metadata['photo_appearance']=copy.deepcopy(owned_photo)
+            if source_photo and metadata.get('initial_source_appearance'):
+                metadata['initial_source_appearance']=copy.deepcopy(child['initial_source_appearance'])
             if metadata.get("review", {}).get("checks") is not None:
                 metadata["review"] = review
             write_json(path, metadata)
@@ -1732,10 +1679,18 @@ def _source_revision(root: Path, run_id: str, *, snapshot: bool,
             auto["review"] = review
             if isinstance(auto.get("metadata"), dict):
                 auto["metadata"].update({"run_id": child_id, "revision": revision})
+                if owned_photo is not None:
+                    auto['metadata']['photo_appearance']=copy.deepcopy(owned_photo)
+                if source_photo and auto['metadata'].get('initial_source_appearance'):
+                    auto['metadata']['initial_source_appearance']=copy.deepcopy(child['initial_source_appearance'])
                 if "checks" in auto["metadata"].get("review", {}):
                     auto["metadata"]["review"] = review
         if isinstance(child.get("render"), dict):
             child["render"].update({"run_id": child_id, "revision": revision})
+            if owned_photo is not None:
+                child['render']['photo_appearance']=copy.deepcopy(owned_photo)
+            if source_photo and child['render'].get('initial_source_appearance'):
+                child['render']['initial_source_appearance']=copy.deepcopy(child['initial_source_appearance'])
             if "checks" in child["render"].get("review", {}):
                 child["render"]["review"] = review
         # A completed continuation can consume this byte-identical snapshot.
@@ -1827,83 +1782,66 @@ def select_source_variant(root: Path, run_id: str, variant_id: str, *, progress=
     selected = next((item for item in parent.get("variants", []) if item.get("variant_id") == variant_id), None)
     if selected is None:
         raise ValueError(f"unknown variant: {variant_id}")
-    candidate = resolve(Path(selected["candidate_path"]), root)
-    if not candidate.is_file():
-        raise FileNotFoundError(candidate)
-    path, child = _source_revision(root, run_id, snapshot=False, selected_variant_id=variant_id)
-    target = path.parent / "inputs" / f"{variant_id}.png"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(candidate, target)
-    provenance_path = selected.get("provenance_path")
-    provenance = read_json(resolve(Path(provenance_path), root)) if provenance_path else {}
-    if provenance_path:
-        shutil.copy2(resolve(Path(provenance_path), root), target.with_name(target.stem + ".provenance.json"))
-    options = child.setdefault("options", {})
-    options['render_mode'] = 'native_source_design'
-    options.update(prompt=selected["prompt"], effective_prompt=selected["prompt"])
-    if isinstance(selected.get("generation_design"), dict):
-        child["generation_design"] = options["generation_design"] = copy.deepcopy(selected["generation_design"])
-        child["character_research"] = options["character_research"] = copy.deepcopy(child["generation_design"].get("character_research", {}))
-        child["design_brief"] = options["design_brief"] = copy.deepcopy(child["generation_design"].get("design_brief", {}))
-    if isinstance(selected.get("preset_snapshot"), dict):
-        old_preset = options.get("preset") or {}
-        new_preset = copy.deepcopy(selected["preset_snapshot"])
-        if new_preset.get("id") != old_preset.get("id"):
-            for key in ("denoise_strength"):
-                # Values that differ from the old preset are user overrides.
-                # Move preset defaults to the selected style without dropping edits.
-                if new_preset.get(key) is not None and options.get(key) == old_preset.get(key):
-                    options[key] = new_preset[key]
-            revision = options.get("appearance_revision") or {}
-            if revision.get("preset") == old_preset.get("id"):
-                if revision.get("params", {}) == old_preset.get("appearance", {}) and revision.get("regions", {}) == old_preset.get("appearance_regions", {}):
-                    revision.update(preset=new_preset["id"], params=copy.deepcopy(new_preset.get("appearance", {})))
-                    revision["regions"] = copy.deepcopy(new_preset.get("appearance_regions", {}))
-                else:
-                    revision.pop("preset", None)
-        options["preset"] = new_preset
-    child["reference"] = candidate_record(target, root, provider=provenance.get("provider") or options.get("provider"),
-                                          model=provenance.get("model") or options.get("model"),
-                                          prompt=selected["prompt"], generation_id=provenance.get("generation_id"))
-    child["selected_variant_id"] = variant_id
-    child["reference_role"] = "candidate"
-    for key in ("fallback", "warning"):
-        child.pop(key, None)
-    args = parse_args(["--root", str(root), "--source", str(child["source"]["path"])])
-    args.residual = options.get("residual", "bicubic")
-    args.complete_post = bool(options.get('complete_post', False))
-    args.task_intent = copy.deepcopy(options.get('task_intent') or child.get('task_intent'))
-    for key in ('provider', 'api_base', 'api_url', 'api_key_env', 'vision_model'):
-        if key in options:
-            setattr(args, key, options[key])
-    append_event(child, 'rendering', detail=f'selected_variant:{variant_id}',
-                 log_path=path.parent / 'logs' / 'run.log.jsonl')
-    write_json(path, child)
-    if progress:
-        progress(child['run_id'])
-    _prepare_task_portrait_beauty(root, child, args)
-    write_json(path, child)
-    plan_prepared = _prepare_task_boundary_light(root, child, args)
-    write_json(path, child)
-    if plan_prepared:
-        child['_native_plan_prepared_for_render'] = True
-    try:
-        rendered = render_candidate(root, child, args)
-    finally:
-        child.pop('_native_plan_prepared_for_render', None)
-    child.update(auto_draft=rendered, render=rendered.get("metadata"), review=rendered.get("review"),
-                 artifacts=rendered.get("outputs", {}), delivery_status="auto_draft", software_version=SOFTWARE_VERSION)
-    if rendered.get("review_path"):
-        child["artifacts"]["visual_review"] = rendered["review_path"]
-    append_event(child, "needs_visual_review", detail=f"selected_variant:{variant_id}",
-                 log_path=path.parent / "logs" / "run.log.jsonl")
-    write_json(path, child)
-    update_project_state(root, child)
-    diagnose_cosplay_post(root, child, args)
-    write_json(path, child)
-    update_project_state(root, child)
-    _record_saved_result(root, child)
-    return child
+    if _source_native_initialization(parent.get('task_plan') or {}):
+        from appearance_assets import materialize_asset, validate_asset
+        from generated_appearance_render import validate_run
+        if (parent.get('selected_variant_id')==variant_id
+                and (parent.get('options') or {}).get('photo_appearance')
+                and parent.get('auto_draft')
+                and (parent.get('result_publication') or {}).get('state')=='committed'):
+            validate_run(root,parent)
+            return parent
+        if (selected.get('status') not in {'complete','no_edited_candidate'}
+                and not (selected.get('status')=='needs_attention' and selected.get('pixel_status')=='complete')):
+            raise ValueError('Only a complete saved initial candidate can be selected')
+        asset=selected.get('photo_appearance')
+        binding={'source_sha256':parent['source']['sha256'],
+            'scope':parent['task_plan']['editing_scope'],
+            'design_id':parent['generation_design']['observed_design']['design_id']}
+        receipt=validate_asset(asset,**binding)
+        if receipt['files']['preview']['sha256']!=selected.get('candidate_sha256'):
+            raise ValueError('Saved candidate differs from its native appearance')
+        path,child=_source_revision(root,run_id,snapshot=False,selected_variant_id=variant_id)
+        owned=materialize_asset(asset,path.parent/'inputs/selected-appearance',**binding)
+        options=child.setdefault('options',{})
+        options['photo_appearance']=owned
+        options['render_mode']='native_source_design'
+        child['reference']=copy.deepcopy(selected['reference'])
+        preview=Path(owned['path'])/receipt['files']['preview']['file']
+        child['reference'].update(path=str(preview),relative_path=relative_or_absolute(preview,root),
+            photo_appearance=copy.deepcopy(owned))
+        if receipt.get('photographic_operation'):
+            operation=receipt['photographic_operation']['operation_receipt']
+            child['reference']['provenance']=str(Path(owned['path'])/operation['file'])
+            child['reference'].setdefault('processing',{})['operation_receipt']={
+                'path':child['reference']['provenance'],'sha256':operation['sha256']}
+        elif receipt.get('generation'):
+            child['reference']['provenance']=str(Path(owned['path'])/receipt['generation']['provider_receipt']['file'])
+        child['selected_variant_id']=variant_id
+        child['reference_role']='candidate'
+        # The finisher copies this actual session before continuing the shared
+        # allowance; rebasing a locator alone would invent nonexistent evidence.
+        child['photo_edit_session']=copy.deepcopy(selected['photo_edit_session'])
+        args=parse_args(['--root',str(root),'--source',str(child['source']['path'])])
+        for key in ('provider','api_base','api_url','api_key_env','vision_model'):
+            if key in options:setattr(args,key,options[key])
+        args.task_intent=copy.deepcopy(child.get('task_intent'))
+        append_event(child,'rendering',detail=f'selected_variant:{variant_id}',
+            log_path=path.parent/'logs/run.log.jsonl')
+        write_json(path,child)
+        if progress:progress(child['run_id'])
+        rendered=render_candidate(root,child,args)
+        child.update(auto_draft=rendered,render=rendered.get('metadata'),review=rendered.get('review'),
+            artifacts=rendered.get('outputs',{}),delivery_status='auto_draft',software_version=SOFTWARE_VERSION)
+        append_event(child,'needs_visual_review',detail=f'selected_variant:{variant_id}',
+            log_path=path.parent/'logs/run.log.jsonl')
+        write_json(path,child)
+        diagnose_cosplay_post(root,child,args)
+        write_json(path,child)
+        update_project_state(root,child)
+        _record_saved_result(root,child)
+        return child
+    raise ValueError('Unsupported creation format; start a current source-native task')
 
 
 @workflow_timing.entry('adjust_saved_run', lambda root, *args, **kwargs: root)
@@ -2135,7 +2073,53 @@ def _accept_run_unlocked(root: Path, run_id: str, *, reviewer: str, notes: str =
         copy2(log_path, delivery / "run.log.jsonl")
     run["next_action"] = "done"
     write_json(path, run)
-    copy2(path, delivery / "manifest.json")
+    delivered_run=copy.deepcopy(run)
+    if (run.get('options') or {}).get('photo_appearance'):
+        from appearance_assets import materialize_asset,validate_asset
+        binding={'source_sha256':run['source']['sha256'],'scope':run['task_plan']['editing_scope'],
+            'design_id':run['generation_design']['observed_design']['design_id']}
+        def delivery_asset(asset):
+            destination=delivery/'appearances'/asset['asset_id']
+            if destination.exists():
+                owned={**asset,'path':str(destination.resolve())}
+                validate_asset(owned,**binding)
+                return owned
+            return materialize_asset(asset,destination,**binding)
+        owned=delivery_asset(run['options']['photo_appearance'])
+        baseline=delivery_asset(run['initial_source_appearance'])
+        delivered_run['options']['photo_appearance']=owned
+        delivered_run['initial_source_appearance']=baseline
+        receipt=validate_asset(owned,**binding)
+        reference_asset=owned
+        if run['options'].get('shaping_state') is not None:
+            from photo_shaping import validate_state
+            shape=validate_state(run['options']['shaping_state'],current=run['options']['photo_appearance'],**binding)
+            shape['base_appearance']=delivery_asset(shape['base_appearance'])
+            delivered_run['options']['shaping_state']=shape
+            reference_asset=shape['base_appearance']
+        reference_receipt=validate_asset(reference_asset,**binding)
+        delivered_run['reference'].update(photo_appearance=copy.deepcopy(reference_asset),
+            path=str(Path(reference_asset['path'])/reference_receipt['files']['preview']['file']))
+        if reference_receipt.get('photographic_operation'):
+            operation=reference_receipt['photographic_operation']['operation_receipt']
+            delivered_run['reference']['provenance']=str(Path(reference_asset['path'])/operation['file'])
+            delivered_run['reference'].setdefault('processing',{})['operation_receipt']={
+                'path':delivered_run['reference']['provenance'],'sha256':operation['sha256']}
+        elif reference_receipt.get('generation'):
+            delivered_run['reference']['provenance']=str(Path(reference_asset['path'])/reference_receipt['generation']['provider_receipt']['file'])
+        for record in (delivered_run.get('render'),(delivered_run.get('auto_draft') or {}).get('metadata')):
+            if isinstance(record,dict):
+                record.update(photo_appearance=copy.deepcopy(owned),initial_source_appearance=copy.deepcopy(baseline))
+        for key,value in list(delivered_run.get('artifacts',{}).items()):
+            if isinstance(value,str) and (delivery/Path(value).name).is_file():
+                delivered_run['artifacts'][key]=str(delivery/Path(value).name)
+        if isinstance(delivered_run.get('auto_draft'),dict):
+            delivered_run['auto_draft']['outputs']=copy.deepcopy(delivered_run['artifacts'])
+        metadata=delivered_run.get('render')
+        if isinstance(metadata,dict):
+            metadata['outputs']=copy.deepcopy(delivered_run['artifacts'])
+            if (delivery/'metadata.json').is_file():write_json(delivery/'metadata.json',metadata)
+    write_json(delivery / 'manifest.json',delivered_run)
     artifact_hashes: dict[str, str] = {}
     for item in delivery.rglob("*"):
         if item.is_file() and item.name not in {"delivery.json"}:
@@ -2175,6 +2159,11 @@ def _accept_run_unlocked(root: Path, run_id: str, *, reviewer: str, notes: str =
 
 def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     root = args.root.expanduser().resolve()
+    if args.generate and (not isinstance(getattr(args,'task_plan',None),dict)
+            or not args.task_plan.get('editing_scope')
+            or not _source_native_initialization(args.task_plan)
+            or (getattr(args,'task_intent',None) or {}).get('mode')!='create_reference'):
+        raise ValueError('Creation requires a checked scoped task; use task-plan and task-start')
     from project_cli import create_native_project_if_missing
     create_native_project_if_missing(root, default_sample=getattr(args, 'sample', None) or 'source')
     task_intent = copy.deepcopy(getattr(args, 'task_intent', None))
@@ -2216,7 +2205,16 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             args.input_prompt = args.prompt = args.effective_prompt = full_prompt
     elif getattr(args, 'creative_direction', None) is not None:
         raise ValueError('Creative direction requires a checked task plan')
-    planning_allowed = task_text_vision_allowed({}, args) and not (task_plan or {}).get('creative_direction')
+    # Scoped editing has its own real observation tool. The older design
+    # planner must not consume a second request before that tool executes.
+    scoped_editing = (task_plan or {}).get('editing_scope')
+    if (task_plan or {}).get('shaping_request') is not None:
+        from photo_shaping import execute
+        return execute(root,args)
+    if (task_plan or {}).get('editing_iteration') is not None:
+        from photo_edit_iteration import execute
+        return execute(root,args)
+    planning_allowed = task_text_vision_allowed({}, args) and not (task_plan or {}).get('creative_direction') and scoped_editing is None
     from creative_task import normalize_preparation_policy
     checked_policy = normalize_preparation_policy((task_plan or {}).get('preparation_policy'))
     requested_policy = normalize_preparation_policy(getattr(args, 'preparation_policy', None), default=checked_policy)
@@ -2310,6 +2308,7 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                                           or getattr(args, 'final_repair_only', False)),
                 mode=preflight_mode,
                 execution_strategy=preflight_strategy,
+                editing_scope=scoped_editing,
             )
         except RuntimeError as exc:
             # A supplied candidate can be retained as evidence while local
@@ -2353,20 +2352,6 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     correction_budget = min(correction_budget, task_image_budget({}, args, 'reference_correction', default=1))
     args.cosplay_correction_budget = correction_budget
     profile = copy.deepcopy(getattr(args, "character_profile", None))
-    if (planning_allowed and args.generate and profile is None and not frozen_retry
-            and not source_info.get("decode_error")):
-        check_generation_cancel(args)
-        from character_profile import analyze_character
-        try:
-            profile = analyze_character(source, run_dir / "character", character_name=getattr(args, "character_name", ""),
-                                        character_notes=getattr(args, "character_notes", ""), provider=args.provider,
-                                        vision_model=getattr(args, "vision_model", None), api_base=args.api_base,
-                                        api_url=args.api_url, api_key_env=args.api_key_env)
-        except Exception as exc:
-            # Recognition failure is visible but does not prevent an editorial
-            # candidate from being generated from the supplied photograph.
-            profile = {"identification": "unavailable", "error": str(exc), "recommended_styles": [], "character_direction": ""}
-        check_generation_cancel(args)
     if planning_allowed and preset is None and profile:
         recommendations = profile.get("recommended_styles") or []
         if recommendations:
@@ -2413,35 +2398,7 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             check_generation_cancel(args)
         input_prompt = task_user_brief(task_intent)
         args.prompt = generation_design.get('effective_prompt') or input_prompt
-    if args.generate and not source_info.get('decode_error'):
-        check_generation_cancel(args)
-        from generation_design import DESIGN_VERSION
-        prepared_matches = (generation_design or {}).get('schema_version') == DESIGN_VERSION and (
-            generation_design or {}).get('status') == 'ready' and matching_design(generation_design, binding)
-        if frozen_retry:
-            from generation_design import DESIGN_VERSION
-            if not generation_design or generation_design.get('schema_version') != DESIGN_VERSION or generation_design.get('status') != 'ready':
-                raise ValueError('Exact retry requires a complete current generation design')
-            generation_design["effective_prompt"] = frozen_prompt
-        elif not planning_allowed:
-            generation_design = _unrequested_design(binding, input_prompt, args.prompt,
-                                                    preset.get('id') if preset else None)
-        elif not prepared_matches:
-            generation_design = prepare_bound_design(source, run_dir / "design", profile, source_hash=str(source_info["sha256"]),
-                character_name=getattr(args, "character_name", ""), character_notes=getattr(args, "character_notes", ""),
-                style_id=explicit_style_id, input_prompt=input_prompt, provider=args.provider,
-                vision_model=getattr(args, "vision_model", None), api_base=args.api_base, api_url=args.api_url, api_key_env=args.api_key_env)
-        elif frozen_prompt and frozen_prompt != generation_design["effective_prompt"]:
-            generation_design["effective_prompt"] = frozen_prompt
-        if generation_design.get("generated_effective_prompt"):
-            generation_design["final_prompt_edited"] = generation_design["effective_prompt"] != generation_design["generated_effective_prompt"]
-        check_generation_cancel(args)
-        if generation_design.get("selected_style_id") and not frozen_retry:
-            from preset_store import get_preset
-            preset = get_preset(generation_design["selected_style_id"])
-        args.prompt = generation_design["effective_prompt"]
-        write_json(run_dir / "design" / "generation_design.json", generation_design)
-    elif not planning_allowed and reference_for_preflight is not None:
+    if not planning_allowed and reference_for_preflight is not None:
         from generation_design import existing_reference_binding
         if task_intent:
             binding = existing_reference_binding(str(source_info['sha256']), sha256(reference_for_preflight),
@@ -2459,9 +2416,31 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             creative_direction=copy.deepcopy(creative_direction),
             planning_status='ready', planning_basis='user_and_rule_compiled')
         write_json(run_dir / 'design' / 'generation_design.json', generation_design)
+    if scoped_editing is not None and args.generate and not source_info.get('decode_error'):
+        from photo_art_direction import prepare as observe_design, generation_design as bind_observed_design, validate_generation_design
+        family='qwen_image_2_1' if resolved_provider.get('kind')=='comfyui' else 'gpt_image'
+        if frozen_retry:
+            generation_design=validate_generation_design(generation_design,scoped_editing,
+                family=family,source_sha256=str(source_info['sha256']))
+            if frozen_prompt!=generation_design['effective_prompt']:
+                raise ValueError('Exact retry cannot change the observed editing prompt')
+        else:
+            check_generation_cancel(args)
+            observed=observe_design(source,run_dir/'design'/'observed',scoped_editing,
+                brief=input_prompt,character_name=getattr(args,'character_name',''),
+                character_notes=getattr(args,'character_notes',''),provider=args.provider,
+                vision_model=getattr(args,'vision_model',None),api_base=args.api_base,
+                api_url=args.api_url,api_key_env=args.api_key_env,
+                cancel=lambda:bool(getattr(args,'cancel_request_path',None) and Path(args.cancel_request_path).is_file()))
+            generation_design=bind_observed_design(observed,scoped_editing,
+                family=family,source_sha256=str(source_info['sha256']))
+        args.prompt=args.effective_prompt=generation_design['effective_prompt']
+        write_json(run_dir/'design'/'generation_design.json',generation_design)
     selected_denoise = float(getattr(args, "denoise_strength", None)
                              if getattr(args, "denoise_strength", None) is not None
                              else (preset or {}).get("denoise_strength", 0.0))
+    if scoped_editing is not None and args.generate:
+        selected_denoise=0.0
     run: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "software_version": SOFTWARE_VERSION,
@@ -2555,7 +2534,7 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, 'reference_pipeline_inputs', None):
         run['reference_pipeline_inputs'] = copy.deepcopy(args.reference_pipeline_inputs)
     _begin_result_publication(run, operation='create_run', checked=task_plan is not None)
-    if preset:
+    if preset and not (scoped_editing is not None and args.generate):
         run["options"]["preset"] = {
             "id": preset["id"],
             "name": preset.get("name"),
@@ -2621,7 +2600,6 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         return run
 
     reference = reference_for_preflight
-    beauty_request = None
     try:
         if runtime_preflight_error:
             # Bind the existing candidate before recording the local failure;
@@ -2656,150 +2634,57 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 run['generation_budget'].update(origin_run_id=resume['origin_run_id'],
                     resumed_unsubmitted_region_from_run_id=resume['resume_from_run_id'])
         if args.generate:
-            if not args.prompt.strip():
-                raise ValueError("--generate requires --prompt; no provider request was sent")
-            append_event(run, "generating", log_path=run_log_path)
-            run["generation_budget"] = {"requested_variants": variant_count,
-                "max_image_submissions": variant_count + correction_budget, "image_submissions": 0,
-                "initial_variant_budget": variant_count,
-                "reference_correction_budget": correction_budget,
-                "correction_image_submissions": 0,
-                "automatic_image_retry": False, "further_generation": "explicit_user_retry",
-                "origin_run_id": run['run_id'], "submissions": []}
-            if 'regional_refinement' in (task_plan or {}).get('image_budget', {}):
-                regional_allowance = task_plan['image_budget']['regional_refinement']
-                run['generation_budget'].update(regional_refinement_image_budget=regional_allowance,
-                    regional_refinement_image_submissions=0, regional_provider_ids=[],
-                    max_image_submissions=variant_count+correction_budget+regional_allowance)
-            write_json(manifest_path, run)
-            styles = getattr(args, "variant_styles", []) or []
-            for index in range(variant_count):
-                check_generation_cancel(args)
-                selected_style = preset
-                variant_args = copy.copy(args)
-                variant_design = generation_design
-                if not frozen_retry and index < len(styles) and styles[index]:
-                    from preset_store import get_preset
-                    selected_style = get_preset(styles[index])
-                    if selected_style["id"] != (generation_design or {}).get("selected_style_id"):
-                        if not planning_allowed:
-                            variant_prompt = compose_generation_prompt(input_prompt, selected_style['prompt']) + declared_context
-                            variant_binding = {**binding, 'style_id': selected_style['id']}
-                            variant_design = _unrequested_design(variant_binding, input_prompt, variant_prompt, selected_style['id'])
-                            write_json(run_dir / 'design' / f'v{index + 1}' / 'generation_design.json', variant_design)
-                        else:
-                            variant_design = prepare_bound_design(source, run_dir / "design" / f"v{index + 1}", profile,
-                            source_hash=str(source_info["sha256"]), character_name=getattr(args, "character_name", ""),
-                            character_notes=getattr(args, "character_notes", ""), style_id=selected_style["id"],
-                            input_prompt=input_prompt, provider=args.provider, vision_model=getattr(args, "vision_model", None),
-                            api_base=args.api_base, api_url=args.api_url, api_key_env=args.api_key_env,
-                            character_research=(generation_design or {}).get("character_research"))
-                    variant_args.prompt = variant_design["effective_prompt"]
-                variant_id = f"v{index + 1}"
-                variant_args.candidate_out_dir = run_dir / "variants" / variant_id
-                if (index == 0 and resolved_provider.get('kind') == 'comfyui' and variant_count == 1
-                        and (task_intent or {}).get('mode') == 'create_reference'
-                        and (task_plan or {}).get('execution_strategy') == 'layered_reference_transfer'
-                        and not getattr(args, 'defer_reference_selection', False)):
-                    # Beauty depends only on the source. Finish and freeze it
-                    # before yielding this GPU to Qwen; the post-reference gate
-                    # then consumes that owned layer without another inference.
-                    try:
-                        _prepare_task_portrait_beauty(root, run, args)
-                    except InterruptedError:
-                        check_generation_cancel(args)
-                        raise
-                    write_json(manifest_path, run)
-                    check_generation_cancel(args)
-                elif (index == 0 and resolved_provider.get('kind') == 'openai-compatible'
-                        and (task_intent or {}).get('mode') == 'create_reference'
-                        and (task_plan or {}).get('execution_strategy') == 'layered_reference_transfer'
-                        and not getattr(args, 'defer_reference_selection', False)):
-                    beauty_request = _begin_task_portrait_beauty(root, run, args)
-                    write_json(manifest_path, run)
-                    check_generation_cancel(args)
-                # Count submissions before sending: a timeout can still be
-                # charged remotely, so it must not silently replenish budget.
-                run["generation_budget"]["image_submissions"] += 1
-                submission = {"variant_id": variant_id, "status": "submitted_outcome_unknown", "submitted_at": now()}
-                run['generation_budget']['submissions'].append(submission)
-                write_json(manifest_path, run)
-                try:
-                    candidate = generate_candidate(root, run, variant_args)
-                except Exception as generation_exc:
-                    from reference_provider import QwenInputQualityError
-                    if isinstance(generation_exc, QwenInputQualityError):
-                        run['generation_budget']['image_submissions'] -= 1
-                        submission.update(status='rejected_before_submission', error=str(generation_exc),
-                                          request_submitted=False, image_generation_submissions=0,
-                                          attempted_at=submission.pop('submitted_at'))
-                    else:
-                        submission.update(status='failed_or_outcome_unknown', error=str(generation_exc))
-                    write_json(manifest_path, run)
-                    if not run['variants']:
-                        raise
-                    # Already paid successful candidates remain usable. Stop
-                    # this batch; do not regenerate them or refill lost slots.
-                    run['generation_warning'] = {'message': str(generation_exc),
-                        'completed_variants': len(run['variants']), 'additional_requests_sent': False}
-                    append_event(run, 'generating', detail=f'partial_candidates_retained:{len(run["variants"])}', log_path=run_log_path)
-                    break
-                submission['status'] = 'succeeded'
-                sidecar = candidate.with_name(candidate.stem + ".provenance.json")
-                run["variants"].append({"variant_id": variant_id, "index": index + 1,
-                                        "style_id": selected_style.get("id") if selected_style else None,
-                                        "style_name": selected_style.get("name") if selected_style else "Custom editorial",
-                                        "candidate_path": str(candidate.resolve()),
-                                        "provenance_path": str(sidecar.resolve()) if sidecar.is_file() else None,
-                                        "prompt": variant_args.prompt, "preset_snapshot": copy.deepcopy(selected_style),
-                                        "generation_design": copy.deepcopy(variant_design)})
-                append_event(run, "generating", detail=f"candidate_ready:{variant_id}/{variant_count}", log_path=run_log_path)
-                write_json(manifest_path, run)
+            from photo_edit_finish import initial_candidates
+            allowance=(task_plan.get('editing_autofinish') or {}).get('maximum_improvements',0)
+            run['generation_budget']={'requested_variants':variant_count,
+                'max_image_submissions':variant_count+allowance,'image_submissions':0,
+                'initial_variant_budget':variant_count,'reference_correction_budget':0,
+                'correction_image_submissions':0,'editing_refinement_image_budget':allowance,
+                'automatic_image_retry':False,'origin_run_id':run['run_id'],'submissions':[],
+                'further_generation':'checked_model_selected_tools_only'}
+            append_event(run,'preparing',detail='source_native:baseline',log_path=run_log_path)
+            write_json(manifest_path,run)
+            run['variants']=initial_candidates(root,run,args)
             check_generation_cancel(args)
-            if getattr(args, 'defer_reference_selection', False):
-                # The default desktop route deliberately stops here.  All
-                # generated candidates remain owned by this run and the user
-                # must choose one before any local correspondence, matte or
-                # composite work starts.
-                reference = None
-                run["selected_variant_id"] = None
-                run["reference_role"] = "candidate_pending_selection"
-                run["next_action"] = "select_reference_variant"
-                append_event(run, "awaiting_reference", detail="candidate_selection_required", log_path=run_log_path)
-                write_json(manifest_path, run)
+            available=[item for item in run['variants']
+                if (item.get('status') in {'complete','no_edited_candidate'}
+                    or item.get('status')=='needs_attention' and item.get('pixel_status')=='complete')
+                and item.get('candidate_path') and item.get('photo_appearance')]
+            if not available:
+                raise RuntimeError('No complete known appearance was returned; inspect the recorded operation before retrying')
+            if getattr(args,'defer_reference_selection',False) and variant_count>1:
+                reference=None
+                run['selected_variant_id']=None
+                run['reference_role']='candidate_pending_selection'
+                run['next_action']='select_reference_variant'
+                append_event(run,'awaiting_reference',detail='candidate_selection_required',log_path=run_log_path)
             else:
-                first = run["variants"][0]
-                reference = Path(first["candidate_path"])
-                run["selected_variant_id"] = first["variant_id"]
-                args.prompt = first["prompt"]
-                run["options"].update(prompt=args.prompt, effective_prompt=args.prompt,
-                    prompt_template_version=prompt_template_version(args.prompt,
-                        saved_version=getattr(args, "prompt_template_version", None) if frozen_retry else None))
-                run["generation_design"] = run["options"]["generation_design"] = copy.deepcopy(first["generation_design"])
-                run["character_research"] = run["options"]["character_research"] = copy.deepcopy((first["generation_design"] or {}).get("character_research"))
-                run["design_brief"] = run["options"]["design_brief"] = copy.deepcopy((first["generation_design"] or {}).get("design_brief"))
+                first=available[0]
+                reference=resolve(Path(first['candidate_path']),root)
+                run['selected_variant_id']=first['variant_id']
+                run['options']['photo_appearance']=copy.deepcopy(first['photo_appearance'])
+                run['reference']=copy.deepcopy(first['reference'])
+                run['photo_edit_session']=copy.deepcopy(first['photo_edit_session'])
+            write_json(manifest_path,run)
         if reference is not None:
             if not reference.is_file():
                 raise FileNotFoundError(reference)
-            run["reference"] = candidate_record(
-                reference,
-                root,
-                provider=args.provider,
-                model=args.model,
-                prompt=args.prompt,
-                generation_id=args.generation_id,
-            )
+            if _source_native_initialization(task_plan):
+                if sha256(reference)!=run['reference']['sha256']:
+                    raise ValueError('Selected native appearance preview changed')
+            else:
+                run["reference"] = candidate_record(reference,root,provider=args.provider,
+                    model=args.model,prompt=args.prompt,generation_id=args.generation_id)
             run["reference_role"] = "candidate"
             append_event(run, "candidate_ready", log_path=run_log_path)
             run["next_action"] = "render_single_input_then_visual_review"
-            if beauty_request is None:
+            if scoped_editing is None:
                 _prepare_task_portrait_beauty(root, run, args)
-            else:
-                _prepare_task_portrait_beauty(root, run, args, pending=beauty_request)
             write_json(manifest_path, run)
-            if ((args.generate or getattr(args, 'complete_post', False))
+            if (getattr(args, 'complete_post', False)
                     and not getattr(args, 'preserve_effective_prompt', False)
                     and task_text_vision_allowed(run, args)
+                    and scoped_editing is None
                     and (run.get('generation_design') or {}).get('status') == 'ready'):
                 from automatic_native_retouch import prepare_once
                 prepared_source = prepare_once(root, run, args, authorized=True)
@@ -2807,7 +2692,7 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 append_event(run, 'source_retouch_prepared', detail=prepared_source['status'], log_path=run_log_path)
                 write_json(manifest_path, run)
                 check_generation_cancel(args)
-            plan_prepared = _prepare_task_boundary_light(root, run, args)
+            plan_prepared = scoped_editing is None and _prepare_task_boundary_light(root, run, args)
             write_json(manifest_path, run)
             append_event(run, "rendering", log_path=run_log_path)
             write_json(manifest_path, run)
@@ -2878,16 +2763,6 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                                   else "retry_local_processing" if local_failure else "retry")
     finally:
         _record_regional_reservation(root, run)
-        try:
-            _cleanup_task_portrait_beauty(root, run, args, beauty_request)
-        except Exception as cleanup_exc:
-            # Cleanup must not hide the paid transport error or retained
-            # candidate. The service cleanup itself always attempts tree stop.
-            run.setdefault('portrait_beauty_preparation', {})['cleanup_error'] = str(cleanup_exc)
-        if beauty_request is not None:
-            # Also retain cleanup evidence on KeyboardInterrupt or another
-            # BaseException that propagates past the ordinary error handlers.
-            write_json(manifest_path, run)
     if run.get('status') == 'needs_visual_review' and (run.get('artifacts') or {}).get('auto_draft'):
         if _cosplay_diagnosis_requested(run, args) and task_visual_review_allowed(run, args):
             run['cosplay_post_review'] = {
@@ -2900,11 +2775,11 @@ def _create_run_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     diagnose_cosplay_post(root, run, args)
     write_json(manifest_path, run)
     update_project_state(root, run)
-    if (task_visual_review_allowed(run, args)
+    if (scoped_editing is None and task_visual_review_allowed(run, args)
             and not getattr(args, 'defer_reference_selection', False)
             and (correction_budget or getattr(args, 'final_repair_only', False)
-            or (task_intent and task_intent['mode'] in ('existing_reference', 'create_reference')
-                and (args.generate or getattr(args, 'complete_post', False))))):
+            or (task_intent and task_intent['mode'] == 'existing_reference'
+                and getattr(args, 'complete_post', False)))):
         from system_post_completion import complete_once
         run = complete_once(root, run, args)
     _record_saved_result(root, run)
@@ -2968,6 +2843,11 @@ def _run_id_lock(root: Path, run_id: str):
 def create_run(args: argparse.Namespace) -> dict[str, Any]:
     """Serialize one run-id, including explicit ``--force`` retries."""
     root = args.root.expanduser().resolve()
+    if args.generate and (not isinstance(getattr(args,'task_plan',None),dict)
+            or not args.task_plan.get('editing_scope')
+            or not _source_native_initialization(args.task_plan)
+            or (getattr(args,'task_intent',None) or {}).get('mode')!='create_reference'):
+        raise ValueError('Creation requires a checked scoped task; use task-plan and task-start')
     configure_persistent_cache(root)
     source = resolve(args.source, root)
     requested = str(args.run_id) if getattr(args, "run_id", None) else None
@@ -3066,7 +2946,7 @@ def apply_workflow_settings(args: argparse.Namespace, settings: dict[str, Any]) 
         args.algorithm_profile = settings['algorithm_profile']
     if settings.get('model_registry'):
         args.model_registry = Path(settings['model_registry'])
-    for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "creative_direction", "regional_resume_authorization", "regional_candidate_reuse_authorization", "native_source_retouch"):
+    for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "creative_direction", "editing_request", "editing_iteration", "editing_autofinish", "shaping_request", "regional_resume_authorization", "regional_candidate_reuse_authorization", "native_source_retouch"):
         if isinstance(settings.get(key), dict):
             setattr(args, key, settings[key])
     for key in ("prompt", "prompt_template_version", "effective_prompt", "input_prompt", "character_name", "character_notes", "vision_model", "cancel_request_path", "execution_strategy", "preparation_policy"):

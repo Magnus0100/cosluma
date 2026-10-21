@@ -28,7 +28,7 @@ $sourceExport = Join-Path $env:TEMP 'cosplay-source-current'
 .\.venv\Scripts\python.exe .\scripts\prepare_source_release.py --output "$sourceExport"
 ```
 
-导出包含源码、公共模板、构建与依赖许可，并生成逐文件大小与SHA-256清单 `SOURCE_MANIFEST.json`。检查完成后再在导出目录建立公开Git历史；不要对含私人历史的本地仓库使用 `git archive`作为公开源码交付。二进制分发与对应源码要求见 [BINARY_LICENSES.md](BINARY_LICENSES.md)。
+此命令生成带 `SOURCE_MANIFEST.json` 的冻结发布源码。继续开发或建立公开仓库时加 `--for-repository`，得到不带冻结清单的可编辑导出。导出包含源码、公共模板、构建与依赖许可；不要对含私人历史的本地仓库使用 `git archive`作为公开源码交付。二进制分发与对应源码要求见 [BINARY_LICENSES.md](BINARY_LICENSES.md)。
 
 ## 运行与CLI
 
@@ -114,12 +114,12 @@ Debug带控制台，适合收集脱敏后的启动错误。Release不显示控�
 
 `.github/workflows/ci.yml`在Windows上安装固定桌面依赖、检查公开资源并运行当前基础行为检查。手动运行 `prepare-release.yml` 会从清洁源码快照构建和检查Debug/Release，上传完整Windows包、对应源码和四份发布说明／清单。工作流产物不等于已经发布远程Release。
 
-行为检查统一从 `tests/`运行，不再散落于生产脚本目录。常规CI执行 `python tests/run.py core`，按模块检查可使用 `python tests/run.py reference_appearance_stack boundary_light_coordination_worker`；修改共享导入或测试目录时可执行 `python tests/run.py all --model-python <已安装分析Python>`。桌面依赖和模型依赖不混装；检查使用临时工程，避免写入开发者的真实工作区。
+行为检查统一用 `tests/run.py`，先按 [Agent 指南](AGENT_GUIDE.md) 选择受影响检查，再运行短 `core`。完整离线回归为显式 `full`（`core`＋`integration`），仅在发布或共享生产边界变更时执行；`all` 自动发现入口已移除。可先用 `--list` 查看选择，重复检查名只执行一次。模型相关修改只选择必要的模型检查，并显式提供 `--model-python <已安装分析Python>`；共享导入或文档修改不自动触发全部模型检查。桌面依赖和模型依赖分开，夹具使用临时工程。
 
 
 ## 当前开发工具
 
-仅保留源码检查、打包、发布校验和当前模型安装工具。具体入口以 `scripts/` 中的文件和 `scripts/runtime_manifest.json` 为准；实验性审片、历史评估和一次性输入探针已删除。
+源码工具包含 `engineering_context.py` 只读上下文、`engineering_execution.py` 受控执行代码快照、源码检查、打包发布与模型安装工具。产品执行仍走已检查的公开任务入口；生产模块以 `scripts/runtime_manifest.json` 为准。
 
 ## 验证与修改边界
 

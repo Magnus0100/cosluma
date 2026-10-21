@@ -5,6 +5,8 @@ coefficients at global native pixel centres; reference RGB is never composited.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import argparse
 import copy
 from functools import lru_cache
@@ -154,7 +156,7 @@ def prepare(root, run, baseline_master, output):
                    '--worker', str(request_path)]
         log_path = output / 'preparation.log'
         with log_path.open('w', encoding='utf8') as log:
-            completed = subprocess.run(command, stdout=log, stderr=log, timeout=900,
+            completed = external_python_run(command, stdout=log, stderr=log, timeout=900,
                 env=isolated_python_environment(),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         if completed.returncode or not result.is_file():

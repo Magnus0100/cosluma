@@ -145,9 +145,46 @@ def validate_connections(node_ids, connections, *, registry=None):
     return order, incoming
 
 
-def compile_workflow(mode, controls=None):
+def compile_workflow(mode, controls=None, *, editing_scope=None, visual_review=False, editing_iteration=None, editing_autofinish=None,
+                     editing_initialization=None, initial_variant_count=1, shaping_request=None):
     if mode not in {'local_portrait', 'existing_reference', 'create_reference'}:
         raise ValueError('Unknown Cos workflow route')
+    if mode=='create_reference' and editing_scope is None:
+        raise ValueError('Creation requires the current checked editing scope')
+    from scoped_workflow import selected, compile_scoped_workflow, SOURCE_NATIVE_INITIALIZATION
+    if mode=='create_reference' and editing_initialization!=SOURCE_NATIVE_INITIALIZATION:
+        raise ValueError('Creation requires the current source-native initialization policy')
+    if mode!='create_reference' and editing_initialization is not None:
+        raise ValueError('Initialization policy requires a creation task')
+    if mode=='create_reference' and not selected(mode,editing_scope):
+        raise ValueError('Creation requires a checked editing scope')
+    if type(visual_review) is not bool:
+        raise ValueError('Workflow visual review selection must be boolean')
+    if editing_autofinish is not None:
+        if (mode!='create_reference' or editing_scope is None or editing_iteration is not None
+                or not isinstance(editing_autofinish,dict) or 'maximum_improvements' not in editing_autofinish
+                or set(editing_autofinish)-{'maximum_improvements','maximum_zero_image_finishes'}
+                or type(editing_autofinish['maximum_improvements']) is not int
+                or not 0<=editing_autofinish['maximum_improvements']<=8
+                or type(editing_autofinish.get('maximum_zero_image_finishes',0)) is not int
+                or not 0<=editing_autofinish.get('maximum_zero_image_finishes',0)<=1
+                or (editing_autofinish.get('maximum_zero_image_finishes',0)
+                    and (not editing_autofinish['maximum_improvements'] or not visual_review))
+                or not selected(mode,editing_scope)):
+            raise ValueError('Automatic finishing needs an explicit scoped creation policy')
+        if editing_autofinish['maximum_improvements'] and not visual_review:
+            raise ValueError('Automatic finishing requires independent review')
+    if shaping_request is not None and (editing_iteration is not None or editing_autofinish is not None
+            or not selected(mode,editing_scope,shaping_request=shaping_request)):
+        raise ValueError('Shaping requires its independent checked existing-reference workflow')
+    if editing_iteration is not None and not selected(mode,editing_scope,editing_iteration):
+        raise ValueError('Editing iteration requires an explicit scoped existing-reference workflow')
+    if selected(mode,editing_scope,editing_iteration,shaping_request=shaping_request):
+        if controls:
+            raise ValueError('Scoped appearance workflow is read-only; legacy layer controls do not apply')
+        return compile_scoped_workflow(mode,editing_scope,visual_review,editing_iteration=editing_iteration,
+            editing_autofinish=editing_autofinish,editing_initialization=editing_initialization,
+            initial_variant_count=initial_variant_count,shaping_request=shaping_request)
     controls = controls or {}
     if not isinstance(controls, dict) or set(controls) - EDITABLE:
         raise ValueError('Unknown editable Cos workflow node')

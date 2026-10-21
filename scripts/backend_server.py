@@ -9,6 +9,8 @@ serve image bytes; responses return paths and workflow evidence.
 
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 import argparse
 import contextlib
 import copy
@@ -168,47 +170,13 @@ class Backend:
         profile = analyze_character(source, directory, **kwargs)
         return {"ok": True, "profile": profile}
 
-    def prepare_generation(self, body: dict[str, Any]) -> dict[str, Any]:
-        self._checked_assistance_task(body, allowed_modes={'existing_reference', 'create_reference'})
-        import uuid
-        import single_source_workflow as workflow
-        source = Path(str(body.get("source") or ""))
-        if not source.is_absolute():
-            source = self.root / source
-        if not source.is_file():
-            raise FileNotFoundError("source image is required")
-        directory = self.root / "outputs" / "staging" / "generation-design" / workflow.sha256(source)[:16] / uuid.uuid4().hex[:8]
-        profile = body.get("character_profile") if isinstance(body.get("character_profile"), dict) else None
-        if profile is None:
-            from character_profile import analyze_character
-            kwargs = {key: body[key] for key in ("character_name", "character_notes", "provider", "vision_model", "api_base", "api_url", "api_key_env") if body.get(key)}
-            try:
-                profile = analyze_character(source, directory / "character", **kwargs)
-            except Exception as exc:
-                profile = {"identification": "unavailable", "error": str(exc), "recommended_styles": [], "character_direction": ""}
-        design = workflow.prepare_bound_design(source, directory / "design", profile, source_hash=workflow.sha256(source),
-            character_name=str(body.get("character_name") or ""), character_notes=str(body.get("character_notes") or ""),
-            style_id=body.get("style_id") or body.get("preset") or None,
-            input_prompt=str(body.get("input_prompt") if body.get("input_prompt") is not None else body.get("prompt") or workflow.DEFAULT_PROMPT),
-            character_research=body.get("character_research") if isinstance(body.get("character_research"), dict) else None,
-            **{key: body[key] for key in ("provider", "vision_model", "api_base", "api_url", "api_key_env") if body.get(key)})
-        return {"ok": True, "character_profile": profile, "generation_design": design}
-
-    @staticmethod
-    def _check_task_vision_policy(body):
-        if body.get('creative_task'):
-            from creative_task import normalize_task_intent
-            intent = normalize_task_intent(body['creative_task'])
-            if not intent['services']['text_vision']:
-                raise ValueError('当前制作任务未允许外部文本/视觉服务；请选择允许服务的任务后再研究或识别。')
-
     def _checked_assistance_task(self, body: dict[str, Any], *, allowed_modes: set[str]) -> dict[str, Any]:
-        """Require advisory research/design work to belong to a checked task.
+        """Require explicit character recognition to belong to a checked task.
 
-        Character research and design preparation may write staging receipts and
-        call the configured vision service and therefore require the checked
-        task boundary even though they do not create a run.
-        Recheck the plan identity before allowing either operation.
+        Character recognition writes staging receipts and calls the configured
+        vision service, so it requires the checked task boundary even though
+        it does not create a run.
+        Recheck the plan identity before allowing recognition.
         """
         from creative_task import REQUEST_FIELDS, plan_task, validate_task_plan
         if not isinstance(body, dict):
@@ -216,7 +184,7 @@ class Backend:
         intent = body.get('task_intent') or body.get('creative_task')
         plan = body.get('task_plan')
         if not isinstance(intent, dict) or not isinstance(plan, dict):
-            raise ValueError('character research/design preparation requires /api/tasks/plan first')
+            raise ValueError('Character recognition requires /api/tasks/plan first')
         validate_task_plan(plan, intent)
         if intent.get('mode') not in allowed_modes:
             raise ValueError('This assistance route is unavailable for the selected creative task mode')
@@ -235,38 +203,6 @@ class Backend:
         if body is not None:
             provider_settings.save_settings(body)
         return {"ok": True, **provider_settings.public_settings()}
-
-    def plan_source_light(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        from single_source_workflow import load_run
-        from source_relight import source_render_plan_for_run
-        from source_color import source_color_plan_for_run
-        _path, run = load_run(self.root, run_id)
-        if not isinstance(run.get('task_plan'), dict) or not isinstance(run.get('task_intent'), dict):
-            raise RuntimeError('Current checked task required; create a new current run before planning.')
-        options = run.get('options') or {}
-        previous = run.get('generation_design') or options.get('generation_design') or {}
-        request = {key: options[key] for key in ('provider', 'vision_model', 'api_base', 'api_url', 'api_key_env',
-                   'character_name', 'character_notes', 'input_prompt') if options.get(key)}
-        request.update({key: body[key] for key in ('provider', 'vision_model', 'character_name', 'character_notes') if body.get(key)})
-        request['source'] = run['source']['path']
-        # Advisory design preparation belongs to the run's current checked task.
-        request['task_intent'] = copy.deepcopy(run.get('task_intent') or options.get('task_intent'))
-        request['task_plan'] = copy.deepcopy(run.get('task_plan') or options.get('task_plan'))
-        request['character_profile'] = run.get('character_profile') or options.get('character_profile')
-        request['character_research'] = previous.get('character_research')
-        request['style_id'] = previous.get('selected_style_id')
-        request.setdefault('input_prompt', (previous.get('inputs') or {}).get('input_prompt') or
-                            (previous.get('inputs') or {}).get('base_prompt') or options.get('prompt'))
-        prepared = self.prepare_generation(request)
-        design = prepared['generation_design']
-        return {**prepared, 'run_id': run_id,
-                'source_render_plan': source_render_plan_for_run({'generation_design': design}),
-                'source_color_plan': source_color_plan_for_run({'generation_design': design})}
-
-    def plan_source_color(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        # A single image-specific design carries both source operations. It is
-        # a read-only planning operation; editing/saving creates a child later.
-        return self.plan_source_light(run_id, body)
 
     def auto_source_color(self, run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         from local_photo_analysis import prepare_local_appearance
@@ -835,7 +771,7 @@ class Backend:
                 continue
             if value not in (None, ""):
                 args.extend([flag, str(value)])
-        settings = {key: body[key] for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "creative_direction", "regional_resume_authorization", "regional_candidate_reuse_authorization", "native_source_retouch", "task_intent", "task_plan") if isinstance(body.get(key), dict)}
+        settings = {key: body[key] for key in ("appearance_revision", "manual_layers", "preset_snapshot", "character_profile", "generation_design", "creative_direction", "editing_request", "editing_iteration", "editing_autofinish", "shaping_request", "regional_resume_authorization", "regional_candidate_reuse_authorization", "native_source_retouch", "task_intent", "task_plan") if isinstance(body.get(key), dict)}
         for key in ("prompt_template_version", "effective_prompt", "input_prompt", "character_name", "character_notes", "vision_model", "cancel_request_path", "execution_strategy", "preparation_policy"):
             if isinstance(body.get(key), str):
                 settings[key] = body[key]
@@ -1100,8 +1036,11 @@ class Backend:
                         beauty_capability, broker_environment = self._beauty_broker.issue(job_id, run_id, checked_source.get('sha256'))
                     environment = {**environment, **broker_environment}
                 cli_args = [str(python), str(cli), "--root", str(self.root), *args]
-                process = subprocess.Popen(
-                    cli_args, cwd=str(cli.parent if isolated_desktop else ROOT), stdout=subprocess.PIPE,
+                process = external_python_popen(
+                    # The installed CLI source is under _internal. Using that
+                    # as cwd would reintroduce bundled DLLs through Windows'
+                    # current-directory search after DLL-path isolation.
+                    cli_args, cwd=str(self.root if isolated_desktop else ROOT), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, encoding="utf-8",
                     env=environment,
                     start_new_session=os.name != 'nt',
@@ -1390,8 +1329,11 @@ class Backend:
                 supplied = body.get(role)
                 path = Path(str(supplied)).expanduser().resolve() if supplied else None
                 expected = Path(str(recorded.get('path'))).expanduser().resolve() if recorded.get('path') else None
+                frozen_restore=(role=='source' and (plan.get('shaping_request') or {}).get('action')=='restore'
+                    and sum(plan['image_budget'].values())==0
+                    and recorded.get('sha256')==(plan.get('shaping_authorization') or {}).get('source_sha256'))
                 if (path is None or expected is None or path != expected
-                        or not path.is_file() or sha(path) != recorded.get('sha256')):
+                        or not frozen_restore and (not path.is_file() or sha(path) != recorded.get('sha256'))):
                     raise ValueError('Task inputs changed; check the task plan again')
         else:
             # A plan-shaped object is not enough: re-read the request through
@@ -1441,14 +1383,16 @@ class Backend:
 
     def start_task(self, body):
         from production_coordinator import checked_request
-        request = checked_request(self.root, body)
-        # HTTP/desktop callers queue by default. The CLI explicitly supplies
-        # async=False so its process owns the task until all artifacts exist.
-        # Preserve the full direct-one-click validation for callers that enter
-        # that method themselves, while avoiding a second expensive planner
-        # pass for this already checked route.
-        request[_CHECKED_TASK_KEY] = _CHECKED_TASK_MARKER
-        return {**self.one_click(request), 'task_plan': request['task_plan']}
+        from appearance_read_scope import parent_operation
+        with parent_operation(self.root, body):
+            request = checked_request(self.root, body)
+            # HTTP/desktop callers queue by default. The CLI explicitly supplies
+            # async=False so its process owns the task until all artifacts exist.
+            # Preserve the full direct-one-click validation for callers that enter
+            # that method themselves, while avoiding a second expensive planner
+            # pass for this already checked route.
+            request[_CHECKED_TASK_KEY] = _CHECKED_TASK_MARKER
+            return {**self.one_click(request), 'task_plan': request['task_plan']}
 
     def task_batch_plan(self, body):
         from creative_task import plan_batch
@@ -2445,13 +2389,6 @@ def make_handler(backend: Backend):
                     result = backend.export_source_batch(body)
                 elif path == "/api/character/recognize":
                     result = backend.recognize_character(body)
-                elif path == "/api/generation/prepare":
-                    result = backend.prepare_generation(body)
-                elif path.startswith("/api/source-runs/") and path.endswith("/plan-light"):
-                    run_id = path.removeprefix("/api/source-runs/").removesuffix("/plan-light").strip("/")
-                    if not run_id or "/" in run_id:
-                        raise ValueError("invalid_run_id")
-                    result = backend.plan_source_light(run_id, body)
                 elif path.startswith("/api/source-runs/") and path.endswith("/matte-preview"):
                     run_id = path.removeprefix("/api/source-runs/").removesuffix("/matte-preview").strip("/")
                     if not run_id or "/" in run_id:
@@ -2477,11 +2414,6 @@ def make_handler(backend: Backend):
                     if not run_id or "/" in run_id:
                         raise ValueError("invalid_run_id")
                     result = backend.preview_source_run(run_id, body)
-                elif path.startswith("/api/source-runs/") and path.endswith("/plan-color"):
-                    run_id = path.removeprefix("/api/source-runs/").removesuffix("/plan-color").strip("/")
-                    if not run_id or "/" in run_id:
-                        raise ValueError("invalid_run_id")
-                    result = backend.plan_source_color(run_id, body)
                 elif path.startswith("/api/source-runs/") and path.endswith("/auto-color"):
                     run_id = path.removeprefix("/api/source-runs/").removesuffix("/auto-color").strip("/")
                     if not run_id or "/" in run_id:

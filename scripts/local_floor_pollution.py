@@ -1,6 +1,8 @@
 """Bound observed floor reflections before cleanup; inference stays in its worker."""
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import hashlib
 import json
 import os
@@ -383,7 +385,7 @@ def prepare_candidate_floor_pollution(root,scene,*,registry_path=None):
     log_path=directory/'worker.log'
     try:
         with log_path.open('w',encoding='utf-8') as log:
-            completed=subprocess.run([str(paths['python']),'-X','utf8',
+            completed=external_python_run([str(paths['python']),'-X','utf8',
                 str(code_path('sam3_floor_worker.py')),'--candidate-input',str(request_path),
                 '--output-dir',str(directory),'--model-root',str(paths['models'])],
                 stdout=log,stderr=log,timeout=300,

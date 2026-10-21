@@ -61,14 +61,7 @@ def _highpass(values: np.ndarray, radius: float = 1.5) -> np.ndarray:
     return values - blurred
 
 
-def grid_metrics(path: Path, *, content_sha256: str | None = None) -> dict:
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with Image.open(path) as image:
-        image.load()
-        gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
-        width, height = image.size
+def _gray_metrics(gray: np.ndarray) -> dict:
     highpass = _highpass(gray)
     diagonal = {str(lag): _lag_correlation(highpass, lag, lag)
                 for lag in (1, 2, 4, 8, 16)}
@@ -78,13 +71,6 @@ def grid_metrics(path: Path, *, content_sha256: str | None = None) -> dict:
                      for lag in (1, 2, 4, 8, 16)}
     peak = max(diagonal[str(lag)] for lag in (4, 8, 16))
     return {
-        "path": str(path),
-        # Callers that already authenticated the exact bytes (for example the
-        # provider response) can pass that digest and avoid a second full
-        # sequential read after the raster has been decoded for diagnostics.
-        "sha256": content_sha256 if content_sha256 is not None else sha256_file(path),
-        "bytes": path.stat().st_size,
-        "size": [width, height],
         "mean_rgb8": float(gray.mean() * 255.0),
         "std_rgb8": float(gray.std() * 255.0),
         "highpass_std": float(highpass.std() * 255.0),
@@ -95,6 +81,47 @@ def grid_metrics(path: Path, *, content_sha256: str | None = None) -> dict:
     }
 
 
+def grid_metrics(path: Path, *, content_sha256: str | None = None) -> dict:
+    """Inspect visible colour; zero-alpha RGB can never affect the verdict.
+
+    Opaque rasters retain the original luminance calculation exactly. An
+    associated linear composite on both black and white tests opacity as well
+    as colour without assuming the eventual photographic background.
+    """
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with Image.open(path) as image:
+        image.load()
+        width, height = image.size
+        rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        alpha = rgba[..., 3]
+        if np.all(alpha == 255):
+            metrics = _gray_metrics(np.asarray(image.convert("L"), dtype=np.float32) / 255.0)
+            metrics["evaluation_domain"] = "opaque_encoded_luminance"
+        else:
+            from float_appearance import srgb_to_linear, linear_to_srgb
+            opacity = alpha.astype(np.float32) / 255.0
+            associated = srgb_to_linear(rgba[..., :3].astype(np.float32) / 255.0) * opacity[..., None]
+            projections = {}
+            for name, background in (("over_black", 0.), ("over_white", 1.)):
+                linear = associated + background * (1 - opacity[..., None])
+                encoded = np.uint8(np.clip(linear_to_srgb(linear), 0, 1) * 255 + .5)
+                gray = np.asarray(Image.fromarray(encoded).convert("L"), dtype=np.float32) / 255.0
+                projections[name] = _gray_metrics(gray)
+            primary = max(projections, key=lambda name: projections[name]["diag_peak_lag_4_16"])
+            metrics = dict(projections[primary])
+            metrics.update(evaluation_domain="associated_linear_rgb_over_neutral_backgrounds",
+                           primary_projection=primary, visible_projections=projections)
+        metrics["opacity"] = {"minimum": int(alpha.min()), "maximum": int(alpha.max()),
+            "zero_pixels": int(np.count_nonzero(alpha == 0)),
+            "nonopaque_pixels": int(np.count_nonzero(alpha != 255)),
+            "hidden_rgb_ignored": True}
+    return {"path": str(path),
+        "sha256": content_sha256 if content_sha256 is not None else sha256_file(path),
+        "bytes": path.stat().st_size, "size": [width, height], **metrics}
+
+
 def periodic_grid_evidence(metrics: dict, *, threshold: float) -> dict:
     """Require two harmonic peaks distinct from ordinary neighboring detail.
 
@@ -103,6 +130,16 @@ def periodic_grid_evidence(metrics: dict, *, threshold: float) -> dict:
     with both peaks above their immediate neighbors. The historical absolute
     threshold stays unchanged; each independent peak must corroborate it.
     """
+    if metrics.get("visible_projections"):
+        projections = metrics["visible_projections"]
+        evidence = {name: periodic_grid_evidence(value, threshold=threshold)
+                    for name, value in projections.items()}
+        corroborated = [name for name, value in evidence.items() if value["corroborated"]]
+        primary = max(corroborated or list(evidence),
+                      key=lambda name: projections[name]["diag_peak_lag_4_16"])
+        return {**evidence[primary], "method": "two_harmonic_peaks_per_visible_projection.v1",
+                "visible_projections": evidence, "primary_projection": primary,
+                "corroborated": bool(corroborated)}
     scores = metrics.get("diag_lag") or {}
     neighbors = metrics.get("diag_lag_neighbors") or {}
     pairs = []

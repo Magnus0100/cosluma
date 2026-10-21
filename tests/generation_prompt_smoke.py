@@ -11,7 +11,7 @@ from PIL import Image
 from generation_prompt import (DEFAULT_PROMPT, PROMPT_VERSION, STYLE_MARKER, DESIGN_MARKER,
                                CHARACTER_MARKER, compose_generation_prompt, prompt_template_version,
                                prompt_for_new_task)
-from generation_design import prepare_generation_design
+from generation_design import prepare_existing_reference_design
 from preset_store import get_preset
 
 
@@ -41,31 +41,30 @@ def main():
         prompt_template_version(custom, saved_version='prior-template')
         raise AssertionError('Retired prompt template accepted')
     except ValueError: pass
-    sent = []
-    def planner(source, destination, prompt, **kwargs):
+    sent=[]
+    def planner(source,destination,prompt,**kwargs):
         sent.append(prompt)
         from generation_design_smoke import plan_fixture
-        return plan_fixture(), {'request_id':'offline-fixture'}
+        payload=plan_fixture(dramatic=False)
+        payload.update(reference_background_policy={'mode':'use_reference','reason':'Observed supplied reference'},
+            reference_effect_observation={'present':False,'description':'No baked additional effects'})
+        return payload,{'request_id':'offline-paired-fixture'}
     with tempfile.TemporaryDirectory(prefix='cosplay_prompt_') as temporary:
-        root = Path(temporary)
-        source = root/'source.png'
-        Image.new('RGB', (32, 48), '#587070').save(source)
-        with patch('vision_transport.request_vision_json', side_effect=planner), \
-             patch('source_color.diagnose_source_colors', return_value={'scope':'fixture'}):
-            result = prepare_generation_design(source, root/'design', {}, style_id='cinematic_backlight',
-                base_prompt=planned, character_research={'status':'unavailable'})
+        root=Path(temporary);source=root/'source.png';reference=root/'reference.png'
+        for path in (source,reference):Image.new('RGB',(32,48),'#587070').save(path)
+        intent={'mode':'existing_reference','schema_version':'cosplay_task_intent.v1','brief':custom,
+            'constraints':{'preserve_background':False,'no_effects':False},'services':{'text_vision':True,'visual_review':False}}
+        with patch('vision_transport.request_vision_json',side_effect=planner):
+            result=prepare_existing_reference_design(source,reference,root/'design',intent,style_id='cinematic_backlight')
+        assert result['status']=='ready',result
         assert len(sent)==1 and night not in sent[0] and back in sent[0]
-        assert 'OLD SHOT' not in sent[0] and '2-6' not in sent[0] and 'exposure_ev' not in sent[0]
-        assert result['effective_prompt'].startswith(custom+STYLE_MARKER+back)
-        assert result['effective_prompt'].count(DESIGN_MARKER)==1
-        assert result['prompt_template_version']=='custom'
-        assert 'source_render_plan' not in result['design_brief']
-        assert 'source_color_plan' not in result['design_brief']
-        assert 'local_environment_intent' not in result['design_brief']
-        assert json.loads((root/'design/generation_design.json').read_text(encoding='utf-8'))==result
+        assert 'OLD SHOT' not in sent[0] and 'Do not output coordinates' in sent[0]
+        assert result['effective_prompt'].startswith(custom) and result['effective_prompt'].count(DESIGN_MARKER)==1
+        assert result['image_submissions']==0
+        assert json.loads((root/'design/generation_design.json').read_text(encoding='utf8'))==result
     print(json.dumps({'ok':True,'one_current_style':True,'custom_brief_preserved':True,
         'old_generated_blocks_replaced':True,'exact_same_style_roundtrip':True,
-        'actual_planner_brief_checked':True,'no_legacy_numeric_plans_requested':True,
+        'actual_imported_pair_planner_brief_checked':True,'no_legacy_numeric_plans_requested':True,
         'version_matches_text':True,'network_calls':0}))
 
 

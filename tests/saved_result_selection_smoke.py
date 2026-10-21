@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -85,6 +87,41 @@ def main():
             else:
                 raise AssertionError('Persistent publication failure was hidden')
         assert index.read_bytes() == stable and not list(index.parent.glob('*.tmp'))
+        # Fresh asynchronous validation may commit without ever waiting on the
+        # GUI thread; contention, cancellation and stale manifests preserve it.
+        from cache_store import exclusive_file_lock
+        digest=hashlib.sha256((root/'outputs/runs/old/manifest.json').read_bytes()).hexdigest()
+        with exclusive_file_lock(index.with_suffix('.lock')):
+            started=time.perf_counter()
+            try:store.select_saved_result(root,'old',explicit=True,lock_timeout=0,expected_manifest_sha256=digest)
+            except TimeoutError:pass
+            else:raise AssertionError('Nonwaiting selection ignored the held lock')
+            assert time.perf_counter()-started<.25
+        assert index.read_bytes()==stable
+        for options in ({'guard':lambda:False},{'expected_manifest_sha256':'0'*64}):
+            try:store.select_saved_result(root,'old',explicit=True,lock_timeout=0,**options)
+            except ValueError:pass
+            else:raise AssertionError('Stale guarded selection was published')
+            assert index.read_bytes()==stable
+        calls=[]
+        def late_cancel():
+            calls.append(1);return len(calls)==1
+        try:store.select_saved_result(root,'old',explicit=True,lock_timeout=0,guard=late_cancel)
+        except ValueError:pass
+        else:raise AssertionError('Late cancelled selection was committed')
+        assert len(calls)==2 and index.read_bytes()==stable and not list(index.parent.glob('*.tmp'))
+        with patch.object(store.os,'replace',side_effect=PermissionError('nonwaiting replace')) as replace:
+            try:store.select_saved_result(root,'old',explicit=True,lock_timeout=0)
+            except PermissionError:pass
+            else:raise AssertionError('Nonwaiting replace error hidden')
+        assert replace.call_count==1 and index.read_bytes()==stable
+        store.select_saved_result(root,'old',explicit=True,lock_timeout=0,
+            expected_manifest_sha256=digest,guard=lambda:True)
+        assert store.saved_result_state(root)['selected_saved_run_id']=='old'
+        with patch.object(store,'saved_result_state',side_effect=AssertionError('GUI must not scan all saved runs')):
+            assert store.select_saved_result(root,'new',explicit=True,lock_timeout=0,
+                guard=lambda:True,return_state=False) is None
+        assert store.saved_result_state(root)['selected_saved_run_id']=='new'
 
     import qt_workbench as qt
     from design_reconstruction_ui_smoke import Window, Pool, last, write_run

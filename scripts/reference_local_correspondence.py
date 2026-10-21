@@ -5,6 +5,8 @@ geometry, paste reference texture, or infer correspondence from background H.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import hashlib
 import json
 import os
@@ -289,7 +291,7 @@ or sample-specific settings are consumed.
     runtime = Path(registry['python'])
     log_path = directory/'worker.log'
     with log_path.open('w', encoding='utf8') as stream:
-        process = subprocess.run([str(runtime), '-B', '-X', 'utf8', str(worker), '--request', str(request_path)],
+        process = external_python_run([str(runtime), '-B', '-X', 'utf8', str(worker), '--request', str(request_path)],
             stdout=stream, stderr=stream, timeout=900,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
             env={**os.environ, 'PYTHONIOENCODING': 'utf8'})

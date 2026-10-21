@@ -1,6 +1,8 @@
 """One budgeted native ROI image; edit permission is enforced only by the CPU."""
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 import argparse
 import copy
 import json
@@ -346,7 +348,7 @@ def prepare(root,run,plan,output,*,saved=None,cancel=None):
     request=output/'request.json';write(request,{'root':str(Path(root).resolve()),'run':run,'plan':plan,'handoff':handoff})
     python=load_registry(root,registry_path=run.get('options',{}).get('model_registry'))['python']
     with (output/'worker.log').open('wb') as log:
-        process=subprocess.Popen([python,'-B','-X','utf8',str(code_path('regional_scene_worker.py')),
+        process=external_python_popen([python,'-B','-X','utf8',str(code_path('regional_scene_worker.py')),
             '--request',str(request),'--output',str(output)],stdout=log,stderr=subprocess.STDOUT,
             env=isolated_python_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         try:

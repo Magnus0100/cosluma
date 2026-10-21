@@ -2,11 +2,17 @@
 
 [![CI](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-CosLuma is a Windows desktop workbench for source-faithful cosplay photo finishing. It keeps the source subject's structure and texture while preparing editable appearance, lighting, background and effect layers. The project includes a desktop UI, CLI and local HTTP backend.
+CosLuma is a Windows desktop workbench for cosplay photo finishing. Retouching, partial compositing and full compositing share checked tasks, a desktop UI, CLI and local HTTP backend.
 
-The current source version is **0.5.46**. Windows EXE packages are built locally; publication to GitHub is a separate release step.
+**Download the 0.7.0 preview:** [Windows x64 application ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/cosplay-workbench-0.7.0-windows-x64.zip) · [matching source ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/cosplay-workbench-0.7.0-source.zip) · [SHA-256 checksums](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/SHA256SUMS.txt).
 
-One production pipeline handles source → imported/generated reference → Beauty → scene/native T/B/S → boundary → save. GPT Image, local ComfyUI/Qwen Image and compatible providers remain selectable upstream. Reference creation defaults to one image; multiple candidates are explicit. Source-only work disables the reference and scene nodes in the same pipeline. External text/vision planning and review are optional and default off.
+Extract the complete Windows folder and open `cosplay-workbench.exe`. Model weights and inference runtimes are configured separately. Developers can clone this repository or use the source archive. This is a preview; cross-image quality, shaping naturalness and the complete installed workflow are not yet accepted.
+
+The current source version is **0.7.0**, with source-native initialization, photographic development and model-selected tools connected. Verify the installed application identity, actual model output and cross-image quality separately. Windows packages are built locally; publication is a separate release step.
+
+AI creation observes the source, freezes a native float baseline, selects a photographic, local or joint editing tool, independently reviews actual pixels and conditionally improves them before saving. Design and review default on. Partial compositing keeps the original setting by default. Qwen and GPT receive model-specific instructions for the same goal. Generated content uses its actual visible and permitted coverage; untouched pixels retain native floats. Joint editing permits changes to both subject and setting. Generated detail is not camera detail. Cross-image artistic acceptance remains incomplete.
+
+Source-only and ordinary imported-reference tools remain available through the same checked production entry. Removed asset formats and retired workflows have no compatibility or migration path.
 
 ## Install and run
 
@@ -21,13 +27,13 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe .\scripts\qt_workbench.py --root "$env:USERPROFILE\CosplayWorkbench\workspace" --embedded-backend --auto-start-backend
 ```
 
-Open **Model Management** from the main window. Put installed models in the [model folder](model/README.md) beside the EXE, or select an existing installation directory. Standard folders and relative configuration paths are supported; saved selections survive restart. Individual paths and JSON import are available under advanced settings. Read the [ComfyUI architecture notes](docs/COMFYUI_ARCHITECTURE.md) and [repository layout](docs/REPOSITORY_LAYOUT.md) for implementation scope.
+Open **Model Management** from the main window. Put installed models in the [model folder](model/README.md) beside the EXE, or select an existing installation directory. Standard folders and relative configuration paths are supported; saved selections survive restart. Individual paths and JSON import are available under advanced settings. Read the [production architecture](docs/PRODUCT_ARCHITECTURE.md) and [repository layout](docs/REPOSITORY_LAYOUT.md) for implementation scope.
 
-The professional canvas and task plans share typed node contracts and checked layer dependencies. Original subject alpha and generated beauty appearance remain separate. Status refreshes preserve selection, layout and zoom. Connections use the current production preset; a generic DAG executor and editable wiring are future work.
+The professional canvas and task plans share typed node contracts and checked layer dependencies. Original subject alpha and generated beauty appearance remain separate. Status refreshes preserve selection, layout and zoom. Connections show the current production dependency graph; arbitrary editable wiring is unsupported.
 
-The desktop launcher attempts Beauty prewarming and reports success only after a completed loading receipt. Qwen configuration, service connectivity and model loading are separate states. Tasks show measured stage and elapsed time; an ETA requires at least three compatible successful runs, otherwise it remains pending. AI review, execution success and file export do not constitute the user's final human approval.
+After restoring saved settings, the desktop initializes the selected managed service; unused Beauty models are not loaded unconditionally. Qwen configuration, service connectivity and model loading are separate states. Tasks show measured stage and elapsed time; an ETA requires at least three compatible successful runs, otherwise it remains pending. AI review, execution success and file export do not constitute the user's final human approval.
 
-The compiled layer plan now also carries ComfyUI-style upstream input signatures. A beauty strength change invalidates BeautyGRPO and downstream appearance, lighting, composite and export work while allowing independent source analysis, reference and background results to be reused. Pixel bytes remain validated by the existing frozen-asset workers.
+The layer plan records upstream input signatures and invalidates affected downstream work. Actual reuse additionally verifies frozen asset content, producer and runtime identities; graph status alone does not prove a pixel cache hit.
 
 ## Documentation and development
 

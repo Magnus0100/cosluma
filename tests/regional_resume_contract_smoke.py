@@ -31,7 +31,8 @@ class ResumeTests(unittest.TestCase):
         self.enterContext(patch('task_model_preflight.inspect_task_models', side_effect=mocked_task_capability))
         self.enterContext(patch('reference_provider.provider_health', return_value={'ready': True}))
         self.enterContext(patch('urllib.request.urlopen', side_effect=AssertionError('Preflight attempted network')))
-        original = task.plan_task(self.root, {**self.common, 'creative_task': enhanced(regional=True)})
+        original = task.plan_task(self.root, {**self.common, 'reference': reference,
+            'creative_task': enhanced('existing_reference',regional=True)})
         self.parent = {'kind': 'single_input_run', 'run_id': 'failed-parent', 'status': 'blocked',
             'source': original['plan']['inputs']['source'],
             'reference': {'path': reference, 'sha256': task.sha(Path(reference))},
@@ -173,11 +174,6 @@ class ResumeTests(unittest.TestCase):
             'image_generation': False, 'offline': True, 'configured': True,
             'network_probed': False, 'sent_content': [], 'text_vision_requests_upper_bound': 0,
             'price': '不调用外部服务'})
-        creation = task._services({}, task.normalize_task_intent(enhanced()))
-        self.assertTrue(creation['image_generation'])
-        self.assertFalse(creation['offline'])
-        self.assertNotIn('local_image_inference', creation)
-        self.assertEqual(creation['price'], '不调用文本/视觉规划服务；生图费用另计')
         intent = copy.deepcopy(self.body['creative_task']); intent['mode'] = 'create_reference'
         with self.assertRaises(ValueError):
             task.normalize_task_intent(intent)

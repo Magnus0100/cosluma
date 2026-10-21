@@ -735,6 +735,8 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
     render facts must also match this revision before any effect is reported
     as applied; inherited masters cannot make pending edits look saved.
     """
+    from scoped_product_state import selected as scoped_product, build as scoped_report
+    if scoped_product(run):return scoped_report(run,observations)
     assets = _record(observations.get("assets"))
     source = _record(run.get("source"))
     reference = _record(run.get("reference"))
@@ -1109,6 +1111,8 @@ def build_stage_report(run: Mapping[str, Any], observations: Mapping[str, Any]) 
 
 def read_stage_report(root: Path, run: Mapping[str, Any], manifest_path: Path | None = None) -> dict[str, Any]:
     """Read presence, review and small Beauty identity metadata; preserve assets."""
+    from scoped_product_state import selected as scoped_product, observe as scoped_observe
+    if scoped_product(run):return build_stage_report(run,scoped_observe(root,run,manifest_path))
     root = Path(root)
     artifacts = _record(run.get("artifacts"))
     plan = _record(_record(_record(run.get("options")).get("appearance_revision")).get("design_reconstruction_plan"))
@@ -1191,11 +1195,40 @@ def format_stage_report(report: Mapping[str, Any]) -> str:
     if work.get('result_state'):
         lines.append('作品状态：' + str(work.get('result_label') or work['result_state']))
         lines.append('任务执行结束后，作品仍按缺项、证据和人工批准分别判断。')
-        effects = _record(work.get('required_effects'))
-        labels={'not_required':'本次无需','fulfilled':'已确认','failed':'待修','unknown':'待证据'}
-        lines.append('设计主效：'+labels.get(effects.get('fulfillment'),'待证据')+'；'+str(effects.get('reason') or ''))
+        if report.get('workflow_family')!='scoped_appearance':
+            effects = _record(work.get('required_effects'))
+            labels={'not_required':'本次无需','fulfilled':'已确认','failed':'待修','unknown':'待证据'}
+            lines.append('设计主效：'+labels.get(effects.get('fulfillment'),'待证据')+'；'+str(effects.get('reason') or ''))
+    timing=_record(report.get('timing'))
+    usage=_record(report.get('request_usage'))
+    if usage.get('basis')=='saved_origin_budget_snapshot_including_design':
+        def usage_text(key,label):
+            row=_record(usage.get(key))
+            value=lambda field:str(row[field]) if row.get(field) is not None else '未知'
+            return label+'已确认 '+value('confirmed')+'、已预留 '+value('reserved')+' / 上限 '+value('limit')
+        lines.append('来源请求用量（保存快照，含原图设计）：'+usage_text('image_submissions','图像')+'；'+usage_text('vision_requests','视觉')+'。')
+        lines.append('预留包含结果待核实的请求；流程会话计数不代替实际外部调用总数。')
+    if timing.get('available'):
+        lines.append('本次实测总用时：'+f"{float(timing.get('whole_seconds') or 0):.1f} 秒"
+            +('（最后计时快照，任务仍在执行）' if timing.get('snapshot_only') else '')+'；不含父版本历史用时。')
     for stage in report.get("stages") or []:
-        lines.append(f"{stage['label']} · {stage['status_label']}：{stage['detail']}")
+        measured=stage.get('measured_seconds')
+        duration=f' · 本次实测 {measured:.1f} 秒' if measured is not None else ''
+        lines.append(f"{stage['label']} · {stage['status_label']}{duration}：{stage['detail']}")
+    if timing.get('available'):
+        lines.append('模块实测（exclusive，自身耗时；不重复相加嵌套步骤）：'+'；'.join(
+            str(row['label'])+f" {row['seconds']:.1f} 秒" for row in timing.get('modules',[])))
+    resolution=_record(work.get('generated_resolution'))
+    lineage=_record(work.get('generated_appearance_lineage'))
+    if lineage:
+        lines.append('初始生图尺寸：'+str(_record(lineage.get('initial_candidate')).get('size'))
+            +'；本轮生图尺寸：'+str(_record(lineage.get('generated_image')).get('size'))
+            +'；完整工作画布：'+str(lineage.get('initial_native_canvas'))
+            +'；本轮有效编辑覆盖：'+str(lineage.get('effective_coverage_fraction'))
+            +'。完整画布的尺寸不代表继承区域被重新生成为相机原生细节。')
+    elif resolution:
+        lines.append('生成图尺寸：'+str(resolution.get('input_size'))+'；输出画布：'+str(resolution.get('output_canvas'))
+            +'。画布映射不证明恢复了同等相机原生细节；原生细节尚未经批准。')
     diagnosis = _record(report.get('cosplay_post_diagnosis'))
     if diagnosis.get('status') in {'reviewed','inherited'}:
         if diagnosis.get('status')=='inherited':

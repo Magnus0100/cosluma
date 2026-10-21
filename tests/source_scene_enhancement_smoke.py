@@ -36,14 +36,17 @@ def fixture(root,*,size=(192,160),regional=False):
     fp=arr('fp',source*alpha[...,None],representation='premultiplied_RGB')
     background=arr('candidate',source*1.12,representation='sampling_validity_associated_RGB',validity_associated=True)
     validity=arr('validity',np.ones((h,w),np.float32),representation='sampling_coverage')
-    intent={'schema_version':task.INTENT_SCHEMA,'mode':'create_reference' if regional else 'existing_reference',
+    # The reference already exists. An opted-in native regional repair belongs
+    # to this explicit import task, never the retired creation pipeline.
+    intent={'schema_version':task.INTENT_SCHEMA,'mode':'existing_reference',
         'brief':'保留原场景；主效：两只旧纸蝴蝶。','constraints':{'preserve_background':False,'no_effects':False,'background_mode':'enhance_source'},
         'services':{'text_vision':False,'visual_review':False},
         'regional_refinement':{'maximum_submissions':int(regional),'coordinate_space':'source_canvas',
             'regions':[{'id':'bg-1','core_box':[128,128,640,640],'instruction':'唯一局部生成两只小旧纸蝴蝶，保留原场景。'}] if regional else []}}
     intent=task.normalize_task_intent(intent);direction=compile_direction(intent,source_sha256=source_asset['sha256'])
     checked={'schema_version':task.PLAN_SCHEMA,'mode':intent['mode'],'intent':intent,'ready':True,
-        'image_budget':task.image_budget(intent),'creative_direction':direction,'inputs':{'source':source_asset},
+        'image_budget':task.image_budget(intent),'creative_direction':direction,
+        'inputs':{'source':source_asset,'reference':ref_asset},
         'plan_id':'a'*64,'execution_strategy':'layered_reference_transfer','preparation_policy':'prepare_current',
         'layer_workflow':compile_workflow(intent['mode'])}
     plan={'schema_version':'design_reconstruction_plan.v1','enabled':True,'source_sha256':source_asset['sha256'],

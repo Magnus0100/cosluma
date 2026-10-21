@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from check_repository import (validate_public_content, validate_public_path,
-                              validate_source_manifest, validate_tracked_files, validate_versions)
+                              validate_source_manifest, validate_tracked_files, validate_versions, check)
 from prepare_source_release import TOP_LEVEL, public_files
 from verify_desktop_dependencies import VerificationError
 
@@ -60,6 +60,12 @@ def main():
         subprocess.run(['git', '-C', str(root), 'add', 'private-notes.txt'], check=True, capture_output=True)
         rejected(lambda: validate_tracked_files(root, public_files(root)))
         note.unlink()
+        retired=root/'scripts/retired_module.py'
+        retired.write_text('retired = True\n',encoding='utf8')
+        subprocess.run(['git','-C',str(root),'add','scripts/retired_module.py'],check=True,capture_output=True)
+        assert validate_tracked_files(root,public_files(root))==1
+        retired.unlink()
+        assert validate_tracked_files(root,public_files(root))==0,'Physically deleted tracked modules are not live export inputs'
         # Ignore rules never conceal an already tracked private file.
         subprocess.run(['git', '-C', str(root), 'add', '-f', 'scripts/.env.production'],
                        check=True, capture_output=True)
@@ -105,6 +111,12 @@ def main():
         assert not (repository/'.git').exists() and not (repository/'SOURCE_MANIFEST.json').exists()
         assert not (repository/'providers/local-models.current.json').exists()
         assert not (repository/'.cache').exists()
+        assert check(repository)['ok']
+        runtime=json.loads((repository/'scripts/runtime_manifest.json').read_text(encoding='utf8'))
+        claimed=repository/'scripts'/runtime['files'][0]
+        assert claimed.resolve().is_relative_to((repository/'scripts').resolve()) and claimed.is_file()
+        claimed.unlink()
+        rejected(lambda:check(repository))
     print('OK: private inputs, tracked allowlist, credentials, snapshot identities and editable repository export')
 
 

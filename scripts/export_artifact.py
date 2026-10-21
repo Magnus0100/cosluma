@@ -74,15 +74,37 @@ def export_source_run(root: Path, run_id: str, *, directory: str, format: str="P
         review_path=resolve(outputs.get('visual_review') or manifest_path.parent/'visual_review.json')
         approved=False;approval=None
     else:raise ValueError("artifact must be draft or delivery")
-    render_mode_for_run(run)
-    plan=plan_for_run(run)
-    if plan:
-        validate_current_native_plan(plan);size=tuple(map(int,plan['canvas']['source_oriented_size']))
+    scoped=(run.get('task_plan') or {}).get('editing_scope')
+    typed=(run.get('options') or {}).get('photo_appearance')
+    if typed:
+        from generated_appearance_render import validate_run,saved_display_transform
+        from appearance_assets import validate_asset
+        scope,design,_,_=validate_run(root,run)
+        receipt=validate_asset(typed,source_sha256=run['source']['sha256'],scope=scope,
+            design_id=design['observed_design']['design_id'])
+        size=tuple(receipt['canvas_size'])
+        render=run.get('render') or {}
+        if render.get('photo_appearance')!=typed:
+            raise ValueError('Saved render belongs to a different appearance master')
+        saved=render.get('saved_artifact_sha256') or {}
+        for key,path in (('auto_draft',image_path),('render_master',master_path),('render_scene_master',scene_path)):
+            if not saved.get(key) or _hash(path)!=saved[key]:
+                raise ValueError('Saved typed render bytes changed: '+key)
+        if _hash(image_path)!=receipt['files']['preview']['sha256']:
+            raise ValueError('Saved preview differs from the selected native master')
+        display=saved_display_transform(root,run)
+    elif scoped:
+        raise ValueError('A current scoped result requires its native appearance asset')
     else:
-        source_only=run.get('options',{}).get('source_only_plan') or {}
-        size=tuple(map(int,source_only.get('native_size') or []))
-        if len(size)!=2:raise ValueError("Current source-only native canvas is missing")
-    display=display_plan_for_run(run)
+        render_mode_for_run(run)
+        plan=plan_for_run(run)
+        if plan:
+            validate_current_native_plan(plan);size=tuple(map(int,plan['canvas']['source_oriented_size']))
+        else:
+            source_only=run.get('options',{}).get('source_only_plan') or {}
+            size=tuple(map(int,source_only.get('native_size') or []))
+            if len(size)!=2:raise ValueError("Current source-only native canvas is missing")
+        display=display_plan_for_run(run)
     render=run.get('render') or {};precision=render.get('render_precision') or {}
     if (render.get('operator',{}).get('working_domain')!='display_linear_sRGB'
             or precision.get('working_domain')!='display_linear_sRGB'

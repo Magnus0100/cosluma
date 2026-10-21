@@ -22,13 +22,17 @@ def main():
         root = Path(folder)
         backend = Backend(root, embedded=True)
         source = root/'source.jpg'; source.write_bytes(b'not decoded by this test')
-        cli = root/'project_cli.py'
-        cli.write_text('''import json,sys,time
+        cli = root/'_internal'/'project_cli.py'
+        cli.parent.mkdir()
+        cli.write_text('''import json,os,sys,time
 from pathlib import Path
 arguments=sys.argv[1:]
 root=Path(arguments[arguments.index('--root')+1])
 options=Path(arguments[arguments.index('--options-file')+1])
 record=json.loads(options.read_text(encoding='utf-8'))
+if record.get('character_notes')=='direct-exe':
+ location='${PACKAGE_ROOT}/model/installation-marker.json'.replace('${PACKAGE_ROOT}',os.environ.get('COSPLAY_PACKAGE_ROOT',''))
+ assert json.loads(Path(location).read_text())=={'installed':True}
 if record.get('character_notes')=='wait': time.sleep(30)
 time.sleep(.25)
 print(json.dumps({'run_id':arguments[arguments.index('--run-id')+1],
@@ -39,6 +43,8 @@ print(json.dumps({'run_id':arguments[arguments.index('--run-id')+1],
         saved = latest.read_bytes()
         runtime = Path(sys.executable).resolve()
         fake_exe = root/'cosplay-workbench.exe'; fake_exe.touch()
+        (root/'model').mkdir()
+        (root/'model/installation-marker.json').write_text('{"installed":true}',encoding='utf-8')
         submitted = []
         real_popen = subprocess.Popen
 
@@ -65,7 +71,7 @@ print(json.dumps({'run_id':arguments[arguments.index('--run-id')+1],
             registry.assert_called_once_with(root, registry_path='selected-models.json')
             argv, kwargs = submitted[-1]
             assert argv[:2] == [str(runtime), str(cli)] and argv[0] != str(fake_exe)
-            assert kwargs['cwd'] == str(cli.parent)
+            assert kwargs['cwd'] == str(root) and kwargs['cwd'] != str(cli.parent)
             assert kwargs['env']['COSPLAY_PACKAGE_ROOT'] == str(root/'installed-package')
             assert 'PYTHONPATH' not in kwargs['env'] and 'PYTHONHOME' not in kwargs['env']
             assert kwargs['env']['PYTHONFAULTHANDLER'] == '1'
@@ -76,6 +82,14 @@ print(json.dumps({'run_id':arguments[arguments.index('--run-id')+1],
             assert healthy['child_process']['owner_stamp'] == process_stamp(os.getpid())
             assert healthy['execution_process_isolation'] == 'external_python'
             assert not backend._job_processes and latest.read_bytes() == saved
+
+            # Direct double-click has no launcher environment. A real external
+            # worker must still resolve ${PACKAGE_ROOT} against the frozen EXE.
+            with patch.dict(os.environ):
+                os.environ.pop('COSPLAY_PACKAGE_ROOT',None)
+                with patch.object(module.subprocess,'Popen',side_effect=capture):
+                    assert execute('job-direct-exe',character_notes='direct-exe')['status']=='succeeded'
+                assert submitted[-1][1]['env']['COSPLAY_PACKAGE_ROOT']==str(root.resolve())
 
             # A native fast-fail is a child result: no abort, resubmission or publication in parent.
             for code in (-1073740791, 0xc0000409):
@@ -144,7 +158,8 @@ print(json.dumps({'run_id':arguments[arguments.index('--run-id')+1],
         assert backend._worker_slots.acquire(blocking=False)
         backend._worker_slots.release()
     print(json.dumps({'ok': True, 'frozen_external_runtime': True, 'native_exit_does_not_abort_parent': True,
-                     'owned_tree_cancellation': True, 'latest_preserved': True, 'source_embedded_compatible': True}))
+                     'owned_tree_cancellation': True, 'latest_preserved': True, 'source_embedded_compatible': True,
+                     'direct_exe_child_portable_model_paths': True}))
 
 
 if __name__ == '__main__': main()

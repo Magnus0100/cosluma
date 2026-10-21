@@ -1,5 +1,7 @@
 """Automatically prepare a native, switchable hair boundary-light child layer."""
 from __future__ import annotations
+
+from runtime_resources import external_python_popen
 import argparse, copy, hashlib, json, os, subprocess, time
 from pathlib import Path
 import numpy as np
@@ -362,7 +364,7 @@ def prepare_for_workbench(root, run, output, *, cancel=None, progress=None):
     log = output.with_name(output.name+'-worker.log')
     if progress: progress('hair_boundary_light', '正在观察参考发梢并准备原尺寸受光层；不新增生图。')
     with log.open('wb') as stream:
-        process = subprocess.Popen([python, '-B', '-X', 'utf8', str(code_path('boundary_light_worker.py')),
+        process = external_python_popen([python, '-B', '-X', 'utf8', str(code_path('boundary_light_worker.py')),
             '--root', str(root), '--run-json', str(snapshot), '--output', str(output)], cwd=str(root),
             stdout=stream, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         def stop():

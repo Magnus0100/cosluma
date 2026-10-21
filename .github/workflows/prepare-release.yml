@@ -25,7 +25,7 @@ jobs:
           python scripts/prepare_source_release.py --output "$env:RUNNER_TEMP/cosplay-source"
           if ($LASTEXITCODE -ne 0) { throw 'Public source export failed' }
           Set-Location "$env:RUNNER_TEMP/cosplay-source"
-          python tests/run.py core
+          python -B tests/run.py full
           if ($LASTEXITCODE -ne 0) { throw 'Current behavior checks failed' }
           python tests/run.py desktop_dependency_gate release_artifacts
           if ($LASTEXITCODE -ne 0) { throw 'Release failure-path checks failed' }

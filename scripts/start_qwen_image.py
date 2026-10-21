@@ -1,8 +1,11 @@
 """Start the shared local Qwen Image 2.1 ComfyUI service on demand."""
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 import math
 import os
@@ -151,12 +154,46 @@ def process_created_at(pid: int) -> float | None:
         kernel.CloseHandle(handle)
 
 
+def _storage_models() -> dict:
+    """Explicit per-role weight placement, separate from the Comfy runtime."""
+    from provider_settings import settings_path
+    try:
+        path = settings_path().with_name('qwen-model-storage.json')
+    except RuntimeError:
+        if os.environ.get('COSPLAY_CONFIG_ROOT') or os.environ.get('COSPLAY_PROVIDER_SETTINGS'):
+            raise
+        return {}  # A portable catalog inspection may have no user profile.
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding='utf-8-sig'))
+    if (not isinstance(value, dict) or set(value) != {'schema', 'models'}
+            or value['schema'] != 'cosplay_qwen_model_storage.v1'
+            or not isinstance(value['models'], dict)):
+        raise ValueError('Invalid Qwen model storage configuration')
+    for role, target in value['models'].items():
+        if not isinstance(role, str) or not isinstance(target, str) or not Path(target).expanduser().is_absolute():
+            raise ValueError('Qwen weight placement requires named roles and absolute paths')
+    return {role:str(Path(target).expanduser().resolve()) for role,target in value['models'].items()}
+
+
 def model_catalog() -> dict:
     try:
         path = resource_path('providers/qwen-image-2.1-models.json')
     except FileNotFoundError:
         path = resource_path('providers/qwen-image-2.1-models.example.json')
-    return json.loads(path.read_text(encoding='utf-8'))
+    catalog = json.loads(path.read_text(encoding='utf-8'))
+    storage = _storage_models()
+    if set(storage) - {row['role'] for row in catalog['models']}:
+        raise ValueError('Unknown role in Qwen model storage configuration')
+    for row in catalog['models']:
+        if row['role'] in storage:
+            target = Path(storage[row['role']])
+            original = Path(row['destination'])
+            if target.name != original.name:
+                raise ValueError('Relocated Qwen weight filename differs from the selected model')
+            row['storage_type'] = original.parent.name
+            row['destination'] = str(target)
+    return catalog
 
 
 def deployment_root(*, required: bool = True) -> Path | None:
@@ -362,11 +399,19 @@ def _compatibility_current(folder, record):
 
 
 def launch_policy() -> dict:
-    """Keep weight offload in host memory, with upstream bounded pinning."""
-    return {'schema':'cosplay_qwen_launch_policy.v2',
-            'pinned_memory':'upstream_default',
-            'required_arguments':['--disable-fast-disk'],
-            'forbidden_arguments':['--disable-pinned-memory', '--fast-disk']}
+    """Bind runtime isolation, host buffers and storage to the actual launch."""
+    windows = os.name == 'nt'
+    policy = {'schema':'cosplay_qwen_launch_policy.v4',
+            'external_runtime_isolation':'frozen_bundle_dll_directory_and_path_v1',
+            'pinned_memory':'disabled' if windows else 'upstream_default',
+            'required_arguments':['--disable-pinned-memory'] if windows else [],
+            'forbidden_arguments':['--disable-fast-disk']}
+    storage = _storage_models()
+    if storage:
+        from provider_settings import settings_path
+        policy['weight_storage_sha256'] = hashlib.sha256(json.dumps(storage, sort_keys=True).encode()).hexdigest()
+        policy['required_arguments'] += ['--extra-model-paths-config', str(settings_path().with_name('qwen-model-paths.runtime.json'))]
+    return policy
 
 
 def _launch_policy_current(record):
@@ -773,7 +818,7 @@ def start_service(folder: Path, *, cancel=None) -> dict:
     _check_start_cancel(cancel)
     launched_at=time.time()
     with log_path.open("ab") as log:
-        process = subprocess.Popen(command, cwd=main.parent,
+        process = external_python_popen(command, cwd=main.parent,
             env=environment, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     launcher=_process_identity(process.pid)
@@ -816,9 +861,17 @@ def service_launch(folder: Path) -> tuple[list[str], dict[str, str]]:
                str(folder / 'ComfyUI/main.py'), '--listen', '127.0.0.1',
                '--port', '8188', '--preview-method', 'none', '--offline',
                '--cache-lru', '16', '--temp-directory', str(folder / 'temp')]
-    # Reuse resident host weights instead of streaming them from a slow model
-    # volume each step. Upstream manages the pinning budget and GPU residency.
-    command.extend(launch_policy()['required_arguments'])
+    # Windows host buffers can precommit enough extra RAM to grow the system
+    # pagefile even before it is used. SSD-backed mapped weights avoid that.
+    policy = launch_policy()
+    if policy.get('weight_storage_sha256'):
+        storage = _storage_models()
+        groups = {row['role']:{'is_default':True, row['storage_type']:str(Path(row['destination']).parent)}
+                  for row in model_catalog()['models'] if row['role'] in storage}
+        target = Path(policy['required_arguments'][-1])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(groups, indent=2)+'\n', encoding='utf8')
+    command.extend(policy['required_arguments'])
     attention = str(environment.get('COSPLAY_QWEN_ATTENTION', 'auto')).strip().lower()
     if attention not in {'auto', 'ck', 'pytorch'}:
         raise ValueError('COSPLAY_QWEN_ATTENTION must be auto, ck, or pytorch')

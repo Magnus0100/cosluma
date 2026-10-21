@@ -1,4 +1,4 @@
-"""Checked direction survives HTTP options, CLI settings and producer entry."""
+"""Existing-reference direction survives HTTP/CLI; creation cannot use offline direction."""
 import copy
 import json
 from pathlib import Path
@@ -17,12 +17,12 @@ from task_model_preflight_smoke import mocked_task_capability
 def main():
     with tempfile.TemporaryDirectory(prefix='direction-execution-') as temporary:
         root = Path(temporary)
-        registry, sources, _ = fixture(root)
-        body = {'source':sources[0], 'model_registry':str(registry),
+        registry, sources, reference = fixture(root)
+        body = {'source':sources[0], 'reference':reference, 'model_registry':str(registry),
             'provider':'qwen_image_2_1_uncensored_fast',
             'character_name':'祝小红','character_notes':'两只蝴蝶是情感意象，不是技能',
             'input_prompt':'Keep the person and original scene.',
-            'creative_task':enhanced()}
+            'creative_task':enhanced('existing_reference', regional=True)}
         with patch('task_model_preflight.inspect_task_models',side_effect=mocked_task_capability), \
                 patch('reference_provider.provider_health',return_value={'ready':True}):
             planned = plan_task(root, body)
@@ -49,8 +49,15 @@ def main():
         assert workflow.task_image_budget(region_run, Namespace(final_repair_only=True), 'regional_refinement') == 0
         region_run['task_intent']['regional_refinement']['maximum_submissions'] = 0
         assert workflow.task_image_budget(region_run, Namespace(), 'regional_refinement') == 0
-        args = workflow.parse_args(['--root',str(root),*argv[1:]])
+        from project_cli import build_parser, _checked_one_click_args
+        cli = build_parser().parse_args(['--root',str(root),*argv])
+        assert cli.generate is False and str(cli.reference) == reference
+        # project_cli translates its explicit --no-generate into the native
+        # parser's default false; it is not a native-workflow flag.
+        args = workflow.parse_args(['--root',str(root),
+            *(value for value in argv[1:] if value != '--no-generate')])
         workflow.apply_workflow_settings(args,settings)
+        _checked_one_click_args(args, root)
         contract = route_contract(vars(args))
         assert contract['creative_direction_id'] == checked['creative_direction']['direction_id']
         observed=[]
@@ -61,16 +68,15 @@ def main():
             assert run['generation_design']['design_origin'] == 'checked_local_creative_direction'
             raise RuntimeError('CPU fixture stops at actual model boundary')
         with patch('runtime_preflight.preflight_for_run',return_value={'status':'ready'}), \
-                patch.object(workflow,'generate_candidate',side_effect=producer), \
-                patch('beautygrpo_prepare.prepare_cached_for_workbench',return_value={
-                    'ok':True,'no_change':True,'result':None,'layer':None,
-                    'generation_inferences_this_attempt':0,'cache_hit':True}), \
+                patch.object(workflow,'_prepare_task_portrait_beauty',side_effect=producer), \
+                patch('reference_provider.request_edit',side_effect=AssertionError('Existing reference generated an image')), \
+                patch.object(workflow,'_prepare_task_boundary_light',side_effect=AssertionError('CPU boundary escaped')), \
                 patch('character_profile.analyze_character',side_effect=AssertionError('Unexpected external planning')):
             saved = workflow.create_run(args)
         assert observed == [checked['creative_direction']['prompt']]
         assert saved['status'] in {'blocked','failed'}
         assert saved['result_publication']['state']=='pending'
-        assert saved['generation_budget']['image_submissions']==1
+        assert saved['generation_budget']['image_submissions']==0
         copied=copy.deepcopy(saved)
         copied['task_plan']['image_budget']['regional_refinement']=1
         copied['options']['appearance_revision']={'design_reconstruction_plan':{'provenance':{
@@ -98,7 +104,7 @@ def main():
         assert copied['generation_budget']['regional_refinement_image_submissions']==1
         assert not copied['generation_budget']['regional_submission_count_uncertain']
     print(json.dumps({'ok':True,'HTTP_CLI_actual_producer_prompt_bound':True,
-        'no_external_planning':True,'failed_generation_not_published':True,
+        'no_external_planning':True,'failed_native_preparation_not_published':True,
         'regional_count_idempotent_and_bounded':True,'actual_model_submissions':0}))
 
 

@@ -1,6 +1,8 @@
 """One current diagnosis-bound CPU receiver repair and an owned native child."""
 from __future__ import annotations
 
+from runtime_resources import external_python_popen
+
 import copy
 import json
 import os
@@ -54,7 +56,7 @@ def prepare_receiver_detail(root, run, output, *, cancel=None):
                '--root', str(root), '--run', str(snapshot), '--output', str(output)]
     log = output/'receiver-detail.log'
     with log.open('ab') as stream:
-        process = subprocess.Popen(command, cwd=str(root), stdout=stream, stderr=subprocess.STDOUT,
+        process = external_python_popen(command, cwd=str(root), stdout=stream, stderr=subprocess.STDOUT,
             env={**os.environ, 'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'},
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         try:

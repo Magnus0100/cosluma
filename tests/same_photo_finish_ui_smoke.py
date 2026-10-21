@@ -31,32 +31,33 @@ def main():
         quick.task_mode.setCurrentIndex(quick.task_mode.findData('create_reference'))
         quick.brief.setText('冷蓝环境、明净肤色和清晰织纹；保留原片人物与场景结构')
         assert not window.creative_task_reference.text()
-        assert window.creative_task_payload()['constraints']['reference_role'] == 'source_conditioned_design'
+        assert 'reference_role' not in window.creative_task_payload()['constraints']
+        assert window.editing_request_payload()['work_type'] == 'partial_composite'
         assert 'regional_refinement' not in window.creative_task_payload()
         with patch('current_model_registry.registry_status', return_value=model_registry_fixture()), \
              patch('task_model_preflight.inspect_task_models', side_effect=model_capability_fixture), \
              patch.object(contract, '_services', side_effect=service_fixture), \
-             patch('reference_provider.provider_config', return_value={'kind': 'comfyui', 'registry_id': 'qwen_image_2_1_uncensored_fast'}), \
+             patch('reference_provider.provider_config', return_value={'kind': 'comfyui', 'registry_id': 'qwen_image_2_1'}), \
              patch('reference_provider.provider_health', return_value={'ready': True}):
             quick.check_plan_button.click(); source_task = window.pool.tasks[-1]
             assert source_task.path == '/api/tasks/plan' and not source_task.body.get('reference')
             source_checked = contract.plan_task(root, source_task.body)
             plan = source_checked['plan']
             assert plan['ready'] is True and set(plan['inputs']) == {'source'}
-            assert plan['intent']['constraints']['reference_role'] == 'source_conditioned_design'
+            assert 'reference_role' not in plan['intent']['constraints']
+            assert plan['editing_scope']['appearance_policy'] == 'permitted_regions_own_edited_appearance'
             assert plan['image_budget']['initial_reference'] == 1
-            assert all(value == 0 for key, value in plan['image_budget'].items() if key != 'initial_reference')
-            assert plan['reference_contract']['reference_binding'] == 'after_generation'
-            assert plan['reference_contract']['reference_sha256'] is None
-            assert plan['reference_contract']['texture_owner'] == 'source_native'
-            assert plan['reference_contract']['registration_status'] == 'not_checked'
+            assert plan['image_budget']['editing_refinement'] == 2
+            assert sum(plan['image_budget'].values()) == 3
+            assert 'reference_contract' not in plan
             source_task.signals.result.emit(source_checked)
             text = window.creative_plan_summary.toPlainText()
-            assert '不需要人工精修图作为输入' in text and '总上限：1' in text
+            assert '半合成' in text and '保持原片' in text and '总上限：3' in text
             assert '新增生图 0 次' not in text and '同照精修匹配意图' not in text
             quick.start_plan_button.click(); source_start = window.pool.tasks[-1]
             assert source_start.path == '/api/tasks/start' and not source_start.body.get('reference')
-            assert source_start.body['creative_task']['constraints']['reference_role'] == 'source_conditioned_design'
+            assert source_start.body['editing_request']['work_type'] == 'partial_composite'
+            assert 'reference_role' not in source_start.body['creative_task']['constraints']
             source_start.signals.error.emit('Captured source-only submission; no model or network run')
         quick.task_mode.setCurrentIndex(quick.task_mode.findData('existing_reference'))
         window.creative_task_reference.setText(str(reference))
@@ -143,7 +144,7 @@ def main():
         window.session_timer.stop(); window.close(); app.processEvents()
     print(json.dumps({'ok': True, 'shared_opt_in': True, 'zero_budget_captured_transport': True,
                      'source_owner_and_unchecked_registration_visible': True,
-                     'default_source_only_generation_budget_one': True, 'generated_reference_bound_after_generation': True}))
+                     'default_scoped_generation_with_conditional_budget': True, 'generated_appearance_owned_by_editing_scope': True}))
 
 
 if __name__ == '__main__': main()

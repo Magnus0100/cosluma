@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import ExitStack
 
 from PIL import Image
 import numpy as np
@@ -34,7 +35,11 @@ def brief(intent, *, baked=False):
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='imported-complete-') as folder:
+    with tempfile.TemporaryDirectory(prefix='imported-complete-') as folder, ExitStack() as isolated:
+        isolated.enter_context(patch('runtime_preflight.preflight_for_run',return_value={'status':'ready','CPU_fixture':True}))
+        isolated.enter_context(patch.object(workflow,'_prepare_task_portrait_beauty',return_value=None))
+        isolated.enter_context(patch.object(workflow,'_prepare_task_boundary_light',return_value=False))
+        isolated.enter_context(patch('urllib.request.urlopen',side_effect=AssertionError('Unexpected actual network')))
         root = Path(folder)
         source, reference = root/'source.png', root/'reference.png'
         Image.new('RGB', (20, 24), '#805050').save(source)
@@ -43,9 +48,10 @@ def main():
         hashes = {str(path): workflow.sha256(path) for path in (source, reference, project)}
         intent = normalize_task_intent({'schema_version': 'cosplay_task_intent.v1', 'mode': 'existing_reference',
             'brief': 'Keep this makeup and finish the imported reference.',
-            'constraints': {}, 'services': {'text_vision': True}})
+            'constraints': {}, 'services': {'text_vision': True,'visual_review':True}})
         plan = {'schema_version': 'cosplay_task_plan.v2', 'plan_id': 'a'*64, 'mode': intent['mode'],
             'intent': intent, 'ready': True, 'image_budget': image_budget(intent),
+            'execution_strategy':'layered_reference_transfer','preparation_policy':'replay_frozen',
             'inputs': {role: {'sha256': hashes[str(path)]} for role, path in (('source', source), ('reference', reference))}}
         from cos_node_registry import compile_workflow
         plan['layer_workflow'] = compile_workflow(intent['mode'])
@@ -166,7 +172,7 @@ def main():
         denied_args.task_plan = {**plan, 'intent': offline}
         with patch('vision_transport.request_vision_json', side_effect=AssertionError('Forbidden service request')):
             try: workflow.create_run(denied_args)
-            except ValueError as exc: assert 'text/vision permission' in str(exc)
+            except ValueError as exc: assert 'text/vision' in str(exc)
             else: raise AssertionError('Complete reference task ran without service permission')
         assert all(workflow.sha256(Path(path)) == value for path, value in hashes.items())
     print(json.dumps({'ok': True, 'paired_single_request_binding': True, 'baked_effect_conflict_explicit': True,

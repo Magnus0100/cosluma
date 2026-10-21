@@ -7,6 +7,8 @@ labels locate small native windows, not a claim of full-face or whole-image QA.
 """
 from __future__ import annotations
 
+from runtime_resources import external_python_run
+
 import hashlib
 import json
 import math
@@ -307,7 +309,7 @@ def _current_source_feature_observation(run, output, source_path, semantic, *, r
     directory = output/'source-feature-preparation'
     directory.mkdir()
     with (directory/'worker.log').open('wb') as log:
-        completed = subprocess.run([str(registry['python']), '-B', '-X', 'utf8',
+        completed = external_python_run([str(registry['python']), '-B', '-X', 'utf8',
             str(code_path('source_feature_observation_worker.py')), '--request', str(request_path),
             '--output', str(directory)], stdout=log, stderr=log, timeout=900,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),

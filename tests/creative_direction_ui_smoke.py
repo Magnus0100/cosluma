@@ -36,19 +36,25 @@ def main():
         quick.task_mode.setCurrentIndex(quick.task_mode.findData('create_reference'))
         assert window.character_name.text() == '祝小红' and window.creative_task_brief.toPlainText() == quick.brief.text()
         assert window.creative_task_payload()['constraints'] == {'background_mode':'enhance_source','preserve_background':False,
-            'no_effects':False,'reference_role':'source_conditioned_design'}
+            'no_effects':False}
         assert window.creative_task_payload()['brief']==quick.brief.text()
         window.preset.setCurrentIndex(window.preset.findData('stage_light'))
         assert 'refinement_profile' not in window.creative_task_payload()['constraints']
         window.preset.setCurrentIndex(window.preset.findData('source_refinement'))
-        assert not window.creative_text_vision.isEnabled() and not window.creative_text_vision.isChecked()
-        window.set_background_mode('replace'); assert window.creative_text_vision.isEnabled()
-        window.creative_text_vision.setChecked(True)
-        window.set_background_mode('enhance_source')
-        assert not window.creative_text_vision.isEnabled() and not window.creative_text_vision.isChecked()
+        assert not window.creative_text_vision.isEnabled() and window.creative_text_vision.isChecked()
+        controls = window.editing_scope_panels[-1]
+        controls['style'].setCurrentIndex(controls['style'].findData('dramatic'))
+        assert window.creative_task_payload()['constraints']['background_mode'] == 'enhance_source'
+        assert window.editing_request_payload()['target_setting'] == 'same'
+        assert window.creative_task_payload()['services']['text_vision'] is True
         # The display proxy is low resolution; native dimensions come only from source facts.
         window.result('source-preview', {'source':str(source), 'proxy_path':str(preview),'width':4688,'height':7028})
         assert window.source_native_size() == [4688,7028]
+        # The old manually boxed source-native regional tool remains available
+        # only for an imported reference, separate from scoped generation.
+        assert quick.regional.isHidden()
+        quick.task_mode.setCurrentIndex(quick.task_mode.findData('existing_reference'))
+        window.creative_task_reference.setText(str(reference))
         window.refresh_cos_workspace(); quick.regional.enabled.setChecked(True)
         for key, value in (('left',256),('top',512),('width',768),('height',768)):
             quick.regional.edits[key].setValue(value)
@@ -104,7 +110,7 @@ def main():
             window.refresh_cos_workspace()
             assert window.active_checked_task is None and '旧版本不会补写' in quick.direction_summary.text()
             # A different route never inherits an old positive regional budget.
-            for mode in ('existing_reference','local_portrait'):
+            for mode in ('local_portrait','existing_reference'):
                 window.creative_task_mode.setCurrentIndex(window.creative_task_mode.findData(mode))
                 payload = window.creative_task_request_options(mode)['creative_task']
                 assert not (payload.get('regional_refinement') or {}).get('maximum_submissions')
