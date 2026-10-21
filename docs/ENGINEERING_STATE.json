@@ -17,6 +17,7 @@
         "appearance_assets.py",
         "appearance_read_scope.py",
         "shaping_inspection.py",
+        "shaping_quality.py",
         "photo_shaping_tool.py",
         "photo_art_direction.py",
         "photo_edit_session.py",
@@ -43,7 +44,7 @@
         "visible creative benefit",
         "cross-image observations"
       ],
-      "next_action": "Finish one reversible-editing acceptance: use an existing saved result for one current checked zero-model restore, verify U, save/reopen/export and record actual latency. Current offline checks do not substitute for this real check. Do not start further cache, parser or shaping redesign before reporting that result. Preserve parent edits, original request budgets and unknown outcomes. Naturalness, real strength changes, HD, series consistency and current installation remain separate acceptance items. Existing user instructions and action restrictions govern any continuation."
+      "next_action": "Face shaping is now measured: on the real 662 U at amount .3 the shipped mapping produces forward singular strain [0.714, 2.026] because the 27.9 px outer ramp must host a 10.06 px target (needed 75.5 px); the mapping records that verdict as natural_strain_bound_met=false. Widening the inner band folds, widening only the outer band reaches [0.717, 1.207] but moves 1.8x more neighbourhood pixels, and forcing the whole field inside the bound drops the delivered delta to 7.7 px or less. Objective acceptance now exists in scripts/shaping_quality.py (six measured items, sealed report, artistic and human acceptance kept false); on that same U it reproduces the human complaint numerically: delivered narrowing 9.989 of 10.062 requested, zero changed pixels and zero delta-E outside the declared support, boundary seam ratio 0.996, but in-band high-frequency energy retention 0.792 below 0.80 and forward strain 0.714-2.026, so verdict fail on texture_retention and geometric_naturalness. Next: run one human same-viewport A/B of the shipped default against the widened-outer candidate on that U, then build a new field construction (thin-plate spline or harmonic/Poisson displacement with fixed feature anchors and a 0.8-1.25 forward-strain gate that rejects rather than reduces the requested amount). Only after that, run one real checked apply/strength/restore/save/reopen/export. No SOTA specialist model is obtainable here: MirrorPPR-Face is an exemplar-pair Qwen-Image-Edit diffusion with no Pro weights, no licence and an unreachable huggingface.co; DeepFaceReshaping remains an empty placeholder. Preserve parent edits, budgets and unknown outcomes; naturalness, HD, series consistency and installation remain separate acceptance items."
     },
     {
       "id": "model_specific_prompting",

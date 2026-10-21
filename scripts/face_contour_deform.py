@@ -24,7 +24,9 @@ from runtime_resources import code_path
 SCHEMA='cosluma_face_contour_mapping.v1'
 PARAMETERS={'face_grid_pitch':1.,'support_erosion':float(np.sqrt(2)+1),
     'minimum_component_gap':1.,'inward_gap_fraction':.6,'face_width_cap_fraction':.03,
-    'outward_gap_cap_fraction':.75,'chin_tanh_face_fraction':.2,
+    'outward_gap_cap_fraction':.75,'ramp_peak_derivative':1.5,
+    'forward_strain_min':.8,'forward_strain_max':1.25,
+    'chin_tanh_face_fraction':.2,
     'invalid_row_transition_face_fraction':.015,'interpolation':'bilinear_display_linear_RGB_and_G',
     'zero_policy':'exact_original_copy_without_interpolation'}
 ARRAYS=('displacement','protected','allowed','edit_support')
@@ -120,6 +122,18 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
     protected=planes['P'].copy();allowed=(planes['J']>0)
     reasons=Counter();counts=Counter();row_min=analytic_min=1.;max_row_change=0.;max_control=0.
     displacement=np.zeros(shape,np.float32)
+    # The user's strength selects one target narrowing. The admitted ramps must
+    # be wide enough to deliver it inside the checked forward-strain window: a
+    # smoothstep ramp of width w moving delta has peak |d'| = 1.5*delta/w, so the
+    # compressed inner ramp needs w >= 6*delta and the stretched outer ramp needs
+    # w >= 7.5*delta for forward strain in 0.8-1.25. These ratios are recorded as
+    # evidence; the measured field itself decides natural_strain_bound_met.
+    strain_min=float(PARAMETERS['forward_strain_min']);strain_max=float(PARAMETERS['forward_strain_max'])
+    if not 0<strain_min<1<strain_max:raise ValueError('Invalid face contour strain bound')
+    peak=float(PARAMETERS['ramp_peak_derivative'])
+    inner_ramp_ratio=peak*strain_min/(1-strain_min)
+    outer_ramp_ratio=peak*strain_max/(strain_max-1.)
+    target_delta=amount*float(PARAMETERS['face_width_cap_fraction'])*info['face_width']
     if amount:
         corners=np.asarray([[left,top],[right,top],[right,bottom],[left,bottom]],np.float64)
         projected=(corners-origin)@matrix;pitch=PARAMETERS['face_grid_pitch']
@@ -167,7 +181,7 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
                 if not isinstance(value,tuple):continue
                 inner,outer,c,inward,outward,taper,lateral=value
                 delta=min(amount*PARAMETERS['inward_gap_fraction']*inward,
-                    amount*PARAMETERS['face_width_cap_fraction']*info['face_width'],PARAMETERS['outward_gap_cap_fraction']*outward)
+                    target_delta,PARAMETERS['outward_gap_cap_fraction']*outward)
                 delta*=taper*lateral*tapers[side][row]
                 if delta<=0:continue
                 target=c-delta
@@ -184,8 +198,18 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
             x=xx+left-origin[0];y=yy+top-origin[1]
             q=(h[0]*x+h[1]*y-q0)/pitch;v=(vertical[0]*x+vertical[1]*y-v0)/pitch
             displacement[row:stop]=map_coordinates(face,[v,q],order=1,prefilter=False,mode='constant',cval=0.)
-    stats={**_jacobian(displacement,h,cancel=cancel),'face_grid_minimum_q_derivative':row_min,
+    jacobian=_jacobian(displacement,h,cancel=cancel)
+    stats={**jacobian,'face_grid_minimum_q_derivative':row_min,
         'analytic_scanline_minimum_q_derivative':analytic_min,'maximum_adjacent_face_row_change':max_row_change,
+        'target_delta':float(target_delta if amount else 0.),
+        'required_inner_ramp':float(inner_ramp_ratio*target_delta),'required_outer_ramp':float(outer_ramp_ratio*target_delta),
+        'admitted_inner_band':float(info['inner_width']),'admitted_outer_band':float(info['outer_width']),
+        'strain_bound':[strain_min,strain_max],
+        'sampling_jacobian_bound':[1./strain_max,1./strain_min],
+        'forward_strain_min':float(1./jacobian['jacobian_max']),
+        'forward_strain_max':float(1./jacobian['jacobian_min']),
+        'natural_strain_bound_met':bool(amount==0 or (jacobian['jacobian_min']>=1./strain_max
+            and jacobian['jacobian_max']<=1./strain_min)),
         'maximum_control_delta':max_control,'maximum_displacement':float(np.abs(displacement).max(initial=0)),
         'modified_native_pixels':int(np.count_nonzero(displacement)),
         'invalid_scanline_reasons':dict(reasons),'control_counts':dict(counts),
@@ -233,6 +257,12 @@ def _validate_structure(mapping,*,cancel=None):
     actual=_jacobian(d,h,cancel=cancel)
     if actual['jacobian_min']<=0 or any(mapping['stats'].get(key)!=value for key,value in actual.items()):
         raise ValueError('Face contour map folds or its checked Jacobian evidence changed')
+    strain_min=float(PARAMETERS['forward_strain_min']);strain_max=float(PARAMETERS['forward_strain_max'])
+    if mapping['stats'].get('strain_bound')!=[strain_min,strain_max]:
+        raise ValueError('Face contour map lost its checked forward-strain bound')
+    inside=actual['jacobian_min']>=1./strain_max-1e-9 and actual['jacobian_max']<=1./strain_min+1e-9
+    if mapping['stats'].get('natural_strain_bound_met') is not (bool(inside) or amount==0):
+        raise ValueError('Face contour naturalness verdict differs from its actual field')
     if mapping['producer']!=producer_identity() or mapping['parameters']!=PARAMETERS:
         raise ValueError('Face contour producer or fixed strategy changed')
     check=dict(mapping);_seal(check)

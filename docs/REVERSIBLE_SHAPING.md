@@ -2,6 +2,8 @@
 
 形体调整是已保存成片上的独立可选操作，默认关闭。风格、Beauty 强度、重光照和普通反馈不会开启它。当前合同允许选择脸部、腰部、手臂和腿部及各自请求幅度；模型无法从成片明确识别所选部位时应停止，不猜测画外身体。幅度是编辑请求，不是人体测量。
 
+对于合成作品，先完成合成、调色、调光及人物环境融合，再保存成片并进入形体调整；U 指这张成片。塑形后复核已成立的受光、脸颈与头发过渡、衣物和背景线条。后续上游编辑产生的新成片需要新的塑形组与 U，不在旧形变结果上累积。当前普通反馈与形体结果的互操作边界仍见下文。
+
 ## 操作与可复核结果
 
 1. 打开完整保存的成片，选择部位和幅度，检查任务，再计算候选。脸部单独使用确定性轮廓形变，零次生图；身体局部编辑至多提交一张图像。两者均至多三次视觉观察；规划不执行定位或像素计算。
@@ -23,6 +25,7 @@
 当前形体结果支持改力度、恢复和导出；普通反馈继续编辑尚未支持，界面与规划均明确拒绝。恢复只证明像素复用，不伪造新的独立审片，也不承诺恢复后立即具备普通反馈资格。形体后的其它编辑互操作仍待完成。
 
 几何保护精确不等于自然塑形；固定映射仍可能在头发、脸颈或遮挡处产生不自然的轮廓。局部完成与整图达标也不同；当前发布合同仍要求原质量轴及形体目标全部通过，不能用局部变化抹去母版已存在的整体光照问题。旧脸部生成路线已由几何操作替代，历史失败图片与费用保持原记录。
+当前脸部映射把整段收窄压在外侧 2.5% 脸宽过渡带里，因此局部前向形变超出可称自然的范围：真实 662 U、amount=.3、最大控制位移 9.99 原生像素时，实测前向奇异应变 [0.714, 2.026]，最坏处约 2.0 倍横向拉伸，正对应此前独立观察到的耳坠旁暗影变宽与细发被横向拖展。映射现在把该判定写成证据：stats 记录 target_delta、required_inner_ramp／required_outer_ramp、admitted_inner_band／admitted_outer_band、forward_strain_min／forward_strain_max 与 natural_strain_bound_met（阈值取 forward_strain_min／forward_strain_max 参数，默认 0.8／1.25）。这只是记录与自校验，不是自然度通过；当前构造在该真值样本上判为未达标。实测把**内**侧准入带加宽（0.26／0.20、0.18／0.12 及多组过渡带宽度）会在行方向产生跳变并折返（负 Jacobian），不可用；只加宽**外**侧过渡带不折返，可把最坏拉伸从 2.03 降到约 1.21（外带 0.09、包络 0.11，位移与力度不变），代价是邻域参与像素由约 13.8 万增到约 25.5 万；该候选仍因内侧过渡带在单行处的压缩（前向 0.717）未进 0.8–1.25，且尚未做人工同视口复核，因此本轮不设为默认。逐行把过渡带宽压到可容的极值（增大弧端 taper 到 .5 以上）可让整场进入 [0.83,1.10]，但最大控制位移会从 9.99 掉到 7.74 以下，等于把用户请求的力度悄悄缩小，违反本文件关于不得以缩 amount 换通过的要求，故不采用。因此下一步是新的形变场构造（薄板样条或调和位移场，把 0.8–1.25 前向应变写成准入门限并按目标位移求解），而不是继续调这两个宽度参数。
 
 原生源、生成及显影资产仍由当前 `photo_appearance` 创建和校验；几何资产使用独立的 `cosluma_geometric_appearance.v1`。统一 `appearance_assets` IO 按严格类型分派，当前结果唯一指针仍是 `options.photo_appearance`。新增几何操作不改写 U 的发行者或 receipt；原生真实算法变更仍按其 producer 合同使相应旧输入失效，不使用旧 SHA 例外或旧执行器。
 
@@ -46,4 +49,21 @@ restore 附加 `shaping_request={"action":"restore"}`，两项服务均为 false
 
 持久状态只在 `options.shaping_state`，当前像素仍唯一由 `options.photo_appearance` 选择。发布父 A 与实际输入 U 分别绑定，不修改旧 producer、receipt 或授权身份。已启用的当前资产必须是真实从 U 产生的区域候选。
 
-行为检查：`tests/run.py photo_shaping photo_shaping_geometry face_contour_deform geometric_appearance appearance_read_scope appearance_proof_cache face_shaping_preflight shaping_portable shaping_ui shaping_inspection_ui saved_result_selection`。这些使用真实规划、几何、采样、会话、像素、Qt信号和保存路径，只模拟模型边界。CPU 数学验证保存的形变资产不属于定位或生成模型调用，恢复输出始终直接选择原 U。
+行为检查：`tests/run.py photo_shaping photo_shaping_geometry face_contour_deform geometric_appearance appearance_read_scope appearance_proof_cache face_shaping_preflight shaping_portable shaping_ui shaping_inspection_ui shaping_quality saved_result_selection`。这些使用真实规划、几何、采样、会话、像素、Qt信号和保存路径，只模拟模型边界。CPU 数学验证保存的形变资产不属于定位或生成模型调用，恢复输出始终直接选择原 U。
+
+## 客观验收度量
+
+`scripts/shaping_quality.py` 把当前修图评测共识落成可复算的六项度量，全部由一次受检映射和它产生的像素算出：不调用模型、不写工程、不产生新的授权。
+
+| 项目 | 量什么 | 判定 |
+|---|---|---|
+| target_attainment | 请求位移与实际最大控制位移（力度是否真的交付） | 交付/请求 ≥ 0.90 |
+| untouched_regions | 编辑支持域之外是否出现任何改变像素 | 硬门：域外改变像素必须为 0；amount 0 时必须零改动 |
+| texture_retention | 支持域内高频能量保留率（重采样是否抹平纹理） | ≥ 0.80 |
+| tonal_neutrality | 支持域外 ΔE（几何重采样不该改色）；域内亮度变化只记录不判定 | 域外 ΔE 必须为 0 |
+| boundary_seam | 边界梯度与未触碰环带梯度之比 | ≤ 1.6 |
+| geometric_naturalness | 前向应变是否在 0.8–1.25、相邻行跳变 | 应变在窗内且行跳变 ≤ 1 px |
+
+同一张真实 662 U（amount 0.3）实测：力度交付 9.989/10.062=0.993，域外改动 0 像素、域外 ΔE 0，接缝比 0.996，但支持域高频能量保留 **0.792 < 0.80**、前向应变 **0.714–2.026** → `verdict=fail`（`texture_retention`、`geometric_naturalness`）。amount 0 时六项全过且像素零改动。
+
+报告 schema `cosluma_shaping_quality.v1` 自带 `report_sha256`、`verdict`、`failed_items`，并显式保留 `artistic_acceptance=false`、`human_acceptance=false`、`model_inferences=0`；度量通过不等于艺术或人工接受，也不替代同视口 A/B。

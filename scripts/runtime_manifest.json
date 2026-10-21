@@ -180,6 +180,7 @@
     "scoped_workflow.py",
     "session_draft.py",
     "shaping_inspection.py",
+    "shaping_quality.py",
     "simple_cos_workspace.py",
     "single_source_workflow.py",
     "skin_illumination.py",

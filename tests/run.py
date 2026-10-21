@@ -24,7 +24,7 @@ INTEGRATION = (
     'photo_development_product', 'photo_source_session', 'photo_session_evidence',
     'photo_session_review', 'photo_shaping', 'face_contour_deform', 'geometric_appearance',
     'appearance_proof_cache', 'geometric_consumers', 'face_shaping_preflight', 'shaping_portable',
-    'shaping_ui', 'shaping_inspection_ui', 'generated_appearance_render',
+    'shaping_ui', 'shaping_inspection_ui', 'shaping_quality', 'generated_appearance_render',
     'generated_appearance_portable', 'generated_appearance_ui', 'photo_session_decision',
     'photo_request_budget', 'photo_edit_tools', 'photo_edit_iteration', 'photo_edit_finish',
     'photo_edit_autofinish', 'autofinish_ui_graph', 'generated_appearance_selection',
