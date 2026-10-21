@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from time import perf_counter
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +120,10 @@ def main(argv=None):
     env.setdefault('OPENBLAS_NUM_THREADS', '1')
     env.setdefault('OMP_NUM_THREADS', '1')
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+    # Windows runners may expose TEMP through a short name or junction. Use
+    # the same canonical directory as production path validation in children.
+    temporary = str(Path(tempfile.gettempdir()).resolve())
+    env.update(TEMP=temporary, TMP=temporary, TMPDIR=temporary)
     for name, path in zip(names, paths):
         print('Running ' + path.name, flush=True)
         python = str(args.model_python.resolve()) if name in MODEL_CHECKS else sys.executable
