@@ -6,11 +6,11 @@
 
 面向 Windows 的 Cos 后期工作台：从原图出发，按精修、半合成或大合成目标设计照片，处理人物、场景与角色氛围。快速制作和专业画布共用同一任务入口、资产与工程。
 
-**下载 0.7.0 预览版：** [Windows x64 完整程序 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/cosplay-workbench-0.7.0-windows-x64.zip) · [对应源码 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/cosplay-workbench-0.7.0-source.zip) · [SHA-256 校验](https://github.com/Magnus0100/cosluma/releases/download/v0.7.0/SHA256SUMS.txt)。
+**下载 0.7.1 正式版：** [Windows x64 完整程序 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.1/cosplay-workbench-0.7.1-windows-x64.zip) · [对应源码 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.1/cosplay-workbench-0.7.1-source.zip) · [SHA-256 校验](https://github.com/Magnus0100/cosluma/releases/download/v0.7.1/SHA256SUMS.txt)。
 
-普通用户完整解压后双击 `cosplay-workbench.exe`；模型权重和推理运行环境需按安装指南另行配置。开发者可克隆仓库或下载对应源码。此版本用于预览，跨图画质、塑形自然度和完整安装工作流仍待验收。
+普通用户完整解压后双击 `cosplay-workbench.exe`；模型权重和推理运行环境需按安装指南另行配置。开发者可克隆仓库或下载对应源码。本次正式分发面向独立桌面程序。可选形体调整仍为实验功能；跨图自然度、高清和同场一致性尚未完成产品验收，AI 成片须逐张检查。
 
-当前源码版本为 `0.7.0`。项目提供桌面界面、CLI 和本机 HTTP 接口，已接通原片浮点基线、摄影显影与模型工具选择。已安装程序的代码身份、实际模型效果和跨图片质量须分别验收；本地模型和生成服务单独配置。
+当前源码版本为 `0.7.1`。项目提供桌面界面、CLI 和本机 HTTP 接口，已接通原片浮点基线、摄影显影与模型工具选择。已安装程序的代码身份、实际模型效果和跨图片质量须分别验收；本地模型和生成服务单独配置。
 
 当前 AI 制作流程：原片观察与设计 → 原生浮点基线 → 模型选择摄影/局部/整体编辑工具 → 独立审片与有界改进 → 保存与导出。制作范围与风格分别选择，默认在原场地内半合成。普通原片与导入参考的有效图层工具按任务启用。
 

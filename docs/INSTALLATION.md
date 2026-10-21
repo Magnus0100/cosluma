@@ -23,7 +23,7 @@ $workspace = Join-Path $env:USERPROFILE 'CosplayWorkbench\workspace'
 
 独立“研究角色并准备提示词”和旧自动数值光色规划入口已删除。当前原图观察与设计在已检查任务内执行；显式角色识别仍须当前计划与外发许可。保存的实际提示词和设计只读展示，不注入下一任务，也不因此额外研究或生图。已有参考可显式启用成对观察，仍不授予新图像额度。
 
-Windows 预览版程序和对应源码见 [GitHub Release](https://github.com/Magnus0100/cosluma/releases/tag/v0.7.0)。普通用户下载 `windows-x64.zip`，完整解压后双击 EXE；开发者可克隆源码并按[开发指南](DEVELOPMENT.md)构建。程序包不包含 AI 模型和模型专用运行环境。
+Windows 正式版程序和对应源码见 [GitHub Release](https://github.com/Magnus0100/cosluma/releases/tag/v0.7.1)。普通用户下载 `windows-x64.zip`，完整解压后双击 EXE；开发者可克隆源码并按[开发指南](DEVELOPMENT.md)构建。程序包不包含 AI 模型和模型专用运行环境。
 
 ## 从源码运行
 

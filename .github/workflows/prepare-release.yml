@@ -38,7 +38,7 @@ jobs:
       - name: Build and verify frozen Debug and Release
         shell: pwsh
         run: |
-          & "$env:RUNNER_TEMP/cosplay-source/scripts/package_windows.ps1" -PythonExecutable (Get-Command python).Source -SmokeRoot "$env:RUNNER_TEMP/cosplay-smoke" -DistPath "$env:RUNNER_TEMP/cosplay-dist" -WorkPath "$env:RUNNER_TEMP/cosplay-build"
+          & "$env:GITHUB_WORKSPACE/scripts/package_windows.ps1" -PythonExecutable (Get-Command python).Source -SmokeRoot "$env:RUNNER_TEMP/cosplay-smoke" -DistPath "$env:RUNNER_TEMP/cosplay-dist" -WorkPath "$env:RUNNER_TEMP/cosplay-build"
       - name: Assemble and verify release assets
         shell: pwsh
         run: |

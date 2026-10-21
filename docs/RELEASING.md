@@ -4,7 +4,7 @@
 
 ## 准备交付
 
-按 [开发指南](DEVELOPMENT.md) 导出清洁源码，从该目录构建 Debug 和 Release，再用 `assemble_windows_release.py` 生成发布资产。工具自动核验源码、许可、全部当前运行模块、逐文件身份、ZIP 成员和 SHA-256；失败时不交付。
+按 [开发指南](DEVELOPMENT.md) 准备清洁公开 checkout，导出独立的冻结源码，从同一提交的 checkout 构建 Debug 和 Release，再用 `assemble_windows_release.py` 将冻结源码与程序组成发布资产。构建缓存留在 checkout，冻结源码目录保持不变。工具自动核验源码、许可、全部当前运行模块、逐文件身份、ZIP 成员和 SHA-256；失败时不交付。
 
 GitHub 中可手动运行 `Prepare release assets` 工作流。它在 Windows 上安装固定依赖、导出清洁源码，执行当前基础行为检查，构建并启动检查 Debug/Release，然后上传成套资产。工作流仅生成下载产物；发布由维护者在 GitHub 中完成。
 
