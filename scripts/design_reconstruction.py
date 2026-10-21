@@ -722,8 +722,40 @@ def _apply_native_plan(source_linear,plan,geometry,run,include_optics):
                     'error': str(exc)[:500]}
         else:
             candidate_subject_light_execution['bypass_reason'] = 'candidate_reference_or_occupancy_missing'
-        environment_gain, environment_light_execution = estimate_environment_light(
-            background, background_validity, alpha)
+        # The photographed environment the design plate replaces is the anchor
+        # of the joint light solve. Without it a whole-scene level change is
+        # normalised away and the subject keeps an exposure its surroundings no
+        # longer have: measured on the 20261020 reference run the subject/
+        # environment ratio was 8.3434 against a 5.5994 source when only the
+        # local field was solved. It is the plan's own immutable paired source
+        # asset, re-sampled here so the design stages above cannot have altered
+        # the anchor, and it is never candidate subject RGB.
+        try:
+            environment_reference = sample_asset(
+                assets['old_environment'],'values',full_box,size)
+            reference_bypass = None
+        except (KeyError,ValueError,OSError) as exc:
+            environment_reference = None
+            reference_bypass = 'source_environment_unavailable: '+str(exc)[:200]
+        try:
+            environment_gain, environment_light_execution = estimate_environment_light(
+                background, background_validity, alpha,
+                source_environment=environment_reference)
+        except (ValueError,TypeError) as exc:
+            if environment_reference is None:
+                raise
+            # An anchor this run cannot support must not change the delivered
+            # pixels silently: fall back to the local solve and record why.
+            environment_reference = None
+            reference_bypass = 'source_environment_rejected: '+str(exc)[:200]
+            environment_gain, environment_light_execution = estimate_environment_light(
+                background, background_validity, alpha)
+        environment_light_execution.update(
+            source_environment_supplied=environment_reference is not None,
+            source_environment_asset=((assets.get('old_environment') or {}).get('sha256')
+                if environment_reference is not None else None),
+            source_environment_bypass_reason=reference_bypass)
+        del environment_reference
         foreground = apply_environment_light(foreground, environment_gain, alpha)
     else:
         environment_light_execution = {'schema': 'source_environment_light.v1',

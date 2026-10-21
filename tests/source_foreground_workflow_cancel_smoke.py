@@ -1,4 +1,9 @@
-"""Real SourceFG handoff cancellation reaches the workflow without a plan/save."""
+"""Real SourceFG handoff cancellation reaches the workflow without a plan/save.
+
+A cancelled run publishes nothing, so it must not become the project's latest
+saved result: the cancelled status stays in the run manifest and the timing
+report while project.json keeps the workspace-initialized state.
+"""
 from __future__ import annotations
 
 import argparse
@@ -169,7 +174,22 @@ def exercise(root, mode, caller, native):
                 assert run['status'] == 'cancelled' and run['next_action'] == 'retry_when_ready'
                 saved = workflow.read_json(root/run['manifest'])
                 assert saved['status'] == 'cancelled' and 'error' not in saved
-                assert workflow.read_json(root/'project.json')['state']['status'] == 'cancelled'
+                # A cancelled run publishes nothing, so it must not become the
+                # project's latest saved result: project.json keeps the
+                # workspace-initialized state and records no run pointer, while
+                # the cancelled status stays in the run manifest and the timing
+                # report (AGENTS.md: cancellation preserves the parent and the
+                # current edits).  The previous assertion here described the
+                # pre-192ebdf semantics and was never wired into a suite.
+                project = workflow.read_json(root/'project.json')
+                publication = saved['result_publication']
+                assert publication['state'] == 'pending', publication
+                assert publication['scope'] == 'checked_production', publication
+                assert publication['run_id'] == run['run_id'] and not publication.get('committed_at')
+                assert (saved.get('options') or {}).get('preserve_project_selection') is not True
+                assert project['state']['status'] == 'initialized'
+                assert project['state']['status'] != saved['status']
+                assert 'last_source_only_run' not in project['state']
                 assert run['generation_budget']['image_submissions'] == 0
                 assert not run.get('auto_draft') and not run.get('artifacts')
                 assert not (run['options'].get('appearance_revision') or {}).get('design_reconstruction_plan')
@@ -292,6 +312,7 @@ def main():
         'caller_sees_WorkflowCancelled_and_saved_workflow_status_cancelled': True,
         'cancel_before_SourceFG_starts_no_worker': True,
         'no_plan_foreground_or_render_output_published': True,
+        'cancelled_run_does_not_take_over_project_state': True,
         'actual_owned_native_worker_terminated': args.native,
         'forced_close_and_exact_owned_launcher_payload_no_orphan': True,
         'cleanup_failure_preserves_primary_and_resets_session': True,

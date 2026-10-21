@@ -430,9 +430,21 @@ class ProductionJoinTests(unittest.TestCase):
         coverage[self.top:self.bottom, self.left:self.right] = mask
         return result, coverage
 
-    def joined(self, patch, alpha=None):
+    def joined(self, patch, alpha=None, subject=None, subject_only=False):
         return photo_edit_tools.fuse_region(self.parent, patch, alpha, core=list(self.CORE),
-            box=[0, 0, self.SHAPE[1], self.SHAPE[0]])
+            box=[0, 0, self.SHAPE[1], self.SHAPE[0]], subject=subject, subject_only=subject_only)
+
+    def matte(self, centre=(576., 400.), radii=(220., 160.), softness=0.04, shape=None):
+        """A silhouette-shaped subject weight with a real transition around it."""
+        shape = shape or self.SHAPE
+        yy, xx = np.indices(shape, np.float32)
+        inside = 1.-(((xx-centre[0])/radii[0])**2+((yy-centre[1])/radii[1])**2)
+        return np.clip(inside/np.float32(softness), 0., 1.).astype(np.float32)
+
+    def core_mask(self):
+        mask = np.zeros(self.SHAPE, bool)
+        mask[self.top:self.bottom, self.left:self.right] = True
+        return mask
 
     @staticmethod
     def _luma(values):
@@ -711,6 +723,229 @@ class ProductionJoinTests(unittest.TestCase):
         low = gaussian_filter(self._luma(soft[0][top:bottom, left:right])
             -self._luma(self.parent[top:bottom, left:right]), 8., mode='nearest')
         self.assertLessEqual(float(np.median(np.abs(low[closed]))), .01)
+
+    def test_the_subject_matte_owns_the_boundary_instead_of_the_rectangle(self):
+        """A person-only round: the write itself ends where the person ends."""
+        matte = self.matte()
+        kept = matte.copy()
+        tinted = np.clip(self._region(self.parent)*np.asarray([1.6, 1.5, 1.4], np.float32),
+            0., 1.).astype(np.float32)
+        result, coverage, record = self.joined(self._replace(tinted), subject=matte, subject_only=True)
+        self.assertTrue(np.array_equal(matte, kept))
+        subject = record['subject']
+        self.assertEqual(subject['boundary_source'], 'subject_matte_edge')
+        self.assertEqual(subject['write_boundary'], 'subject_matte_edge')
+        self.assertEqual(subject['ownership'], 'subject_generated_scene_retained')
+        self.assertTrue(subject['subject_only_round'])
+        self.assertEqual(record['mode'], 'registered_photographic_join')
+        self.assertEqual(record['analysis_domain'], 'unpremultiplied_provider_colour')
+        self.assertTrue(record['alpha_in_destination_only'])
+        self.assertEqual(record['tone_correction_interior_max'], 0)
+        self.assertTrue(subject['membrane_gated_on_silhouette'])
+        scene = matte <= np.float32(photo_edit_tools.SUBJECT['soft_low'])
+        self.assertGreater(int(np.count_nonzero(scene & self.core_mask())), 10000)
+        # The retained scene keeps the parent's own bytes: the rectangle's
+        # generated shell inside the core is exactly what made the halo.
+        self.assertEqual(int(np.count_nonzero(coverage[scene])), 0)
+        self.assertTrue(np.array_equal(result[scene], self.parent[scene]))
+        # The subject is written with the provider's own content.
+        deep = (matte >= np.float32(.999)) & self.core_mask()
+        self.assertGreater(int(np.count_nonzero(deep)), 10000)
+        self.assertGreaterEqual(float(coverage[deep].min()), .999)
+        self.assertGreater(float(np.abs(result[deep]-self.parent[deep]).max()), 1e-3)
+        # Coverage is still bounded edit permission: nothing outside the core.
+        self.assertEqual(int(np.count_nonzero(coverage[~self.core_mask()])), 0)
+        # The transition sits on the silhouette, not on the box.
+        self.assertGreater(subject['join_band_on_silhouette_fraction'], .5)
+        self.assertGreater(subject['written_fraction_of_core'], .05)
+        self.assertLess(subject['written_fraction_of_core'], .95)
+        self.assertAlmostEqual(subject['written_fraction_of_core']
+            +subject['retained_scene_fraction_of_core'], 1., places=4)
+        self.assertGreaterEqual(subject['edge_width_px'],
+            float(photo_edit_tools.FUSION['minimum_taper_px']))
+        self.assertLessEqual(subject['edge_width_px'],
+            float(photo_edit_tools.SUBJECT['maximum_edge_width_px']))
+        self.assertLess(subject['taper_px']['minimum'], subject['taper_px']['maximum'])
+
+    def test_the_edit_coverage_cannot_stand_in_for_a_subject_matte(self):
+        """Permission is not segmentation: the reserved box and the coverage are refused."""
+        for name, value in (('whole canvas', np.ones(self.SHAPE, np.float32)),
+                ('reserved box', box_mask(self.CORE, self.SHAPE)),
+                ('labels', np.zeros(self.SHAPE, np.int32)),
+                ('wrong canvas', np.ones((64, 64), np.float32)),
+                ('out of range', np.full(self.SHAPE, 1.5, np.float32)),
+                ('empty', np.zeros(self.SHAPE, np.float32))):
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    self.joined(self.patch, subject=value)
+
+    def test_an_authorized_core_without_the_subject_keeps_the_reserved_write(self):
+        """A core in the scene has no subject boundary to own, and says so."""
+        far = self.matte(centre=(80., 80.), radii=(60., 60.))
+        self.assertEqual(int(np.count_nonzero((far >= np.float32(.5)) & self.core_mask())), 0)
+        plain = self.joined(self.patch)
+        clipped = self.joined(self.patch, subject=far)
+        self.assertEqual(clipped[2]['subject']['boundary_source'], 'authorized_core_without_subject')
+        self.assertEqual(clipped[2]['subject']['ownership'], 'authorized_core_written_as_reserved')
+        self.assertTrue(np.array_equal(clipped[0], plain[0]))
+        self.assertTrue(np.array_equal(clipped[1], plain[1]))
+
+    def test_the_rectangle_shell_is_gone_once_the_subject_owns_the_boundary(self):
+        """The shell the audit measures is the generated band inside the box edge."""
+        from float_appearance import linear_to_srgb
+        local = np.clip(self._region(self.parent)*np.asarray([.55, .60, .50], np.float32),
+            0., 1.).astype(np.float32)
+        patch = self._replace(local)
+        matte = self.matte()
+        far = photo_edit_tools._edge_distance((self.right-self.left, self.bottom-self.top))
+        shell = (far >= 1.) & (far <= 16.)
+        prior_smooth = gaussian_filter(self._luma(self.parent), 3., mode='nearest')
+
+        def shell_step(values):
+            delivered = gaussian_filter(self._luma(values), 3., mode='nearest')
+            return float(np.median(np.abs(delivered[self.top:self.bottom, self.left:self.right][shell]
+                - prior_smooth[self.top:self.bottom, self.left:self.right][shell])))
+
+        def halo(values, coverage):
+            encode = lambda data: np.uint8(np.clip(np.asarray(linear_to_srgb(
+                np.asarray(data, np.float32)), np.float32), 0., 1.)*255.+.5)
+            report = quality.validate(quality.measure(encode(self.parent), encode(values),
+                work_type='partial_composite', coverage=coverage, region=list(self.CORE),
+                label='subject-boundary'))
+            return report['items']['boundary_halo']
+
+        before = self.joined(patch)
+        after = self.joined(patch, subject=matte, subject_only=True)
+        # Before, the band inside the cut is the provider's own darkened scene:
+        # one gain cannot tell the scene from the subject across that cut, so
+        # this is the low-frequency shell the audit measures on real cases.
+        band = slice(self.top, self.bottom), slice(self.left, self.right)
+        self.assertGreater(float(before[1][band][shell].min()), 0.)
+        self.assertGreater(float(np.abs(before[0][band][shell]
+            -self.parent[band][shell]).max()), 1e-3)
+        # After, the scene inside the reserved box that the subject does not own
+        # keeps the parent's own bytes, so there is no shell to measure at all.
+        self.assertEqual(float(after[1][band][shell].max()), 0.)
+        self.assertEqual(shell_step(after[0]), 0.)
+        former, current = halo(before[0], before[1]), halo(after[0], after[1])
+        self.assertTrue(former['applicable'])
+        self.assertLessEqual(current['halo_width'], former['halo_width'])
+        self.assertLess(current['halo_width'], PARAMETERS['halo_width_max']+1)
+        self.assertLess(current['visible_excess'], PARAMETERS['halo_visible'])
+
+    def test_an_authorized_scene_round_writes_the_scene_side_of_the_core(self):
+        """A scene operation authorizes the scene side: it is written, not handed back."""
+        matte = self.matte()
+        tinted = np.clip(self._region(self.parent)*np.asarray([1.6, 1.5, 1.4], np.float32),
+            0., 1.).astype(np.float32)
+        patch = self._replace(tinted)
+        result, coverage, record = self.joined(patch, subject=matte)
+        subject = record['subject']
+        # The default is the authorized core written as reserved; the matte
+        # shapes the transition and the light solve, it does not discard content.
+        self.assertEqual(subject['boundary_source'], 'authorized_rectangle')
+        self.assertEqual(subject['write_boundary'], 'authorized_rectangle')
+        self.assertEqual(subject['transition_boundary'], 'subject_matte_edge')
+        self.assertEqual(subject['ownership'], photo_edit_tools.SUBJECT['default_write'])
+        self.assertFalse(subject['subject_only_round'])
+        scene = matte <= np.float32(photo_edit_tools.SUBJECT['soft_low'])
+        self.assertGreater(int(np.count_nonzero(scene & self.core_mask())), 10000)
+        self.assertGreaterEqual(subject['scene_side_written_fraction'], .99)
+        self.assertGreater(subject['written_fraction_of_core'], .99)
+        # The scene side inside the core is delivered content, and it is the
+        # provider's, not the parent's bytes.
+        far = photo_edit_tools._edge_distance((self.right-self.left, self.bottom-self.top))
+        interior = np.zeros(self.SHAPE, bool)
+        interior[self.top:self.bottom, self.left:self.right] = (far
+            > np.float32(photo_edit_tools.FUSION['maximum_taper_px']+2.))
+        deep = scene & self.core_mask() & interior
+        self.assertGreater(int(np.count_nonzero(deep)), 10000)
+        self.assertGreaterEqual(float(coverage[deep].min()), .999)
+        self.assertGreater(float(np.abs(result[deep]-self.parent[deep]).max()), 1e-3)
+        # The subject is written too, and the transition still follows the matte.
+        owned = (matte >= np.float32(.999)) & self.core_mask() & interior
+        self.assertGreater(int(np.count_nonzero(owned)), 10000)
+        self.assertGreaterEqual(float(coverage[owned].min()), .999)
+        self.assertLess(subject['taper_px']['minimum'], subject['taper_px']['maximum'])
+        # Coverage is still bounded edit permission: nothing outside the core.
+        self.assertEqual(int(np.count_nonzero(coverage[~self.core_mask()])), 0)
+        self.assertTrue(np.array_equal(result[coverage == 0], self.parent[coverage == 0]))
+
+    def test_only_the_person_only_round_narrows_the_write_to_the_subject(self):
+        """Same matte, same patch: the round's authorization decides the scene side."""
+        matte = self.matte()
+        tinted = np.clip(self._region(self.parent)*np.asarray([1.6, 1.5, 1.4], np.float32),
+            0., 1.).astype(np.float32)
+        patch = self._replace(tinted)
+        scene = matte <= np.float32(photo_edit_tools.SUBJECT['soft_low'])
+        authorized = self.joined(patch, subject=matte)
+        narrowed = self.joined(patch, subject=matte, subject_only=True)
+        self.assertGreater(int(np.count_nonzero(authorized[1][scene])), 10000)
+        self.assertEqual(int(np.count_nonzero(narrowed[1][scene])), 0)
+        self.assertGreater(float(np.abs(authorized[0][scene]-self.parent[scene]).max()), 1e-3)
+        self.assertTrue(np.array_equal(narrowed[0][scene], self.parent[scene]))
+        self.assertGreater(authorized[2]['subject']['written_fraction_of_core'],
+            narrowed[2]['subject']['written_fraction_of_core'])
+        self.assertEqual(narrowed[2]['subject']['scene_pixels_written'], 0)
+        self.assertGreaterEqual(authorized[2]['subject']['scene_pixels_written'],
+            int(.99*authorized[2]['subject']['scene_pixels']))
+        # The matte is not the permission: both arms stay inside the authorized core.
+        for _, coverage, _ in (authorized, narrowed):
+            self.assertEqual(int(np.count_nonzero(coverage[~self.core_mask()])), 0)
+
+    def test_the_receipt_takes_its_boundary_from_the_join_that_wrote_it(self):
+        """A stale rectangle declaration cannot stand in for the written boundary."""
+        matte = self.matte()
+        tinted = np.clip(self._region(self.parent)*np.asarray([1.6, 1.5, 1.4], np.float32),
+            0., 1.).astype(np.float32)
+        patch = self._replace(tinted)
+
+        def declaration():
+            return {'schema': photo_edit_tools.SUBJECT['schema'], 'available': True,
+                'boundary_source': 'authorized_rectangle',
+                'ownership': 'authorized_core_written_as_reserved',
+                'authoritative': 'pre_join_declaration',
+                'acquisition': {'boundary_source': 'authorized_rectangle'}}
+
+        for subject_only, boundary, ownership in (
+                (False, 'authorized_rectangle', photo_edit_tools.SUBJECT['default_write']),
+                (True, 'subject_matte_edge', photo_edit_tools.SUBJECT['narrowed_write'])):
+            with self.subTest(subject_only=subject_only):
+                record = self.joined(patch, subject=matte, subject_only=subject_only)[2]
+                receipt = photo_edit_tools._joined_subject_record(declaration(), record)
+                self.assertEqual(receipt['boundary_source'], boundary)
+                self.assertEqual(receipt['write_boundary'], boundary)
+                self.assertEqual(receipt['transition_boundary'], 'subject_matte_edge')
+                self.assertEqual(receipt['ownership'], ownership)
+                self.assertEqual(receipt['subject_only_round'], subject_only)
+                self.assertEqual(receipt['authoritative'], 'join.subject')
+                self.assertEqual(receipt['boundary_source'],
+                    record['subject']['boundary_source'])
+                # What the round declared before the join still survives.
+                self.assertEqual(receipt['acquisition']['boundary_source'], 'authorized_rectangle')
+        # A join with no boundary claim of its own leaves the declaration alone.
+        plain = self.joined(patch)[2]
+        receipt = photo_edit_tools._joined_subject_record({'boundary_source':
+            'authorized_core_below_photographic_join_support',
+            'authoritative': 'pre_join_declaration'}, plain)
+        self.assertEqual(receipt['boundary_source'],
+            'authorized_core_below_photographic_join_support')
+        self.assertEqual(receipt['authoritative'], 'pre_join_declaration')
+
+    def test_the_matte_never_reaches_the_provider_alpha_contract(self):
+        """The matte decides ownership only; registered alpha still owns the join."""
+        matte = self.matte()
+        yy, xx = np.indices(self.SHAPE, np.float32)
+        alpha = np.clip(1.5-(((xx-576.)/300.)**2+((yy-480.)/260.)**2), 0., 1.).astype(np.float32)
+        kept = alpha.copy()
+        result, coverage, record = self.joined(self.patch, alpha=alpha, subject=matte)
+        self.assertTrue(np.array_equal(alpha, kept))
+        self.assertTrue(record['provider_alpha_registered'])
+        self.assertTrue(record['alpha_in_destination_only'])
+        self.assertTrue(np.array_equal(result[coverage == 0], self.parent[coverage == 0]))
+        self.assertEqual(int(np.count_nonzero(coverage[alpha == 0])), 0)
+        self.assertLessEqual(float(coverage.max()), 1.)
+
 
 
 if __name__ == '__main__':

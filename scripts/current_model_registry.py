@@ -67,6 +67,227 @@ _REGISTRY_JSON_CACHE: dict[tuple[str, int, int, int], dict] = {}
 _SELECTION_JSON_CACHE: dict[tuple[str, int, int, int], dict] = {}
 
 
+# --- Installed model file identity ---------------------------------------
+# A registry declares *installed components*.  A path that exists but is not
+# the component it claims to be (a template placeholder, a truncated download,
+# another revision) must be rejected while the operator is still looking at the
+# configuration.  Later, inside a provider, the raw runtime error cannot tell a
+# broken model from a broken program, so configuration, model loading and
+# execution failures stop being distinguishable for the user.
+#
+# Verification follows the requested capability: a caller that names the keys a
+# route consumes (required_keys) gets its model files proved to be models; a
+# caller that only inspects the registry (model manager, discovery, path
+# repair) keeps reading configuration and path presence, so an unused component
+# can never block an unrelated route.
+ONNX_MODEL_KEYS = ('birefnet_model_path',)
+MODEL_DIGEST_KEYS = {'birefnet_model_path': 'birefnet_model_sha256'}
+MINIMUM_MODEL_BYTES = 64
+ONNX_MAX_IR_VERSION = 20
+_MODEL_IDENTITY_CACHE: dict[tuple, dict] = {}
+
+
+class ModelFileError(RuntimeError):
+    """A registered model file is missing, mislabelled or the wrong revision.
+
+    The kind attribute names the failure layer (configuration_*) so callers can
+    report it without conflating it with a model *loading* error raised by the
+    provider runtime or an *execution* error raised by a run.
+    """
+
+    def __init__(self, message, *, kind, reason, path, detail):
+        super().__init__(message)
+        self.kind = kind
+        self.reason = reason
+        self.path = str(path)
+        self.detail = detail
+
+
+class _OnnxStructureError(ValueError):
+    def __init__(self, reason, note):
+        super().__init__(note)
+        self.reason = reason
+
+
+def _read_varint(stream, size, what):
+    value = shift = 0
+    while True:
+        if stream.tell() >= size:
+            return None
+        byte = stream.read(1)[0]
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value
+        shift += 7
+        if shift > 63:
+            raise _OnnxStructureError('not_onnx', what + ' has an unterminated varint')
+
+
+def _walk_onnx_fields(path, size):
+    """Walk the top-level ModelProto framing without reading weight bytes."""
+    ir_version = None
+    graphs = 0
+    graph_bytes = 0
+    fields = 0
+    with path.open('rb') as stream:
+        while stream.tell() < size:
+            tag = _read_varint(stream, size, 'a field tag')
+            if tag is None:
+                raise _OnnxStructureError('truncated', 'the file ends inside a field tag')
+            number, wire = tag >> 3, tag & 7
+            if number == 0 or number > 32:
+                raise _OnnxStructureError('not_onnx',
+                                          'field number ' + str(number) + ' is not a ModelProto field')
+            if wire in (3, 4):
+                raise _OnnxStructureError('not_onnx',
+                                          'field ' + str(number) + ' uses a deprecated group wire type')
+            if wire == 2:
+                length = _read_varint(stream, size, 'the length of field ' + str(number))
+                if length is None:
+                    raise _OnnxStructureError('truncated', 'field ' + str(number) + ' has no length')
+                remaining = size - stream.tell()
+                if length > remaining:
+                    raise _OnnxStructureError('truncated', 'field ' + str(number) + ' declares ' + str(length)
+                                              + ' bytes with only ' + str(remaining) + ' left in the file')
+                if number == 7:
+                    graphs += 1
+                    graph_bytes = length
+                stream.seek(length, 1)
+            elif wire == 0:
+                value = _read_varint(stream, size, 'the value of field ' + str(number))
+                if value is None:
+                    raise _OnnxStructureError('truncated', 'field ' + str(number) + ' has no value')
+                if number == 1:
+                    ir_version = value
+            elif wire in (1, 5):
+                width = 8 if wire == 1 else 4
+                if stream.tell() + width > size:
+                    raise _OnnxStructureError('truncated', 'field ' + str(number) + ' is cut off')
+                stream.seek(width, 1)
+            else:
+                raise _OnnxStructureError('not_onnx',
+                                          'field ' + str(number) + ' uses wire type ' + str(wire))
+            fields += 1
+    if ir_version is None:
+        raise _OnnxStructureError('not_onnx', 'the file has no ONNX ir_version field')
+    if not 1 <= ir_version <= ONNX_MAX_IR_VERSION:
+        raise _OnnxStructureError('not_onnx', 'the declared ir_version is ' + str(ir_version))
+    if graphs != 1:
+        raise _OnnxStructureError('not_onnx', 'the file has ' + str(graphs) + ' ONNX graph fields')
+    return {'ir_version': int(ir_version), 'graph_bytes': int(graph_bytes), 'fields': fields}
+
+
+def _looks_like_text(head):
+    return bool(head) and all(byte in (9, 10, 13) or 0x20 <= byte < 0x7f for byte in head)
+
+
+def _model_failure_message(detail, note, expected_sha256=None):
+    return '; '.join((
+        'Installed model file is not usable: ' + str(detail.get('path')),
+        'layer: configuration (the registry points at a file that is not the declared model)',
+        'reason: ' + note,
+        'size: ' + str(detail.get('size')) + ' bytes',
+        'actual sha256: ' + str(detail.get('sha256') or 'not computed (no digest pinned)'),
+        'expected sha256: ' + str(expected_sha256 or 'not pinned by the registry'),
+        'ir_version: ' + str(detail.get('ir_version', 'unknown')),
+        'first bytes: ' + str(detail.get('first_bytes'))))
+
+
+def _identify_model_file(path, size, expected_sha256=None):
+    with path.open('rb') as stream:
+        head = stream.read(64)
+    detail = {'path': str(path), 'size': int(size), 'first_bytes': head[:16].hex()}
+    if _looks_like_text(head):
+        raise ModelFileError(_model_failure_message(
+            detail, 'the file starts with ASCII text ' + repr(bytes(head[:32]))
+            + ' instead of a protobuf header'), kind='configuration_invalid_model',
+            reason='text_placeholder', path=path, detail=detail)
+    if size < MINIMUM_MODEL_BYTES:
+        raise ModelFileError(_model_failure_message(
+            detail, 'the file is only ' + str(size) + ' bytes; a serialized ONNX model is larger than '
+            + str(MINIMUM_MODEL_BYTES) + ' bytes'), kind='configuration_invalid_model',
+            reason='too_small', path=path, detail=detail)
+    try:
+        structure = _walk_onnx_fields(path, size)
+    except (_OnnxStructureError, OSError) as exc:
+        raise ModelFileError(_model_failure_message(
+            detail, getattr(exc, 'reason', 'unreadable') + ': ' + str(exc)),
+            kind='configuration_invalid_model',
+            reason=getattr(exc, 'reason', 'unreadable'), path=path, detail=detail) from exc
+    detail.update(structure)
+    if expected_sha256:
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        detail['sha256'] = digest.hexdigest()
+        if detail['sha256'] != expected_sha256:
+            raise ModelFileError(_model_failure_message(
+                detail, 'the file digest does not match the pinned revision',
+                expected_sha256=expected_sha256), kind='configuration_model_digest_mismatch',
+                reason='digest_mismatch', path=path, detail=detail)
+    return detail
+
+
+def model_file_identity(path, *, expected_sha256=None):
+    """Return the identity of a registered model file, or raise ModelFileError.
+
+    Only the top-level ONNX framing is walked, so a large installed model is
+    never read into memory.  The full digest is computed only when the registry
+    pins one, which keeps an ordinary preflight free of weight reads.
+    """
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ModelFileError('Installed model file is missing: ' + str(path)
+                             + '; layer: configuration (the registry names a file that is not there)',
+                             kind='configuration_missing_model', reason='missing', path=path,
+                             detail={'path': str(path)}) from exc
+    if not path.is_file():
+        raise ModelFileError('Installed model file is not a file: ' + str(path)
+                             + '; layer: configuration', kind='configuration_missing_model',
+                             reason='not_a_file', path=path, detail={'path': str(path)})
+    pinned = (expected_sha256 or '').lower() or None
+    key = (str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns), pinned or '')
+    cached = _MODEL_IDENTITY_CACHE.get(key)
+    if cached is None:
+        cached = _identify_model_file(path, stat.st_size, pinned)
+        if len(_MODEL_IDENTITY_CACHE) >= _JSON_CACHE_LIMIT:
+            _MODEL_IDENTITY_CACHE.pop(next(iter(_MODEL_IDENTITY_CACHE)))
+        _MODEL_IDENTITY_CACHE[key] = dict(cached)
+    return dict(cached)
+
+
+def model_digest_pin(config, key):
+    """Return the optional pinned sha256 declared for a registered model key."""
+    pin_key = MODEL_DIGEST_KEYS.get(key)
+    pinned = config.get(pin_key) if pin_key else None
+    if pinned is None:
+        return None
+    if (not isinstance(pinned, str) or len(pinned) != 64
+            or any(character not in '0123456789abcdefABCDEF' for character in pinned)):
+        raise ModelFileError('Installed-model registry declares an unusable ' + str(pin_key) + ' pin: '
+                             + repr(pinned) + '; layer: configuration (a 64-character sha256 hex digest is '
+                             'required, or omit the pin to verify the ONNX structure only)',
+                             kind='configuration_invalid_model', reason='invalid_pin',
+                             path=str(config.get(key, '')), detail={'pin_key': pin_key, 'pin': pinned})
+    return pinned.lower()
+
+
+def verify_registered_models(config, *, keys):
+    """Prove the model files of the requested capabilities are those models."""
+    verified = {}
+    for key in keys:
+        if key not in ONNX_MODEL_KEYS:
+            continue
+        value = config.get(key)
+        if not isinstance(value, str) or not value:
+            continue  # validate_config already rejects a missing absolute path
+        verified[key] = model_file_identity(value, expected_sha256=model_digest_pin(config, key))
+    return verified
+
+
 def _cached_json(path, cache):
     path = Path(path).resolve()
     stat = path.stat()
@@ -185,6 +406,14 @@ def validate_config(config, *, required_keys=None, required_profiles=None):
 
 
 def load_registry(root=None, *, registry_path=None, required_keys=None, required_profiles=None):
+    """Load the current registry and prove the model files of the named keys.
+
+    Naming a key is a statement that a route consumes that component, so the
+    file behind it is verified to be the declared model (ONNX structure, plus
+    the pinned digest when the registry declares one).  A caller that passes no
+    key list is inspecting the registry rather than gating a route; it keeps
+    reading configuration and path presence only.
+    """
     path, _origin = registry_location(root, registry_path=registry_path)
     if not path.is_file():
         raise RuntimeError('Current installed-model registry is unavailable: '+str(path))
@@ -196,7 +425,8 @@ def load_registry(root=None, *, registry_path=None, required_keys=None, required
                            'set installed model/runtime paths and ready=true, then set '
                            'COSPLAY_MODEL_REGISTRY to that file\'s absolute path.')
     validate_config(config, required_keys=required_keys, required_profiles=required_profiles)
-    return {**config, 'registry_path': path}
+    verified = verify_registered_models(config, keys=frozenset(required_keys)) if required_keys is not None else {}
+    return {**config, 'registry_path': path, 'verified_models': verified}
 
 
 def registry_status(root=None, *, registry_path=None, required_keys=None, required_profiles=None):

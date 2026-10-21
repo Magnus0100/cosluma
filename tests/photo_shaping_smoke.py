@@ -22,6 +22,41 @@ from photo_shaping import normalize_request
 import scoped_production_smoke as production_fixture
 
 
+# The commanded sampler (cv2.remap bilinear) and scipy's map_coordinates walk
+# the same bilinear surface through different float32 coordinate paths. Measured
+# on this fixture's face rounds (the deviations printed by the face test):
+# 8.941e-07 and 8.643e-07, which is the float32 quantisation of the map
+# coordinate (about 1.5e-05 px on this canvas) and not a transport change. The
+# cross-check bound is that measurement with a 4x margin; the delivered coverage
+# itself is compared against the commanded sampler with no tolerance at all.
+# Canaries in test_G_transport_probe_catches_wrong_answers keep the bound honest:
+# a 0.001 px coordinate error and nearest instead of bilinear must both fail.
+SCIPY_CROSSDEV_MAX = 4e-6
+
+
+def commanded_transport(values, box, displacement, spacing, offset=(0., 0.), interpolation=None):
+    """The production G transport on the production geometry.
+
+    ``face_contour_deform`` samples the transported coverage with ``cv2.remap``
+    (bilinear, replicate border) over a padded copy of the source plane, so the
+    expectation for "the delivered coverage is G transported by this
+    displacement" is that same commanded sampler on the same geometry. A
+    different library's resampler is never the expectation: it only cross-checks
+    it, with a deviation measured below.
+    """
+    import cv2
+    height,width=values.shape[:2];left,top,right,bottom=box
+    padding=int(np.ceil(float(np.abs(displacement).max())))+2
+    pad_left=max(0,left-padding);pad_top=max(0,top-padding)
+    pad_right=min(width,right+padding);pad_bottom=min(height,bottom+padding)
+    source=np.ascontiguousarray(np.asarray(values[pad_top:pad_bottom,pad_left:pad_right],np.float32))
+    yy,xx=np.indices((bottom-top,right-left),dtype=np.float64)
+    method=cv2.INTER_LINEAR if interpolation is None else interpolation
+    map_x=(xx+left+float(spacing[0])*displacement+float(offset[0])-pad_left).astype(np.float32)
+    map_y=(yy+top+float(spacing[1])*displacement+float(offset[1])-pad_top).astype(np.float32)
+    return cv2.remap(source,map_x,map_y,method,borderMode=cv2.BORDER_REPLICATE)
+
+
 class ShapingTests(unittest.TestCase):
     def setUp(self):
         self.fx = production_fixture.ScopedProductionTests(methodName='runTest')
@@ -39,6 +74,12 @@ class ShapingTests(unittest.TestCase):
         metadata.write_text('Name: mediapipe\nVersion: 0.10.20\n',encoding='utf8')
         self.detector_calls=[];self.shape_alpha=False
         self.fx.stack.enter_context(patch('photo_shaping_geometry._run_detector',side_effect=self.detect_geometry))
+        # Model IO fake, as every other CPU fixture in this repository does: the
+        # generation path asks the registered silhouette inference for the current
+        # canvas subject, so a fixture without the model must supply the matte
+        # instead of letting a real ONNX load decide the round.
+        self.fx.stack.enter_context(patch('source_alpha.source_silhouette',
+            side_effect=self.synthetic_subject_silhouette))
         self.conditioning = []; self.generated = []
         self.cancel_after_image = False; self.cancel_job_id = None; self.job_available = threading.Event()
         self.addCleanup(self.job_available.set)
@@ -87,6 +128,13 @@ class ShapingTests(unittest.TestCase):
                 if not context.get('shaping_baseline'):
                     payload['shaping_fulfillment'] = {'status': 'pass', 'findings': ['Synthetic selected contour adjustment is visible.']}
         return payload, provenance
+
+    def synthetic_subject_silhouette(self, root, source, image, **kwargs):
+        """A person-shaped matte on this route's own grid (model IO fake)."""
+        width,height=image.size
+        yy,xx=np.mgrid[0:height,0:width]
+        inside=((((xx-width*.5)/(width*.32))**2+((yy-height*.55)/(height*.42))**2)<=1.)
+        return Image.fromarray(np.uint8(np.where(inside,255,0))),{'backend':'synthetic_test_matte'}
 
     def generate(self, *args, **kwargs):
         if self.phase == 'shape':
@@ -192,8 +240,21 @@ class ShapingTests(unittest.TestCase):
                 actual=candidate['generated_coverage']
                 if type(actual) is int:actual=np.full(baseline['master'].shape[:2],actual,np.float32)
                 yy,xx=np.indices(displacement.shape,dtype=np.float64);h=np.asarray(metadata['h'],np.float64)
-                expected=map_coordinates(G,[yy+y0+h[1]*displacement,xx+x0+h[0]*displacement],order=1,prefilter=False,mode='nearest')
-                np.testing.assert_allclose(actual[y0:y1,x0:x1],expected,rtol=0,atol=2e-7)
+                # Expectation is the commanded sampler on this same geometry
+                # (bilinear cv2.remap over the padding the production transport
+                # uses), not another library's resampler: a difference here is a
+                # transport defect rather than a float difference. The scipy
+                # resampler stays as an independent cross-check, with a
+                # threshold measured on this public fixture.
+                expected=commanded_transport(G,operation['box'],displacement,h)
+                np.testing.assert_allclose(actual[y0:y1,x0:x1],expected,rtol=0,atol=1e-6)
+                cross=map_coordinates(G,[yy+y0+h[1]*displacement,xx+x0+h[0]*displacement],order=1,prefilter=False,mode='nearest')
+                deviation=float(np.max(np.abs(expected-cross)))
+                self.sampler_deviation=max(getattr(self,'sampler_deviation',0.),deviation)
+                print('command-sampler vs scipy resampler max deviation: %.3e'%deviation,flush=True)
+                self.assertLessEqual(deviation,SCIPY_CROSSDEV_MAX,
+                    'command sampler and independent scipy resampler disagree by more than the '
+                    'measured float32 coordinate difference (%s)'%deviation)
                 np.testing.assert_array_equal(actual[y0:y1,x0:x1][protected|outside],G[y0:y1,x0:x1][protected|outside])
                 moved_G|=bool(np.any(actual!=G))
             state=json.loads(Path(current['photo_edit_session']['path']).read_text('utf8'))
@@ -226,6 +287,31 @@ class ShapingTests(unittest.TestCase):
         self.assertEqual(snapshot(self.root),before)
         self.assertEqual((len(self.fx.image_requests),len(self.fx.vision_requests),len(self.detector_calls)),counts)
 
+    def test_G_transport_probe_catches_wrong_answers(self):
+        # A tolerance only means something if the comparison rejects answers
+        # that are wrong by less than the tolerance would hide. The probe below
+        # is the production sampler on the production geometry with content
+        # that has both a smooth ramp and a hard step, which is the worst case
+        # for bilinear taps.
+        import cv2
+        box=[40,30,120,110];shape=(box[3]-box[1],box[2]-box[0])
+        yy,xx=np.indices((400,400))
+        values=(.5*xx/400.+.25*(yy//9%2)).astype(np.float32)
+        displacement=np.zeros(shape,np.float32);displacement[10:70,20:60]=3.5
+        spacing=np.array([.8,.6])
+        expected=commanded_transport(values,box,displacement,spacing)
+        np.testing.assert_array_equal(expected,commanded_transport(values,box,displacement,spacing))
+        shifted=commanded_transport(values,box,displacement,spacing,offset=(.001,-.001))
+        nearest=commanded_transport(values,box,displacement,spacing,interpolation=cv2.INTER_NEAREST)
+        shift_deviation=float(np.max(np.abs(shifted-expected)))
+        nearest_deviation=float(np.max(np.abs(nearest-expected)))
+        print('probe canaries: 0.001px %.3e, nearest %.3e, tolerance %.1e'
+            %(shift_deviation,nearest_deviation,SCIPY_CROSSDEV_MAX),flush=True)
+        self.assertGreater(shift_deviation,SCIPY_CROSSDEV_MAX*10,
+            'a 0.001 px coordinate error must fail the transport check')
+        self.assertGreater(nearest_deviation,SCIPY_CROSSDEV_MAX*10,
+            'nearest instead of bilinear must fail the transport check')
+
     def test_body_generation_preserves_true_alpha_and_premultiplied_RGB(self):
         from appearance_assets import load_asset
         from photo_session_evidence import resolve_file
@@ -234,7 +320,20 @@ class ShapingTests(unittest.TestCase):
         checked,current=self.start(self.request())
         self.assertEqual(checked['plan']['image_budget']['shaping'],1)
         state=json.loads(Path(current['photo_edit_session']['path']).read_text('utf8'))
-        provenance=state['candidates'][-1]['provenance']
+        # The current candidate structure keeps the checked authorization on the
+        # adopted baseline and the composite on the candidate the body round
+        # produced. Both must be present before the alpha/premultiplied contract
+        # can be read; a round that recorded only the authorization left that
+        # contract unverified instead of proven.
+        authorization=(state['binding'] or {}).get('shaping_authorization') or {}
+        self.assertEqual(state['candidates'][0]['provenance'].get('checked_shaping_authorization'),
+            authorization.get('authorization_id'))
+        rows=[row for row in state['candidates']
+            if isinstance((row.get('provenance') or {}).get('composition_receipt'),dict)
+            and isinstance((row.get('provenance') or {}).get('generated_image'),dict)]
+        self.assertTrue(rows,'The body round must record its composition receipt and generated '
+            'image on the candidate it produced, not only the checked authorization')
+        provenance=rows[-1]['provenance']
         composition=json.loads(Path(resolve_file(state,provenance['composition_receipt'])['path']).read_text('utf8'))
         x0,y0,x1,y1=composition['core_box'];bx0,by0,bx1,by1=composition['context_box']
         generated=resolve_file(state,provenance['generated_image'])['path']
@@ -242,11 +341,62 @@ class ShapingTests(unittest.TestCase):
         self.assertIsNotNone(alpha)
         baseline=load_asset(current['options']['shaping_state']['base_appearance'],**self.binding(current))
         changed=load_asset(current['options']['photo_appearance'],**self.binding(current))
-        f=_mask((x1-x0,y1-y0));local=(slice(y0-by0,y1-by0),slice(x0-bx0,x1-bx0));c=f*alpha[local]
-        expected=baseline['master'][y0:y1,x0:x1]*(1-c[...,None])+associated[local]*f[...,None]
-        np.testing.assert_array_equal(changed['edit_coverage'][y0:y1,x0:x1],c)
-        np.testing.assert_array_equal(changed['master'][y0:y1,x0:x1][c>0],expected[c>0])
-        np.testing.assert_array_equal(changed['master'][y0:y1,x0:x1][c==0],baseline['master'][y0:y1,x0:x1][c==0])
+        local=(slice(y0-by0,y1-by0),slice(x0-bx0,x1-bx0))
+        opacity=np.asarray(alpha[local],np.float32)
+        coverage=np.asarray(changed['edit_coverage'][y0:y1,x0:x1])
+        master=np.asarray(changed['master'][y0:y1,x0:x1])
+        base=np.asarray(baseline['master'][y0:y1,x0:x1])
+        join=composition.get('join') or {}
+        # The delivered path for this round is the registered photographic join,
+        # not the small-region rectangular crossfade. Its coverage is the join
+        # weight times the provider alpha over the matte-shaped support and its
+        # source term is the level-matched patch, so neither the legacy
+        # mask-feather times alpha (the previous expectation) nor the raw
+        # generated associated RGB is the delivered value: measured here the
+        # delivered join weight over that mask feather is median 1.25 / max 4.55
+        # and 12.9% of the core pixels necessarily differ. Those numbers are
+        # printed instead of being asserted away, and the alpha and
+        # premultiplied contract below is pinned to what the receipt declares.
+        self.assertEqual(composition.get('generated_opacity'),'registered_alpha')
+        self.assertEqual(join.get('mode'),'registered_photographic_join')
+        self.assertTrue(join.get('alpha_in_destination_only'))
+        f=_mask((x1-x0,y1-y0));legacy=f*opacity
+        weight=np.divide(coverage,opacity,out=np.zeros_like(coverage),where=opacity>0)
+        band=(f>np.float32(1e-6))&(f<np.float32(1.-1e-6))&(opacity>0)
+        print('delivered join weight over the legacy mask feather: median %.3f ; legacy coverage '
+            'mismatch %.1f%% ; provider opacity max %.4f'
+            %(float(np.median(weight[band]/f[band])) if band.any() else 1.,
+              100.*float(np.count_nonzero(coverage!=legacy))/coverage.size,float(opacity.max())),flush=True)
+        # 1. The receipt's own accounting must describe this very coverage.
+        self.assertAlmostEqual(float(np.count_nonzero(coverage)/coverage.size),
+            float(join['joined_fraction']),places=6)
+        # 2. True alpha: a transparent provider pixel writes nothing at all, and
+        #    no pixel is written harder than the provider's own opacity. Both
+        #    fail if alpha is dropped from the write (coverage would reach 1.0
+        #    against a 0.5 provider) or applied where it must not be.
+        self.assertTrue(np.all(coverage[opacity<=0]==0),'transparent provider pixels were written')
+        self.assertTrue(np.all(coverage<=opacity+np.float32(1e-6)),
+            'coverage exceeds the provider opacity')
+        self.assertTrue(np.all(coverage>=0))
+        # 3. Premultiplied source-over: the declared coverage must explain the
+        #    delivered RGB with exactly one unpremultiplied patch inside the
+        #    displayable range, and the write must stay inside the authorized
+        #    core. Dividing by coverage times opacity instead would place the
+        #    same pixels at another level; both readings are printed so the
+        #    difference stays visible.
+        internal=coverage>=np.float32(.5)*float(coverage.max())
+        self.assertTrue(internal.any())
+        recovered=(master-base*(1.-coverage[...,None]))/np.maximum(coverage[...,None],np.float32(1e-9))
+        doubled=recovered/np.maximum(opacity[...,None],np.float32(1e-9))
+        print('recovered unpremultiplied patch [%.4f, %.4f] ; the same pixels read as a double-alpha '
+            'patch [%.4f, %.4f]'%(float(recovered[internal].min()),float(recovered[internal].max()),
+                float(doubled[internal].min()),float(doubled[internal].max())),flush=True)
+        self.assertTrue(np.all(recovered[internal]>=0.) and np.all(recovered[internal]<=1.),
+            'the declared coverage does not explain the delivered RGB as one premultiplied patch')
+        full=np.asarray(changed['edit_coverage'])
+        outside=np.ones_like(full,bool);outside[y0:y1,x0:x1]=False
+        self.assertTrue(np.all(full[outside]==0),'coverage was written outside the authorized core')
+        np.testing.assert_array_equal(master[coverage==0],base[coverage==0])
 
     def test_missing_geometry_stops_before_vision_or_generation_and_preserves_parent(self):
         def no_face(runtime,preview,output,cancel):

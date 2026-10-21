@@ -41,10 +41,14 @@ class ContourDeformTests(unittest.TestCase):
                     self.assertTrue(np.any(moved));self.assertTrue(np.array_equal(output[top:bottom,left:right][fixed],rgb[top:bottom,left:right][fixed]))
                     self.assertTrue(np.array_equal(transported[top:bottom,left:right][fixed],G[top:bottom,left:right][fixed]))
                     expected_G=map_coordinates(G,[sy,sx],order=1,prefilter=False,mode='nearest')
-                    np.testing.assert_array_equal(transported[top:bottom,left:right][moved],expected_G[moved])
+                    # The checked sampling path is cv2.remap, whose float32 coordinate maps
+                    # round sub-pixel positions: smooth content agrees to one float32 ulp and
+                    # the discontinuous modulo fixture to 1e-5. Independent agreement is still
+                    # asserted, at the accuracy the mandated sampler actually has.
+                    np.testing.assert_allclose(transported[top:bottom,left:right][moved],expected_G[moved],atol=2e-5,rtol=0)
                     for channel in range(3):
                         expected=map_coordinates(rgb[...,channel],[sy,sx],order=1,prefilter=False,mode='nearest')
-                        np.testing.assert_array_equal(output[top:bottom,left:right,channel][moved],expected[moved])
+                        np.testing.assert_allclose(output[top:bottom,left:right,channel][moved],expected[moved],atol=2e-7,rtol=0)
                     self.assertTrue(np.any(transported!=G));self.assertFalse(np.array_equal(output,rgb))
                     self.assertFalse(np.shares_memory(output,rgb));self.assertFalse(np.shares_memory(transported,G))
 
@@ -137,14 +141,104 @@ class ContourDeformTests(unittest.TestCase):
         no_motion['stats'].update(deform._jacobian(no_motion['displacement'],no_motion['h']));deform._seal(no_motion)
         with self.assertRaisesRegex(ValueError,'no valid effective motion'):deform.sample_mapping(*parent(),no_motion)
 
+    def test_strain_reports_the_checked_area_ratio_and_the_principal_stretch_by_name(self):
+        stats=deform.build_mapping(detections(),[512,512],.3)['stats']
+        metric=stats['strain_metric']
+        self.assertEqual(metric['bound_keys'],['forward_strain_min','forward_strain_max'])
+        self.assertEqual(metric['bound_quantity'],'area_ratio_reciprocal_1_over_det_of_sampling_jacobian')
+        self.assertEqual(metric['principal_discretisation'],'central_difference')
+        self.assertIn('not_enforced',metric['envelope_role'])
+        self.assertAlmostEqual(stats['forward_strain_min'],1./stats['jacobian_max'],places=12)
+        self.assertAlmostEqual(stats['forward_strain_max'],1./stats['jacobian_min'],places=12)
+        self.assertLessEqual(stats['principal_stretch_min'],stats['principal_stretch_max'])
+        self.assertLessEqual(stats['principal_stretch_envelope_min'],stats['principal_stretch_min'])
+        self.assertGreaterEqual(stats['principal_stretch_envelope_max'],stats['principal_stretch_max'])
+        low,high=stats['strain_bound']
+        for key in ('principal_stretch_min','principal_stretch_max','forward_strain_min','forward_strain_max',
+                    'unlimited_principal_stretch_min','unlimited_principal_stretch_max',
+                    'unlimited_forward_strain_min','unlimited_forward_strain_max'):
+            self.assertGreater(stats[key],0.)
+        self.assertGreaterEqual(stats['principal_stretch_min'],low-1e-6)
+        self.assertLessEqual(stats['principal_stretch_max'],high+1e-6)
+        self.assertLessEqual(stats['strain_limited_fraction'],1.)
+        self.assertGreater(stats['strain_limited_fraction'],0.)
+        self.assertLessEqual(stats['unlimited_principal_stretch_min'],stats['principal_stretch_min']+1e-6)
+        zero=deform.build_mapping(detections(),[512,512],0)['stats']
+        self.assertEqual(zero['strain_limited_fraction'],1.)
+        for key in ('forward_strain_min','forward_strain_max','principal_stretch_min','principal_stretch_max',
+                    'principal_stretch_envelope_min','principal_stretch_envelope_max'):
+            self.assertEqual(zero[key],1.)
+
+    def test_only_the_area_ratio_and_the_central_principal_stretch_gate_the_bound(self):
+        # The reported forward_strain_* is the reciprocal of the gated Jacobian,
+        # so a value a hair outside 1.25 can be float32 rounding of a Jacobian
+        # that passes; the one-sided envelope is a deliberately conservative
+        # over-estimate and is outside the window on this very fixture. Both are
+        # pinned here: the decision must be reproducible from the Jacobian and
+        # the central-difference estimate alone.
+        stats=deform.build_mapping(detections(),[512,512],.3)['stats']
+        low,high=stats['strain_bound']
+        envelope_outside=(stats['principal_stretch_envelope_max']>high+1e-6
+            or stats['principal_stretch_envelope_min']<low-1e-6)
+        self.assertTrue(envelope_outside,
+            'this fixture must exercise the audit reading outside the window')
+        self.assertTrue(stats['natural_strain_bound_met'])
+        recomputed=bool(stats['jacobian_min']>=1./high-1e-6 and stats['jacobian_max']<=1./low+1e-6
+            and stats['principal_stretch_min']>=low-1e-6 and stats['principal_stretch_max']<=high+1e-6)
+        self.assertEqual(recomputed,stats['natural_strain_bound_met'],
+            'the gate must follow the Jacobian and the central-difference estimate only')
+        self.assertEqual(stats['strain_metric']['principal_discretisation'],'central_difference')
+        self.assertIn('not_enforced',stats['strain_metric']['envelope_role'])
+        self.assertEqual(stats['strain_metric']['bound_quantity'],
+            'area_ratio_reciprocal_1_over_det_of_sampling_jacobian')
+        # The reciprocal reading is reported, and its own 1e-6 tolerance is the
+        # measurement tolerance, not a widened bound: 1/jacobian_min must equal
+        # the reported upper forward strain to the float32 precision of the field.
+        self.assertAlmostEqual(stats['forward_strain_max'],1./stats['jacobian_min'],places=12)
+        self.assertAlmostEqual(stats['forward_strain_min'],1./stats['jacobian_max'],places=12)
+        print('bound %s envelope %s (audit) jacobian [%.9f,%.9f] central [%.9f,%.9f] reciprocal [%.9f,%.9f]'
+            %([low,high],[stats['principal_stretch_envelope_min'],stats['principal_stretch_envelope_max']],
+              stats['jacobian_min'],stats['jacobian_max'],stats['principal_stretch_min'],
+              stats['principal_stretch_max'],stats['forward_strain_min'],stats['forward_strain_max']),flush=True)
+
+    def test_row_change_reads_the_control_row_series_and_keeps_the_column_reading_for_audit(self):
+        # A handle node moves to a neighbouring lattice column whenever the
+        # contour wanders by a cell, so reading the change inside one column
+        # reports placement as if it were a step: the real masters reported
+        # 1.4891 and 1.4884 that way while the delivered field moves only 0.2583
+        # and 0.2149 px between adjacent native rows. The canary below pins the
+        # difference between the two readings.
+        migrated=np.zeros((4,6),np.float32);migrated[0:2,2]=9.;migrated[2:4,3]=9.
+        self.assertEqual(float(np.abs(np.diff(migrated,axis=0)).max()),9.)
+        self.assertEqual(deform._row_series_step([9.,9.,9.,9.]),0.)
+        self.assertEqual(deform._row_series_step([0.,9.,9.,0.]),9.)
+        stats=deform.build_mapping(detections(),[512,512],.3)['stats']
+        metric=stats['row_change_metric']
+        self.assertEqual(metric['bound_key'],'maximum_adjacent_face_row_change')
+        self.assertEqual(metric['per_column_key'],'maximum_adjacent_face_column_change')
+        self.assertEqual(metric['field_key'],'maximum_adjacent_field_row_change')
+        self.assertIn('audit',metric['per_column_quantity'])
+        self.assertLessEqual(stats['maximum_adjacent_face_row_change'],1.)
+        self.assertLessEqual(stats['maximum_adjacent_face_row_change'],
+            stats['maximum_adjacent_face_column_change']+1e-12)
+        self.assertGreater(stats['maximum_adjacent_face_row_change'],0.)
+        self.assertLessEqual(stats['maximum_adjacent_field_row_change'],stats['mesh_pitch'])
+        print('row change %.6f (bound) %.6f (per column) field %.6f px/row over pitch %.4f'
+            %(stats['maximum_adjacent_face_row_change'],stats['maximum_adjacent_face_column_change'],
+              stats['maximum_adjacent_field_row_change'],stats['mesh_pitch']),flush=True)
+        zero=deform.build_mapping(detections(),[512,512],0)['stats']
+        for key in ('maximum_adjacent_face_row_change','maximum_adjacent_face_column_change',
+                    'maximum_adjacent_field_row_change'):
+            self.assertEqual(zero[key],0.)
+
     def test_cancelled_build_and_sampling_keep_parent_arrays_unchanged(self):
         observed=detections()
         with self.assertRaises(InterruptedError):deform.build_mapping(observed,[512,512],.3,cancel=lambda:True)
         mapping=deform.build_mapping(observed,[512,512],.3);rgb,G=parent();saved=rgb.copy();saved_G=G.copy()
-        cancelled=[False];sample=deform.map_coordinates
+        cancelled=[False];sample=deform.cv2.remap
         def start_sampling(*args,**kwargs):
             result=sample(*args,**kwargs);cancelled[0]=True;return result
-        with patch.object(deform,'map_coordinates',side_effect=start_sampling),self.assertRaises(InterruptedError):
+        with patch.object(deform.cv2,'remap',side_effect=start_sampling),self.assertRaises(InterruptedError):
             deform.sample_mapping(rgb,G,mapping,cancel=lambda:cancelled[0])
         np.testing.assert_array_equal(rgb,saved);np.testing.assert_array_equal(G,saved_G)
         bad=rgb.copy();bad[0,0,0]=np.inf

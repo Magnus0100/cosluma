@@ -152,6 +152,29 @@ def image_submission_budget_text(budget, *, autofinish=False, source_native=Fals
         label + ' ' + str(budget.get(key) or 0) for key, label in names))
 
 
+def shaping_delivery_text(delivery, *, subject='当前版本') -> str:
+    """Requested strength beside the fraction one receipt actually delivered.
+
+    ``delivery`` comes from ``shaping_inspection.delivery_fact``, which reports it
+    only for a verified receipt that records the delivered mapping statistics.
+    Without one the text says unknown; the requested amount is never displayed
+    as if it had been delivered.
+    """
+    unknown = subject + '形体力度：实际交付未知（没有可核验的形体回执；不用请求强度代替交付力度）。'
+    if not isinstance(delivery, dict): return unknown
+    keys = ('requested_amount', 'strain_limited_fraction', 'delivered_fraction_of_request')
+    values = tuple(delivery.get(key) for key in keys)
+    if any(type(value) not in (int, float) for value in values): return unknown
+    if any(not 0 <= value <= 1 for value in values): return unknown
+    requested, limited, delivered = (float(value) for value in values)
+    if requested <= 0: return subject + '形体力度：回执记录请求强度 0.00，本次没有形变交付。'
+    text = (subject + '形体力度（取自已核验回执）：请求 ' + f'{requested:.2f}'
+        + ' · 实际交付 ' + f'{delivered:.2%}' + ' · 限幅系数 ' + f'{limited:.2%}')
+    text += ('；限幅后未足额交付，请求值不等于已交付力度。' if delivered < 1 else '；回执记录足额交付。')
+    if delivery.get('natural_strain_bound_met') is not True: text += '；回执记录的应变窗口未满足。'
+    return text
+
+
 def creative_task_plan_text(plan: dict) -> str:
     """Present the backend's checked facts without inventing readiness or prices."""
     iteration=plan.get('editing_iteration') or {}
@@ -2006,15 +2029,19 @@ if QT_AVAILABLE:
                 amount.valueChanged.connect(lambda value, key=key, enabled=enabled:
                     self.change_shaping_part(key, value) if enabled.isChecked() else None)
             note = QLabel('默认关闭。检查不调用模型；预览最多一次生图、三次视觉调用，可能产生费用。'); note.setWordWrap(True)
+            delivery = QLabel(shaping_delivery_text(None)); delivery.setWordWrap(True)
+            delivery.setAccessibleName('形体请求与实际交付力度')
+            delivery.setToolTip('数值取自保存版本形体回执的 stats（strain_limited_fraction / '
+                'delivered_fraction_of_request），界面只显示不重算；没有回执时显示未知。')
             check = QPushButton('检查形体预览'); check.clicked.connect(lambda: self.plan_shaping('apply'))
             start = QPushButton('开始已检查的形体任务'); start.clicked.connect(self.start_planned_creative_task)
             before = QCheckBox('查看形体调整前版本'); before.toggled.connect(self.compare_shaping)
             adopt = QPushButton('采用此候选版本'); adopt.clicked.connect(self.adopt_shaping_candidate)
             cancel = QPushButton('取消预览，保留当前版本'); cancel.clicked.connect(self.cancel_shaping_preview)
             restore = QPushButton('关闭并恢复调整前版本'); restore.clicked.connect(lambda: self.plan_shaping('restore'))
-            for widget in (note, check, start, before, adopt, cancel, restore): layout.addWidget(widget)
-            self.shaping_panels.append({'panel':panel, 'parts':parts, 'note':note, 'check':check,
-                'start':start, 'before':before, 'adopt':adopt, 'cancel':cancel, 'restore':restore})
+            for widget in (note, delivery, check, start, before, adopt, cancel, restore): layout.addWidget(widget)
+            self.shaping_panels.append({'panel':panel, 'parts':parts, 'note':note, 'delivery':delivery,
+                'check':check, 'start':start, 'before':before, 'adopt':adopt, 'cancel':cancel, 'restore':restore})
             return panel
 
         def shaping_parent_state(self, *, ignore_busy=False):
@@ -2153,6 +2180,12 @@ if QT_AVAILABLE:
             state = self.shaping_parent_state(); execution = self.shaping_execution
             candidate = self.shaping_candidate
             current_candidate = self._shaping_candidate_current(candidate, state)
+            inspection = (candidate or {}).get('inspection') or {}
+            if current_candidate and isinstance(inspection, dict) and inspection.get('ok'):
+                delivery, subject = (inspection.get('state') or {}).get('delivery'), '候选版本'
+            else:
+                delivery, subject = state.get('delivery'), '当前版本'
+            delivery_text = shaping_delivery_text(delivery, subject=subject)
             planned = self.creative_task_plan or {}
             checked = bool(planned.get('shaping_parent') and planned.get('plan', {}).get('ready') is True
                 and planned['shaping_parent'] == state.get('parent'))
@@ -2169,6 +2202,7 @@ if QT_AVAILABLE:
                 controls['check'].setEnabled(editable and bool(self.shaping_parts))
                 controls['start'].setEnabled(editable and checked)
                 controls['restore'].setEnabled(editable and state.get('restore_available', False))
+                controls['delivery'].setText(delivery_text)
                 controls['before'].setEnabled(current_candidate or bool(state.get('restore_available')))
                 controls['adopt'].setEnabled(editable and current_candidate)
                 controls['cancel'].setEnabled(bool(candidate or execution or 'candidate' in self.shaping_inspections or self.shaping_adoption))

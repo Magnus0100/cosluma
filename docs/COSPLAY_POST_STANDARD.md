@@ -28,6 +28,23 @@
 
 保存原片身份和观察事实不等于覆盖全部生成 RGB。新增受光及内容按当前资产职责保留；图像变化或审片通过均不自动授予人工批准。
 
+## 区域编辑的边界归属
+
+显式 scoped 编辑的授权核心区里，谁写入由**本轮授权操作**决定，不由核心区里有没有主体决定：
+
+| 本轮授权 | 核心区内的写入 |
+|---|---|
+| 含 `scene_edit` / `scene_cleanup` / `scene_composite` | 场景侧是本轮授权内容，必须写入，并被接合与联合光照覆盖 |
+| 含 `relight` | 跨边界联合光照，两侧都必须被写入并被同一求解覆盖；只写主体一侧在语义上不成立 |
+| 无上述操作但 `scene_policy ≠ preserve` | 同上：本轮允许改变场景，场景侧按授权写入 |
+| 仅人物类操作（`portrait_retouch`、`detail_repair`）且 `scene_policy == preserve` | 才由当前画布的真实主体分割收窄：主体像素归生成层，场景像素保留父级字节 |
+
+判定原则一句话：**授权内容永不静默丢弃；拿不准时选"写"**。
+
+主体分割（`source_alpha` 的 BiRefNet 剪影）是分割，不是许可：权重 ≤ `soft_low=0.02` 的像素算场景侧，≥ 0.5 算主体；整画布、纯色、矩形、标签图和编辑覆盖率都不能充当它。核心区内主体像素少于 `minimum_subject_pixels=256` 时不收窄，保留预留写入并记录 `authorized_core_without_subject`；分割缺失、运行时不可用或被显式关闭时退回已评审的矩形接合，并记录缺失原因，不静默改判。
+
+收据的 `boundary_source` 以接合（`join.subject`）实际写下的边界为单一事实来源：收窄轮次为 `subject_matte_edge`，授权全写轮次为 `authorized_rectangle`，接合前的声明只留在 `acquisition`。场景侧的交付改动量不得为 0。
+
 ## 原片与普通导入参考的专项审片与修复
 
 `cosplay_post_review.v2` 按 `cosplay_review_scope.v1` 分开记录整图艺术、场景上下文、匹配原生窗口、眼口特征和覆盖缺口。`cosplay_native_review_inputs.v2` 保存实际可用的眼口/双手/双臂/发丝/衣料/边缘/接地/高光证据；检测不足或无已知源支持的区域保持unknown。各项 pass/fail/unknown/unavailable，抽样与缺失可见。局部通过仅覆盖所见匹配窗口，整图艺术通过不认证全图原生细节；局部fail仍保留，自动审片不授予人工批准。

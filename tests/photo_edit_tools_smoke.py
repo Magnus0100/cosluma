@@ -18,6 +18,7 @@ from PIL import Image,ImageDraw
 
 from asset_identity import sha256_file
 import photo_edit_session as session
+import photo_edit_tools
 from photo_edit_tools import make_tools
 from photo_editing import editing_scope,validate_observed_design
 from photo_appearance import create_source_baseline,load_asset
@@ -517,6 +518,139 @@ class EditingToolsTests(unittest.TestCase):
                         if work=='retouch':self.assertIn('不新增叙事特效' if language=='zh' else 'Do not add narrative effects',prompt)
                         if work=='partial_composite':self.assertIn('主要结构' if language=='zh' else 'main structure',prompt)
                         if family=='qwen_image_2_1':self.assertNotIn('\n',prompt)
+
+    def test_subject_matte_comes_from_a_real_segmentation_and_is_recorded(self):
+        from photo_edit_tools import _current_canvas_subject
+        with Image.open(self.best) as raster:
+            base=raster.convert('RGB')
+        y,x=np.indices((base.height,base.width),np.float32)
+        score=np.clip(1.2-(((x-base.width*.5)/(base.width*.3))**2
+            +((y-base.height*.55)/(base.height*.25))**2),0.,1.).astype(np.float32)
+        calls=[]
+        def provider(*,root,canvas_path,image):
+            calls.append((Path(root),Path(canvas_path),image.size))
+            return score,{'producer':'fixture-subject-segmentation','model_sha256':'0'*64}
+        config={'root':str(self.root),'subject_matte':provider}
+        best={'path':str(self.best),'sha256':sha256_file(self.best)}
+        matte,record=_current_canvas_subject(config,best,base)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0][1],self.best)
+        self.assertTrue(record['available'])
+        self.assertEqual(record['producer'],'fixture-subject-segmentation')
+        self.assertEqual(record['current_canvas_sha256'],best['sha256'])
+        self.assertFalse(record['matte_is_the_edit_coverage'])
+        self.assertEqual(record['canvas_size'],[base.width,base.height])
+        self.assertGreater(record['subject_fraction_of_canvas'],.1)
+        self.assertLess(record['subject_fraction_of_canvas'],.9)
+        self.assertEqual(matte.shape,(base.height,base.width))
+        self.assertEqual(matte.dtype,np.float32)
+
+    def test_edit_coverage_cannot_stand_in_for_a_subject_matte(self):
+        from photo_edit_tools import _current_canvas_subject
+        with Image.open(self.best) as raster:
+            base=raster.convert('RGB')
+        best={'path':str(self.best),'sha256':sha256_file(self.best)}
+        def provider(value):
+            return lambda *,root,canvas_path,image:(value,{'producer':'fixture-subject-segmentation'})
+        for name,value,reason in (
+                ('whole canvas coverage',np.ones((base.height,base.width),np.float32),'ValueError'),
+                ('no subject at all',np.zeros((base.height,base.width),np.float32),'ValueError'),
+                ('uncalibrated weights',np.full((base.height,base.width),2.,np.float32),'ValueError'),
+                ('wrong canvas',np.ones((16,16),np.float32),'ValueError')):
+            with self.subTest(name):
+                matte,record=_current_canvas_subject({'root':str(self.root),
+                    'subject_matte':provider(value)},best,base)
+                self.assertIsNone(matte)
+                self.assertFalse(record['available'])
+                self.assertTrue(record['reason'].startswith(reason))
+                self.assertIn('matte_is_the_edit_coverage',record)
+                self.assertFalse(record['matte_is_the_edit_coverage'])
+        # The production route asks the registered silhouette inference; a
+        # missing model or runtime is recorded as missing instead of raised.
+        with patch('source_alpha.source_silhouette',
+                side_effect=RuntimeError('no registered silhouette model')):
+            matte,record=_current_canvas_subject({'root':str(self.root)},best,base)
+        self.assertIsNone(matte)
+        self.assertFalse(record['available'])
+        self.assertTrue(record['reason'].startswith('RuntimeError'))
+        self.assertFalse(record['matte_is_the_edit_coverage'])
+        # And it can be switched off explicitly without calling anything.
+        with patch('source_alpha.source_silhouette',
+                side_effect=AssertionError('the subject matte was not disabled')):
+            matte,record=_current_canvas_subject({'root':str(self.root),'subject_matte':False},
+                best,base)
+        self.assertIsNone(matte)
+        self.assertFalse(record['available'])
+        self.assertEqual(record['reason'],'subject_matte_disabled_by_configuration')
+
+    def test_the_rounds_authorized_operations_decide_who_owns_the_scene_side(self):
+        """Ownership follows what the round was authorized to do, not the subject."""
+        from photo_edit_tools import _scene_write_trigger
+        composite=editing_scope({'work_type':'partial_composite'})
+        retouch=editing_scope({'work_type':'retouch'})
+        full=editing_scope({'work_type':'full_composite','target_setting':'outdoor'})
+        cases=(
+            (composite,['scene_edit'],False,'authorized_scene_operation:scene_edit'),
+            (composite,['relight'],False,'authorized_scene_operation:relight'),
+            (composite,['scene_cleanup'],False,'authorized_scene_operation:scene_cleanup'),
+            (full,['scene_composite'],False,'authorized_scene_operation:scene_composite'),
+            # A scene operation decides even where the scope preserves the scene.
+            (retouch,['scene_cleanup'],False,'authorized_scene_operation:scene_cleanup'),
+            # The person-only round is the only narrowing branch: no scene
+            # operation at all, and a scope that preserves the scene.
+            (retouch,['portrait_retouch'],True,'person_only_round:portrait_retouch'),
+            (retouch,['detail_repair'],True,'person_only_round:detail_repair'),
+            (retouch,['portrait_retouch','detail_repair'],True,
+                'person_only_round:detail_repair,portrait_retouch'),
+            # A scope that does not preserve the scene keeps the scene side
+            # authorized even when the round names only person work.
+            (composite,['portrait_retouch'],False,'scope_allows_scene_rebuild:local_edit'),
+            (full,['portrait_retouch'],False,'scope_allows_scene_rebuild:rebuild'))
+        for scope,operations,subject_only,trigger in cases:
+            with self.subTest(operations=operations,policy=scope['scene_policy']):
+                self.assertEqual(_scene_write_trigger(scope,{'operations':operations}),
+                    (subject_only,trigger))
+        # No operations at all is not person work: the scope decides.
+        self.assertEqual(_scene_write_trigger(retouch,{}),(True,'person_only_round:'))
+        self.assertEqual(_scene_write_trigger(composite,{}),
+            (False,'scope_allows_scene_rebuild:local_edit'))
+        # The declared semantics and the branch agree.
+        self.assertEqual(set(photo_edit_tools.SUBJECT['scene_operations']),
+            set(photo_edit_tools.SCENE_OPERATIONS))
+        for name in photo_edit_tools.SCENE_OPERATIONS:
+            self.assertEqual(photo_edit_tools.SUBJECT['operation_semantics'][name]
+                .startswith('authorized_'),True)
+
+    def test_regional_edit_records_the_subject_matte_boundary_it_used(self):
+        self.prepare_decision()
+        with patch('reference_provider.request_edit',side_effect=self.transport):
+            state=self.execute()
+        row=state['candidates'][-1]
+        composition=json.loads(Path(row['provenance']['composition_receipt']['path']).read_text('utf8'))
+        subject=composition['subject_matte']
+        self.assertFalse(subject['available'])
+        self.assertEqual(subject['boundary_source'],'authorized_core_below_photographic_join_support')
+        self.assertFalse(subject['matte_is_the_edit_coverage'])
+        # The join below its photographic support writes the reserved rectangle
+        # without claiming a boundary of its own, so the receipt keeps the
+        # declared reason instead of a generic rectangle claim.
+        self.assertNotIn('boundary_source',composition['join']['subject'])
+        # The round authorized relighting, which is a joint cross-boundary solve:
+        # the scene side is content of this round, so the write is not narrowed
+        # to a subject and the receipt records the ground it decided on.
+        self.assertEqual(subject['scene_write_trigger'],'authorized_scene_operation:relight')
+        self.assertEqual(subject['scene_operations_authorized'],['relight'])
+        self.assertEqual(subject['scene_policy'],'local_edit')
+        self.assertFalse(subject['subject_only_round'])
+        self.assertEqual(subject['ownership_rule'],photo_edit_tools.SUBJECT['ownership_rule'])
+        # A join that makes no boundary claim cannot be passed off as the source
+        # of the receipt's boundary: the declaration stays authoritative.
+        self.assertEqual(subject['authoritative'],'pre_join_declaration')
+        self.assertEqual(subject['acquisition']['boundary_source'],
+            'authorized_core_below_photographic_join_support')
+        # Coverage is still bounded edit permission, not an inferred subject matte.
+        self.assertEqual(composition['coverage_semantics'],
+            'current_canvas_edit_coverage_not_source_subject_alpha')
 
 
 if __name__=='__main__':unittest.main()

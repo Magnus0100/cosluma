@@ -2,7 +2,16 @@
 
 Current retouching work scores an edit by target attainment, by whether
 untouched regions really stay untouched, and by whether resampling destroys
-texture; the aesthetic judgement itself stays human. Those measurements are
+texture; the aesthetic judgement itself stays human.
+
+Strain is reported under named quantities, never as one ambiguous number:
+'forward_strain' is the checked bound quantity (the reciprocal area ratio
+1/det(ds/dx)), 'principal_stretch' is the local principal stretch of the
+forward deformation (central-difference estimate), and
+'principal_stretch_envelope' is the conservative one-sided over-estimate kept
+for audit. 'unlimited_*' records what the request would have produced without
+the amplitude limiter, and 'strain_limited_fraction' records the fraction that
+was actually delivered. Those measurements are
 computed here from a checked mapping and the base/result pixels. Nothing here
 loads a model, writes a run, or claims artistic or human acceptance.
 """
@@ -24,7 +33,7 @@ PARAMETERS = {
     'delta_e_outside_tolerance': 1e-6,  # pixels outside the support must be untouched
     'seam_gradient_ratio_max': 1.6,     # boundary gradient against the untouched ring
     'attainment_min': .90,              # delivered narrowing against the requested target
-    'row_change_max': 1.,               # adjacent-row control change that reads as a step
+    'row_change_max': 1.,               # one side control change between adjacent mesh rows over the mesh pitch
 }
 _ITEMS = ('target_attainment', 'untouched_regions', 'texture_retention', 'tonal_neutrality',
     'boundary_seam', 'geometric_naturalness')
@@ -176,11 +185,38 @@ def measure(mapping, base, shaped):
         'ok': bool(ratio <= PARAMETERS['seam_gradient_ratio_max'])}
 
     strain_ok = bool(stats['natural_strain_bound_met'])
+    # The gated quantity is the control change between adjacent mesh rows of one
+    # side, i.e. the row series the deformation actually follows. The same
+    # difference read inside one lattice column is kept for audit: it also moves
+    # when a handle node shifts by a cell, so it reports placement, not jitter
+    # (measured 1.4891 and 1.4884 against this bound before the handle search
+    # kept every control on its own row). The delivered field's own adjacent-row
+    # change is reported beside them as the quantity a viewer can see.
     row_change = float(stats['maximum_adjacent_face_row_change'])
+    # 'forward_strain' is the checked bound quantity: the reciprocal area ratio
+    # 1/det(ds/dx). It is not a directional stretch, so the same field is also
+    # reported by its principal stretches (central-difference estimate), by the
+    # conservative one-sided envelope, and by the values the request would have
+    # produced without the amplitude limiter. Reading any of them as the bound
+    # would be a different claim, so every one of them states its own quantity.
     naturalness = {'forward_strain': [float(stats['forward_strain_min']), float(stats['forward_strain_max'])],
         'sampling_jacobian': [float(stats['jacobian_min']), float(stats['jacobian_max'])],
+        'principal_stretch': [float(stats['principal_stretch_min']), float(stats['principal_stretch_max'])],
+        'principal_stretch_envelope': [float(stats['principal_stretch_envelope_min']),
+            float(stats['principal_stretch_envelope_max'])],
+        'unlimited_forward_strain': [float(stats['unlimited_forward_strain_min']),
+            float(stats['unlimited_forward_strain_max'])],
+        'unlimited_principal_stretch': [float(stats['unlimited_principal_stretch_min']),
+            float(stats['unlimited_principal_stretch_max'])],
+        'strain_limited_fraction': float(stats['strain_limited_fraction']),
+        'delivered_fraction_of_request': float(stats['delivered_fraction_of_request']),
+        'strain_metric': dict(stats['strain_metric']),
         'strain_bound': list(stats['strain_bound']),
         'maximum_adjacent_row_change': row_change,
+        'maximum_adjacent_row_change_per_column': float(stats['maximum_adjacent_face_column_change']),
+        'maximum_adjacent_field_row_change': float(stats['maximum_adjacent_field_row_change']),
+        'row_change_max': float(PARAMETERS['row_change_max']),
+        'row_change_metric': dict(stats['row_change_metric']),
         'bound_met': strain_ok,
         'row_change_ok': bool(row_change <= PARAMETERS['row_change_max']),
         'ok': bool(strain_ok and row_change <= PARAMETERS['row_change_max'])}

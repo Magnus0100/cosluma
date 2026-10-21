@@ -3,6 +3,11 @@
 ``observe_run`` only observes small in-memory metadata and file stats. Its
 result is a browsing invalidation hint, never a capability or an IO receipt.
 ``inspect_*`` always re-enter the authoritative typed readers.
+
+``delivery_fact`` reports the requested strength next to the fraction one
+saved receipt actually delivered, so the GUI never presents a request as if it
+had been met. Only a geometric receipt carrying the mapping statistics can say
+that; every other receipt reports unknown.
 """
 from __future__ import annotations
 
@@ -100,6 +105,32 @@ def _read_receipt(asset):
     return json.loads(data)
 
 
+def delivery_fact(receipt, *, receipt_sha256=''):
+    """Requested strength beside the fraction one saved receipt delivered.
+
+    Only a verified geometric receipt records the mapping statistics
+    (strain_limited_fraction / delivered_fraction_of_request) that say how much
+    of the requested amount was actually delivered. Every other receipt returns
+    None, so a caller shows unknown instead of presenting the request as met.
+    Nothing here is recomputed from pixels or from the request.
+    """
+    if not isinstance(receipt, dict) or receipt.get('kind') != 'geometric_transform': return None
+    operation = receipt.get('operation')
+    if not isinstance(operation, dict): return None
+    metadata = operation.get('mapping_metadata')
+    stats = metadata.get('stats') if isinstance(metadata, dict) else None
+    if not isinstance(stats, dict): return None
+    values = (operation.get('amount'), stats.get('strain_limited_fraction'),
+        stats.get('delivered_fraction_of_request'))
+    if any(type(value) not in (int, float) for value in values): return None
+    if any(not 0 <= value <= 1 for value in values): return None
+    requested, limited, delivered = (float(value) for value in values)
+    return {'requested_amount':requested, 'strain_limited_fraction':limited,
+        'delivered_fraction_of_request':delivered,
+        'natural_strain_bound_met':stats.get('natural_strain_bound_met') is True,
+        'receipt_sha256':str(receipt_sha256 or '')}
+
+
 def _owned_paths(asset):
     from appearance_assets import declared_files_from_receipt
     receipt = _read_receipt(asset)
@@ -169,6 +200,9 @@ def _inspect(root, run, *, candidate=False, cancel=None):
     else:
         selected = force_audit(current, cancel=cancel, **binding)
         baseline = selected
+    # The delivered strength is read from the same verified receipt; it is
+    # never recomputed here and never inferred from the request.
+    delivery = delivery_fact(selected, receipt_sha256=current.get('receipt_sha256') if isinstance(current, dict) else '')
     _cancelled(cancel)
     if sha256_file(run['artifacts']['auto_draft'], force=True) != selected['files']['preview']['sha256']:
         raise ValueError('保存画面与当前母版不一致')
@@ -182,7 +216,7 @@ def _inspect(root, run, *, candidate=False, cancel=None):
     return {'ok':True, 'snapshot':after, 'watch_paths':paths,
         'state':{'enabled':True, 'reason':'', 'parent':parent, 'base':copy.deepcopy(base),
             'preview':str(Path(base['path']) / baseline['files']['preview']['file']),
-            'restore_available':bool(saved.get('enabled'))},
+            'restore_available':bool(saved.get('enabled')), 'delivery':delivery},
         'manifest_sha256':manifest_sha}
 
 

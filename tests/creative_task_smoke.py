@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,9 +18,11 @@ from unittest.mock import patch
 from PIL import Image
 
 import creative_task as task
+import runtime_preflight
 import task_model_preflight
 from backend_server import Backend, LocalHTTPServer, make_handler
-from current_model_registry import DIRECTORY_KEYS, PATH_KEYS, PROFILES, SCHEMA
+from current_model_registry import (DIRECTORY_KEYS, PATH_KEYS, PROFILES, SCHEMA,
+    verify_registered_models)
 from task_model_preflight_smoke import mocked_task_capability
 
 
@@ -35,6 +38,169 @@ def snapshot(root):
     return {str(p.relative_to(root)): task.sha(p) for p in root.rglob('*') if p.is_file()}
 
 
+def _varint(value):
+    out = bytearray()
+    while True:
+        byte = value & 0x7f
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _delimited(number, payload):
+    return _varint(number << 3 | 2) + _varint(len(payload)) + payload
+
+
+def _varint_field(number, value):
+    return _varint(number << 3) + _varint(value)
+
+
+def _tensor_type(elem_type, dims):
+    shape = b''.join(_delimited(1, _varint_field(1, dim)) for dim in dims)
+    return _delimited(1, _varint_field(1, elem_type) + _delimited(2, shape))
+
+
+def _value_info(name, dims):
+    return _delimited(1, name.encode('utf8')) + _delimited(2, _tensor_type(1, dims))
+
+
+def onnx_identity_model():
+    """A tiny real ONNX model: one float Identity node over a one-element input.
+
+    The registry gate and any loader accept it as a model, so this offline
+    fixture no longer hands a text placeholder to a real loading path.  It is
+    never used for quality or for a silhouette: the graph only echoes its input,
+    and suites that exercise the silhouette adapter inject their own provider.
+    """
+    node = (_delimited(1, b'x') + _delimited(2, b'y') + _delimited(3, b'fixture-node')
+            + _delimited(4, b'Identity'))
+    graph = (_delimited(1, node) + _delimited(2, b'cosluma-fixture-graph')
+             + _delimited(11, _value_info('x', (1,))) + _delimited(12, _value_info('y', (1,))))
+    return (_varint_field(1, 7) + _delimited(2, b'cosluma-fixture')
+            + _delimited(7, graph) + _delimited(8, _varint_field(2, 13)))
+
+
+def model_registry(root, *, model_bytes=None, pin=None, name='models.json', complete=False):
+    """One registry whose silhouette model file is a real (tiny) ONNX model.
+
+    complete=True also fills the source-geometry keys a layered route requires,
+    with text placeholders that this suite never loads.
+    """
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    model = root / 'birefnet.onnx'
+    model.write_bytes(onnx_identity_model() if model_bytes is None else model_bytes)
+    onnx_root = root / 'onnx'
+    (onnx_root / 'onnxruntime').mkdir(parents=True, exist_ok=True)
+    values = {'schema': SCHEMA, 'ready': True, **PROFILES,
+              'birefnet_model_path': str(model), 'onnx_runtime_root': str(onnx_root)}
+    if complete:
+        runtime = root / 'runtime' / 'python.exe'
+        checkpoint = root / 'checkpoints' / 'parser.safetensors'
+        for target in (runtime, checkpoint):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b'metadata fixture, never loaded')
+        for directory in (root / 'repo', root / 'vitmatte'):
+            directory.mkdir(parents=True, exist_ok=True)
+        values.update({'python': str(runtime), 'semantics_checkpoint': str(checkpoint),
+                       'semantics_repo_dir': str(root / 'repo'),
+                       'vitmatte_model_root': str(root / 'vitmatte')})
+    if pin is not None:
+        values['birefnet_model_sha256'] = pin
+    path = root / name
+    path.write_text(json.dumps(values), encoding='utf8')
+    return path, model
+
+
+def silhouette_preflight(root, registry):
+    return runtime_preflight.preflight_for_run(
+        root, registry_path=str(registry), require_local_models=True, mode='local_portrait',
+        execution_strategy='layered_reference_transfer')
+
+
+def preflight_error(root, registry):
+    try:
+        silhouette_preflight(root, registry)
+    except runtime_preflight.RuntimePreflightError as exc:
+        return exc
+    raise AssertionError('An unusable model file passed the silhouette preflight: ' + str(registry))
+
+
+def model_identity_gate():
+    """A registered model file that is not a model fails during the preflight.
+
+    t18 traced a real round that died inside ONNX Runtime with InvalidProtobuf
+    because the registry pointed at a 30-byte text placeholder while the
+    preflight reported ready.  Configuration, model loading and execution have
+    to stay three separate user-visible failures.
+    """
+    with tempfile.TemporaryDirectory(prefix='cosplay-model-identity-') as folder:
+        root = Path(folder).resolve()
+        valid, model = model_registry(root / 'valid')
+        identity = verify_registered_models({'birefnet_model_path': str(model)},
+                                            keys=('birefnet_model_path',))['birefnet_model_path']
+        assert identity['ir_version'] == 7 and identity['size'] == model.stat().st_size, identity
+        accepted = preflight_error(root, valid)
+        assert accepted.kind == 'configuration_onnx_runtime_unavailable', accepted.kind
+
+        placeholder, placeholder_model = model_registry(
+            root / 'placeholder', model_bytes=b'metadata fixture, never loaded')
+        error = preflight_error(root, placeholder)
+        assert error.kind == 'configuration_invalid_model', error.kind
+        assert error.reason == 'text_placeholder', error.reason
+        for expected in (str(placeholder_model), 'layer: configuration', 'size: 30 bytes',
+                         'starts with ASCII text', placeholder_model.read_bytes()[:16].hex(),
+                         'ir_version: unknown', 'not pinned by the registry'):
+            assert expected in str(error), (expected, str(error))
+
+        tiny, _tiny_model = model_registry(root / 'tiny', model_bytes=b'\x08\x07\x00\x00')
+        error = preflight_error(root, tiny)
+        assert (error.kind, error.reason) == ('configuration_invalid_model', 'too_small'), error.reason
+        assert 'size: 4 bytes' in str(error), str(error)
+
+        truncated, truncated_model = model_registry(root / 'truncated')
+        truncated_model.write_bytes(onnx_identity_model()[:-24])
+        error = preflight_error(root, truncated)
+        assert (error.kind, error.reason) == ('configuration_invalid_model', 'truncated'), error.reason
+        assert str(truncated_model) in str(error) and 'truncated' in str(error)
+
+        text, _text_model = model_registry(root / 'text', model_bytes=b'x' * 4096)
+        error = preflight_error(root, text)
+        assert error.reason == 'text_placeholder', error.reason
+        assert 'starts with ASCII text' in str(error)
+
+        digest = hashlib.sha256(onnx_identity_model()).hexdigest()
+        pinned, pinned_model = model_registry(root / 'pinned', pin=digest)
+        verified = verify_registered_models(
+            {'birefnet_model_path': str(pinned_model), 'birefnet_model_sha256': digest},
+            keys=('birefnet_model_path',))['birefnet_model_path']
+        assert verified['sha256'] == digest, verified
+        wrong, _wrong_model = model_registry(root / 'wrong-digest', pin='0' * 64)
+        error = preflight_error(root, wrong)
+        assert error.kind == 'configuration_model_digest_mismatch', error.kind
+        assert digest in str(error) and '0' * 64 in str(error), str(error)
+        bad_pin, _bad_model = model_registry(root / 'bad-pin', pin='not-a-digest')
+        error = preflight_error(root, bad_pin)
+        assert (error.kind, error.reason) == ('configuration_invalid_model', 'invalid_pin'), error.reason
+
+        # A model *loading* failure is a different user-visible failure than a
+        # configuration one: the file was accepted, the runtime could not open
+        # what it was given.
+        layered, _layered_model = model_registry(root / 'layered', complete=True)
+        with patch.object(runtime_preflight, '_probe_runtime',
+                          return_value='No module named fixture_torch'):
+            try:
+                runtime_preflight.preflight_for_run(root, registry_path=str(layered),
+                    require_local_models=True, execution_strategy='layered_reference_transfer')
+            except runtime_preflight.RuntimePreflightError as exc:
+                assert exc.kind == 'model_loading_runtime_probe_failed', exc.kind
+                assert 'fixture_torch' in str(exc), str(exc)
+            else:
+                raise AssertionError('A failing model runtime probe was reported as ready')
+    return {'invalid_model_rejected_before_rendering': True}
+
+
 def fixture(root):
     values = {'schema': SCHEMA, 'ready': True, **PROFILES}
     for key in PATH_KEYS:
@@ -42,6 +208,11 @@ def fixture(root):
         target.parent.mkdir(parents=True, exist_ok=True)
         if key in DIRECTORY_KEYS:
             target.mkdir()
+        elif key == 'birefnet_model_path':
+            # A real (tiny) ONNX model, because the silhouette route consumes
+            # this key: the registry gate and any loader now open it.  The other
+            # keys stay text placeholders that this suite never loads.
+            target.write_bytes(onnx_identity_model())
         else:
             target.write_bytes(b'metadata fixture, never loaded')
         values[key] = str(target)
@@ -64,6 +235,7 @@ def intent(mode):
 
 
 def main():
+    gate = model_identity_gate()
     with tempfile.TemporaryDirectory(prefix='cosplay-creative-task-') as folder:
         root = Path(folder).resolve()
         registry, sources, reference = fixture(root)
@@ -314,7 +486,7 @@ def main():
     print(json.dumps({'ok': True, 'pure_preflight': True, 'content_bound_plan': True,
         'real_http_cli_parity': True, 'durable_independent_batches': True,
         'serialized_failed_retry': True, 'unknown_generation_retry_blocked': True,
-        'execution_model_capability_mocked': True, 'http_cli_model_preflight_real': True}))
+        'execution_model_capability_mocked': True, 'http_cli_model_preflight_real': True, **gate}))
     return 0
 
 

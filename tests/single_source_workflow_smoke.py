@@ -22,12 +22,18 @@ import single_source_workflow as workflow
 
 
 def check_draft_during_diagnosis(root,common,candidate,local):
-    """The normal saved-run reader can open a draft before slow QA returns."""
+    """The normal saved-run reader can open a draft before slow QA returns.
+
+    While the in-flight run's saved pixels are still pending, the project
+    pointer and status keep describing the previous published run; committing
+    those saved pixels is what moves the pointer.
+    """
     from generation_design import DESIGN_VERSION
     observed=[]
     for final_status in ('reviewed','unavailable'):
         entered=threading.Event();release=threading.Event();results=[];errors=[]
         run_id='run-qa-'+final_status
+        published_state=workflow.read_json(root/'project.json')['state']
         args=workflow.parse_args(common+['--run-id',run_id,'--reference',str(candidate)])
         args.cosplay_review_only=True
         args.generation_design={'schema_version':DESIGN_VERSION,'status':'ready','effective_prompt':'Offline fixture.'}
@@ -70,13 +76,31 @@ def check_draft_during_diagnosis(root,common,candidate,local):
                 assert all(Path(saved['artifacts'][key]).is_file()
                     for key in ('auto_draft','render_master','render_scene_master'))
                 project=workflow.read_json(root/'project.json')
-                assert project['state']['last_source_only_run']==saved['manifest']
+                # A run that has saved a draft but not yet committed those saved
+                # pixels must not take over the project pointer: the project
+                # keeps describing the previous published run (AGENTS.md:
+                # incomplete work must not become the latest saved result).
+                publication=saved['result_publication']
+                assert publication['state']=='pending', publication
+                assert publication['scope']=='local_save' and publication['run_id']==run_id, publication
+                assert (saved.get('options') or {}).get('preserve_project_selection') is not True
+                assert project['state']==published_state, (project['state'], published_state)
+                assert project['state']['last_source_only_run']!=saved['manifest']
+                pointed=root/str(project['state']['last_source_only_run'])
+                assert pointed.is_file(), pointed
+                assert workflow.read_json(pointed)['result_publication']['state']=='committed', pointed
                 assert project['state']['status']=='needs_visual_review'
                 observed.append(final_status)
             finally:release.set();worker.join(5)
             assert not worker.is_alive() and not errors, errors
         assert len(results)==1 and results[0]['cosplay_post_review']['status']==final_status
         _,saved=workflow.load_run(root,run_id)
+        # Committing the saved pixels is what moves the project pointer.
+        assert saved['result_publication']['state']=='committed', saved['result_publication']
+        assert saved['result_publication'].get('committed_at')
+        project=workflow.read_json(root/'project.json')
+        assert project['state']['last_source_only_run']==saved['manifest']
+        assert project['state']['status']==saved['status']=='needs_visual_review'
         assert saved['cosplay_post_review']==results[0]['cosplay_post_review']
         assert saved['status']=='needs_visual_review' and not saved.get('acceptance')
         assert saved['cosplay_post_review']['automatic_accepted'] is False
@@ -176,6 +200,8 @@ def main() -> int:
             'review_revision_and_eight_checks_required':True,'saved_master_delivery_bytes_and_hashes':True,
             'no_generation_or_reference_models':True,'unsupported_source_rejected':True,
             'draft_readable_during_pending_qa':True,'slow_and_failed_diagnosis_retains_draft':True,
+            'pending_publication_does_not_take_over_project':True,
+            'committed_publication_moves_project_pointer':True,
             'visual_quality_acceptance_simulated':True}))
     return 0
 

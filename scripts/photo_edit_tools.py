@@ -243,7 +243,19 @@ FUSION={'schema':'cosluma_photographic_join.v3','minimum_region_short_edge':256,
     # The join band is judged against the parent's own band, not against a
     # constant: content that is genuinely smoother than the ring must not force
     # texture to be invented.
-    'join_detail_relative_limit':1.3}
+    'join_detail_relative_limit':1.3,
+    # One constant gain carries the region's mean level and white point onto
+    # the photograph's, but the photograph's own level is not constant inside
+    # the region. Measured on the real 685 product the pixels just inside the
+    # cut sat +0.066 luma above the retained photograph, which is the seam the
+    # audit reads (1.79 against its 1.6 limit) and the reason the membrane
+    # saturated at its 0.35 bound. The relation is therefore solved jointly
+    # across the boundary: the registration holds in the interior and the gain
+    # moves onto the parent's own local relation inside the measured join band,
+    # in both directions, so a darker environment can darken the region instead
+    # of only ever brightening it. It is a per-channel exposure/white-point
+    # gain, not a tone transplant, and it stays inside the reviewed EV bound.
+    'boundary_light_field':'joint_region_band_subject_environment_two_way_gain'}
 _LUMA=np.asarray([.2126,.7152,.0722],np.float32)
 
 
@@ -294,6 +306,95 @@ def _join_ramp(distance,taper):
     """Taper-only source weight of the join, straight from the core geometry."""
     value=np.clip(distance/np.maximum(taper,np.float32(1.)),0.,1.)
     return (value*value*(3.-2.*value)).astype(np.float32)
+
+
+def _ownership_distance(ownership,size):
+    """Distance in pixels to the boundary this join actually writes, whichever side owns it.
+
+    The audit measures its seam, its halo and its join band against the
+    delivered boundary, so a light solve has to be measured from the same
+    place: where ownership hands the pixel back to the parent. The reserved
+    rectangle stays the fallback geometry when there is no ownership to follow,
+    and an ownership that covers (or excludes) the whole core has no boundary
+    inside it at all, so the core geometry stands.
+    """
+    from scipy.ndimage import distance_transform_edt
+    if ownership is None:return _edge_distance(size)
+    owned=np.asarray(ownership,np.float32)>=np.float32(.5)
+    if not owned.any() or owned.all():return _edge_distance(size)
+    return np.ascontiguousarray(distance_transform_edt(~owned),dtype=np.float32)
+
+
+def _support_low(values,support,sigma):
+    """The low band of a field measured only where the field actually exists.
+
+    An unpremultiplied provider patch is exactly zero where nothing is written,
+    so smoothing it raw drags the band near the cut towards those zeros and
+    asks for a gain the provider never needed. Normalising by the support keeps
+    the measurement on the pixels that carry content.
+    """
+    from scipy.ndimage import gaussian_filter
+    weight=np.asarray(support,np.float32)
+    if not bool(weight.min()>np.float32(0.)):
+        numerator=gaussian_filter(np.asarray(values,np.float32)*weight[...,None],
+            (sigma,sigma,0),mode='nearest')
+        denominator=gaussian_filter(weight,(sigma,sigma),mode='nearest')
+        return numerator/np.maximum(denominator,np.float32(1e-6))[...,None]
+    return gaussian_filter(np.asarray(values,np.float32),(sigma,sigma,0),mode='nearest')
+
+
+def _boundary_light_gain(prior,patch,ownership,support_field,distance,scale):
+    """Per-channel low-frequency gain solved jointly across the join boundary.
+
+    A constant registration matches the region's mean level and white point onto
+    the photographed ones, but the photograph's own level is not constant
+    inside the region, and the retained scene around the cut owns the local
+    light field. The solve therefore keeps the registration where the join has
+    its own interior and moves the gain onto the parent's own local relation
+    inside the measured join band, blending between them in log2 exposure so
+    the field is continuous across the boundary instead of stepping on it.
+    Both directions are solved: an environment darker than the source darkens
+    the written pixels exactly as a brighter one lifts them, which the reviewed
+    one-way response could not express. The support, the band, the interior and
+    the EV bound are the reviewed join constants; nothing is widened here, and
+    the field reads the parent and the provider content only, never the edit
+    coverage, so the join stays linear in its own weight.
+    """
+    sigma=float(FUSION['registration_sigma_px'])
+    low_ev,high_ev=FUSION['registration_gain_ev_bounds']
+    support=np.asarray(support_field,bool)
+    # The target across the cut is the photographed level as the retained side
+    # carries it, measured on the parent itself, so the delivered pixels meet
+    # what surrounds them; the provider side is measured on its own support so
+    # the zeros it leaves outside the write cannot drag the band down.
+    prior_low=_support_low(prior,np.ones_like(support),sigma)
+    patch_low=_support_low(patch,support,sigma)
+    local=np.log2(np.maximum(prior_low,np.float32(1e-6))/np.maximum(patch_low,np.float32(1e-6)))
+    band=float(FUSION['band_inner_px']);interior=float(FUSION['band_interior_px'])
+    reach=np.clip((interior-np.asarray(distance,np.float32))/max(interior-band,1.),0.,1.)
+    weight=_smooth(reach).astype(np.float32)[...,None]
+    base=np.log2(np.asarray(scale,np.float32)).reshape(1,1,3)
+    field=base*(np.float32(1.)-weight)+local*weight
+    outside=field<np.float32(low_ev)-np.float32(1e-6)
+    above=field>np.float32(high_ev)+np.float32(1e-6)
+    field=np.clip(field,np.float32(low_ev),np.float32(high_ev))
+    inband=weight[...,0]>=np.float32(.5)
+    record={'policy':FUSION['boundary_light_field'],'support_sigma_px':sigma,
+        'band_px':int(FUSION['band_inner_px']),'interior_px':int(FUSION['band_interior_px']),
+        'gain_ev_bounds':[low_ev,high_ev],
+        'gain_ev_min_max':[round(float(field.min()),4),round(float(field.max()),4)],
+        'registered_scale_ev':[round(float(v),4) for v in np.log2(np.asarray(scale,np.float32))],
+        'band_gain_ev_median':([round(float(v),4) for v in np.median(field[inband],axis=0)]
+            if inband.any() else None),
+        'band_pixels':int(np.count_nonzero(inband)),
+        'clamped_pixels':int(np.count_nonzero(np.any(outside|above,axis=-1))),
+        'clamped_in_band_pixels':int(np.count_nonzero(np.any((outside|above)
+            &(weight[...,0]>=np.float32(.5))[...,None],axis=-1))),
+        'written_pixels':int(np.count_nonzero(support)),
+        'darkened_pixels':int(np.count_nonzero(np.any(field<np.float32(1.)-np.float32(1e-6),axis=-1))),
+        'directions':'brighten_and_darken','environment_side':'retained_parent_around_the_write',
+        'reads_edit_coverage':False,'alpha_modified':False}
+    return np.exp2(field).astype(np.float32),record
 
 
 def _registration_scale(native,core,box,patch,prior,distance=None,*,weight=None):
@@ -450,14 +551,23 @@ def _register_patch(patch,scale):
     must not do that: the provider's detail is right at its own amplitude and
     only the level is wrong. The scale therefore multiplies the 1.6px low band
     while the high band keeps its amplitude; the region mean still lands on the
-    photographed level because that band has zero mean.
+    photographed level because that band has zero mean. The gain is one
+    per-channel value over the whole region when the boundary light solve is
+    off, and one per-channel value per pixel when the solve is on: it is still
+    an exposure/white-point gain on the low band, never a rescale of the
+    provider's texture.
     """
     from scipy.ndimage import gaussian_filter
     sigma=float(FUSION['detail_sigma'])
     values=np.asarray(patch,np.float32)
+    gain=np.asarray(scale,np.float32)
+    if gain.ndim==1:
+        gain=gain.reshape(1,1,3)
+    if gain.ndim!=3 or gain.shape[-1]!=3 or gain.shape[0] not in (1,values.shape[0]) or gain.shape[1] not in (1,values.shape[1]):
+        raise ValueError('Join registration gain must be one value per channel or one per pixel')
     low=gaussian_filter(values,(sigma,sigma,0),mode='nearest')
     high=values-low
-    return np.clip(low*np.asarray(scale,np.float32)+high,0.,np.float32(1.)).astype(np.float32)
+    return np.clip(low*gain+high,0.,np.float32(1.)).astype(np.float32)
 
 
 def _tone_depth(distance):
@@ -513,12 +623,185 @@ def _join_detail(prior,delivered,distance):
         'relative_ok':None if relative is None else bool(relative<=limit)}
 
 
-def fuse_region(native,patch,alpha,*,core,box):
+# The round's own authorized operations, and what each one means for ownership.
+# A scene operation authorizes the scene side of the core as content of this
+# round, so it must be written and joined; only a person-only round may narrow
+# the write to the subject. Relighting is a joint cross-boundary solve, so both
+# sides have to be written for it to mean anything.
+SCENE_OPERATIONS=('scene_edit','scene_cleanup','scene_composite','relight')
+SUBJECT={'schema':'cosluma_subject_ownership.v1','role':'current_canvas_subject_matte',
+    # The matte is the person silhouette of the canvas actually being edited,
+    # inferred by this route's own BiRefNet silhouette (source_alpha), never
+    # taken from the composite's own coverage: coverage is bounded edit
+    # permission, this matte is who owns the boundary.
+    'producer':'source_alpha.source_silhouette:birefnet_lite_onnx',
+    'storage':'subject-matte.npy inside the owned tool attempt',
+    'quantisation':'uint8 round trip of the silhouette score',
+    # Ownership rule, in one place. Default: the authorized core is written as
+    # reserved, scene included. Narrowing to the subject happens only for a
+    # person-only round, and a core with no subject in it never narrows.
+    'ownership_rule':'authorized content is never silently discarded; when in doubt, write',
+    'default_write':'authorized_core_scene_included',
+    'narrowed_write':'subject_generated_scene_retained',
+    'scene_operations':list(SCENE_OPERATIONS),
+    'person_only_operations':['portrait_retouch'],
+    'operation_semantics':{
+        'scene_edit':'authorized_scene_write',
+        'scene_cleanup':'authorized_scene_write',
+        'scene_composite':'authorized_scene_write',
+        'relight':'authorized_joint_lighting_both_sides_written',
+        'portrait_retouch':'person_only_may_narrow_to_the_subject',
+        'detail_repair':'person_only_only_without_any_scene_operation_and_with_preserved_scene_policy'},
+    'narrowing_requires':('no scene operation in the round and scene_policy == preserve'),
+    # matte <= soft_low is the scene side of the core, matte >= .5 is the subject.
+    'soft_low':.02,'soft_high':.98,'maximum_edge_width_px':8.,'minimum_subject_pixels':256}
+
+
+def _smooth(value):
+    value=np.clip(value,0.,1.)
+    return (value*value*(3.-2.*value)).astype(np.float32)
+
+
+def _subject_array(subject,size):
+    """Validate one decoded subject matte that covers exactly this canvas.
+
+    A matte is segmentation, not permission: it has to be a 2-D weight per
+    canvas pixel that actually separates a subject from the scene. A uniform
+    mask, an index image or the edit coverage cannot stand in for it.
+    """
+    if subject is None:return None
+    value=np.asarray(subject)
+    if value.ndim!=2 or tuple(value.shape)!=(size[1],size[0]):
+        raise ValueError('Subject matte must hold one weight per current canvas pixel')
+    if value.dtype==np.uint8:
+        value=value.astype(np.float32)/np.float32(255.)
+    elif value.dtype in (np.float16,np.float32,np.float64,np.bool_):
+        value=value.astype(np.float32)
+    else:
+        raise ValueError('Subject matte must be a decoded segmentation, not indices or labels')
+    if not np.isfinite(value).all() or float(value.min())<0. or float(value.max())>1.:
+        raise ValueError('Subject matte weights must be finite and inside zero to one')
+    inside=int(np.count_nonzero(value>=np.float32(.5)))
+    outside=int(np.count_nonzero(value<np.float32(.5)))
+    floor=int(SUBJECT['minimum_subject_pixels'])
+    if inside<floor or outside<floor:
+        raise ValueError('Subject matte must separate a real subject from a real scene')
+    # A segmentation is not a box: the whole point of the matte is to replace
+    # the reserved rectangle, so a filled rectangle is refused as evidence.
+    subject=value>=np.float32(.5)
+    rows=np.flatnonzero(np.any(subject,axis=1));columns=np.flatnonzero(np.any(subject,axis=0))
+    rectangle=np.zeros_like(subject)
+    rectangle[rows[0]:rows[-1]+1,columns[0]:columns[-1]+1]=True
+    if np.array_equal(rectangle,subject):
+        raise ValueError('Subject matte must be a segmentation, not the reserved rectangle')
+    return np.ascontiguousarray(value,dtype=np.float32)
+
+
+def _matte_soft(matte):
+    return ((matte>np.float32(SUBJECT['soft_low']))&(matte<np.float32(SUBJECT['soft_high'])))
+
+
+def _matte_edge_width(matte):
+    """Measured width of the matte's own transition, in canvas pixels."""
+    from scipy.ndimage import distance_transform_edt
+    soft=_matte_soft(matte)
+    if not soft.any():return float(FUSION['minimum_taper_px'])
+    reach=distance_transform_edt(~soft)
+    width=2.*float(np.median(reach[soft]))
+    return float(np.clip(width,FUSION['minimum_taper_px'],float(SUBJECT['maximum_edge_width_px'])))
+
+
+def _subject_ownership(matte):
+    """The subject's ownership of each core pixel, saturated to exactly zero and one.
+
+    The transition is the matte's own soft band, so the boundary between the
+    generated subject and the retained scene is the person's boundary instead
+    of a rectangle.
+    """
+    low,high=float(SUBJECT['soft_low']),float(SUBJECT['soft_high'])
+    return _smooth((matte-np.float32(low))/np.float32(high-low))
+
+
+def _matte_taper(matte,edge):
+    """Join width: the matte's own edge where the subject boundary is, wider away from it."""
+    from scipy.ndimage import distance_transform_edt
+    wide=float(FUSION['maximum_taper_px'])
+    narrow=float(np.clip(edge,float(FUSION['minimum_taper_px']),wide))
+    soft=_matte_soft(matte)
+    if not soft.any():return np.full(matte.shape,wide,np.float32)
+    reach=distance_transform_edt(~soft)
+    return (narrow+(wide-narrow)*_smooth(reach/np.float32(wide))).astype(np.float32)
+
+
+def _ownership_gate(matte,edge):
+    """One where the join may correct tone, zero across the subject boundary.
+
+    The membrane estimates the parent's tone inside the cut. Across a real
+    ownership change that estimate would paint the scene's tone onto the
+    generated subject (or the reverse), which is exactly the rim it is supposed
+    to close, so the dose is gated to same-owner pixels only.
+    """
+    from scipy.ndimage import distance_transform_edt
+    soft=_matte_soft(matte)
+    if not soft.any():return np.ones(matte.shape,np.float32)
+    reach=distance_transform_edt(~soft)
+    return _smooth(reach/np.float32(max(edge,1.)))
+
+
+def _subject_record(core_matte,core,source,edge,taper,gate,subject_only):
+    """Reviewable evidence of which boundary this join actually wrote.
+
+    The write boundary is the reserved rectangle unless the round narrowed the
+    write to the subject; the transition boundary is the subject's own edge
+    whenever a real matte supplies it. Both are recorded, so the receipt cannot
+    claim a subject boundary it did not write, or hide one it did.
+    """
+    from scipy.ndimage import distance_transform_edt
+    soft=_matte_soft(matte=core_matte)
+    band=(source>np.float32(0))&(source<np.float32(.999))
+    near=soft if not soft.any() else distance_transform_edt(~soft)<=np.float32(1.)
+    pixels=float(core_matte.size)
+    edges=_edge_distance((core[2]-core[0],core[3]-core[1]))<=np.float32(2.)
+    scene=core_matte<=np.float32(SUBJECT['soft_low'])
+    scene_pixels=int(np.count_nonzero(scene))
+    scene_written=int(np.count_nonzero(scene&(source>np.float32(0))))
+    return {'schema':SUBJECT['schema'],'role':SUBJECT['role'],'available':True,
+        'boundary_source':'subject_matte_edge' if subject_only else 'authorized_rectangle',
+        'transition_boundary':'subject_matte_edge',
+        'write_boundary':'subject_matte_edge' if subject_only else 'authorized_rectangle',
+        'ownership':(SUBJECT['narrowed_write'] if subject_only else SUBJECT['default_write']),
+        'subject_only_round':bool(subject_only),
+        'scene_pixels':scene_pixels,'scene_pixels_written':scene_written,
+        'scene_side_written_fraction':round(scene_written/max(scene_pixels,1),6),
+        'edge_width_px':round(float(edge),3),
+        'subject_fraction_of_core':round(float(np.count_nonzero(core_matte>=np.float32(.5)))/pixels,6),
+        'silhouette_pixels_in_core':int(np.count_nonzero(soft)),
+        'written_fraction_of_core':round(float(np.count_nonzero(source>0))/pixels,6),
+        'retained_scene_fraction_of_core':round(float(np.count_nonzero(source<=0))/pixels,6),
+        'taper_px':{'minimum':round(float(taper.min()),3),'median':round(float(np.median(taper)),3),
+            'maximum':round(float(taper.max()),3)},
+        'join_band_pixels':int(np.count_nonzero(band)),
+        'join_band_on_silhouette_fraction':round(float(np.count_nonzero(band&near))
+            /max(int(np.count_nonzero(band)),1),6),
+        'membrane_gated_on_silhouette':bool(gate is not None),
+        'core_edge_inside_the_subject_fraction':round(float(np.mean(core_matte[edges]>=np.float32(.5)))
+            if edges.any() else 0.,6)}
+
+
+def fuse_region(native,patch,alpha,*,core,box,subject=None,subject_only=False):
     """Compose one regional generated patch into the current canvas.
 
     The authorized core and its generation context are exactly the ones the
     reservation checked. Untouched pixels keep the parent's own bytes, and the
     returned coverage is the real written join weight, not a fetched permission.
+
+    Ownership follows the round's authorized operations, not the mere presence
+    of a subject in the core: by default the whole authorized core is written,
+    scene side included, and the subject matte only shapes the transition and
+    the boundary light solve. `subject_only=True` is the person-only round,
+    where the write itself narrows to the subject and the scene side keeps the
+    parent's bytes; a caller may only pass it when the round authorizes no
+    scene operation and the scope preserves the scene (see `_scene_write_trigger`).
     """
     x0,y0,x1,y1=core
     local=patch[y0-box[1]:y1-box[1],x0-box[0]:x1-box[0]]
@@ -529,37 +812,109 @@ def fuse_region(native,patch,alpha,*,core,box):
     prior=np.asarray(native[y0:y1,x0:x1],np.float32)
     result=np.array(native,np.float32,copy=True)
     view=result[y0:y1,x0:x1]
+    canvas_subject=_subject_array(subject,(native.shape[1],native.shape[0]))
+    core_subject=(None if canvas_subject is None
+        else np.ascontiguousarray(canvas_subject[y0:y1,x0:x1]))
+    edge=ownership=gate=None
+    # Only the branches below that truly know the written boundary set these
+    # keys; with no matte the join does not own the declaration, so the caller's
+    # recorded reason for the reserved write stands instead of being overwritten
+    # by a generic rectangle claim.
+    subject_record={'schema':SUBJECT['schema'],'role':SUBJECT['role'],'available':False}
+    if core_subject is not None:
+        inside=int(np.count_nonzero(core_subject>=np.float32(.5)))
+        subject_record.update(available=True,
+            subject_fraction_of_core=round(inside/max(core_subject.size,1),6))
+        if inside<int(SUBJECT['minimum_subject_pixels']):
+            # The authorized core lies in the scene: there is no subject
+            # boundary inside it to own, so the reserved write stands and the
+            # receipt says so instead of silently clipping the edit away.
+            subject_record.update(boundary_source='authorized_core_without_subject',
+                write_boundary='authorized_rectangle',ownership='authorized_core_written_as_reserved',
+                subject_only_round=False)
+            core_subject=None
+        else:
+            edge=_matte_edge_width(core_subject)
+            ownership=_subject_ownership(core_subject)
+            gate=_ownership_gate(core_subject,edge)
+            write_boundary='subject_matte_edge' if subject_only else 'authorized_rectangle'
+            subject_record.update(boundary_source=write_boundary,transition_boundary='subject_matte_edge',
+                write_boundary=write_boundary,
+                ownership=(SUBJECT['narrowed_write'] if subject_only else SUBJECT['default_write']),
+                subject_only_round=bool(subject_only))
     record={'schema':FUSION['schema'],'policy':dict(FUSION),'working_domain':'display_linear_sRGB',
         'alpha_modified':False,'coordinates_changed':False,'generated_texture_added':False,
         'provider_alpha_registered':registered is not None,'visual_acceptance':False}
     if not _join_analysis_ready((x1-x0,y1-y0)):
         weight=_mask((x1-x0,y1-y0))
-        actual=weight if registered is None else weight*registered
+        if ownership is not None:
+            subject_record['transition_boundary']='subject_matte_edge_inside_the_bypass'
+            if subject_only:
+                weight=(weight*ownership).astype(np.float32)
+                subject_record['boundary_source']='subject_matte_edge_inside_the_bypass'
+                subject_record['write_boundary']='subject_matte_edge_inside_the_bypass'
+        actual=weight if registered is None else (weight*registered).astype(np.float32)
         coverage=np.zeros(native.shape[:2],np.float32)
         coverage[y0:y1,x0:x1]=actual
         mixed=prior*(1-actual[...,None])+local*weight[...,None]
         view[actual>0]=mixed[actual>0]
         record.update(mode='bounded_rectangular_crossfade',
-            bypass_reason='edit_region_below_photographic_join_support')
+            bypass_reason='edit_region_below_photographic_join_support',subject=subject_record)
         return result,coverage,record
     from scipy.ndimage import gaussian_filter
     distance=_edge_distance((x1-x0,y1-y0))
-    taper=_structure_taper(prior)
+    # The boundary that gives the generated subject back to the parent is the
+    # subject's own edge whenever a real matte is available; the retained
+    # structure is only the approximation used when there is none.
+    taper=_structure_taper(prior) if ownership is None else _matte_taper(core_subject,edge)
     ramp=_join_ramp(distance,taper)
+    # The write itself narrows to the subject only for a person-only round; the
+    # matte still shapes the taper either way.
+    narrowed=ownership is not None and subject_only
+    written=(ramp*ownership).astype(np.float32) if narrowed else ramp
     # alpha belongs to the destination decay only: the source is the
     # premultiplied patch weighted by the taper, so semi-transparent provider
     # pixels compose as source-over instead of silently darkening the region.
-    source=ramp if registered is None else (ramp*registered).astype(np.float32)
-    registration=_registration_scale(native,core,box,content,prior,weight=registered)
+    source=written if registered is None else (written*registered).astype(np.float32)
+    # The constant field is estimated on the pixels this join actually writes,
+    # so the subject's own level is measured against the photographed subject
+    # instead of against a core that is mostly retained scene.
+    analysis_weight=(written if registered is None
+        else (written*(registered>np.float32(0))).astype(np.float32))
+    registration=_registration_scale(native,core,box,content,prior,weight=analysis_weight)
     registration['unpremultiplied_estimate']=True
-    registered_patch=_register_patch(content,registration['scale'])
+    # The level and white point are not constant inside the region, so the
+    # constant registration alone leaves a rim exactly at the cut. The joint
+    # solve below keeps it in the interior and carries the parent's own local
+    # relation across the boundary band, in both directions, on the geometry
+    # this join actually writes. It reads the parent and the provider content
+    # only, so the join stays linear in its own coverage weight.
+    # The light solve follows the boundary this join actually delivers: the
+    # subject's edge only when the write narrowed to the subject, otherwise the
+    # authorized core's own edge, which is where the delivered pixels meet the
+    # retained photograph.
+    boundary=_ownership_distance(ownership if narrowed else None,(x1-x0,y1-y0))
+    boundary_light=None
+    if ownership is None:
+        gain=registration['scale']
+    else:
+        content_support=(np.ones_like(written,dtype=bool) if registered is None
+            else (registered>np.float32(0.)))
+        gain,boundary_light=_boundary_light_gain(prior,content,ownership,content_support,
+            boundary,registration['scale'])
+    registered_patch=_register_patch(content,gain)
     registration['clipped_pixels']=int(np.count_nonzero(np.any(registered_patch
         >=np.float32(1.),axis=-1)))
     matched,gains=_match_texture(registered_patch,prior)
     correction,depth=_tone_correction(prior,matched,distance)
+    membrane_max=round(float(np.abs(correction).max(initial=0.)),6)
+    if gate is not None:
+        # Same-owner tone only: the membrane may not carry the scene's level
+        # across the subject's boundary or the subject's across the scene's.
+        correction=(correction*gate[...,None]).astype(np.float32)
     aligned=np.clip(matched+correction,0.,1.).astype(np.float32)
     premult=aligned if registered is None else (aligned*registered[...,None]).astype(np.float32)
-    mixed=(prior*(1.-source[...,None])+ramp[...,None]*premult).astype(np.float32)
+    mixed=(prior*(1.-source[...,None])+written[...,None]*premult).astype(np.float32)
     coverage=np.zeros(native.shape[:2],np.float32)
     coverage[y0:y1,x0:x1]=source
     view[source>0]=mixed[source>0]
@@ -582,14 +937,18 @@ def fuse_region(native,patch,alpha,*,core,box):
         achieved_noise_ratio=round(noise_mean(aligned)/max(noise_mean(prior),1e-9),6),
         join_detail=_join_detail(prior,mixed,distance),
         tone_correction_max=round(float(np.abs(correction).max(initial=0.)),6),
+        tone_correction_max_before_ownership_gate=membrane_max,
         tone_correction_interior_max=round(float(np.abs(correction[deep]).max(initial=0.))
             if deep.any() else 0.,6),
         tone_correction_pixels=int(np.count_nonzero(np.any(correction!=0,axis=-1))),
         tone_depth_px=int(depth),
-        boundary_pixels=int(np.count_nonzero((ramp>0)&(ramp<1))),
+        boundary_pixels=int(np.count_nonzero((written>0)&(written<1))),
+        boundary_light=boundary_light,
         joined_fraction=round(float(np.count_nonzero(source>0)/source.size),6),
         alpha_in_destination_only=True,
         analysis_domain='unpremultiplied_provider_colour',
+        subject=(_subject_record(core_subject,core,source,edge,taper,gate,subject_only)
+            if ownership is not None else subject_record),
         coverage_semantics='written_join_weight_inside_the_authorized_core')
     return result,coverage,record
 
@@ -689,6 +1048,106 @@ def _prompt(scope,decision,core_in_input,family,shaping_authorization=None):
     return intro+'\n\nMAIN EDIT\n'+decision['instruction']+'\n\nPRESERVE\n'+limits+' '+setting
 
 
+def _birefnet_subject_matte(root,canvas_path,image):
+    """The route's own real subject silhouette of the canvas being edited.
+
+    The desktop process must not mix ONNX runtimes, so this reuses the
+    registered silhouette inference instead of importing a second runtime.
+    """
+    from source_alpha import source_silhouette
+    silhouette,metadata=source_silhouette(Path(root),Path(canvas_path),image,backend='birefnet')
+    keep=('onnxruntime','execution_provider','session_providers','input_dtype','preprocess',
+        'postprocess','cache_hit','cache_key','source_sha256','oriented_size','candidate_used',
+        'role','requested_backend')
+    return np.asarray(silhouette,np.float32)/np.float32(255.),{'producer':SUBJECT['producer'],
+        'role':SUBJECT['role'],'silhouette':{key:metadata[key] for key in keep if key in metadata}}
+
+
+def _scene_write_trigger(scope,decision):
+    """Does this round authorize the scene side of the core, and on what ground?
+
+    Ownership is decided by what the round was authorized to do, never by the
+    mere presence of a subject in the core. A scene operation - or a scope that
+    does not preserve the scene - makes the scene side authorized content that
+    must be written and joined; only a person-only round may narrow the write to
+    the subject. Relighting is a joint cross-boundary solve, so it counts as a
+    scene write: one-sided relighting is not the operation that was authorized.
+    """
+    operations=[str(name) for name in (decision.get('operations') or [])]
+    scene=sorted(name for name in operations if name in SCENE_OPERATIONS)
+    policy=str(scope.get('scene_policy'))
+    if scene:return False,'authorized_scene_operation:'+','.join(scene)
+    if policy!='preserve':return False,'scope_allows_scene_rebuild:'+policy
+    return True,'person_only_round:'+','.join(sorted(operations))
+
+
+JOINED_SUBJECT_KEYS=('boundary_source','write_boundary','transition_boundary','ownership',
+    'subject_only_round','edge_width_px','written_fraction_of_core','retained_scene_fraction_of_core',
+    'scene_pixels','scene_pixels_written','scene_side_written_fraction','subject_fraction_of_core')
+
+
+def _joined_subject_record(subject_record,fusion):
+    """The receipt's boundary fields, copied from the join that actually wrote them.
+
+    One source of truth: the pre-join declaration says what the round intended,
+    and this overwrites it with the boundary the join delivered, marking itself
+    authoritative. A join that makes no boundary claim at all (a reserved
+    rectangle below the photographic join support) leaves the declaration in
+    place instead of being overwritten by a generic rectangle claim.
+    """
+    joined=(fusion or {}).get('subject') or {}
+    if 'boundary_source' in joined:subject_record['authoritative']='join.subject'
+    for key in JOINED_SUBJECT_KEYS:
+        if key in joined:subject_record[key]=joined[key]
+    return subject_record
+
+
+def _current_canvas_subject(config,best,image):
+    """Ownership from a real subject matte of the current canvas, or a recorded absence.
+
+    A missing model, runtime or registration is recorded as missing; the edit
+    coverage is never substituted for the matte. The caller keeps the reviewed
+    rectangular join when there is no matte, so nothing is silently relabelled.
+    """
+    size=image.size
+    record={'schema':SUBJECT['schema'],'role':SUBJECT['role'],'available':False,
+        'canvas_size':[int(size[0]),int(size[1])],'current_canvas_sha256':best['sha256'],
+        'matte_is_the_edit_coverage':False,
+        # Declared before the join runs, and not the truth about the boundary
+        # that gets written: the join's own record overwrites these and marks
+        # itself authoritative, so a stale rectangle can never stand in for a
+        # subject boundary the matte actually took over.
+        'boundary_source':'authorized_rectangle','ownership':'authorized_core_written_as_reserved',
+        'acquisition':{'available':False,'boundary_source':'authorized_rectangle',
+            'ownership':'authorized_core_written_as_reserved'},
+        'authoritative':'pre_join_declaration'}
+    provider=config.get('subject_matte')
+    if provider is False:
+        record['reason']='subject_matte_disabled_by_configuration'
+        return None,record
+    try:
+        _cancel(config.get('cancel'))
+        if callable(provider):
+            value,provenance=provider(root=Path(config['root']),canvas_path=Path(best['path']),
+                image=image)
+            provenance=dict(provenance or {})
+            provenance.setdefault('producer','injected_subject_matte_provider')
+        else:
+            value,provenance=_birefnet_subject_matte(config['root'],best['path'],image)
+        matte=_subject_array(value,size)
+        pixels=float(max(matte.size,1))
+        record.update(available=True,**provenance)
+        record['subject_fraction_of_canvas']=round(
+            float(np.count_nonzero(matte>=np.float32(.5)))/pixels,6)
+        record['soft_band_fraction_of_canvas']=round(float(np.count_nonzero(_matte_soft(matte)))/pixels,6)
+        return matte,record
+    except (OSError,RuntimeError,ValueError,ImportError,TypeError,AttributeError,KeyError) as error:
+        record['reason']=type(error).__name__+': '+str(error)[:400]
+        return None,record
+    finally:
+        _cancel(config.get('cancel'))
+
+
 def _execute(context,config,kind):
     import reference_provider
     from raw_support import deterministic_srgb_profile
@@ -729,6 +1188,43 @@ def _execute(context,config,kind):
         input_path=output/'current-best-input.png';uploaded.save(input_path,format='PNG',icc_profile=deterministic_srgb_profile())
         local_core=None if core is None else [(core[0]-box[0])/uploaded.width,(core[1]-box[1])/uploaded.height,
             (core[2]-box[0])/uploaded.width,(core[3]-box[1])/uploaded.height]
+        # Ownership comes from the real subject matte of this exact canvas, and
+        # only where a photographic join has the support to carry it.
+        subject=subject_record=None
+        if core is not None and _join_analysis_ready((core[2]-core[0],core[3]-core[1])):
+            subject,subject_record=_current_canvas_subject(config,best,base)
+            if subject is not None:
+                # Store exactly the quantised weights the join uses, so the
+                # recorded digest reproduces the composite bit for bit.
+                matte_path=output/'subject-matte.npy'
+                np.save(matte_path,np.uint8(np.clip(subject*np.float32(255.)+np.float32(.5),0.,255.)),
+                    allow_pickle=False)
+                subject=(np.load(matte_path,allow_pickle=False).astype(np.float32)/np.float32(255.))
+                subject_record.update(file='subject-matte.npy',sha256=sha256_file(matte_path),
+                    dtype='uint8',weights='silhouette_score_over_255')
+        else:
+            whole=core is None
+            subject_record={'schema':SUBJECT['schema'],'role':SUBJECT['role'],'available':False,
+                'boundary_source':('whole_canvas_replacement' if whole
+                    else 'authorized_core_below_photographic_join_support'),
+                'ownership':('authorized_canvas_written_as_reserved' if whole
+                    else 'authorized_core_written_as_reserved'),
+                'reason':('whole_canvas_composite_has_no_join_boundary' if whole
+                    else 'edit_region_below_photographic_join_support'),
+                'matte_is_the_edit_coverage':False}
+        subject_only,trigger=_scene_write_trigger(scope,decision)
+        subject_record.setdefault('acquisition',{})
+        subject_record['acquisition'].update({'available':bool(subject_record.get('available')),
+            'reason':subject_record.get('reason'),
+            'boundary_source':subject_record.get('boundary_source'),
+            'ownership':subject_record.get('ownership')})
+        subject_record.setdefault('authoritative','pre_join_declaration')
+        subject_record.update(scene_write_trigger=trigger,ownership_rule=SUBJECT['ownership_rule'],
+            scene_policy=scope.get('scene_policy'),
+            scene_operations_authorized=[name for name in (decision.get('operations') or [])
+                if name in SCENE_OPERATIONS],
+            subject_only_round=bool(subject_only))
+        record['subject_matte']=subject_record
         prompt=_prompt(scope,decision,local_core,family,shaping);provider_dir=output/'provider'
         arguments=['--root',str(Path(config['root']).resolve()),'--image',str(input_path),
             '--source',source['path'],'--sample','edited','--out-dir',str(provider_dir),'--prompt',prompt,'--preserve-alpha']
@@ -769,8 +1265,13 @@ def _execute(context,config,kind):
             result[coverage>0]=mixed[coverage>0]
             fraction=float(np.count_nonzero(coverage)/(size[0]*size[1]))
         else:
-            result,coverage,fusion=fuse_region(native,patch,alpha,core=core,box=box)
+            result,coverage,fusion=fuse_region(native,patch,alpha,core=core,box=box,subject=subject,
+                subject_only=subject_only)
             fraction=float(np.count_nonzero(coverage)/(size[0]*size[1]))
+        # Single source of truth: the receipt's boundary fields are the ones the
+        # join actually wrote, copied from the join's own record. The pre-join
+        # declaration stays only under 'acquisition'.
+        _joined_subject_record(subject_record,fusion)
         if coverage is not None and not np.any(coverage>0):
             raise ValueError('Generated image has no visible coverage inside its permitted edit')
         record.update(core_box=core,context_box=box)
@@ -788,6 +1289,7 @@ def _execute(context,config,kind):
             'output_encoding':'float32_master_with_matching_RGB8_sRGB_preview','core_box':core,'context_box':box,
             'coverage':loaded['receipt']['edit_coverage'],
             'coverage_semantics':'current_canvas_edit_coverage_not_source_subject_alpha','join':fusion,
+            'subject_matte':subject_record,
             'edit_permission':'full_canvas' if kind=='joint_edit' else 'bounded_region',
             'composition_mode':'opaque_replacement' if coverage is None else 'linear_premultiplied_rgba_over_parent',
             'generated_opacity':'opaque' if alpha is None else 'registered_alpha',
@@ -829,15 +1331,18 @@ def edit_region(context,config):
 
 
 def make_tools(root,output,*,scope,session_directory,provider_options=None,cancel=None,
-               shaping_authorization=None,shaping_base_appearance=None):
+               shaping_authorization=None,shaping_base_appearance=None,subject_matte=None):
     from photo_edit_session import Tool
     scope=validate_scope(scope)
     config={'root':str(Path(root).resolve()),'output':str(Path(output).resolve()),'scope':scope,
         'session_directory':str(Path(session_directory).resolve()),'provider_options':copy.deepcopy(provider_options or {}),
         'cancel':cancel,'shaping_authorization':copy.deepcopy(shaping_authorization),
-        'shaping_base_appearance':copy.deepcopy(shaping_base_appearance)}
+        'shaping_base_appearance':copy.deepcopy(shaping_base_appearance),
+        # None selects the route's own real subject silhouette, False records
+        # the absence, and a callable injects another reviewed segmentation.
+        'subject_matte':subject_matte}
     producer=identity({'code':{name:sha256_file(Path(__file__).parent/name) for name in
-        ('photo_edit_tools.py','photo_appearance.py','photo_session_evidence.py','photo_editing.py','reference_provider.py','qwen_grid_diagnostic.py','raw_support.py','float_appearance.py','photo_shaping.py','photo_shaping_geometry.py')},
+        ('photo_edit_tools.py','photo_appearance.py','photo_session_evidence.py','photo_editing.py','reference_provider.py','qwen_grid_diagnostic.py','raw_support.py','float_appearance.py','photo_shaping.py','photo_shaping_geometry.py','source_alpha.py')},
         'scope_id':scope['scope_id'],'provider_options':config['provider_options'],
         'shaping_authorization':shaping_authorization})
     if shaping_authorization is not None:

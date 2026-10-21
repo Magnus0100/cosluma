@@ -51,7 +51,7 @@ import workflow_timing  # noqa: E402
 
 
 SCHEMA_VERSION = "1.0"
-SOFTWARE_VERSION = "0.7.3"
+SOFTWARE_VERSION = "0.7.4"
 RUNS_DIR = Path("outputs/runs")
 RESULT_PUBLICATION_SCHEMA = 'cosplay_saved_result_publication.v1'
 _RESULT_PUBLICATION = ContextVar('cosplay_result_publication', default=None)

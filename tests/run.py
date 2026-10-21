@@ -55,6 +55,7 @@ INTEGRATION = (
     'local_field_domain', 'frozen_native_paths', 'backend_batch_export', 'source_copy',
     'source_preview_cache', 'quick_progress', 'variant_selection_job', 'job_polling',
     'saved_completion', 'job_owner', 'beauty_reference_overlap', 'beauty_existing_ownership',
+    'single_source_workflow', 'source_foreground_workflow_cancel',
 )
 
 MODEL_CHECKS = frozenset((

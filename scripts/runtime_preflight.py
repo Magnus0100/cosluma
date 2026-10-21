@@ -6,11 +6,12 @@ Python runtime used by the expensive local workers.  Historically a direct
 before SciPy (or the selected model runtime) failed.  This module performs a
 small, side-effect-free check before generation/rendering starts.
 
-Only module availability and executable paths are checked here. The selected
-worker performs real imports once, with its normal readable error reporting.
-Do not import Torch in a throwaway preflight process: on a cold Windows/HDD
-installation that repeats expensive DLL reads before the real worker starts.
-Model weights are left to the existing installation and execution adapters.
+Only module availability, executable paths and the *structure* of a registered
+model file are checked here. The selected worker performs real imports once,
+with its normal readable error reporting. Do not import Torch in a throwaway
+preflight process: on a cold Windows/HDD installation that repeats expensive DLL
+reads before the real worker starts. Model weight bytes are never read here
+unless the registry pins a digest; loading and execution stay with the provider.
 """
 from __future__ import annotations
 
@@ -26,7 +27,23 @@ from runtime_resources import isolated_python_environment
 
 
 class RuntimePreflightError(RuntimeError):
-    """A required interpreter or import is unavailable."""
+    """A required interpreter, model file or import is unavailable.
+
+    The kind attribute keeps the failure layers apart for the user:
+    configuration (the registry, a path or a model file is wrong),
+    model_loading (the selected runtime cannot import or open what it was
+    given) and execution (a round ran and failed).  A configuration failure
+    must never be reported as a runtime crash, and vice versa.
+    """
+
+    def __init__(self, message, *, kind='configuration', reason=None, detail=None):
+        super().__init__(message)
+        self.kind = kind
+        self.reason = reason
+        self.detail = detail or {}
+
+
+MODEL_FAILURE_LAYERS = ('configuration', 'model_loading', 'execution')
 
 
 HOST_IMPORTS = ("scipy",)
@@ -147,13 +164,15 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         if missing:
             raise RuntimePreflightError(
                 "Desktop renderer dependencies are missing before rendering: "
-                + ", ".join(missing) + ". Run the workflow with the project desktop Python."
+                + ", ".join(missing) + ". Run the workflow with the project desktop Python.",
+                kind='configuration_host_dependency_missing'
             )
 
     if generated:
         selection=generated_registry_status(root,registry_path)
         if selection.get('error'):
-            raise RuntimePreflightError('Explicit unused native registry metadata is invalid: '+selection['error'])
+            raise RuntimePreflightError('Explicit unused native registry metadata is invalid: '+selection['error'],
+                                        kind='configuration_unused_registry_invalid')
         receipt.update(route='scoped_generated_appearance',status='ready',native_models_required=False,
             model_registry=selection['registry_path'],model_registry_origin=selection['origin'],
             native_registry_configured=selection['configured'],native_registry_metadata_valid=selection['configuration_valid'],
@@ -162,14 +181,15 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         return receipt
 
     try:
-        from current_model_registry import load_registry, registry_location
+        from current_model_registry import ModelFileError, load_registry, registry_location
 
         selected, origin = registry_location(root, registry_path=registry_path)
         receipt["model_registry"] = str(selected)
         receipt["model_registry_origin"] = origin
     except (OSError, ValueError, RuntimeError) as exc:
         if require_local_models:
-            raise RuntimePreflightError("Local model runtime registry is unavailable: " + str(exc)) from exc
+            raise RuntimePreflightError("Local model runtime registry is unavailable: " + str(exc),
+                                        kind='configuration_registry_unavailable') from exc
         # Source-only rendering does not consume model weights, but retaining
         # the selected path in the receipt makes the automatic registry choice
         # visible for a later local continuation.
@@ -185,8 +205,17 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         config = load_registry(root, registry_path=selected,
                                required_keys=required_keys,
                                required_profiles=required_profiles)
+    except ModelFileError as exc:
+        # Configuration layer: the registry names a model that is not that
+        # model.  Report the file, its bytes and the expected revision here,
+        # instead of letting a provider raise an opaque runtime error inside a
+        # round where the user cannot tell a broken model from a broken program.
+        raise RuntimePreflightError(
+            'Installed model configuration is invalid before rendering: ' + str(exc),
+            kind=exc.kind, reason=exc.reason, detail=exc.detail) from exc
     except (OSError, ValueError, RuntimeError) as exc:
-        raise RuntimePreflightError("Local model runtime registry is unavailable: " + str(exc)) from exc
+        raise RuntimePreflightError("Local model runtime registry is unavailable: " + str(exc),
+                                    kind='configuration_registry_unavailable') from exc
 
     if local_silhouette:
         # Preserve the configured absolute drive.  Resolving a Windows
@@ -199,19 +228,34 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         receipt['onnx_runtime_root'] = str(onnx_root)
         receipt['silhouette_model'] = str(model)
         if not model.is_file():
-            raise RuntimePreflightError('Selected BiRefNet model is unavailable: ' + str(model))
+            raise RuntimePreflightError('Selected BiRefNet model is unavailable: ' + str(model),
+                                        kind='configuration_missing_model')
+        # The registry gate already proved this file is the declared ONNX model
+        # (top-level structure, plus the pinned digest when one is declared).
+        # Record the identity it reported so a ready receipt carries evidence
+        # instead of a claim; a caller that replaced the registry loader has to
+        # say that the identity was not verified.
+        identity = (config.get('verified_models') or {}).get('birefnet_model_path')
+        receipt['silhouette_model_identity'] = dict(identity) if identity else {
+            'path': str(model), 'verified': False,
+            'reason': 'the selected registry loader did not report a verified model identity'}
+        receipt['model_verification'] = ('onnx_structure_and_pinned_digest'
+                                        if identity and identity.get('sha256') else 'onnx_structure')
         module = onnx_root / 'onnxruntime' / '__init__.py'
         if not module.is_file():
-            raise RuntimePreflightError('Selected ONNX Runtime package is unavailable: ' + str(onnx_root))
+            raise RuntimePreflightError('Selected ONNX Runtime package is unavailable: ' + str(onnx_root),
+                                        kind='configuration_onnx_runtime_unavailable')
         native = [*onnx_root.joinpath('onnxruntime', 'capi').glob('onnxruntime_pybind11_state*.pyd'),
                   *onnx_root.joinpath('onnxruntime', 'capi').glob('onnxruntime_pybind11_state*.so')]
         if len(native) != 1 or native[0].stat().st_size <= 0:
-            raise RuntimePreflightError('Selected ONNX Runtime native module is missing or ambiguous: ' + str(onnx_root))
+            raise RuntimePreflightError('Selected ONNX Runtime native module is missing or ambiguous: '
+                                        + str(onnx_root), kind='configuration_onnx_runtime_unavailable')
     else:
         python = Path(str(config.get("python", ""))).expanduser().resolve()
         receipt["model_python"] = str(python)
         if not python.is_file():
-            raise RuntimePreflightError("Selected model runtime Python is unavailable: " + str(python))
+            raise RuntimePreflightError("Selected model runtime Python is unavailable: " + str(python),
+                                        kind='configuration_model_python_unavailable')
         probe_key = _probe_cache_key(python, model_imports, selected)
         cached_probe = any(
             success and key[0] == probe_key[0] and key[2] == probe_key[2]
@@ -232,7 +276,8 @@ def preflight_for_run(root: Path, *, registry_path=None, require_local_models: b
         if error:
             raise RuntimePreflightError(
                 "Selected model runtime module check failed ("
-                + ", ".join(model_imports) + "): " + error
+                + ", ".join(model_imports) + "): " + error,
+                kind='model_loading_runtime_probe_failed'
             )
     receipt["status"] = "ready"
     return receipt

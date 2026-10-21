@@ -47,6 +47,9 @@ def geometric_controls(app):
         window.load_source_run(parent,selection_explicit=True);window.show();app.processEvents()
         wait_inspections(window,app)
         controls=window.shaping_panels[-1];before=saved_result_state(fixture.root)
+        # The native U records no delivered strength; the panel says unknown
+        # instead of repeating the requested amount.
+        assert '实际交付未知' in controls['delivery'].text() and '%' not in controls['delivery'].text()
         state=window.shaping_parent_state();assert state['enabled'],state['reason']
         invalid=copy.deepcopy(candidate)
         invalid['task_intent']['services']={'text_vision':False,'visual_review':False}
@@ -56,6 +59,22 @@ def geometric_controls(app):
             request=candidate['options']['shaping_state']['request'])
         wait_inspections(window,app)
         assert window.validate_shaping_candidate(candidate)
+        # The panel shows the requested strength beside the delivered fraction
+        # its receipt recorded; it never presents the request as delivered.
+        from shaping_inspection import delivery_fact
+        stored=json.loads((Path(candidate['options']['photo_appearance']['path'])/'receipt.json').read_text('utf8'))
+        stats=stored['operation']['mapping_metadata']['stats']
+        delivery=delivery_fact(stored,receipt_sha256=candidate['options']['photo_appearance']['receipt_sha256'])
+        assert delivery is not None and delivery['receipt_sha256']==candidate['options']['photo_appearance']['receipt_sha256']
+        assert delivery['requested_amount']==stored['operation']['amount']
+        assert delivery['delivered_fraction_of_request']==stats['delivered_fraction_of_request']
+        assert delivery['strain_limited_fraction']==stats['strain_limited_fraction']
+        text=controls['delivery'].text()
+        assert text==qt.shaping_delivery_text(delivery,subject='候选版本'),text
+        assert text.startswith('候选版本') and '请求 ' in text and f"{stats['delivered_fraction_of_request']:.2%}" in text
+        assert f"{stats['strain_limited_fraction']:.2%}" in text and f"{stored['operation']['amount']:.2f}" in text
+        assert delivery_fact({'kind':'mixed_regional'}) is None
+        assert '实际交付未知' in qt.shaping_delivery_text(None)
         assert window.previews['final'].path==Path(candidate['artifacts']['auto_draft'])
         assert window.source_run_id==parent['run_id'] and saved_result_state(fixture.root)==before
         controls['before'].click();app.processEvents()
@@ -64,6 +83,10 @@ def geometric_controls(app):
         assert window.source_run_id==candidate['run_id']
         assert saved_result_state(fixture.root)['selected_saved_run_id']==candidate['run_id']
         assert controls['parts']['face'][0].isChecked() and controls['restore'].isEnabled()
+        # The adopted version now owns that receipt, so the panel reports the
+        # same delivered fraction as the current version.
+        assert controls['delivery'].text().startswith('当前版本'),controls['delivery'].text()
+        assert f"{stats['delivered_fraction_of_request']:.2%}" in controls['delivery'].text()
         controls['restore'].click()
         task=window.pool.tasks[-1]
         assert task.path=='/api/tasks/plan'
@@ -138,6 +161,10 @@ def main():
             window.load_source_run(parent, selection_explicit=True); window.show(); app.processEvents()
             wait_inspections(window,app)
             controls = window.shaping_panels[-1]
+            # No shaping receipt exists yet: the delivered strength is unknown,
+            # never the requested 0.30.
+            assert '实际交付未知' in controls['delivery'].text()
+            assert '0.30' not in controls['delivery'].text() and '%' not in controls['delivery'].text()
             assert not window.shaping_parts
             assert all(not row[0].isChecked() for row in controls['parts'].values())
             assert not controls['check'].isEnabled() and not controls['restore'].isEnabled()
@@ -180,6 +207,11 @@ def main():
                 return task
 
             begin_candidate()
+            # A candidate without a delivered mapping receipt keeps saying
+            # unknown even though its checked request is 0.30.
+            assert controls['delivery'].text().startswith('候选版本'),controls['delivery'].text()
+            assert '实际交付未知' in controls['delivery'].text()
+            assert '0.30' not in controls['delivery'].text() and '%' not in controls['delivery'].text()
             window.result('job-run-loaded', {'run':copy.deepcopy(candidate)})
             assert window.source_run_id == parent['run_id'] and saved_result_state(fixture.root) == selected
             zoom = window.previews['final'].zoom
@@ -316,6 +348,7 @@ def main():
             window.load_source_run(restored, selection_explicit=True)
             wait_inspections(window,app)
             assert not controls['parts']['waist'][0].isChecked()
+            assert '实际交付未知' in controls['delivery'].text() and '%' not in controls['delivery'].text()
             assert window.product_run['options']['shaping_state']['base_appearance'] == base
             assert fixture.backend.source_run(parent['run_id'])['run']['options']['photo_appearance'] == original['options']['photo_appearance']
             unhandled.assert_not_called()
