@@ -9,6 +9,10 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
+      # Fixture projects must fit the production Windows storage path budget.
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TMPDIR: ${{ runner.temp }}
       PYTHONDONTWRITEBYTECODE: '1'
       QT_QPA_PLATFORM: offscreen
       OMP_NUM_THREADS: '1'
