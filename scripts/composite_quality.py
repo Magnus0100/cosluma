@@ -323,6 +323,103 @@ def _relative_to_passing_samples(value, low, high):
     return 'within' if value <= high else 'above'
 
 
+
+
+def render_report(report):
+    """Render a measured report as a human-readable Markdown section.
+
+    The readings that never judge anything are printed as readings, with the sample
+    they are compared against, so a person reading the report sees the same numbers an
+    engineer does. Nothing here recomputes a verdict; it repeats the one already in the
+    report.
+    """
+    if not isinstance(report, dict) or report.get('schema') != SCHEMA:
+        raise ValueError('Report rendering needs a ' + SCHEMA + ' report')
+    lines = ['### 合成质量：' + str(report.get('label') or '未命名'),
+        '- 判定：**' + str(report.get('verdict')) + '**'
+        + ('（未通过：' + '、'.join(report.get('failed_items') or []) + '）'
+           if report.get('failed_items') else ''),
+        '- 工作类型：' + str(report.get('work_type'))]
+    detail = (report.get('items') or {}).get('generated_detail') or {}
+    if detail:
+        lines.append('- 细节量比：' + '%.4f' % float(detail.get('high_frequency_ratio', 0.))
+            + ('（通过）' if detail.get('ok') else '（未通过）'))
+        diagnostics = detail.get('provider_diagnostics') or {}
+        if diagnostics:
+            lines.append('')
+            lines.append('**记录值（不参与判定，未标定）**')
+            if 'provider_detail_outside_matte_share' in diagnostics:
+                relative = (diagnostics.get('reading_relative_to_passing_sample') or {}).get(
+                    'provider_detail_outside_matte_share')
+                lines.append('- 生成细节落在主体之外的比例：%.4f' % float(
+                    diagnostics['provider_detail_outside_matte_share'])
+                    + ('（相对已有通过样本：' + relative + '）' if relative else ''))
+            if 'provider_subject_structure_ncc' in diagnostics:
+                relative = (diagnostics.get('reading_relative_to_passing_sample') or {}).get(
+                    'provider_subject_structure_ncc')
+                lines.append('- 生成内容与保留主体的结构相关：%.4f' % float(
+                    diagnostics['provider_subject_structure_ncc'])
+                    + ('（相对已有通过样本：' + relative + '）' if relative else ''))
+            coverage = diagnostics.get('provider_subject_coverage') or {}
+            if coverage:
+                lines.append('- 生成的画面覆盖了保留主体的：%.1f%%' % (
+                    100. * float(coverage.get('provider_covers_subject', 0.))))
+            lines.append('- 以上读数只用于说明原因，不改变判定；样本量不足以设界线。')
+    limits = report.get('limitations') or []
+    if limits:
+        lines.append('')
+        lines.append('**已知限制**')
+        lines.extend('- ' + str(item) for item in limits)
+    return '\n'.join(lines)
+
+def provider_subject_coverage(provider_subject, matte, region=None):
+    """Share of the retained subject that the generated canvas actually covers.
+
+    The generated path hands back an opaque rectangle, so nothing in it says where the
+    subject is; a silhouette of that canvas does. Comparing it against the retained
+    matte answers a question the detail readings cannot: whether the picture that was
+    written even contains the subject it was meant to keep. On four real products the
+    provider covered 0.315 of the retained subject in the case whose generated picture
+    described something else, and 0.806 to 0.989 in the other three.
+
+    Both inputs are masks (0..1 or 0..255) on the same canvas; the function is model
+    free, so the caller supplies the silhouette. Recorded, never judged: four samples
+    locate no bound.
+    """
+    provider_subject = np.asarray(provider_subject)
+    matte = np.asarray(matte)
+    if provider_subject.ndim != 2 or matte.ndim != 2:
+        raise ValueError('Provider subject coverage needs single-channel masks')
+    full = matte.shape
+    if region is None:
+        if provider_subject.shape != full:
+            raise ValueError('Provider subject coverage needs masks on the same canvas')
+    else:
+        x0, y0, x1, y1 = (int(v) for v in region)
+        window = (y1 - y0, x1 - x0)
+        matte = matte[y0:y1, x0:x1]
+        # A silhouette of the written patch naturally arrives at window size, so accept
+        # either that or the full canvas instead of making every caller pad it.
+        if provider_subject.shape == full:
+            provider_subject = provider_subject[y0:y1, x0:x1]
+        elif provider_subject.shape != window:
+            raise ValueError('Provider subject coverage needs masks on the same canvas')
+    scale = 255. if max(float(provider_subject.max(initial=0)), float(matte.max(initial=0))) > 1.5 else 1.
+    inside = (provider_subject.astype(np.float64) / scale) >= .5
+    kept = (matte.astype(np.float64) / scale) >= .5
+    if not kept.any():
+        raise ValueError('Provider subject coverage needs a matte with subject pixels')
+    intersection = float((inside & kept).sum())
+    union = float((inside | kept).sum())
+    return {'provider_covers_subject': intersection / float(kept.sum()),
+        'subject_iou': intersection / union if union > 0. else 0.,
+        'provider_subject_fraction': float(inside.mean()),
+        'retained_subject_fraction': float(kept.mean()),
+        'role': 'recorded_not_judged_no_calibrated_bound',
+        'note': ('four real products measured 0.315 coverage where the generated picture '
+            'described something else and 0.806 to 0.989 elsewhere; iou misleads when the '
+            'generated silhouette is larger, so read the coverage')}
+
 def provider_subject_diagnostics(parent, provider, matte, region):
     """Record why a generated region is detail-limited, without judging anything.
 
@@ -389,7 +486,8 @@ def provider_subject_diagnostics(parent, provider, matte, region):
             'and 0.001 to 0.036. Six samples locate no bound, so neither reading gates this '
             'item; the relative description is disclosed, not enforced')}
 
-def measure(parent, result, *, work_type, coverage=None, region=None, label='', provider=None, matte=None):
+def measure(parent, result, *, work_type, coverage=None, region=None, label='', provider=None,
+            matte=None, provider_subject=None):
     """Measure one finished composite against the canvas it was built from.
 
     ``parent`` is the immediate parent canvas the composite started from,
@@ -572,11 +670,18 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label='', 
     # Recorded beside the judgement, never part of it: a caller that supplies the
     # generated canvas and the retained matte gets the two readings that say why the
     # detail is short, and the verdict above is computed before either is looked at.
-    if provider is not None or matte is not None:
-        if provider is None or matte is None:
-            raise ValueError('Provider diagnostics need both the provider canvas and the matte')
+    if provider is not None and matte is not None:
         detail['provider_diagnostics'] = provider_subject_diagnostics(
             parent, provider, matte, region)
+    elif provider is not None and provider_subject is None:
+        raise ValueError('Provider diagnostics need both the provider canvas and the matte')
+    # A silhouette of the generated canvas answers the question the detail readings
+    # cannot: whether the written picture contains the subject it was meant to keep.
+    if provider_subject is not None:
+        if matte is None:
+            raise ValueError('Provider subject coverage needs the retained matte')
+        detail.setdefault('provider_diagnostics', {})['provider_subject_coverage'] = (
+            provider_subject_coverage(provider_subject, matte, region))
 
     items = {'untouched_regions': untouched, 'boundary_seam': seam,
         'cross_boundary_tonality': tonality, 'hue_step_excess': hue_step,

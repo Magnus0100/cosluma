@@ -788,6 +788,29 @@ def _subject_record(core_matte,core,source,edge,taper,gate,subject_only):
             if edges.any() else 0.,6)}
 
 
+def _recorded_provider_readings(native,patch,box,subject,core):
+  """What the generated picture did with the subject it was meant to keep.
+
+  Recorded beside the verdict and never part of it: the reading explains why a
+  composite may be detail limited, and nothing here changes a decision. Returns
+  None when there is no subject matte to compare against, or when the reading
+  cannot be taken, so a composite that already succeeded never fails here.
+  """
+  if subject is None or core is None:
+    return None
+  try:
+    import composite_quality
+    from float_appearance import linear_to_srgb
+    def srgb8(value):
+      encoded=np.asarray(linear_to_srgb(np.asarray(value,np.float32)),np.float32)
+      return np.uint8(np.clip(encoded,0.,1.)*255.+0.5)
+    canvas=np.zeros_like(native)
+    canvas[box[1]:box[3],box[0]:box[2]]=patch
+    return composite_quality.provider_subject_diagnostics(
+      srgb8(native),srgb8(canvas),np.asarray(subject,np.float32),core)
+  except Exception:
+    return None
+
 def fuse_region(native,patch,alpha,*,core,box,subject=None,subject_only=False):
     """Compose one regional generated patch into the current canvas.
 
@@ -1285,6 +1308,7 @@ def _execute(context,config,kind):
             actual=np.asarray(_best_rgb(destination));old=np.asarray(base)
             if not np.array_equal(actual[coverage==0],old[coverage==0]):
                 raise ValueError('Untouched native preview pixels changed during regional encoding')
+        provider_readings=_recorded_provider_readings(native,patch,box,subject,core)
         composition={'schema':SCHEMA,'binding':binding,'working_domain':'display_linear_sRGB',
             'output_encoding':'float32_master_with_matching_RGB8_sRGB_preview','core_box':core,'context_box':box,
             'coverage':loaded['receipt']['edit_coverage'],
@@ -1300,6 +1324,7 @@ def _execute(context,config,kind):
             'zero_coverage_float_identical_to_current_best':coverage is not None,
             'source_subject_RGB_restored':False,'generated_context_size':generated_size,
             'complete_candidate':candidate,'effective_coverage_fraction':fraction,
+            'provider_readings':provider_readings,
             'identity_verified':False,'geometric_registration_verified':False,
             'lighting_and_depth_of_field_verified':False,'needs_visual_review':True,'human_approved':False}
         composition_path=output/'composition.json';atomic_json(composition_path,composition)

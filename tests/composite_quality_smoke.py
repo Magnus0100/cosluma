@@ -1099,6 +1099,63 @@ class ProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(stranger['ok'], faithful['ok'])
         self.assertEqual(stranger['high_frequency_ratio'], faithful['high_frequency_ratio'])
 
+    def test_the_coverage_reading_says_how_much_of_the_subject_was_written(self):
+        matte = np.zeros(SHAPE, np.float32)
+        matte[100:300, 160:360] = 1.
+        subject = np.zeros(SHAPE, np.float32)
+        subject[100:300, 160:260] = 1.
+        half = quality.provider_subject_coverage(subject, matte)
+        self.assertAlmostEqual(half['provider_covers_subject'], .5, places=6)
+        self.assertEqual(half['role'], 'recorded_not_judged_no_calibrated_bound')
+        full = quality.provider_subject_coverage(matte, matte)
+        self.assertAlmostEqual(full['provider_covers_subject'], 1., places=6)
+        self.assertAlmostEqual(full['subject_iou'], 1., places=6)
+        with self.assertRaises(ValueError):
+            quality.provider_subject_coverage(subject[:10], matte)
+        empty = quality.provider_subject_coverage(np.zeros(SHAPE, np.float32), matte)
+        self.assertEqual(empty['provider_covers_subject'], 0.)
+        # A silhouette of the written patch arrives at window size; that must work too.
+        window = quality.provider_subject_coverage(subject[BOX[1]:BOX[3], BOX[0]:BOX[2]],
+            matte, list(BOX))
+        canvas_wide = quality.provider_subject_coverage(subject, matte, list(BOX))
+        self.assertEqual(window['provider_covers_subject'], canvas_wide['provider_covers_subject'])
+
+    def test_the_coverage_reading_does_not_judge_either(self):
+        matte = np.zeros(SHAPE, np.float32)
+        matte[100:300, 160:360] = 1.
+        scored = np.zeros(SHAPE, np.float32)
+        scored[100:300, 160:360] = 1.
+        without = quality.measure(self.parent, self.result, work_type='partial_composite',
+            coverage=self.coverage, region=list(BOX))['items']['generated_detail']
+        with_coverage = quality.measure(self.parent, self.result, work_type='partial_composite',
+            coverage=self.coverage, region=list(BOX), matte=matte,
+            provider_subject=scored)['items']['generated_detail']
+        self.assertIn('provider_subject_coverage', with_coverage['provider_diagnostics'])
+        self.assertNotIn('provider_diagnostics', without)
+        self.assertEqual(with_coverage['ok'], without['ok'])
+        self.assertEqual(with_coverage['high_frequency_ratio'], without['high_frequency_ratio'])
+
+    def test_the_report_renders_the_readings_for_a_person_to_read(self):
+        matte = np.zeros(SHAPE, np.float32)
+        matte[100:300, 160:360] = 1.
+        report = quality.measure(self.parent, self.result, work_type='partial_composite',
+            coverage=self.coverage, region=list(BOX), label='示例',
+            provider=self.parent, matte=matte, provider_subject=matte)
+        text = quality.render_report(report)
+        self.assertIn('### 合成质量：示例', text)
+        self.assertIn('判定：**' + str(report['verdict']) + '**', text)
+        self.assertIn('结构相关', text)
+        self.assertIn('覆盖了保留主体的', text)
+        self.assertIn('只用于说明原因，不改变判定', text)
+        self.assertEqual(report['verdict'],
+            quality.measure(self.parent, self.result, work_type='partial_composite',
+                coverage=self.coverage, region=list(BOX), label='示例')['verdict'])
+        bare = quality.render_report(quality.measure(self.parent, self.result,
+            work_type='partial_composite', coverage=self.coverage, region=list(BOX)))
+        self.assertNotIn('记录值', bare)
+        with self.assertRaises(ValueError):
+            quality.render_report({'schema': 'other'})
+
     def test_the_readings_need_both_the_provider_and_the_matte(self):
         for extra in ({'provider': self.parent}, {'matte': self.matte}):
             with self.assertRaises(ValueError):

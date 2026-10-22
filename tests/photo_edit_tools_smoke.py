@@ -545,6 +545,43 @@ class EditingToolsTests(unittest.TestCase):
         self.assertEqual(matte.shape,(base.height,base.width))
         self.assertEqual(matte.dtype,np.float32)
 
+    def test_the_composition_receipt_always_says_whether_the_reading_was_taken(self):
+        # This fixture's region is below photographic-join support, so there is no
+        # subject matte to compare against. The key must still be present and
+        # explicitly null: 'not measured here' is a fact the reader can see.
+        self.prepare_decision()
+        with patch('reference_provider.request_edit',side_effect=self.transport):
+            state=self.execute()
+        row=state['candidates'][-1]
+        composition=json.loads(Path(row['provenance']['composition_receipt']['path']).read_text('utf8'))
+        self.assertIn('provider_readings',composition)
+        self.assertIsNone(composition['provider_readings'])
+        self.assertNotIn('verdict',composition)
+        self.assertTrue(composition['needs_visual_review'])
+        self.assertFalse(composition['human_approved'])
+
+    def test_the_recorded_readings_say_what_the_generated_picture_did(self):
+        from photo_edit_tools import _recorded_provider_readings
+        rng=np.random.default_rng(11)
+        native=(rng.random((450,320,3),np.float32)*.4).astype(np.float32)
+        patch=(rng.random((384,256,3),np.float32)*.4).astype(np.float32)
+        box=[20,30,276,414];core=[60,80,236,364]
+        matte=np.zeros((450,320),np.float32);matte[100:400,60:250]=1.
+        readings=_recorded_provider_readings(native,patch,box,matte,core)
+        self.assertEqual(readings['role'],'recorded_not_judged_no_calibrated_bound')
+        self.assertIn(readings['reading_relative_to_passing_sample']['provider_subject_structure_ncc'],
+            ('within','above','below'))
+        self.assertGreaterEqual(readings['provider_detail_outside_matte_share'],0.)
+        self.assertLessEqual(readings['provider_detail_outside_matte_share'],1.)
+        self.assertGreaterEqual(readings['provider_subject_structure_ncc'],-1.)
+        self.assertLessEqual(readings['provider_subject_structure_ncc'],1.)
+        self.assertIn('not judged',readings['role'].replace('_',' '))
+        # Without a subject matte there is nothing to read, and nothing is invented.
+        self.assertIsNone(_recorded_provider_readings(native,patch,box,None,core))
+        self.assertIsNone(_recorded_provider_readings(native,patch,box,matte,None))
+        # A patch that does not fit its box is a caller error, not a composite failure.
+        self.assertIsNone(_recorded_provider_readings(native,patch[:8,:8],box,matte,core))
+
     def test_edit_coverage_cannot_stand_in_for_a_subject_matte(self):
         from photo_edit_tools import _current_canvas_subject
         with Image.open(self.best) as raster:

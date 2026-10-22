@@ -1,5 +1,20 @@
 # 更新记录
 
+## 0.7.7 — 合成的失败原因进了收据，读数能被人读懂
+
+区域合成的产物现在自带读数：生成细节有多少落到主体之外、生成内容与保留主体的结构相关有多高。
+
+- `composition.json` 新增 `provider_readings`；**键永远存在**，测不了时写 `null` 并明确表示「这里没测」
+- 不参与判定：不收 `verdict`，不改 `needs_visual_review` / `human_approved`；读取出错绝不让已成功的合成失败
+- 只在区域短边 ≥256 且 ≥131072 像素、且有真实主体 matte 时计算
+- `composite_quality.render_report()` 把读数渲染成人能读的段落，判定仍只取原判定
+- `provider_subject_coverage()` 记录生成画面覆盖了多少保留主体（8 例真实成片，93d79f85 覆盖 0.3149 为唯一离群）
+- `baseline-0.7.6.json` 记录 6 例全套读数，供后续版本前后对照
+
+验证：`integration` 118 项零回退；`photo_edit_tools` 28 项、`composite_quality` 48 项、`core` 22 项通过。
+
+限制：读数不构成标定、不带阈值；强依赖轮廓质量与编码；桌面复核界面尚未显示该段落。
+
 ## 0.7.6 — 合成的失败原因可读，三条根因逐条结案
 
 - 测量：`composite_quality` 新增 `provider_subject_diagnostics()`；`measure()` 可接收可选 `provider` 与 `matte`，把「provider 细节落在场景侧的比例」与「provider 与保留主体细节结构的相关系数」写进 `generated_detail.provider_diagnostics`。
