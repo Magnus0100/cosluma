@@ -19,6 +19,7 @@ generated, fractional inside a feathered join.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -48,11 +49,38 @@ PARAMETERS = {
     'halo_visible': 2 / 255.,            # a rim changes the join's tone by this much
     'halo_search': 24,                   # deepest ring still treated as part of the join
     'halo_width_max': 2,                 # visible rim thickness in pixels
+    # A different axis from the luminance step and the warmth step: the join may
+    # not rotate the colour relation across the cut by more than one
+    # just-noticeable difference. This bound is provisional and measured on two
+    # real products only (see HUE_STEP_EVIDENCE); the normal range is not
+    # established and a verdict taken from it is not verified.
+    'hue_step_excess_max_dE76': 1.,
 }
 _ITEMS = ('untouched_regions', 'boundary_seam', 'cross_boundary_tonality',
-    'generated_detail', 'boundary_halo')
+    'hue_step_excess', 'generated_detail', 'boundary_halo')
+# The hue step is measured and reported, but it does not yet decide the verdict: two real
+# composites show the reading below its bound, which cannot establish a range. Judging with
+# it would turn a provisional calibration into a gate, the same reason the chroma readings
+# stay advisory; it starts gating when five real composites have been measured.
+PROVISIONAL_ITEMS = ('hue_step_excess',)
+GATING_ITEMS = tuple(name for name in _ITEMS if name not in PROVISIONAL_ITEMS)
+# Provenance of the one new bound this round adds. It is recorded inside every
+# report and re-checked by validate(), so a report can neither claim a different
+# calibration nor hide that it was taken from two photographs. The readings are
+# the measured excess_dE76 of those two cases, in the order of 'cases'.
+HUE_STEP_EVIDENCE = {
+    'status': 'provisional_insufficient_sample',
+    'samples': 2, 'required_samples': 5,
+    'cases': ['662', '685'],
+    'measured_excess_dE76': [0.085676, 0.319792],
+    'measured_photo_chroma_step': [0.026104, 0.163655],
+    'measured_delivered_chroma_step': [0.064314, 0.238786],
+    'note': ('Two real products cannot establish a normal range; the bound is '
+             'provisional and this item is disclosed as unverified in 0.7.5.'),
+}
 _FIELDS = frozenset({'schema', 'work_type', 'label', 'canvas_size', 'region', 'coverage',
-    'inputs', 'parameters', 'items', 'not_applicable_items', 'failed_items', 'verdict',
+    'inputs', 'parameters', 'items', 'not_applicable_items', 'failed_items',
+    'provisional_items', 'verdict',
     'artistic_acceptance', 'human_acceptance', 'model_inferences', 'evidence_note',
     'report_sha256'})
 
@@ -142,6 +170,65 @@ def _join_step(field, covered, inside, outside, depth):
         return None
     step = abs(inward[0] - outward[-1])
     return step, float(np.median(slopes))
+
+
+def _shell_step(a_field, b_field, covered, inside, outside, depth):
+    """Signed (a*, b*) change between the first written and last retained shell.
+
+    The step is kept as a vector on purpose. A magnitude cannot tell a stronger
+    colour from the same colour rotated, and the residual this measures is a
+    rotation of the hue relation across the cut.
+    """
+    if depth < 2:
+        return None
+    outward_a, inward_a = _shells(a_field, covered, inside, outside, depth)
+    outward_b, inward_b = _shells(b_field, covered, inside, outside, depth)
+    if inward_a[0] is None or outward_a[-1] is None or inward_b[0] is None or outward_b[-1] is None:
+        return None
+    return inward_a[0] - outward_a[-1], inward_b[0] - outward_b[-1]
+
+
+def _hue_step_item(parent_lab, result_lab, covered, inside, outside, depth):
+    """Hue-type step across the join, measured against the photograph itself.
+
+    The baseline is the photograph's own step over the same shells, never a
+    constant: a region that legitimately sits on a different colour carries that
+    difference in its parent step too, while a flat background has almost none
+    and must not be excused by a floor. The judged number is the length of the
+    difference of the two vectors, so a pass means the delivered join rotates
+    the colour relation across the cut no further than the photograph did.
+    """
+    photo = (None if parent_lab is None else
+        _shell_step(parent_lab[..., 1], parent_lab[..., 2], covered, inside, outside, depth))
+    delivered = (None if result_lab is None else
+        _shell_step(result_lab[..., 1], result_lab[..., 2], covered, inside, outside, depth))
+    item = {'applicable': bool(photo is not None and delivered is not None),
+        'baseline': 'parent_canvas_own_step_across_the_same_shells',
+        'judged_axis': 'signed_CIELAB_a_star_and_b_star_vector',
+        'shells': int(depth), 'units': 'delta_e76',
+        'threshold_evidence': copy.deepcopy(HUE_STEP_EVIDENCE)}
+    if not item['applicable']:
+        item.update(photo_step_da=0., photo_step_db=0., delivered_step_da=0., delivered_step_db=0.,
+            photo_chroma_step=0., delivered_chroma_step=0., excess_da=0., excess_db=0.,
+            excess_dE76=0., hue_rotation_degrees=0., ok=True)
+        return item
+    excess = delivered[0] - photo[0], delivered[1] - photo[1]
+    item.update(photo_step_da=round(float(photo[0]), 6), photo_step_db=round(float(photo[1]), 6),
+        delivered_step_da=round(float(delivered[0]), 6),
+        delivered_step_db=round(float(delivered[1]), 6),
+        photo_chroma_step=round(float(np.hypot(*photo)), 6),
+        delivered_chroma_step=round(float(np.hypot(*delivered)), 6),
+        excess_da=round(float(excess[0]), 6), excess_db=round(float(excess[1]), 6),
+        excess_dE76=round(float(np.hypot(*excess)), 6))
+    # Recorded beside the judged length and never judged itself: two colours of
+    # equal chroma rotate freely without changing a magnitude, so the angle is
+    # what shows a rotation the readings above cannot.
+    rotation = float(np.arctan2(delivered[1], delivered[0]) - np.arctan2(photo[1], photo[0]))
+    item['hue_rotation_degrees'] = round(
+        float(np.degrees((rotation + np.pi) % (2. * np.pi) - np.pi)), 3)
+    item['hue_rotation_role'] = 'advisory_not_gating_a_magnitude_cannot_see_it'
+    item['ok'] = bool(item['excess_dE76'] <= PARAMETERS['hue_step_excess_max_dE76'])
+    return item
 
 
 def _halo(result_grey, parent_grey, covered, inside, outside, deepest):
@@ -289,8 +376,23 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
         outside_distance = distance_transform_edt(~covered)
         depth = int(min(PARAMETERS['tonality_profile_depth'], inside.max(), outside_distance.max()))
         luma_step = _join_step(result_grey, covered, inside, outside_distance, depth)
-        warmth = _lab(result)[..., 2]
+        lab = _lab(result)
+        warmth = lab[..., 2]
         warmth_step = _join_step(warmth, covered, inside, outside_distance, depth)
+        # The residual across the join is mostly hue-type, not luma-type: the generated region
+        # carries the provider's own colour, so a luma-only step under-reads it. The same step is
+        # therefore measured on chroma (the distance from the neutral axis in a*/b*) and reported
+        # beside the luma and warmth readings. It is advisory only: with two real cases there is no
+        # calibrated bound, and no threshold is asserted from two samples.
+        chroma = np.hypot(lab[..., 1], lab[..., 2])
+        chroma_step = _join_step(chroma, covered, inside, outside_distance, depth)
+        # A hue-type step is its own axis and is measured beside the two above,
+        # never instead of them. Both of those compare per-pixel excesses, and
+        # the chroma reading beside them is a magnitude: it is unchanged when the
+        # colour simply rotates, which is exactly the residual this one measures.
+        # The step is therefore taken on the signed a*/b* pair, against the
+        # photograph's own step over the same shells.
+        hue_step = _hue_step_item(_lab(parent), lab, covered, inside, outside_distance, depth)
         tonality = {'applicable': bool(luma_step is not None and warmth_step is not None)}
         if tonality['applicable']:
             tonality.update(luma_step=float(luma_step[0]),
@@ -298,7 +400,11 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
                 luma_excess=float(luma_step[0] - luma_step[1]),
                 warmth_step=float(warmth_step[0]),
                 warmth_content_step=float(warmth_step[1]),
-                warmth_excess=float(warmth_step[0] - warmth_step[1]))
+                warmth_excess=float(warmth_step[0] - warmth_step[1]),
+                chroma_step=float(chroma_step[0]) if chroma_step is not None else 0.,
+                chroma_content_step=float(chroma_step[1]) if chroma_step is not None else 0.,
+                chroma_excess=float(chroma_step[0] - chroma_step[1]) if chroma_step is not None else 0.,
+                chroma_excess_role='advisory_not_gating_no_calibrated_bound')
             tonality['ok'] = bool(abs(tonality['luma_excess']) <= PARAMETERS['tonality_step_max']
                 and abs(tonality['warmth_excess']) <= PARAMETERS['warmth_step_max'])
         else:
@@ -318,9 +424,15 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
             'gradient_ratio': 1., 'ok': True}
         tonality = {'applicable': False, 'luma_step': 0., 'luma_content_step': 0.,
             'luma_excess': 0., 'warmth_step': 0., 'warmth_content_step': 0.,
-            'warmth_excess': 0., 'ok': True}
+            'warmth_excess': 0., 'chroma_step': 0., 'chroma_content_step': 0.,
+            'chroma_excess': 0., 'chroma_excess_role': 'advisory_not_gating_no_calibrated_bound',
+            'ok': True}
         boundary_halo = {'applicable': False, 'deep_tone_offset': 0.,
             'visible_excess': 0., 'halo_width': 0, 'ok': True}
+        # No join in this canvas, so there is no cross-boundary step to measure;
+        # the item declares itself inapplicable instead of reporting a zero that
+        # would read as a pass.
+        hue_step = _hue_step_item(None, None, None, None, None, 0)
 
     generated = coverage >= PARAMETERS['generated_alpha_min']
     original = coverage <= PARAMETERS['original_alpha_max']
@@ -347,6 +459,15 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
     # absolute ratio so a content-limited region is visible as a measurement
     # instead of a claim. It does not relax the threshold.
     parent_region_detail = float(np.abs(highpass_parent[generated]).mean())
+    # The absolute high-frequency amplitude is not comparable across regions of different
+    # brightness: a correctly exposed-down generated region loses absolute detail in proportion to
+    # its level even when its contrast is intact. The same measurements are therefore also recorded
+    # relative to the level they sit on (high frequency / mean level), which is the contrast the eye
+    # reads. Both are reported side by side and neither changes the threshold below.
+    generated_level = float(result_grey[generated].mean())
+    parent_generated_level = float(parent_grey[generated].mean())
+    generated_relative = float(generated_detail / max(generated_level, 1e-9))
+    parent_relative = float(parent_region_detail / max(parent_generated_level, 1e-9))
     detail = {'basis': basis,
         'generated_fraction_of_canvas': float(generated.mean()),
         'original_fraction_of_canvas': float(original.mean()),
@@ -360,12 +481,18 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
             if original_detail > 1e-9 else 1.),
         'observed_over_parent_region': float(generated_detail / parent_region_detail
             if parent_region_detail > 1e-9 else 1.),
+        'generated_level': generated_level, 'parent_generated_level': parent_generated_level,
+        'generated_relative_detail': generated_relative, 'parent_relative_detail': parent_relative,
+        'relative_detail_ratio': float(generated_relative / parent_relative
+            if parent_relative > 1e-9 else 1.),
+        'relative_detail_note': ('absolute and relative readings are both recorded; only '
+            'high_frequency_ratio and noise_ratio judge this item'),
         'ok': bool(PARAMETERS['detail_ratio_min'] <= detail_ratio <= PARAMETERS['detail_ratio_max']
             and noise_ratio <= PARAMETERS['noise_ratio_max'])}
 
     items = {'untouched_regions': untouched, 'boundary_seam': seam,
-        'cross_boundary_tonality': tonality, 'generated_detail': detail,
-        'boundary_halo': boundary_halo}
+        'cross_boundary_tonality': tonality, 'hue_step_excess': hue_step,
+        'generated_detail': detail, 'boundary_halo': boundary_halo}
     report = {'schema': SCHEMA, 'work_type': work_type, 'label': label,
         'canvas_size': [int(width), int(height)],
         'region': None if region is None else [int(value) for value in region],
@@ -374,7 +501,8 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
             'result_sha256': _pixel_digest(result)},
         'parameters': dict(PARAMETERS), 'items': items,
         'not_applicable_items': [name for name in _ITEMS if not items[name].get('applicable', True)],
-        'failed_items': [name for name in _ITEMS if not items[name]['ok']],
+        'failed_items': [name for name in GATING_ITEMS if not items[name]['ok']],
+        'provisional_items': [name for name in PROVISIONAL_ITEMS],
         'artistic_acceptance': False, 'human_acceptance': False, 'model_inferences': 0,
         'evidence_note': ('Measured from one parent canvas, one delivered canvas and the '
             "composite's own edit coverage. A pass is not an artistic or human acceptance.")}
@@ -406,6 +534,9 @@ def _expected_ok(name, item):
         return True if not item['applicable'] else bool(
             abs(item['luma_excess']) <= PARAMETERS['tonality_step_max']
             and abs(item['warmth_excess']) <= PARAMETERS['warmth_step_max'])
+    if name == 'hue_step_excess':
+        return True if not item['applicable'] else bool(
+            item['excess_dE76'] <= PARAMETERS['hue_step_excess_max_dE76'])
     return bool(PARAMETERS['detail_ratio_min'] <= item['high_frequency_ratio']
         <= PARAMETERS['detail_ratio_max'] and item['noise_ratio'] <= PARAMETERS['noise_ratio_max'])
 
@@ -455,7 +586,30 @@ def validate(report):
     for value, expected in zip(recorded, recomputed):
         if abs(value - expected) > 1e-9 * max(1., abs(expected)):
             raise ValueError('Composite quality detail ratio differs from its own measurements')
-    failed = [name for name in _ITEMS if not items[name]['ok']]
+    # The hue step is recomputed from the vectors the report carries, so its
+    # length, the length of each canvas's own step, and the difference of the
+    # two cannot drift apart, and the calibration it was taken from cannot be
+    # rewritten inside a report.
+    hue_item = items['hue_step_excess']
+    if hue_item.get('threshold_evidence') != HUE_STEP_EVIDENCE:
+        raise ValueError('Composite quality hue step lost its provisional calibration')
+    if hue_item['applicable']:
+        try:
+            photo = (float(hue_item['photo_step_da']), float(hue_item['photo_step_db']))
+            delivered = (float(hue_item['delivered_step_da']), float(hue_item['delivered_step_db']))
+            excess = (float(hue_item['excess_da']), float(hue_item['excess_db']))
+            recorded = (float(hue_item['photo_chroma_step']),
+                float(hue_item['delivered_chroma_step']), float(hue_item['excess_dE76']))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('Composite quality hue step lacks its measured vectors') from None
+        recomputed = (float(np.hypot(*photo)), float(np.hypot(*delivered)),
+            float(np.hypot(excess[0] - 0., excess[1] - 0.)))
+        for value, expected in zip(recorded, recomputed):
+            if abs(value - expected) > 1e-5:
+                raise ValueError('Composite quality hue step differs from its own vectors')
+        if abs(excess[0] - (delivered[0] - photo[0])) > 1e-5 or abs(excess[1] - (delivered[1] - photo[1])) > 1e-5:
+            raise ValueError('Composite quality hue excess is not the delivered-minus-photograph step')
+    failed = [name for name in GATING_ITEMS if not items[name]['ok']]
     if failed != list(report['failed_items']) or report['verdict'] != ('fail' if failed else 'pass'):
         raise ValueError('Composite quality verdict differs from its measured items')
     absent = [name for name in _ITEMS if not items[name].get('applicable', True)]

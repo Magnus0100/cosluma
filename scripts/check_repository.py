@@ -130,6 +130,17 @@ def check(root):
     paths = [path for path in selected if path.suffix == '.py']
     for path in paths:
         ast.parse(path.read_text(encoding='utf-8-sig'), filename=path.relative_to(root).as_posix())
+    # tests/run.py executes every check as a plain script, so a unittest module without its own
+    # unittest.main defines test cases, runs none of them and still exits 0 - a silent pass. A
+    # working copy of tests/composite_quality_smoke.py lost that block and reported green for as
+    # long as nobody read the test count, so the shape is gated here instead of trusted.
+    for path in paths:
+        if path.parent.name != 'tests' or not path.name.endswith('_smoke.py'):
+            continue
+        source = path.read_text(encoding='utf-8-sig')
+        if 'unittest.TestCase' in source and 'unittest.main' not in source:
+            raise VerificationError('Test suite defines unittest cases but never runs them: '
+                + path.relative_to(root).as_posix())
     manifest = json.loads((root/'scripts/runtime_manifest.json').read_text('utf8'))
     names = manifest['files']
     if len(names) != len(set(names)) or names != sorted(names):

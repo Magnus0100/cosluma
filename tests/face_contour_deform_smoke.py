@@ -231,6 +231,35 @@ class ContourDeformTests(unittest.TestCase):
                     'maximum_adjacent_field_row_change'):
             self.assertEqual(zero[key],0.)
 
+    def test_the_support_retry_fires_only_when_the_strain_budget_names_a_wider_one(self):
+        # A request the window admits must be built at the base support with no retry recorded, so
+        # its field stays bit-identical to the fixed-support construction.
+        base=float(deform.PARAMETERS['handle_reach_multiple'])
+        small=deform.build_mapping(detections(),[512,512],.3)['stats']
+        scaling=small['support_scaling']
+        self.assertEqual(small['strain_limited_fraction'],1.)
+        self.assertEqual(scaling['base_multiple'],base)
+        self.assertEqual(scaling['applied_multiple'],base)
+        self.assertFalse(scaling['retry_rule_fires'])
+        self.assertIsNone(scaling['retry_reason'])
+        # A request the limiter has to cut names a wider support from its own budget. On this
+        # fixture that wider support delivers less, so the checked field is kept - and the attempt
+        # is still recorded, which is what separates 'retried and rejected' from 'no retry due'.
+        big=deform.build_mapping(detections(),[512,512],.6)['stats']
+        scaling=big['support_scaling']
+        self.assertLess(big['strain_limited_fraction'],1.)
+        self.assertTrue(scaling['retry_rule_fires'])
+        self.assertGreater(scaling['candidate_multiple'],base)
+        self.assertEqual(scaling['applied_multiple'],base)
+        self.assertIsNone(scaling['retry_reason'])
+        # The named support is the one the recorded budget names, not a free choice of constant.
+        raw=big['maximum_control_delta']/big['strain_limited_fraction']
+        self.assertAlmostEqual(scaling['candidate_multiple'],
+            deform.PARAMETERS['support_ramp_factor']*big['required_inner_ramp']/raw,places=6)
+        # amount=0 names nothing and never retries.
+        zero=deform.build_mapping(detections(),[512,512],0)['stats']['support_scaling']
+        self.assertEqual(zero['candidate_multiple'],0.)
+        self.assertFalse(zero['retry_rule_fires'])
     def test_cancelled_build_and_sampling_keep_parent_arrays_unchanged(self):
         observed=detections()
         with self.assertRaises(InterruptedError):deform.build_mapping(observed,[512,512],.3,cancel=lambda:True)

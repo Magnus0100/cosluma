@@ -117,6 +117,31 @@ class CompositeQualityTests(unittest.TestCase):
         Image.fromarray(np.uint8(np.round(values * 255.))).save(
             path, icc_profile=deterministic_srgb_profile())
 
+    def test_relative_contrast_and_chroma_are_reported_without_touching_the_verdict(self):
+        report = quality.validate(self.measure(self.composite, label='fixture'))
+        detail = report['items']['generated_detail']
+        tonality = report['items']['cross_boundary_tonality']
+        # The judged reading keeps exactly its old threshold formula; the new readings ride beside it.
+        self.assertEqual(detail['ok'], bool(
+            quality.PARAMETERS['detail_ratio_min'] <= detail['high_frequency_ratio']
+            <= quality.PARAMETERS['detail_ratio_max']
+            and detail['noise_ratio'] <= quality.PARAMETERS['noise_ratio_max']))
+        self.assertGreater(detail['generated_level'], 0.)
+        self.assertGreater(detail['parent_generated_level'], 0.)
+        self.assertAlmostEqual(detail['generated_relative_detail'],
+            detail['generated_high_frequency'] / detail['generated_level'], places=12)
+        self.assertAlmostEqual(detail['parent_relative_detail'],
+            detail['parent_region_high_frequency'] / detail['parent_generated_level'], places=12)
+        self.assertAlmostEqual(detail['relative_detail_ratio'],
+            detail['generated_relative_detail'] / detail['parent_relative_detail'], places=9)
+        self.assertIn('only high_frequency_ratio and noise_ratio', detail['relative_detail_note'])
+        # Chroma runs the same step machinery and is explicitly never a gate.
+        self.assertAlmostEqual(tonality['chroma_excess'],
+            tonality['chroma_step'] - tonality['chroma_content_step'], places=12)
+        self.assertEqual(tonality['chroma_excess_role'], 'advisory_not_gating_no_calibrated_bound')
+        self.assertEqual(tonality['ok'], bool(abs(tonality['luma_excess']) <= quality.PARAMETERS['tonality_step_max']
+            and abs(tonality['warmth_excess']) <= quality.PARAMETERS['warmth_step_max']))
+
     def test_work_types_follow_the_editing_scope(self):
         self.assertEqual(quality.WORK_TYPES, tuple(photo_editing.WORK_TYPES))
         self.assertEqual(set(quality.WORK_TYPES), {'retouch', 'partial_composite', 'full_composite'})
@@ -127,7 +152,7 @@ class CompositeQualityTests(unittest.TestCase):
         self.assertEqual(report['failed_items'], [])
         self.assertEqual(report['not_applicable_items'], [])
         self.assertEqual(set(report['items']), {'untouched_regions', 'boundary_seam',
-            'cross_boundary_tonality', 'generated_detail', 'boundary_halo'})
+            'cross_boundary_tonality', 'hue_step_excess', 'generated_detail', 'boundary_halo'})
         self.assertEqual(report['items']['untouched_regions']['changed_outside_region'], 0)
         self.assertEqual(report['items']['untouched_regions']['changed_under_zero_coverage'], 0)
         self.assertEqual(report['items']['generated_detail']['basis'], 'untouched_original_pixels')
@@ -160,12 +185,20 @@ class CompositeQualityTests(unittest.TestCase):
         self.assertGreater(abs(report['items']['cross_boundary_tonality']['luma_excess']),
             PARAMETERS['tonality_step_max'])
 
-    def test_colour_temperature_break_fails_tonality_alone(self):
+    def test_colour_temperature_break_fails_tonality_and_the_hue_axis(self):
         report = quality.validate(quality.measure(self.parent, self.warm, work_type='partial_composite',
             coverage=self.warm_coverage, region=list(BOX)))
+        # A colour-temperature break rotates the colour relation at the cut, so the
+        # hue-type item is expected to report it too; neither item replaces the other.
         self.assertEqual(report['failed_items'], ['cross_boundary_tonality'])
+        self.assertEqual(report['provisional_items'], ['hue_step_excess'])
+        self.assertNotIn('hue_step_excess', report['failed_items'])
         self.assertGreater(abs(report['items']['cross_boundary_tonality']['warmth_excess']),
             PARAMETERS['warmth_step_max'])
+        self.assertGreater(report['items']['hue_step_excess']['excess_dE76'],
+            PARAMETERS['hue_step_excess_max_dE76'])
+        self.assertEqual(report['items']['hue_step_excess']['baseline'],
+            'parent_canvas_own_step_across_the_same_shells')
         self.assertTrue(report['items']['boundary_seam']['ok'])
 
     def test_change_outside_the_target_region_fails_untouched_regions(self):
@@ -183,9 +216,78 @@ class CompositeQualityTests(unittest.TestCase):
 
     def test_added_grain_in_generated_content_fails_detail(self):
         report = quality.validate(self.measure(self.noisy))
+        # Known sensitivity, recorded rather than tuned away: grain moves the
+        # colour of the first written shell, so this fixture crosses the
+        # provisional hue bound as well. Two real products cannot separate that
+        # reading from a real hue rotation.
         self.assertEqual(report['failed_items'], ['generated_detail'])
         self.assertGreater(report['items']['generated_detail']['noise_ratio'],
             PARAMETERS['noise_ratio_max'])
+        self.assertGreater(report['items']['hue_step_excess']['excess_dE76'],
+            PARAMETERS['hue_step_excess_max_dE76'])
+
+    def test_hue_step_is_measured_against_the_photograph_and_never_replaces_tonality(self):
+        report = quality.validate(self.measure(self.composite, label='fixture'))
+        hue = report['items']['hue_step_excess']
+        tonality = report['items']['cross_boundary_tonality']
+        # Both axes stand side by side; the luminance/warmth verdict keeps exactly its own formula.
+        self.assertEqual(tonality['ok'], bool(
+            abs(tonality['luma_excess']) <= PARAMETERS['tonality_step_max']
+            and abs(tonality['warmth_excess']) <= PARAMETERS['warmth_step_max']))
+        self.assertEqual(hue['ok'], bool(
+            hue['excess_dE76'] <= PARAMETERS['hue_step_excess_max_dE76']))
+        self.assertEqual(hue['baseline'], 'parent_canvas_own_step_across_the_same_shells')
+        self.assertEqual(hue['judged_axis'], 'signed_CIELAB_a_star_and_b_star_vector')
+        self.assertAlmostEqual(hue['photo_chroma_step'],
+            float(np.hypot(hue['photo_step_da'], hue['photo_step_db'])), places=5)
+        self.assertAlmostEqual(hue['delivered_chroma_step'],
+            float(np.hypot(hue['delivered_step_da'], hue['delivered_step_db'])), places=5)
+        self.assertAlmostEqual(hue['excess_dE76'],
+            float(np.hypot(hue['delivered_step_da'] - hue['photo_step_da'],
+                hue['delivered_step_db'] - hue['photo_step_db'])), places=5)
+
+    def test_hue_step_baseline_is_the_photographs_own_step(self):
+        # The same delivered canvas over two different photographs has to read
+        # differently, because the baseline is the photograph's own step and not a constant.
+        tinted = self.parent.copy()
+        tinted[BOX[1]:BOX[3], BOX[0]:BOX[2]] = np.clip(
+            tinted[BOX[1]:BOX[3], BOX[0]:BOX[2]] * np.array([1., .82, 1.12], np.float32), 0., 1.)
+        near = quality.validate(quality.measure(self.parent, self.composite,
+            work_type='partial_composite', coverage=self.coverage,
+            region=list(BOX)))['items']['hue_step_excess']
+        far = quality.validate(quality.measure(tinted, self.composite,
+            work_type='partial_composite', coverage=self.coverage,
+            region=list(BOX)))['items']['hue_step_excess']
+        self.assertNotAlmostEqual(near['photo_chroma_step'], far['photo_chroma_step'], places=3)
+        self.assertAlmostEqual(near['delivered_chroma_step'], far['delivered_chroma_step'], places=9)
+        self.assertNotAlmostEqual(near['excess_dE76'], far['excess_dE76'], places=3)
+
+    def test_hue_step_records_its_provisional_calibration(self):
+        report = quality.validate(self.measure(self.composite))
+        evidence = report['items']['hue_step_excess']['threshold_evidence']
+        self.assertEqual(evidence, quality.HUE_STEP_EVIDENCE)
+        self.assertEqual(evidence['samples'], 2)
+        self.assertEqual(evidence['status'], 'provisional_insufficient_sample')
+        self.assertGreater(evidence['required_samples'], evidence['samples'])
+        self.assertEqual(len(evidence['measured_excess_dE76']), 2)
+        self.assertIn('unverified', evidence['note'])
+        # The calibration cannot be rewritten inside a report.
+        forged = copy.deepcopy(report)
+        forged['items']['hue_step_excess']['threshold_evidence']['samples'] = 40
+        with self.assertRaises(ValueError):
+            quality.validate(forged)
+
+    def test_hue_step_rejects_a_reading_that_does_not_match_its_own_vectors(self):
+        report = quality.validate(self.measure(self.composite))
+        forged = copy.deepcopy(report)
+        item = forged['items']['hue_step_excess']
+        item['excess_dE76'] = 0.
+        item['ok'] = True
+        forged['failed_items'] = [name for name in quality.GATING_ITEMS if not forged['items'][name]['ok']]
+        forged['verdict'] = 'fail' if forged['failed_items'] else 'pass'
+        forged['report_sha256'] = quality._digest(forged)
+        with self.assertRaises(ValueError):
+            quality.validate(forged)
 
     def test_bright_and_dark_rims_report_a_halo_width(self):
         for amplitude in (.03, -.03):
@@ -204,7 +306,7 @@ class CompositeQualityTests(unittest.TestCase):
             work_type='full_composite', coverage={'uniform': 1}))
         self.assertEqual(report['verdict'], 'pass')
         self.assertEqual(report['not_applicable_items'],
-            ['boundary_seam', 'cross_boundary_tonality', 'boundary_halo'])
+            ['boundary_seam', 'cross_boundary_tonality', 'hue_step_excess', 'boundary_halo'])
         self.assertEqual(report['region'], None)
         self.assertTrue(report['items']['untouched_regions']['scope_covers_canvas'])
         self.assertEqual(report['items']['generated_detail']['basis'], 'immediate_parent_pixels')
@@ -224,7 +326,7 @@ class CompositeQualityTests(unittest.TestCase):
             work_type='full_composite', coverage=1))
         self.assertEqual(report['failed_items'], ['generated_detail'])
         self.assertEqual(report['not_applicable_items'],
-            ['boundary_seam', 'cross_boundary_tonality', 'boundary_halo'])
+            ['boundary_seam', 'cross_boundary_tonality', 'hue_step_excess', 'boundary_halo'])
 
     def test_report_digest_and_item_verdicts_reject_forgery(self):
         report = quality.validate(self.measure(self.composite))

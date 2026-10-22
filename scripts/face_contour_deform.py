@@ -92,6 +92,11 @@ PARAMETERS={'face_grid_pitch':1.,'mesh_pitch_fraction':.006,'support_erosion':fl
     'forward_strain_min':.8,'forward_strain_max':1.25,
     'chin_tanh_face_fraction':.2,'invalid_row_transition_face_fraction':.015,
     'handle_reach_multiple':9.,'anchor_margin_cells':1,'mesh_relaxation_passes':2,'mesh_relaxation_weight':.5,'strain_limited_amplitude':True,
+    # When the strain window would force the limiter to cut the request, the support is retried once
+    # at this multiple of the transition distance the budget actually needs (required_inner_ramp).
+    # 4x measured on both real masters: the recovered delivery is 0.9240/0.9479 at amount .30 while
+    # the 9x support delivers 0.8429/0.8227. See docs/ALGORITHM_DECISIONS.md.
+    'support_ramp_factor':4.,'support_ramp_multiple_max':64.,
     'handle_node_search_cells':3,
     'weight_operator':'bounded_harmonic_mesh_weights',
     'interpolation':'cv2_remap_bilinear_display_linear_RGB_and_G',
@@ -289,12 +294,27 @@ def _limited_fraction(measured,strain_min,strain_max):
     return float(max(min(fraction,1.),0.))
 
 
-def build_mapping(detections,canvas_size,amount,*,cancel=None):
-    """Freeze a deterministic bounded mesh-weight displacement along eye axis h."""
+def _build_mapping_once(detections,canvas_size,amount,*,cancel=None,reach_multiple=None,retry_reason=None,
+        geometry_cache=None,validate=True):
+    """Freeze one deterministic bounded mesh-weight displacement along eye axis h.
+
+    The geometry_cache argument lets the one correction in build_mapping reuse the canonical
+    geometry of its first build: the protection, admitted envelope and safe band (P/E/J) depend on
+    the detections and the native canvas only, never on the support multiple, so a second candidate
+    that re-derived them would pay the measured _geometry cost again (2.50 s on the 662 master,
+    5.65 s on 685) for a field that may be discarded. The cache is keyed to this call's own detections object and canvas; anything else
+    rebuilds. validate=False marks a candidate that can be discarded: the mapping that leaves this
+    module is always finished by _finish_mapping, so no returned artifact skips validation.
+    """
     import photo_shaping_geometry as geometry
     _cancel(cancel);canvas_size=_size(canvas_size);amount=_amount(amount)
     if not isinstance(detections,dict):raise ValueError('Canonical detections are required')
-    planes,info=geometry._geometry(detections,canvas_size,cancel=cancel)
+    key=(id(detections),tuple(canvas_size));planes=info=None
+    if isinstance(geometry_cache,dict) and geometry_cache.get('key')==key:
+        planes,info=geometry_cache.get('planes'),geometry_cache.get('info')
+    if planes is None or info is None:
+        planes,info=geometry._geometry(detections,canvas_size,cancel=cancel)
+        if isinstance(geometry_cache,dict):geometry_cache.update(key=key,planes=planes,info=info)
     points=np.asarray(detections['faces'][0]['landmarks'],np.float64)
     eye_a=(points[33]+points[133])*.5;eye_b=(points[362]+points[263])*.5
     h=eye_b-eye_a;h/=np.linalg.norm(h);vertical=np.array([-h[1],h[0]])
@@ -306,6 +326,8 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
     # complete central protection: that is where the mesh may legally act at all.
     allowed=envelope&~protected
     reasons=Counter();counts=Counter();max_control=0.;max_handle_step=0.;row_step=0.
+    base_multiple=float(PARAMETERS['handle_reach_multiple'])
+    support_scaling={'base_multiple':base_multiple,'applied_multiple':base_multiple,'reach_px':0.,'retry_reason':retry_reason}
     mesh_info={'mesh_free_nodes':0,'mesh_anchor_nodes':0,'mesh_rows':0,'mesh_columns':0,'mesh_nodes':0,'mesh_handle_nodes':0,'mesh_pitch':0.,'mesh_relaxation_passes':0,'weight_operator':PARAMETERS['weight_operator'],'strain_headroom':0.}
     displacement=np.zeros(shape,np.float32)
     # Strain budget: a smoothstep ramp of width w moving delta has peak |d'| =
@@ -368,8 +390,11 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
         # 3. Every handle gap (a missing row, an arc end or the chin end of the
         #    covered contour) must empty over the reach the strain budget needs,
         #    otherwise the mesh has to absorb the whole narrowing across one cell.
-        reach=max(float(PARAMETERS['handle_reach_multiple'])*(max(raw.values()) if raw else 0.),
+        effective_multiple=base_multiple if reach_multiple is None else float(reach_multiple)
+        support_scaling['applied_multiple']=float(effective_multiple)
+        reach=max(effective_multiple*(max(raw.values()) if raw else 0.),
             float(PARAMETERS['invalid_row_transition_face_fraction'])*info['face_width'])
+        support_scaling['reach_px']=float(reach)
         tapers={}
         for side in (-1,1):
             valid=np.array([isinstance(row.get(side),tuple) for row in controls])
@@ -453,8 +478,28 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
             max_control*=fraction
             jacobian=_jacobian(displacement,h,cancel=cancel)
         limited=float(max(min(limited,1.),0.))
+    # The retry rule itself is derived from this build's own budget, so whether it fires is
+    # knowable before the field is sealed. That distinction matters: a mapping with the rule fired
+    # but retry_reason None records a retry that was attempted and delivered less, while a mapping
+    # with the rule not fired records that no retry was warranted. Without it the two look alike.
+    candidate_multiple=0.
+    if amount and limited>0:
+        raw_peak=float(max_control)/max(float(limited),1e-9)
+        if raw_peak>0:
+            # The named support is bounded. The lattice reach is this multiple times the measured
+            # peak, so a degenerate budget (a peak far below the requested transition) can name a
+            # support far larger than any face needs; the cap keeps the second build inside a known
+            # cost instead of letting one pathological request decide it. Capping is recorded, never
+            # hidden, and on both real masters the named multiple is 24.18/24.19, well inside it.
+            candidate_multiple=min(float(PARAMETERS['support_ramp_factor'])*float(inner_ramp_ratio*target_delta)/raw_peak,
+                float(PARAMETERS['support_ramp_multiple_max']))
+    support_scaling['candidate_multiple']=float(candidate_multiple)
+    support_scaling['candidate_capped']=bool(candidate_multiple>=float(PARAMETERS['support_ramp_multiple_max']))
+    # The rule fires only when the limiter is actually cutting and the named support is wider:
+    # a request that fits the window never pays for a second build, whatever its budget names.
+    support_scaling['retry_rule_fires']=bool(candidate_multiple>base_multiple*(1.+1e-3) and limited<.999)
     field_row_change=float(np.abs(np.diff(displacement,axis=0)).max(initial=0.)) if shape[0]>1 else 0.
-    stats={**jacobian,**mesh_info,'strain_limited_fraction':float(limited),
+    stats={**jacobian,**mesh_info,'strain_limited_fraction':float(limited),'support_scaling':dict(support_scaling),
         'maximum_adjacent_face_row_change':float(row_step/mesh_pitch),
         'maximum_adjacent_face_column_change':float(max_handle_step/mesh_pitch),
         'maximum_adjacent_field_row_change':field_row_change,
@@ -496,9 +541,47 @@ def build_mapping(detections,canvas_size,amount,*,cancel=None):
         'canonical_landmarks':points.tolist(),'source_detections_id':identity(detections),
         'parameters':copy.deepcopy(PARAMETERS),'producer':producer_identity(),'stats':stats,
         'displacement':displacement,'protected':protected,'allowed':allowed,'edit_support':displacement!=0}
-    _seal(mapping);_validate_structure(mapping,cancel=cancel);_VERIFIED.add(mapping['mapping_id'])
+    _seal(mapping)
+    return _finish_mapping(mapping,cancel=cancel) if validate else mapping
+
+
+def _finish_mapping(mapping,*,cancel=None):
+    """Validate the one chosen mapping and register its identity for in-process sampling."""
+    _validate_structure(mapping,cancel=cancel);_VERIFIED.add(mapping['mapping_id'])
     if len(_VERIFIED)>16:_VERIFIED.pop()
     return mapping
+
+
+def build_mapping(detections,canvas_size,amount,*,cancel=None):
+    """Freeze the checked field, retrying the support once when the limiter would cut the request.
+
+    The lattice support is not a taste: the strain budget needs a transition distance of
+    required_inner_ramp, and the harmonic field concentrates its peak gradient above the naive ramp
+    rate. When that concentration pushes the request out of the checked window the limiter can only
+    cut the amplitude, so the support is widened once to the multiple the budget itself names
+    (support_ramp_factor * required_inner_ramp) and the two candidates are compared on the delivered
+    control displacement. The retry is skipped entirely when the first build already fits the window,
+    so a request inside the current capacity produces exactly the previous field. Nothing here
+    relaxes the strain window and nothing is silently adopted: both readings are recorded in
+    stats.support_scaling and stats.strain_limited_fraction. The two candidates share the one
+    canonical geometry of these detections, because the support multiple cannot change P/E/J, and
+    only the chosen field is validated; the correction therefore pays a second mesh build rather
+    than a second geometry derivation and a second structure validation.
+    """
+    cache={}
+    mapping=_build_mapping_once(detections,canvas_size,amount,cancel=cancel,geometry_cache=cache,validate=False)
+    stats=mapping.get('stats') or {}
+    if PARAMETERS['strain_limited_amplitude'] and float(amount or 0.):
+        limited=float(stats.get('strain_limited_fraction') or 1.)
+        scaling=stats.get('support_scaling') or {}
+        multiple=float(scaling.get('candidate_multiple') or 0.) if scaling.get('retry_rule_fires') else 0.
+        if limited<.999 and multiple>0:
+            retried=_build_mapping_once(detections,canvas_size,amount,cancel=cancel,reach_multiple=multiple,
+                retry_reason='strain_limiter_would_cut',geometry_cache=cache,validate=False)
+            if float(retried['stats'].get('maximum_control_delta') or 0.)>float(stats.get('maximum_control_delta') or 0.):
+                mapping=retried
+    _cancel(cancel)
+    return _finish_mapping(mapping,cancel=cancel)
 
 
 def _validate_structure(mapping,*,cancel=None):
