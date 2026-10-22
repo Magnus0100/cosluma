@@ -1050,5 +1050,65 @@ class ProductionJoinTests(unittest.TestCase):
 
 
 
+class ProviderDiagnosticsTests(unittest.TestCase):
+    """The recorded reason a generated region is short, and what it must never do."""
+
+    def setUp(self):
+        self.parent = np.uint8(np.clip(photograph(), 0., 1.) * 255. + .5)
+        self.matte = np.zeros(SHAPE, np.float32)
+        self.matte[BOX[1]:BOX[3], BOX[0]:(BOX[0] + BOX[2]) // 2] = 1.
+        self.coverage = feather()
+        self.result = np.uint8(np.clip(self.parent.astype(np.float64)
+            + self.coverage[..., None] * 6., 0., 255.))
+
+    def provider_reading(self, provider):
+        report = quality.measure(self.parent, self.result, work_type='partial_composite',
+            coverage=self.coverage, region=list(BOX), provider=provider, matte=self.matte)
+        return report['items']['generated_detail']
+
+    def test_the_readings_are_recorded_beside_the_verdict_and_never_judge_it(self):
+        without = quality.measure(self.parent, self.result, work_type='partial_composite',
+            coverage=self.coverage, region=list(BOX))['items']['generated_detail']
+        with_provider = self.provider_reading(self.parent)
+        self.assertNotIn('provider_diagnostics', without)
+        recorded = with_provider['provider_diagnostics']
+        self.assertEqual(recorded['role'], 'recorded_not_judged_no_calibrated_bound')
+        self.assertIn('Six samples locate no bound', recorded['note'])
+        self.assertEqual(with_provider['ok'], without['ok'])
+        self.assertEqual(with_provider['high_frequency_ratio'], without['high_frequency_ratio'])
+
+    def test_a_picture_of_something_else_lowers_the_structure_reading(self):
+        rng = np.random.default_rng(11)
+        foreign = np.uint8(rng.random(SHAPE + (3,)) * 255. + .5)
+        faithful = self.provider_reading(self.parent)['provider_diagnostics']
+        stranger = self.provider_reading(foreign)['provider_diagnostics']
+        self.assertGreater(faithful['provider_subject_structure_ncc'], .99)
+        self.assertLess(stranger['provider_subject_structure_ncc'], .5)
+        self.assertGreaterEqual(stranger['provider_subject_structure_ncc'], -1.)
+
+    def test_the_relative_description_discloses_and_never_enforces(self):
+        faithful = self.provider_reading(self.parent)
+        rng = np.random.default_rng(11)
+        stranger = self.provider_reading(np.uint8(rng.random(SHAPE + (3,)) * 255. + .5))
+        recorded = stranger['provider_diagnostics']
+        self.assertEqual(recorded['reading_relative_to_passing_sample'][
+            'provider_subject_structure_ncc'], 'below')
+        self.assertEqual(recorded['passing_sample_readings']['cases'], 6)
+        self.assertEqual(faithful['provider_diagnostics']['reading_relative_to_passing_sample'][
+            'provider_subject_structure_ncc'], 'above')
+        self.assertEqual(stranger['ok'], faithful['ok'])
+        self.assertEqual(stranger['high_frequency_ratio'], faithful['high_frequency_ratio'])
+
+    def test_the_readings_need_both_the_provider_and_the_matte(self):
+        for extra in ({'provider': self.parent}, {'matte': self.matte}):
+            with self.assertRaises(ValueError):
+                quality.measure(self.parent, self.parent, work_type='partial_composite',
+                    coverage=self.coverage, region=list(BOX), **extra)
+        with self.assertRaises(ValueError):
+            quality.measure(self.parent, self.parent, work_type='partial_composite',
+                coverage=self.coverage, region=list(BOX),
+                provider=self.parent[:10], matte=self.matte)
+
+
 if __name__ == '__main__':
     unittest.main()

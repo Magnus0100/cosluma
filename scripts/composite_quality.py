@@ -309,7 +309,87 @@ def _region(values, shape):
     return [left, top, right, bottom]
 
 
-def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
+# Measured on six real products (2775149f, 747293ed, 93d79f85, 5230b663, 35126407,
+# 2404f212) and recorded so a new reading can be described relative to them. This is
+# a disclosure: six samples locate no bound, so nothing here reaches a verdict.
+PASSING_SAMPLE_READINGS = {'cases': 6,
+    'provider_subject_structure_ncc': (0.2849, 0.3351),
+    'provider_detail_outside_matte_share': (0.0014, 0.0363)}
+
+
+def _relative_to_passing_samples(value, low, high):
+    if value < low:
+        return 'below'
+    return 'within' if value <= high else 'above'
+
+
+def provider_subject_diagnostics(parent, provider, matte, region):
+    """Record why a generated region is detail-limited, without judging anything.
+
+    'parent' and 'provider' are display-encoded canvases, 'matte' the retained
+    subject mask and 'region' the (x0, y0, x1, y1) authorization being written. Two
+    readings come out.
+
+    'provider_detail_outside_matte_share' is the share of scene-side pixels whose
+    detail reaches the subject side's 90th percentile, so it separates a generated
+    picture that is smooth everywhere from one that put its detail where the subject
+    is not.
+
+    'provider_subject_structure_ncc' is the correlation of the generated detail map
+    with the retained photograph's inside the subject, so it separates too little
+    detail from detail that describes a different subject. A composite whose
+    generator drew a different picture cannot be repaired by any matte or threshold,
+    and saying so is the point of recording it.
+
+    Neither reading gates a verdict: six real products put this per-pixel correlation
+    between 0.040 and 0.407 and the leak between 0.001 and 0.305. Averaging 8x8 blocks
+    before correlating, a coarser scale measured the same ordering from 0.185 to 0.880;
+    quote the scale with the number. Either way six samples locate no bound.
+    """
+    parent = np.asarray(parent, np.float64)
+    provider = np.asarray(provider, np.float64)
+    matte = np.asarray(matte, np.float64)
+    if parent.ndim != 3 or provider.shape != parent.shape or matte.shape != parent.shape[:2]:
+        raise ValueError('Provider diagnostics need matching parent, provider and matte canvases')
+    if region is not None:
+        x0, y0, x1, y1 = (int(v) for v in region)
+        parent = parent[y0:y1, x0:x1]; provider = provider[y0:y1, x0:x1]
+        matte = matte[y0:y1, x0:x1]
+    inside = matte >= 0.5
+    outside = matte <= 0.02
+    if not inside.any() or not outside.any():
+        raise ValueError('Provider diagnostics need a matte with subject and scene pixels')
+    luma = np.array([0.2126, 0.7152, 0.0722])
+    def detail(rgb):
+        grey = rgb @ luma
+        return np.abs(grey - gaussian_filter(grey, PARAMETERS['highpass_sigma'], mode='nearest'))
+    provider_detail = detail(provider)
+    parent_detail = detail(parent)
+    threshold = float(np.percentile(provider_detail[inside], 90.))
+    leak = float((provider_detail[outside] > threshold).mean())
+    a = provider_detail[inside]; b = parent_detail[inside]
+    a = a - a.mean(); b = b - b.mean()
+    scale = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    ncc = float((a * b).sum() / scale) if scale > 1e-12 else 0.
+    structure_low, structure_high = PASSING_SAMPLE_READINGS['provider_subject_structure_ncc']
+    leak_low, leak_high = PASSING_SAMPLE_READINGS['provider_detail_outside_matte_share']
+    return {'provider_detail_outside_matte_share': leak,
+        'provider_subject_structure_ncc': ncc,
+        'outside_share_of_region': float(outside.mean()),
+        'inside_p90_provider_detail': threshold,
+        'reading_relative_to_passing_sample': {
+            'provider_subject_structure_ncc': _relative_to_passing_samples(
+                ncc, structure_low, structure_high),
+            'provider_detail_outside_matte_share': _relative_to_passing_samples(
+                leak, leak_low, leak_high)},
+        'passing_sample_readings': dict(PASSING_SAMPLE_READINGS),
+        'role': 'recorded_not_judged_no_calibrated_bound',
+        'note': ('six real products put this per-pixel correlation between 0.040 and 0.407 '
+            'and the leak between 0.001 and 0.305; the passing three measured 0.285 to 0.335 '
+            'and 0.001 to 0.036. Six samples locate no bound, so neither reading gates this '
+            'item; the relative description is disclosed, not enforced')}
+
+def measure(parent, result, *, work_type, coverage=None, region=None, label='', provider=None, matte=None):
     """Measure one finished composite against the canvas it was built from.
 
     ``parent`` is the immediate parent canvas the composite started from,
@@ -489,6 +569,14 @@ def measure(parent, result, *, work_type, coverage=None, region=None, label=''):
             'high_frequency_ratio and noise_ratio judge this item'),
         'ok': bool(PARAMETERS['detail_ratio_min'] <= detail_ratio <= PARAMETERS['detail_ratio_max']
             and noise_ratio <= PARAMETERS['noise_ratio_max'])}
+    # Recorded beside the judgement, never part of it: a caller that supplies the
+    # generated canvas and the retained matte gets the two readings that say why the
+    # detail is short, and the verdict above is computed before either is looked at.
+    if provider is not None or matte is not None:
+        if provider is None or matte is None:
+            raise ValueError('Provider diagnostics need both the provider canvas and the matte')
+        detail['provider_diagnostics'] = provider_subject_diagnostics(
+            parent, provider, matte, region)
 
     items = {'untouched_regions': untouched, 'boundary_seam': seam,
         'cross_boundary_tonality': tonality, 'hue_step_excess': hue_step,
