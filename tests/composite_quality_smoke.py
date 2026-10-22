@@ -1156,6 +1156,24 @@ class ProviderDiagnosticsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quality.render_report({'schema': 'other'})
 
+    def test_the_readings_render_alone_or_say_plainly_that_none_were_taken(self):
+        nothing = quality.render_readings(None)
+        self.assertIn('本次未测', nothing)
+        self.assertIn('这不是通过，也不是失败', nothing)
+        one = quality.render_readings({'provider_detail_outside_matte_share': .1234,
+            'provider_subject_structure_ncc': .5678,
+            'reading_relative_to_passing_sample': {'provider_detail_outside_matte_share': 'above',
+                'provider_subject_structure_ncc': 'within'},
+            'role': 'recorded_not_judged_no_calibrated_bound'})
+        self.assertIn('0.1234', one)
+        self.assertIn('0.5678', one)
+        self.assertIn('above', one)
+        self.assertIn('不改变判定', one)
+        self.assertNotIn('本次未测', one)
+        with_coverage = quality.render_readings({'provider_subject_structure_ncc': .5},
+            subject_coverage={'provider_covers_subject': .3149})
+        self.assertIn('31.5%', with_coverage)
+
     def test_the_readings_need_both_the_provider_and_the_matte(self):
         for extra in ({'provider': self.parent}, {'matte': self.matte}):
             with self.assertRaises(ValueError):

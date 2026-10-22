@@ -1328,6 +1328,15 @@ def _execute(context,config,kind):
             'identity_verified':False,'geometric_registration_verified':False,
             'lighting_and_depth_of_field_verified':False,'needs_visual_review':True,'human_approved':False}
         composition_path=output/'composition.json';atomic_json(composition_path,composition)
+        # The same reading, written where a person opening the run folder will find it.
+        # It reports; it never decides, and a failure to write it cannot fail the work.
+        if core is not None:
+            try:
+                import composite_quality
+                (output/'quality-readings.md').write_text(
+                    composite_quality.render_readings(provider_readings)+chr(10),encoding='utf8')
+            except Exception:
+                pass
         record.update(state='complete',complete_candidate=candidate,appearance_asset=asset,
             composition_receipt=_asset(composition_path),elapsed_seconds=time.perf_counter()-started)
         atomic_json(attempt_path,record);_cancel(config.get('cancel'))

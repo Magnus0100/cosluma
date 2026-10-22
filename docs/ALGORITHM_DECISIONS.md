@@ -125,4 +125,13 @@ BeautyGRPO 的当前配置与使用见 [人像美化](PORTRAIT_BEAUTY.md)。
 
 改动前后 `integration` **118 项零回退**，`photo_edit_tools` 28 项、`composite_quality` 48 项、`core` 22 项全绿。
 
-仍属工程测量：桌面复核界面显示这段文字需要改 `validate_saved_comprehensive_review` 的逐字相等校验，**尚未改动**。
+### 同一段文字同时写成人能打开的文件
+
+每次区域合成还会在同一个目录写 `quality-readings.md`：
+
+- 有读数：三行数字 + 「只用于说明原因，不改变判定；样本量不足以设界线」
+- 没读数：写明「本次未测……这不是通过，也不是失败，只是没有测量」
+
+`render_readings()` 只渲染读数，**不写判定**（测试断言文件里不出现 `判定：`）。写入失败也不影响已成功的合成。
+
+为什么旁挂文件而不是塞进复核对象：`validate_saved_comprehensive_review` 用 `_json_bytes` 逐字比对保存的复核，新增字段会让历史复核失去可校验性；旁挂文件与复核对象零耦合。

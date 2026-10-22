@@ -325,6 +325,39 @@ def _relative_to_passing_samples(value, low, high):
 
 
 
+
+
+def render_readings(readings, *, title='为什么这次合成可能出现细节不足', subject_coverage=None):
+    """Render only the recorded readings, or say plainly that none were taken.
+
+    Written next to the composite receipt so a person opening the run folder reads the
+    same numbers an engineer does. It never states a verdict: the composite decision
+    belongs to the delivery path and the review, not to these readings.
+    """
+    lines = ['### ' + str(title), '']
+    if not readings:
+        lines.extend(['本次未测：区域小于摄影级接合支持（短边 ≥256、≥131072 像素）或没有主体 matte，',
+            '所以没有可对照的主体轮廓。这不是通过，也不是失败，只是没有测量。'])
+        return '\n'.join(lines)
+    lines.append('**记录值（不参与判定，未标定）**')
+    if 'provider_detail_outside_matte_share' in readings:
+        relative = (readings.get('reading_relative_to_passing_sample') or {}).get(
+            'provider_detail_outside_matte_share')
+        lines.append('- 生成细节落在主体之外的比例：%.4f' % float(
+            readings['provider_detail_outside_matte_share'])
+            + ('（相对已有通过样本：' + relative + '）' if relative else ''))
+    if 'provider_subject_structure_ncc' in readings:
+        relative = (readings.get('reading_relative_to_passing_sample') or {}).get(
+            'provider_subject_structure_ncc')
+        lines.append('- 生成内容与保留主体的结构相关：%.4f' % float(
+            readings['provider_subject_structure_ncc'])
+            + ('（相对已有通过样本：' + relative + '）' if relative else ''))
+    if subject_coverage:
+        lines.append('- 生成的画面覆盖了保留主体的：%.1f%%' % (
+            100. * float(subject_coverage.get('provider_covers_subject', 0.))))
+    lines.append('- 以上读数只用于说明原因，不改变判定；样本量不足以设界线。')
+    return '\n'.join(lines)
+
 def render_report(report):
     """Render a measured report as a human-readable Markdown section.
 
