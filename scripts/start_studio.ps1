@@ -12,7 +12,12 @@ if (Test-Path -LiteralPath $DesktopExe) {
 }
 if (-not $Python) {
     $SettingsPath = if ($env:COSLUMA_CONFIG) { $env:COSLUMA_CONFIG } else { Join-Path $env:USERPROFILE 'CosplayWorkbench\config\cosluma.json' }
-    $Python = (Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json).python
+    if (Test-Path -LiteralPath $SettingsPath) {
+        $Python = (Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json).python
+    }
+}
+if (-not $Python) {
+    throw 'Source launch requires an existing Python. Set COSLUMA_PYTHON to its python.exe path, or pass -Python <path>. See README.'
 }
 & $Python -B (Join-Path $PSScriptRoot 'qt_workbench.py') @ExtraArgs
 exit $LASTEXITCODE

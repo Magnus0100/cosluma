@@ -5,15 +5,18 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import json
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QSettings, QThread, Signal, Slot, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QPixmap
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QTabWidget,
     QLabel, QLineEdit, QListWidget, QMainWindow, QPushButton,
     QPlainTextEdit, QVBoxLayout, QWidget)
 
 from photo_pipeline import finish_batch
-from settings import default_settings_path, load_settings
+from settings import default_settings_path, editable_settings, load_settings, save_settings
 from app_version import VERSION
 
 
@@ -48,6 +51,127 @@ class Worker(QThread):
             self.failed.emit(self.batch_error)
 
 
+class ServiceSettings(QDialog):
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = Path(path).expanduser().resolve()
+        self.values = editable_settings(self.path)
+        self.fields = {}
+        self.credentials = {}
+        self.setWindowTitle('服务设置')
+        self.resize(720, 500)
+        layout = QVBoxLayout(self)
+        description = QLabel('填写服务提供方给出的地址和模型名。保存只写入本机配置，不连接模型服务。\n'
+            '密钥使用环境变量或已有密钥文件，配置里只保存名称或路径。')
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        destination = QLabel('配置保存到：' + str(self.path))
+        destination.setWordWrap(True)
+        destination.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(destination)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        library = QWidget()
+        form = QFormLayout(library)
+        self.library = QLineEdit(self.values.get('prompt_library', str(self.path.parent / 'prompts.json')))
+        row = QHBoxLayout()
+        row.addWidget(self.library, 1)
+        browse = QPushButton('选择已有库')
+        browse.clicked.connect(self.choose_library)
+        row.addWidget(browse)
+        form.addRow('提示词库 JSON', row)
+        hint = QLabel('首次保存时，会在默认位置创建随附的通用提示词库；可换成你自己的库。\n'
+            '每条包含 title、text、source，已有文件不会被覆盖。')
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        self.tabs.addTab(library, '提示词库')
+        for service, title in (('llm', '提示词服务'), ('image', '图像编辑服务')):
+            panel = QWidget()
+            form = QFormLayout(panel)
+            self.add_field(form, service, 'url', '完整接口地址')
+            self.add_field(form, service, 'model', '模型名')
+            provider = self.values.get(service, {})
+            mode = QComboBox()
+            for text, key in (('环境变量名', 'api_key_env'), ('密钥文件路径', 'api_key_file'), ('无需密钥', '')):
+                mode.addItem(text, key)
+            key = 'api_key_file' if 'api_key_file' in provider else ('api_key_env' if provider.get('api_key_env') else '')
+            mode.setCurrentIndex(mode.findData(key))
+            value = QLineEdit(provider.get(key, '') if key else '')
+            value.setPlaceholderText('填写变量名或文件路径，请勿粘贴密钥')
+            value.setEnabled(bool(key))
+            mode.currentIndexChanged.connect(lambda _index, mode=mode, value=value: value.setEnabled(bool(mode.currentData())))
+            self.credentials[service] = (mode, value)
+            form.addRow('凭据来源', mode)
+            form.addRow('名称或路径', value)
+            if service == 'image':
+                self.parameters = QPlainTextEdit(json.dumps(provider.get('parameters', {}), ensure_ascii=False, indent=2))
+                self.parameters.setMaximumHeight(120)
+                form.addRow('服务参数 JSON', self.parameters)
+            self.tabs.addTab(panel, title)
+        panel = QWidget()
+        form = QFormLayout(panel)
+        for service, title in (('head', '整头分割'), ('sr', '超分')):
+            self.add_field(form, service, 'url', title + '服务地址')
+            self.add_field(form, service, 'model', title + '权重名')
+        hint = QLabel('使用已准备好的 ComfyUI 服务。分割权重位于 models/checkpoints，'
+            '超分权重位于 models/upscale_models；安装要求见随包 README。')
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        self.tabs.addTab(panel, '分割与超分')
+        self.message = QLabel('')
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        buttons = QDialogButtonBox()
+        buttons.addButton('保存配置', QDialogButtonBox.AcceptRole)
+        buttons.addButton('取消', QDialogButtonBox.RejectRole)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def add_field(self, form, service, key, label):
+        edit = QLineEdit(self.values.get(service, {}).get(key, ''))
+        self.fields[service, key] = edit
+        form.addRow(label, edit)
+
+    def choose_library(self):
+        filename, _ = QFileDialog.getOpenFileName(self, '选择提示词库', self.library.text(), 'JSON (*.json)')
+        if filename:
+            self.library.setText(filename)
+
+    def save(self):
+        try:
+            library = self.library.text().strip()
+            if not library:
+                raise ValueError('请填写提示词库路径')
+            for (service, key), edit in self.fields.items():
+                value = edit.text().strip()
+                if not value:
+                    raise ValueError('请填写服务地址和模型名')
+                if key == 'url':
+                    parsed = urlsplit(value)
+                    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.hostname == 'api.example.com':
+                        raise ValueError('请填写服务提供方的完整 HTTP/HTTPS 地址，替换示例地址')
+                self.values.setdefault(service, {})[key] = value
+            for service, (mode, value) in self.credentials.items():
+                key = mode.currentData()
+                if key and not value.text().strip():
+                    raise ValueError('请填写凭据的环境变量名或密钥文件路径')
+                provider = self.values[service]
+                provider.pop('api_key_env', None)
+                provider.pop('api_key_file', None)
+                if key:
+                    provider[key] = value.text().strip()
+            parameters = json.loads(self.parameters.toPlainText())
+            if not isinstance(parameters, dict):
+                raise ValueError('图像服务参数必须是 JSON 对象')
+            self.values['image']['parameters'] = parameters
+            self.values['prompt_library'] = library
+            save_settings(self.path, self.values)
+            self.accept()
+        except Exception as error:
+            self.message.setText('无法保存：' + str(error))
+
+
 class Workbench(QMainWindow):
     def __init__(self, root=None, config=None):
         super().__init__()
@@ -68,6 +192,14 @@ class Workbench(QMainWindow):
         title = QLabel('选照片、填角色，自动设计整组成片')
         title.setStyleSheet('font-size: 22px; font-weight: 600; margin-bottom: 8px')
         layout.addWidget(title)
+        setup_row = QHBoxLayout()
+        self.setup_hint = QLabel('')
+        self.setup_hint.setWordWrap(True)
+        setup_row.addWidget(self.setup_hint, 1)
+        self.setup_button = QPushButton('服务设置')
+        self.setup_button.clicked.connect(self.configure_services)
+        setup_row.addWidget(self.setup_button)
+        layout.addLayout(setup_row)
         row = QHBoxLayout()
         select = QPushButton('选择照片')
         select.clicked.connect(self.select_sources)
@@ -100,6 +232,7 @@ class Workbench(QMainWindow):
         advanced_panel = QWidget()
         advanced_form = QFormLayout(advanced_panel)
         self.config = QLineEdit(str(config))
+        self.config.textChanged.connect(self.update_setup_hint)
         advanced_form.addRow('配置文件', self.path_row(self.config))
         self.edge = QLineEdit(self.preferences.value('output_edge','',type=str))
         self.edge.setPlaceholderText('留空使用配置，默认长边 6000；以单次超分覆盖范围为准')
@@ -125,6 +258,23 @@ class Workbench(QMainWindow):
         open_folder.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(
             str(self.batch_directory or (Path(self.current_output).parent if self.current_output else Path(self.root.text()))))))
         layout.addWidget(open_folder)
+        self.update_setup_hint()
+
+    def update_setup_hint(self):
+        exists = Path(self.config.text()).expanduser().is_file()
+        self.setup_hint.setText('服务配置已选择；需要更换服务时打开“服务设置”。' if exists else
+            '首次使用：请打开“服务设置”，填写模型服务后保存；通用提示词库随包提供。')
+
+    def configure_services(self):
+        try:
+            dialog = ServiceSettings(self.config.text(), self)
+            if dialog.exec() == QDialog.Accepted:
+                self.config.setText(str(dialog.path))
+                self.remember_preferences()
+                self.update_setup_hint()
+                self.status.setText('配置已保存。选择照片、填写角色后即可开始；连接错误会显示在对应制作步骤。')
+        except Exception as error:
+            self.status.setText('无法打开服务设置：' + str(error))
 
     def switch_character(self):
         character = self.character.text().strip()
@@ -171,6 +321,10 @@ class Workbench(QMainWindow):
 
     def produce(self):
         try:
+            if not Path(self.config.text()).expanduser().is_file():
+                self.configure_services()
+                if not Path(self.config.text()).expanduser().is_file():
+                    return
             if not self.sources or not self.character.text().strip():
                 raise ValueError('请选择原片并填写角色')
             if not self.root.text().strip():
@@ -192,6 +346,7 @@ class Workbench(QMainWindow):
             self.preview.setText('正在设计整组场景与光色')
             self.output_info.clear()
             self.start.setEnabled(False)
+            self.setup_button.setEnabled(False)
             self.worker.start()
         except Exception as error:
             self.status.setText('无法开始：' + str(error))
@@ -229,6 +384,7 @@ class Workbench(QMainWindow):
         self.status.setText('\n'.join([summary, *worker.errors]))
         worker.deleteLater()
         self.start.setEnabled(True)
+        self.setup_button.setEnabled(True)
         if self.close_after_finish:
             self.close()
             QApplication.instance().quit()

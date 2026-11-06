@@ -1,6 +1,6 @@
 {
   "python": "C:/path/to/your/existing/python.exe",
-  "prompt_library": "../prompt-library/prompts.json",
+  "prompt_library": "prompts.json",
   "head": {
     "url": "http://127.0.0.1:8188",
     "model": "sam3.1-image-fp16.safetensors",

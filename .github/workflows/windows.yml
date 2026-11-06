@@ -65,6 +65,11 @@ jobs:
           sys.path.insert(0, "scripts")
           from app_version import VERSION
           executable = Path(os.environ["RUNNER_TEMP"]) / "package/CosLuma/CosLuma.exe"
+          providers = executable.parent / "providers"
+          settings = json.loads((providers / "settings.example.json").read_text(encoding="utf-8"))
+          prompts = json.loads((providers / "prompts.example.json").read_text(encoding="utf-8"))
+          assert settings["prompt_library"] == "prompts.json"
+          assert prompts and all({"title", "text", "source"} <= item.keys() for item in prompts)
           for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
               subprocess.run([str(executable), *arguments], check=True)
           process = subprocess.Popen([str(executable)])
