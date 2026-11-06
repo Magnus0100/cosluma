@@ -116,10 +116,14 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             message = str(error)
         record.update(status='failed',error={'type':type(error).__name__,'message':message})
         save_json(directory/'run.json',record)
-        raise RuntimeError(f'{record["stage"]}: {message}. Run: {directory}') from None
+        failure = RuntimeError(f'{record["stage"]}: {message}. Run: {directory}')
+        failure.directory = str(directory)
+        failure.stage = record['stage']
+        raise failure from None
 
 
-def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None, progress=None, photo_progress=None):
+def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None,
+        progress=None, photo_progress=None, batch_started=None):
     """Run independent photos through finish_photo; each photo is attempted once."""
     report = progress or (lambda message: None)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -128,9 +132,11 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
     names = Counter(source.stem.casefold() for source in sources)
     directory = Path(root).expanduser().resolve()/('batch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
-    state = {'status':'running','stage':'设计整组场景与光色方向','total':len(sources),
+    state = {'status':'running','stage':'设计整组场景与光色方向','total':len(sources),'sources':[str(source) for source in sources],
         'character':character,'brief':brief,'items':{}}
     save_json(directory/'batch.json',state)
+    if batch_started is not None:
+        batch_started(str(directory))
     report('设计整组场景与光色方向')
     try:
         art_direction = plan_photos(sources,character,brief,config['prompt_library'],config['llm'],directory)
@@ -153,7 +159,11 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
         except Exception as error:
             # Return the error text so a Future does not retain a traceback
             # and the full-resolution image buffers in the failed call.
-            return {'source':str(source),'status':'failed','error':str(error)}
+            result = {'source':str(source),'status':'failed','error':str(error)}
+            if getattr(error, 'directory', None):
+                result['directory'] = str(error.directory)
+                result['stage'] = getattr(error, 'stage', '')
+            return result
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {pool.submit(produce, source): source for source in sources}
         for future in as_completed(pending):
