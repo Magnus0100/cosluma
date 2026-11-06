@@ -70,6 +70,22 @@ jobs:
           prompts = json.loads((providers / "prompts.example.json").read_text(encoding="utf-8"))
           assert settings["prompt_library"] == "prompts.json"
           assert prompts and all({"title", "text", "source"} <= item.keys() for item in prompts)
+          from PySide6.QtWidgets import QApplication, QDialog
+          from qt_workbench import ServiceSettings, endpoint_url
+          from settings import load_settings
+          app = QApplication([])
+          with tempfile.TemporaryDirectory() as directory:
+              config = Path(directory) / "cosluma.json"
+              dialog = ServiceSettings(config)
+              for name in ("llm", "image"):
+                  dialog.fields[name, "url"].setText("https://example.invalid/v1")
+                  dialog.fields[name, "model"].setText("local-verification")
+                  dialog.credentials[name][0].setCurrentIndex(dialog.credentials[name][0].findData(""))
+              dialog.save()
+              assert dialog.result() == QDialog.Accepted, dialog.message.text()
+              assert Path(load_settings(config)["prompt_library"]).is_file()
+              assert endpoint_url("https://example.invalid/v1", "image").endswith("/v1/images/edits")
+              dialog.close()
           for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
               subprocess.run([str(executable), *arguments], check=True)
           process = subprocess.Popen([str(executable)])

@@ -119,7 +119,7 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         raise RuntimeError(f'{record["stage"]}: {message}. Run: {directory}') from None
 
 
-def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None, progress=None):
+def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None, progress=None, photo_progress=None):
     """Run independent photos through finish_photo; each photo is attempted once."""
     report = progress or (lambda message: None)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -144,8 +144,12 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
     workers = config.get('workers', 4) if workers is None else workers
     def produce(source):
         try:
+            def report_photo(message):
+                if photo_progress is not None:
+                    photo_progress(str(source), message)
+                report(f'{Path(source).name}：{message}')
             return finish_photo(source, character, directory, config, brief=brief, size=size,art_direction=art_direction,
-                progress=lambda message: report(f'{Path(source).name}：{message}'))
+                progress=report_photo)
         except Exception as error:
             # Return the error text so a Future does not retain a traceback
             # and the full-resolution image buffers in the failed call.
