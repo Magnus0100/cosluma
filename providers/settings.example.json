@@ -1,0 +1,31 @@
+{
+  "python": "C:/path/to/your/existing/python.exe",
+  "prompt_library": "../prompt-library/prompts.json",
+  "head": {
+    "url": "http://127.0.0.1:8188",
+    "model": "sam3.1-image-fp16.safetensors",
+    "input_max_edge": 2048
+  },
+  "output_long_edge": 6000,
+  "workers": 4,
+  "finish_curve": null,
+  "llm": {
+    "url": "https://api.example.com/v1/chat/completions",
+    "model": "gpt-6.1-sol",
+    "api_key_env": "COSLUMA_API_KEY"
+  },
+  "image": {
+    "url": "https://api.example.com/v1/images/edits",
+    "model": "gpt-image-2.5-sunburst",
+    "api_key_env": "COSLUMA_API_KEY",
+    "parameters": {
+      "quality": "max",
+      "size": "auto",
+      "output_format": "png"
+    }
+  },
+  "sr": {
+    "url": "http://127.0.0.1:8188",
+    "model": "4xNomos2_hq_atd.safetensors"
+  }
+}

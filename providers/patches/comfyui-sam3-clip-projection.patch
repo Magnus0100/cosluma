@@ -1,0 +1,27 @@
+--- a/comfy/text_encoders/sam3_clip.py
++++ b/comfy/text_encoders/sam3_clip.py
+@@ -1,5 +1,5 @@
+ import re
+-from comfy import sd1_clip
++from comfy import clip_model, sd1_clip
+ 
+ SAM3_CLIP_CONFIG = {
+     "architectures": ["CLIPTextModel"],
+@@ -16,9 +16,16 @@
+ }
+ 
+ 
++class SAM3TextModel(clip_model.CLIPTextModel):
++    def __init__(self, config_dict, dtype, device, operations):
++        super().__init__(config_dict, dtype, device, operations)
++        self.text_projection = operations.Linear(config_dict["hidden_size"],
++            config_dict["projection_dim"], bias=False, dtype=dtype, device=device)
++
++
+ class SAM3ClipModel(sd1_clip.SDClipModel):
+     def __init__(self, device="cpu", dtype=None, model_options={}):
+-        super().__init__(device=device, dtype=dtype, max_length=32, layer="last", textmodel_json_config=SAM3_CLIP_CONFIG, special_tokens={"start": 49406, "end": 49407, "pad": 0}, return_projected_pooled=False, return_attention_masks=True, enable_attention_masks=True, model_options=model_options)
++        super().__init__(device=device, dtype=dtype, max_length=32, layer="last", model_class=SAM3TextModel, textmodel_json_config=SAM3_CLIP_CONFIG, special_tokens={"start": 49406, "end": 49407, "pad": 0}, return_projected_pooled=False, return_attention_masks=True, enable_attention_masks=True, model_options=model_options)
+ 
+ 
+ class SAM3Tokenizer(sd1_clip.SDTokenizer):

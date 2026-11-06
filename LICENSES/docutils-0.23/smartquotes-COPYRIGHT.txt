@@ -1,0 +1,13 @@
+# :Copyright: © 2010-2023 Günter Milde,
+#             original `SmartyPants`_: © 2003 John Gruber
+#             smartypants.py:          © 2004, 2007 Chad Miller
+# :Maintainer: docutils-develop@lists.sourceforge.net
+# :License: Released under the terms of the `2-Clause BSD license`_, in short:
+#
+#    Copying and distribution of this file, with or without modification,
+#    are permitted in any medium without royalty provided the copyright
+#    notices and this notice are preserved.
+#    This file is offered as-is, without any warranty.
+#
+# .. _2-Clause BSD license: https://opensource.org/licenses/BSD-2-Clause
+

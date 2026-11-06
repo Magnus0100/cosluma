@@ -1,120 +1,47 @@
-# Agent instructions
+# 开发约定
 
-This file applies to the whole repository. Read it before changing files, then
-use the English [Agent development guide](docs/AGENT_GUIDE.md) for setup, code
-navigation, task examples and troubleshooting. Follow the developer's current
-request and preserve unrelated work already present in the checkout.
+产品流程与使用方法以 [README.md](README.md) 和用户当前要求为准。
 
-## Project in one minute
+只保留一条制作链：原片与角色 → LLM 看代表原片与提示词库目录，确定整组摄影方向并选择参考
+→ LLM 按单张构图写提示词，同时确定一个主体整头范围
+→ 整图生图 → 必要时模型超分一次 → SAM3.1 提取原片头部、头发与头饰的并集
+→ SIFT 对应点与整体等比对齐 → 一次 MKL 仿色与浮点蒙版融合 → 可选整图明度曲线 → 保存。
+唯一单张入口是 `scripts/photo_pipeline.py` 的 `finish_photo`；桌面与 CLI 的批量制作使用同文件的
+`finish_batch`，逐张调用该入口。默认四张并行，每张只执行一次，单张失败不影响其他照片。
+用户日常只需提供照片和角色，补充要求可留空。整组摄影方向在提示词模块内只设计一次，
+单张据构图和原片受光细化，不各自另起场景与影调；从库的具体条目选参考，不依赖角色名的字面检索。
+批次完成的图片自动按原片名整理到 PNG 与 JPEG 子目录，JPEG 是同一结果的 8 位查看副本。
+当前只回贴原片整头，保留本人身份、脸型与清晰度；身体、实物服装和环境保留生成画面的整体空间光关系。
+不保留并列的脸部关键点贴脸、全身原片覆盖、人工替代成片或单独背景生成路径。
+人物亮度、阴影与近处景物必须和环境相容，通透不等于高亮人物；明度曲线不冒充空间重打光。
+对齐保留原片脸型几何，不通过非均匀缩放或局部变形塑脸。
+特效依据单张照片的构图、动作、视线、留白和情绪决定，不设全组统一开关。
+改进先看身份相似、整图自然度、光感与输出清晰度，薄纱透明度细节放低优先级。
+原片与 MKL 计算保持浮点，RGB 合成使用 float32，成片保存 16 位 PNG。
+分析预览不作为回贴素材；原片 RGB 只按一个整体相似变换采样一次，不模糊或生成式重绘脸部。
+模型输入和分割蒙版传输中的 8 位精度必须如实说明。
+默认请求长边 6000；配置可调整尺寸，不将请求尺寸作为放行条件。
+超分只运行一次配置模型，之后只裁切或下采样；覆盖不足时使用实际覆盖范围并记录。
 
-CosLuma is a Windows x64, Python 3.12 photo-finishing application with a
-PySide6 desktop, a local HTTP backend and a CLI. Production Python modules live
-in `scripts/`; this is not a conventional `src/` package. Install the pinned
-dependencies from `scripts/requirements-desktop.txt`, not with `pip install -e .`.
-Model workers use separate registered Python environments.
-The public name is CosLuma; existing `COSPLAY_*` variables, schemas, executable
-filenames and user-data locations remain compatibility identifiers.
+不增加后期检查放行、评分、审批、预算、能力准入、自动重试、运行时自动换模型或 fallback。
+真实错误在失败步骤显示，保留已经生成的图片，不把未完成结果标成完成。
+模块职责固定，实现可以替换。哪个模块有问题，就修正或替换该模块，不叠加新的模块补救。
+提示词模块负责编辑意图；生图模块负责完整画面与空间受光；超分模块负责生成区域的输出清晰度；
+身份区域模块负责原片人物的提取、位置与几何；融合模块负责局部光色与边界；保存模块负责尺寸、色彩和位深。
+算法、模型、输入尺寸、设备和融合方法可以在开发时替换更新；替换对应模块后仍只保留一条制作链。
+显式提供已有生成图或超分图时，复用该阶段结果，后续仍走同一整头合成链；不把复用实现成失败回退。
+这是离线高质量照片后期，没有轻量或实时要求；选型优先身份、细节、几何和自然度，不以低延迟为首要目标。
+图像处理使用现有库，保持适配代码简单；不增加通用任务、节点或证明框架。
+算法采用工业成熟方案，或有明确任务、数据集、指标和日期依据的学术 SOTA，优先使用上游实现。
+选型要求用于开发决策，不转成运行时门禁；未经验证的候选不宣称已满足要求。
+项目不商用、不盈利，依赖和权重仍遵循各自许可。
 
-All production routes share this flow:
+修改前查看现有改动，保留无关工作，不执行 reset/clean。
+原片只读，成片另存。照片、模型、运行环境、私人配置和凭据放在仓库外。
+使用已配置的 Python，不新建运行环境。推理设备按算法支持、实测性能和设备占用选择，不强制人脸使用 CPU；
+GPU 工作可使用已有远端服务，设备配置保持明确，不自动切换或失败回退。
+凭据只在调用对应服务时读取，不打印、不写入运行记录。
 
-```text
-desktop / CLI / local HTTP
-  -> creative_task: check inputs, intent, capabilities and generation budget
-  -> production_coordinator: validate the checked execution contract
-  -> single_source_workflow: prepare assets, render and save
-  -> optional post-completion work, review and export
-```
-
-The source anchors identity and observed facts. Source-based portrait and
-imported-reference work retain their native geometry/alpha contracts. Explicit
-composite editing scopes permit generated appearance and joint lighting;
-their full-canvas coverage is not a source subject matte. Preserve requested
-geometry and review actual pixels rather than claiming generation proves it.
-BeautyGRPO supplies explicitly selected generated face appearance. Generated
-texture or an enlarged output canvas must not be described as camera detail.
-The canvas represents the current production pipeline; it is not a generic
-ComfyUI plugin executor or freely wired DAG.
-
-## Start each task
-
-For product iteration, read [the product goal](docs/PRODUCT_GOAL.md) and
-[the AI harness workflow](docs/AI_HARNESS.md), then run
-`<desktop-python> -B scripts/engineering_context.py`. Use its current task and
-module map; private execution/visual observations stay outside the checkout.
-The existing coding agent owns decisions and tool use. This context helper is
-read-only and is not a second production runner. Persist observations and the
-next concrete action before ending a substantial iteration. Judge whole-image
-quality before pursuing optional local detail; use the same implementation on
-different originals, never image-specific source branches.
-
-1. Inspect `git status --short` and the diff before editing. Keep existing user
-   changes intact. Confirm the actual workspace and interpreter; never copy a
-   maintainer's machine paths into code or documentation.
-2. Read only the relevant modules and nearby `tests/*_smoke.py` checks. Use the
-   guide's ownership table rather than loading the entire UI or workflow file.
-3. Reproduce the behavior with an isolated temporary workspace or synthetic
-   fixture. Use an explicit `--root` for CLI/backend/UI commands so experiments
-   do not write a project into the checkout or a user's real workspace.
-4. Implement the smallest complete change through the existing production
-   path. Update affected documentation, resource lists and behavior checks.
-
-## Contracts to preserve
-
-- Product execution goes through `task-plan` / `task-start` or
-  `/api/tasks/plan` / `/api/tasks/start`. Internal `one-click` requires the current
-  checked task; do not introduce a second pipeline that bypasses it.
-- `local_portrait`, `existing_reference` and `create_reference` select inputs
-  and enabled nodes in one pipeline. Planning must not perform image generation.
-  Existing-reference tasks have zero new-image budget by default; an explicitly
-  checked regional task has its own bounded budget. Retries do not grant more.
-- Keep `replay_frozen` for saved-result replay distinct from `prepare_current`
-  for explicit new preparation. Reuse requires the current input, producer,
-  parameter and runtime identities. A graph signature alone does not prove a
-  pixel cache hit. Do not make a stale receipt current by changing metadata.
-- Preserve source alpha, coordinate systems, color domains, premultiplied
-  increments and layer ownership. Do not apply beauty, lighting, display
-  transforms or reference effects twice.
-- Save complete child revisions atomically. Failure, cancellation and late
-  callbacks must preserve the parent and current edits; incomplete work must
-  not become the latest saved result. Do not inherit human approval.
-- Distinguish configuration, connectivity, model loading, execution, saved
-  pixels, automated review and human acceptance. Report missing evidence as
-  missing; successful CPU fixtures do not prove artistic quality.
-
-## Validation and delivery
-
-Run commands from the repository root with the configured desktop interpreter:
-
-```powershell
-git diff --check
-.\.venv\Scripts\python.exe -B .\scripts\check_repository.py
-.\.venv\Scripts\python.exe -B .\tests\run.py core
-```
-
-Use `tests/run.py` for selected behavior checks; it sets production imports,
-offscreen Qt and bytecode policy. Start with affected checks, then run the short
-`core` suite for code changes before handing off. `integration` holds the wider
-offline regressions; `full` combines both and belongs to release validation or
-justified cross-cutting changes, not every iteration. Inspect suites with
-`--list`; the implicit `all` command is removed. Model checks require explicit
-names and `--model-python`. For documentation-only work, verify links, commands
-and the source gate. Do not generate images to validate wording. See the guide
-for the test selection table.
-
-When adding a shipped production module or worker, update the sorted
-`scripts/runtime_manifest.json`. When changing public root files, update
-`scripts/prepare_source_release.py`'s `TOP_LEVEL` and the required-file gate as
-appropriate. Preserve byte-sensitive files covered by `.gitattributes`,
-especially license texts and identity-bound producers.
-
-Keep photos, project outputs, weights, runtimes, credentials and local model
-registries out of commits and source exports. Preserve the existing license
-inventories. For a public repository use a fresh `prepare_source_release.py
---for-repository` export; omit that flag for a frozen release-source snapshot. Local
-development history may contain private records. See
-[open-source preparation](docs/OPEN_SOURCE_READINESS.md).
-
-In the handoff, state what changed, checks actually run, their results, and any
-remaining limitation. If an environment or model is unavailable, name it and
-report the unrun check. Update this file or the guide when entry points,
-contracts or developer commands change.
+只做修改所必需的基本验证，不增加测试框架、全仓检查或多轮测试流程，不把验证变成制作步骤。
+项目文档仅保留 README.md、本文件和 LICENSES/README.md。
+文档只写当前行为与限制，不维护历史证据、审计清单、交接报告或重复说明。

@@ -1,93 +1,149 @@
 # CosLuma
 
-[![CI](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Magnus0100/cosluma/actions/workflows/ci.yml) [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/) [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+当前版本：**0.9.0**，Windows x64。
 
-**English:** CosLuma is a Windows desktop workbench for cosplay photo finishing, with a simple photo workspace and a professional layer/workflow view. It prepares editable portrait beauty, appearance, lighting, background and effect layers. See [English overview](README.en.md).
-
-面向 Windows 的 Cos 后期工作台：从原图出发，按精修、半合成或大合成目标设计照片，处理人物、场景与角色氛围。快速制作和专业画布共用同一任务入口、资产与工程。
-
-**下载 0.7.2 正式版：** [Windows x64 完整程序 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.2/cosplay-workbench-0.7.2-windows-x64.zip) · [对应源码 ZIP](https://github.com/Magnus0100/cosluma/releases/download/v0.7.2/cosplay-workbench-0.7.2-source.zip) · [SHA-256 校验](https://github.com/Magnus0100/cosluma/releases/download/v0.7.2/SHA256SUMS.txt)。
-
-普通用户完整解压后双击 `cosplay-workbench.exe`；模型权重和推理运行环境需按安装指南另行配置。开发者可克隆仓库或下载对应源码。本次正式分发面向独立桌面程序。可选形体调整仍为实验功能；跨图自然度、高清和同场一致性尚未完成产品验收，AI 成片须逐张检查。
-
-当前源码版本为 `0.7.8`。项目提供桌面界面、CLI 和本机 HTTP 接口，已接通原片浮点基线、摄影显影与模型工具选择。已安装程序的代码身份、实际模型效果和跨图片质量须分别验收；本地模型和生成服务单独配置。
-
-当前 AI 制作流程：原片观察与设计 → 原生浮点基线 → 模型选择摄影/局部/整体编辑工具 → 独立审片与有界改进 → 保存与导出。制作范围与风格分别选择，默认在原场地内半合成。普通原片与导入参考的有效图层工具按任务启用。
-
-Qwen 和 GPT 使用相同创作目标、各自的实际编辑指令。生成结果按实际可见且获准的覆盖合成，其他位置保留当前浮点像素；整图编辑允许同时调整人物与场景外观。生成分辨率与原尺寸画布分别记录，不将放大的生成纹理称为相机原生细节。执行成功、自动评价和人工批准分别记录，不兼容已删除的旧资产格式或流程。
-
-## 快速开始
-
-拿到Windows程序包后，完整解压并保留EXE旁边的 `_internal`，使用安装目录的 `Start-Cosplay-Studio.cmd` 或桌面唯一快捷方式启动。程序默认在 `%USERPROFILE%\CosplayWorkbench\workspace` 创建可写工作区，启动内嵌后台，并在恢复用户设置后初始化选定服务。服务就绪与权重加载分别记录，不无条件加载未选中的 Beauty；开始前仍检查本次任务计划。
-
-需要指定工作区时，在程序目录打开PowerShell：
-
-```powershell
-$workspace = Join-Path $env:USERPROFILE 'CosplayWorkbench\workspace'
-.\cosplay-workbench.exe --root "$workspace" --embedded-backend --auto-start-backend
-```
-
-默认进入“快速制作”：导入原片，选择“仅人像美化”或“完整 Cos 后期”，可补充效果说明，对比画面，再保存高清版本和导出成片。美化完成后可直接调整强度；原片和当前效果并排显示，缩放和拖动同步，也可双击查看。处理中可取消任务。处理、保存与导出沿用同一工程和任务状态。
-
-首次使用点击主界面的“模型管理”。软件优先使用主目录下的 [`model` 文件夹](model/README.md)，自动识别标准目录和已有安装；也可以选择一次模型总目录。分析模型与 BeautyGRPO 状态按用途显示，保存配置后重启继续使用；相对路径支持移动完整模型目录。逐项路径和 JSON 导入保留在高级设置。生成服务在设置中配置。专业创作入口可选择“本地原片精修”“已有参考完整后期”或“创作参考并完成后期”，填写创作要求和限制，再检查制作计划中的缺失配置、步骤、外部服务和生图预算。检查计划只读取文件和配置。
-
-节点架构的当前范围见 [产品架构](docs/PRODUCT_ARCHITECTURE.md)。
-
-源码与发行包的桌面、CLI 和 HTTP 都使用 `creative_task → production_coordinator → single_source_workflow`，唯一执行策略是 `layered_reference_transfer`。现行 worker 完成 Beauty、场景/人物图层、边界及保存；画布合同与真实执行事实分别记录。runtime 选择、节点职责、失败恢复和活动 job 互斥见[产品数据流](docs/PRODUCT_ARCHITECTURE.md)。
-
-所有制作入口先检查当前 task plan、源/参考身份、模型/runtime、控制与预算，再开始有归属的 job。无参考原片制作关闭参考及场景节点。预检失败不启动 worker；失败、取消或过期保留父版本及首错。旧冻结输出继续只读查看，缺现行任务合同的版本须创建新任务后继续制作。
-
-当前保留按显存预算选择设备/host staging 的共享背景 SR 和有界并行 TIFF 压缩。性能以当前请求的真实账本为准；当前仍未达到稳定发布。
-
-已有参考制作默认不新增图像生成；显式选择原景增强、使用本地Qwen并开启单区精修的新独立任务，可获全局参考0次、局部最多1次的检查预算。普通重试与最终修复不新增额度，详见[原景增强](docs/SOURCE_SCENE_ENHANCEMENT.md)。普通原片／导入参考的文本视觉服务默认关闭；scoped 创建及塑形 apply 按计划要求视觉服务。批量每张独立建立计划、job、版本与质量证据，失败项可独立重试。保存成功与人工艺术批准分别记录。
-
-阶段计时口径见[流程与性能](docs/WORKFLOW_PERFORMANCE.md)。制作中显示阶段及累计用时；预计剩余时间只使用至少三次兼容成功记录，样本不足显示“估算中”。AI 审阅、执行完成和文件导出不能代替用户最终人工批准。
-
-每个桌面窗口绑定自己的工程和内嵌后台。默认端口占用时自动选择可用端口；界面显示实际地址。使用 `--root`打开另一工程的新窗口。
-
-未决请求和缺失审片结论明确保留为待核查，不自动补发生图；已有完整草稿、实际请求和错误记录保留。
-
-源码运行使用Windows x64和Python 3.12。完整配置、源码运行及打包命令见 [安装指南](docs/INSTALLATION.md)。可从源码构建 Windows 包。
-
-## 工作流程
-
-桌面、CLI 与本机 HTTP 均通过 `task-plan / task-start → production_coordinator → single_source_workflow` 检查和执行。模型看实际原图形成设计，选择必要工具；代码负责权限、像素资产、预算、取消与保存。
-
-- 精修、半合成和大合成分别表达制作范围；风格另选。原景半合成为默认，不自动把室内改成室外。
-- 当前浮点母版与查看预览分离。局部编辑保留覆盖外像素，整图生成不再被原人物 RGB 盖回。
-- 首次操作与后续改进分别记账，默认最多两轮条件改进。独立判断自然可信度与创作收益，保留较好完整版本，未知请求不续发额度。
-- 当前工程可复制、重开、导出 PNG/JPEG 和真实 TIFF16/32，并通过 v3 便携工程交换；只支持当前格式。自动评价不授予人工批准。
-
-普通原片与导入参考按任务启用有效的人像美化、原生图层与光色工具。详见[人像美化](docs/PORTRAIT_BEAUTY.md)、[源域边界受光](docs/BOUNDARY_LIGHT.md)与[原景增强](docs/SOURCE_SCENE_ENHANCEMENT.md)；它们不构成 AI 创建的固定必经链。
-
-## 当前边界
-
-本地分析需要另行安装模型权重及兼容运行时。模型从各自的开源社区来源下载到用户自己的目录，仓库只提供来源、版本、哈希和许可说明，不上传模型本体。生成、研究和审片可能使用配置的外部服务；程序包不包含权重、凭据或个人工程。仓库中的文件边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。
-
-局部原尺寸通过只覆盖实际检查的窗口。零对应支持、接触/反射细节及低支持区域仍可能需要补证据或人工修复。系统没有完整物理重光照或自动接收面投影/镜面反射，跨人物、妆造和场次的艺术质量泛化尚未完成验收。
-
-## 文档与参与
-
-使用 Agent 参与开发：先读英文 [AGENTS.md](AGENTS.md) 与 [Agent 开发指南](docs/AGENT_GUIDE.md)，按隔离工作区、模块导航和验证流程开始。
-
-[安装](docs/INSTALLATION.md) · [开发与构建](docs/DEVELOPMENT.md) · [Release发布](docs/RELEASING.md) · [文档索引](docs/README.md) · [参与贡献](CONTRIBUTING.md) · [安全与隐私](SECURITY.md) · [更新记录](CHANGELOG.md)
-
-当前目标、验证事实和未完成能力见 [产品目标](docs/PRODUCT_GOAL.md) 与 [工程状态](docs/ENGINEERING_STATE.json)。
-
-## 仓库结构
+给原片和角色，自动设计 COS 后期，并将原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
 ```text
-.github/       CI、发布工作流、Issue 模板和代码所有者
-docs/          使用、开发、算法范围、发布和许可说明
-presets/       可公开的创作预设
-providers/     provider 定义、公开模型清单和工作流模板
-scripts/       桌面、后台、CLI、worker 和构建工具
-tests/         离线行为检查及临时工程 fixture
-LICENSES/      依赖和第三方组件的许可证原文
+原片 + 角色 + 提示词库
+  → LLM 看代表原片与提示词库目录，确定整组场景、光色并选择参考
+  → LLM 按单张构图写编辑提示词，同时标出原片一个主体头部范围
+  → 图像模型生成完整画面
+  → 必要时模型超分一次
+  → SAM3.1 提取原片头部、头发和头饰
+  → SIFT 对应点与整体等比对齐
+  → 一次 MKL 光色匹配、浮点蒙版融合
+  → 可选整图明度曲线
+  → 保存 16 位 PNG 和便于查看的 JPEG
 ```
 
-更详细的提交边界见 [仓库内容与本地文件边界](docs/REPOSITORY_LAYOUT.md)。公开交付流程见 [开源准备](docs/OPEN_SOURCE_READINESS.md)，使用不含旧 Git 历史的清洁源码目录建立公开历史。
+唯一单张入口是 `scripts/photo_pipeline.py` 的 `finish_photo`。
+桌面与 CLI 的批量制作统一使用 `finish_batch`，默认四张并行，每张调用同一个单张入口一次。
+HTTP 单张请求调用 `finish_photo`，多张请求调用 `finish_batch`。
+生图是基于完整原片的整图编辑，身体、服装和环境使用生成结果，保留该画面的空间受光；
+原片回贴区域包含脸、头发和头饰。提示词要求保持实物服装结构，生成模型仍可能改变衣物细节。
+提示词要求保留人物位置、大小、姿态、原片头部几何与服装结构，使场景光向与原片头部相容。
+清理干扰景物，特效依据单张照片的动作、视线、留白和情绪决定，允许不加。
 
-## 开源许可
+这是离线高质量照片后期，没有轻量或实时要求。模块职责固定，实现可以替换，问题在对应模块内解决。
+没有评分放行、审批、预算、自动重试、自动换模型或 fallback。真实错误显示在失败步骤，
+保留已有生成文件，不把未完成结果标为完成。原片只读，每次制作另建目录。
+照片、模型、运行环境、私人配置和凭据保存在仓库外。
 
-项目代码采用 `GPL-3.0-or-later`，详见 [LICENSE](LICENSE)。这表示基于项目代码发布的衍生版本也应在 GPL 条件下提供对应源码；第三方依赖、provider、模型代码和模型权重继续使用各自许可。分发桌面包前请阅读 [第三方声明](docs/THIRD_PARTY_NOTICES.md) 和 [Windows 依赖许可](docs/BINARY_LICENSES.md)。
+## 使用
+
+日常只需选择照片、填写角色、点击开始制作。补充要求可留空；软件先依据角色、原片受光与实物妆造
+确定一个整组摄影方向，再处理每张照片。场景、材质、光质和配色保持一致，具体光向、景别与特效按单张决定。
+配置文件和请求尺寸放在桌面的折叠高级设置中，服务配置完成后不必每次调整。
+桌面会记住角色、保存目录、配置路径、请求长边和每个角色各自的补充要求；切换角色时分别恢复。
+这些偏好保存在 `~/CosplayWorkbench/config/desktop.ini`，不保存凭据。
+
+Windows 发布包解压后双击 `CosLuma.exe`，已包含桌面和图像处理依赖。
+同一可执行文件可用 `CosLuma.exe --cli ...` 运行下方 CLI 参数，或用 `CosLuma.exe --server ...` 启动本地 HTTP。
+模型服务、权重、提示词库与服务配置仍需另行准备；发布包不含个人服务地址或密钥。
+源码包使用下方 Python 启动方式，或双击 `Start-Cosplay-Studio.cmd` 使用配置中指定的已有 Python。
+
+使用已有 Python，不新建运行环境。另一台机器安装本机依赖时：
+
+```powershell
+python -m pip install -r scripts/requirements-desktop.txt
+```
+
+将 [配置示例](providers/settings.example.json) 另存到 `~/CosplayWorkbench/config/cosluma.json`；
+`COSLUMA_CONFIG` 或桌面 `--config` 可指定其他配置文件，并优先于记住的路径。
+资源相对路径以配置文件目录为准。
+配置提示词库、LLM、图像编辑服务，以及 ComfyUI 的整头提取和超分服务。
+`head.model` 是远端 `models/checkpoints` 中的 SAM3.1 权重名，`sr.model` 是超分权重名。
+GPU 设备由远端服务明确配置，本机 SIFT 和光色合成使用 OpenCV、NumPy 和 color-matcher。
+凭据通过 `api_key_env` 或 `api_key_file` 指定，只在调用对应服务时读取。
+
+```powershell
+# 桌面
+python -B scripts/qt_workbench.py --root <保存目录>
+
+# 单张或文件夹
+python -B scripts/project_cli.py --root <保存目录> stylize --source <原片或目录> --character <角色>
+
+# 显式设置并行照片数；也可在配置中设置 workers
+python -B scripts/project_cli.py --root <保存目录> stylize --source <原片目录> --character <角色> --workers 4
+
+# 使用已有生成图，完成主体头部定位、必要超分与整头融合
+python -B scripts/project_cli.py --root <保存目录> compose --source <原片> --generated <生成图>
+
+# 复用已有模型超分图
+python -B scripts/project_cli.py --root <保存目录> compose --source <原片> --generated <原生生成图> --superresolved <模型超分图>
+
+# 本地 HTTP
+python -B scripts/backend_server.py --root <保存目录>
+```
+
+`compose` 仍调用一次 LLM 确定主体头部，跳过生图；提供 `--superresolved` 时也跳过超分。
+可同时提供 `--character` 和 `--brief`。这些是显式复用阶段结果，后续仍走同一制作链。
+HTTP 提供 `POST /api/stylize`、`POST /api/compose`、`GET /api/jobs/<id>`，默认监听 `127.0.0.1:8765`。
+两种 POST 都接受 `source`、`character`、可选的 `brief`、`size`；`stylize` 可用 `sources` 路径数组
+代替 `source` 批量制作，共享整组方向。`compose` 另外接受必填的 `generated` 和可选的 `superresolved`，
+与 CLI 的复用行为一致。
+任务状态保存在内存，制作结果保存在磁盘。批量制作另建一个批次目录，`PNG` 与 `JPEG` 子目录
+按原片文件名整理完成的图片，桌面“打开保存目录”直接打开该批次；每张工作文件位于各自子目录。
+不同目录的原片重名时，成片使用各自工作目录名区分，不覆盖已经保存的文件。
+整理成片先写临时文件，写入完成后才改为正式文件名；写入失败会清理本次临时文件，工作目录内的完整成片仍保留。
+`batch.json` 记录当前批次的方向、结果与失败原因。整组方向只设计一次；这一步失败时显示原始错误并停止该批次。
+单张失败保留该张错误，其他照片继续处理；
+批次存在失败时，桌面显示“批次未全部完成”，CLI 返回非零退出码，不自动重试或补入替代图。
+
+## 当前行为与限制
+
+原片通过 Qt 或 rawpy/LibRaw 解码为浮点 sRGB，校正朝向。生图发送完整画面的 sRGB JPEG，
+默认输入长边最多 1536 像素，`image.input_max_edge` 可调整。只做一次整图编辑，不追加独立背景生成。
+最终回贴素材从完整分辨率原片直接采样。
+
+超分只运行一次配置模型，之后按目标比例裁切或下采样。默认请求长边 6000；`output_long_edge` 可改长边，
+设为 `null` 时请求原片尺寸。
+CLI `--size WIDTH HEIGHT` 可指定画布。一次返回不足时，使用实际覆盖范围并记录尺寸，
+不循环超分或通过 RGB 插值扩大交付尺寸。
+
+LLM 只选一个主体头部，不选择水面、屏幕或照片里的次要人像；镜中正脸是作品主体时可以选择镜像。
+这仍是模型判断，无法保证所有照片都选对。SAM3.1 在选定的原片裁片中分别识别头部、头发和头饰，
+使用同次执行返回蒙版的并集；不是精细透明度抠图。分析输入默认长边最多 2048 像素，
+远端 ComfyUI 的 SAM3 节点内部使用 1008×1008 输入。当前服务的 SAM3 CLIP 投影层需要匹配
+权重的 512 维输出，适配修正见 [补丁](providers/patches/comfyui-sam3-clip-projection.patch)。
+
+SIFT 在原片头部和生成图对应范围寻找纹理对应点，OpenCV 拟合等比缩放、旋转和平移。
+仅将这一个变换用于完整分辨率原片，不通过局部形变或非均匀缩放塑脸，分析预览不作为回贴素材。
+纹理不足或头部姿态明显变化时，对齐可能失败或偏移；模型蒙版与纹理对应不保证每张都正确。
+
+原片 RGB 与蒙版以预乘透明度方式使用同一个 Lanczos 变换采样，避免裁片边界的黑色或背景颜色渗入头部边缘。
+color-matcher 的 MKL 在蒙版内部拟合一次光色变换，随后进行 float32 RGB 蒙版合成。
+不模糊或生成式重绘脸部。MKL 不能重新创造方向不同的空间光照，
+源头受光相容仍依赖生图模块。头发边缘和半透明头纱可能留下接缝或原背景颜色。
+
+`finish_curve` 接受归一化的 `[输入明度, 输出明度]` 控制点，用单调三次插值整理整图明度，默认不调整。
+纯黑像素按曲线的黑点映射为中性灰，其余像素保持 RGB 比例后裁切到可保存范围。
+它不提供空间重打光；通透依靠明暗层次，不等于暗背景中的人物异常明亮。
+原片与 MKL 计算保留浮点，合成结果保存为带 sRGB 配置的 16 位 PNG。
+模型图片和分割蒙版在服务传输中为 8 位，16 位保存不会恢复上游缺失的精度，模型超分纹理也不等于相机原生细节。
+
+每次制作保存摄影方向、提示词、模型返回、原片头部裁片、匹配头部、蒙版、`final.png`、`final.jpg` 和 `run.json`。
+PNG 是 16 位成片，JPEG 是同一结果的 8 位查看副本。
+提示词库是包含 `title`、`text`、`source` 的 JSON 数组，通用条目可标 `overview: true`，
+整组设计时向 LLM 提供非通用条目的标题目录和最多六张均匀抽取的代表原片，由它选择具体参考。
+单张提示词使用这些参考的正文和整组方向，不依赖角色名与条目的字面匹配。
+库中其他角色的妆造、换脸、改衣、固定画幅和版式要求不应用于原片。
+摄影方向与逐张判断仍依赖模型，不保证每张都符合用户审美，也不通过后期评分、重试或替代图掩盖失败。
+
+| 职责 | 文件 |
+| --- | --- |
+| 制作顺序与保存 | `photo_pipeline.py` |
+| LLM、生图、远端超分与分割 | `model_clients.py` |
+| 整头对齐、MKL 与浮点融合 | `head_composite.py` |
+| 图片读取与保存 | `image_io.py` |
+| 提示词库目录与配置 | `prompt_library.py`、`settings.py` |
+| 桌面、CLI、HTTP | `qt_workbench.py`、`project_cli.py`、`backend_server.py` |
+
+照片与文本会发送到配置的 LLM 和图像编辑服务；生成图发送到超分服务，原片头部裁片发送到分割服务。
+项目不商用、不盈利，依赖和权重仍遵循各自许可。项目许可见 [LICENSE](LICENSE)，
+第三方许可见 [LICENSES](LICENSES/README.md)。
+
+构建 Windows 发布目录使用已有、安装了 PyInstaller 的 Python 运行 `python -m PyInstaller CosLuma.spec`。
+可用 `--distpath`、`--workpath` 将产物放在仓库外。版本统一定义在 `scripts/app_version.py`；
+桌面、CLI 与 HTTP 启动命令均支持 `--version`。发布包需随附同版本源码与第三方许可。

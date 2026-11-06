@@ -1,9 +1,7 @@
 # Private photos, projects, model weights and generated artifacts
-/data/*
-!/data/README.md
+/data/
 /output/
-/outputs/*
-!/outputs/README.md
+/outputs/
 /project.json
 /workspace/
 *.cosplayproj
@@ -11,7 +9,6 @@
 /providers/qwen-image-2.1-models.json
 .env
 .env.*
-!.env.example
 *.pem
 *.key
 *.p12
@@ -48,8 +45,7 @@
 # Model downloads and local runtimes. Keep only public manifests, URLs,
 # revisions, hashes and license notices in the repository.
 /models/
-/model/*
-!/model/README.md
+/model/
 /weights/
 /checkpoints/
 /runtime/
@@ -68,6 +64,10 @@
 **/artifacts/
 **/scratch/
 **/logs/
+
+# Local agent-team state: mailboxes, task records and activity logs are
+# per-machine working data, never part of a source export.
+/.agent-teams/
 
 # Python, editors and OS
 __pycache__/
