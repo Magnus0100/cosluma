@@ -25,7 +25,8 @@ def make_server(root, config, host='127.0.0.1', port=8765):
             if mode == 'styles':
                 options = []
                 for option in make_style_samples(body['sources'],body['sample_source'],body['character'],root,config,
-                        brief=body.get('brief',''),size=body.get('size'),progress=progress):
+                        brief=body.get('brief',''),size=body.get('size'),progress=progress,
+                        creative_direction=body.get('creative_direction','')):
                     options.append(option)
                     with lock:
                         jobs[job_id].update(options=list(options),styles_directory=option['styles_directory'])

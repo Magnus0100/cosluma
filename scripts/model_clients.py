@@ -65,13 +65,17 @@ def multipart(fields, name, filename, data, content_type='image/png', *, additio
     return b''.join(parts), 'multipart/form-data; boundary=' + boundary
 
 
-def _describe(instruction, images, config, response_path):
+def _describe(instruction, images, config, response_path, *, conversation=()):
     content = [{'type':'text','text':instruction}]
     for label,url in images:
         content.extend([{'type':'text','text':label},
             {'type':'image_url','image_url':{'url':url}}])
+    messages = [{'role':'user','content':content}]
+    if conversation:
+        messages = [{'role':'system','content':instruction},*conversation[:-1],
+            {'role':'user','content':[{'type':'text','text':conversation[-1]['content']},*content[1:]]}]
     response = post_json(config['url'], {'model':config['model'],'stream':False,
-        'messages':[{'role':'user','content':content}]}, key=credential(config),response_path=response_path)
+        'messages':messages}, key=credential(config),response_path=response_path)
     content = response['choices'][0]['message']['content']
     if isinstance(content,list):
         content = '\n'.join(row['text'] for row in content if row.get('type')=='text')
@@ -83,11 +87,51 @@ def _describe(instruction, images, config, response_path):
     return json.loads(content)
 
 
-def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None):
+def _representatives(sources):
+    count = min(6,len(sources))
+    return [sources[round(index*(len(sources)-1)/max(1,count-1))] for index in range(count)]
+
+
+def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', samples=(), focus=None):
+    """Discuss the current photographs and samples without submitting production."""
+    images = []
+    for source in _representatives(sources):
+        with open_rgb(source) as image:
+            images.append(('原片：'+Path(source).name,preview_data_url(image,1280)))
+    descriptions = []
+    for option in samples:
+        descriptions.append({key:option[key] for key in ('index','title','summary','status')})
+        if option['status']=='complete':
+            with open_rgb(option['result']['files']['jpeg']) as image:
+                images.append((f'方案 {option["index"]+1} 的真实样片：'+option['title'],preview_data_url(image,1280)))
+    instruction = (
+        '你是与用户共同创作 COS 摄影后期的摄影 Agent，现在处于讨论与试样阶段。'
+        '用自然的中文对话，先观察本次角色和原片的妆造、道具、构图、受光，结合完整对话与已生成样片讨论。'
+        '用户可以提想法、问问题、比较样片并修改要求；需要关键的角色信息时简短提问，不懂的角色设定不要编造。'
+        '不提供固定风格菜单，不预设三个场景，不把提示词目录标题凑成候选。'
+        '回复具体说明适合这组素材的场景、色彩、情绪与光感；有样片时应针对实际画面交流，分清原片和样片编号。'
+        '保留原片身份、脸型、机位、姿态与实物服装结构；整头会回贴，摄影方向须与原片受光相容。'
+        '明度和色温可以调整，但不能用曲线冒充空间重打光。特效按单张动作、视线和留白决定，不设整组开关。'
+        '本次调用只讨论，不运行生图、超分、分割或批量。'
+        '需要试样时请用户点击“按当前讨论生成三个样片”；修改后仍由用户主动生成，不声称已经完成未执行的动作。'
+        '最终方向只能由用户点击样片的“定稿并用于批量”决定；不要自行宣布定稿或开始批量。'
+        '返回 JSON，只有 reply 和 direction。reply 是直接显示给用户的自然对话，不包含 JSON 或算法术语。'
+        'direction 是当前双方讨论形成的创作要求，供下一次样片设计使用；保留此前未取消的要求，未知内容保持未定。'
+        '只有用户增加或修改影响画面的要求时才更新 direction；只是询问、比较或选择已有样片时保持原值。'
+        'direction 只写实际创作要求，不写对话过程、打招呼、试样操作或用户尚未作出的选择。'
+        f'\n角色：{character}\n用户最初补充要求：{brief or "无"}\n当前创作要求：{direction}\n'
+        f'当前讨论对象：{focus or "整组创作方向"}\n已有样片：{json.dumps(descriptions,ensure_ascii=False)}\n'
+        '提示词目录仅供摄影参考，不限制场景范围：\n'+catalogue(load_library(library_path)))
+    result = _describe(instruction,images,config,directory/('chat-'+uuid.uuid4().hex[:8]+'-response.json'),conversation=conversation)
+    if not isinstance(result.get('reply'),str) or not result['reply'].strip() or not isinstance(result.get('direction'),str):
+        raise ValueError('摄影 Agent 没有返回有效的回复与创作要求；原始响应已保存')
+    return {'reply':result['reply'].strip(),'direction':result['direction'].strip()}
+
+
+def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction=''):
     """Design directions for the supplied character and photos, using library references."""
     entries = load_library(library_path)
-    count = min(6,len(sources))
-    selected = [sources[round(index*(len(sources)-1)/max(1,count-1))] for index in range(count)]
+    selected = _representatives(sources)
     images = []
     for source in selected:
         with open_rgb(source) as image:
@@ -131,7 +175,8 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         '目录仅供场景、布光和色彩灵感，是参考素材而不是候选风格菜单，也不限制可设计的场景范围；'
         '先确定适合当前角色与原片的创作意图，再选能帮助实现它的具体参考，不把参考标题直接凑成候选。'
         '条目里其他人物、换装、广告版式和固定画幅均不适用。'
-        f'\n角色：{character}\n补充要求：{brief or "无，由你决定"}\n提示词目录：\n'+catalogue(entries))
+        '双方已讨论的创作要求是本次设计依据，不另起相矛盾的方向；在这些要求内设计可比较的变化。'
+        f'\n角色：{character}\n补充要求：{brief or "无，由你决定"}\n双方讨论的创作要求：{creative_direction or "尚无讨论，依据角色与原片设计"}\n提示词目录：\n'+catalogue(entries))
     name = 'style-options' if option_count is not None else 'art-direction'
     description = _describe(instruction,images,config,directory/(name+'-response.json'))
     descriptions = description['options'] if option_count is not None else [description]
@@ -146,7 +191,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         if any(type(index) is not int or index<0 or index>=len(entries) for index in indices):
             raise ValueError('The prompt writer selected an unknown library reference')
         plan = {'direction':direction,'references':[entries[index] for index in indices],
-            'representative_sources':[str(source) for source in selected]}
+            'representative_sources':[str(source) for source in selected],'creative_direction':creative_direction}
         if option_count is not None:
             for key in ('title', 'summary'):
                 if not isinstance(item.get(key), str) or not item[key].strip():

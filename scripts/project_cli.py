@@ -30,6 +30,7 @@ def main(argv=None):
     samples.add_argument('--source', type=Path, required=True)
     samples.add_argument('--sample', type=Path, required=True, help='one original from this group')
     samples.add_argument('--character', required=True)
+    samples.add_argument('--creative-direction', default='', help='creative requirements agreed before sampling')
     compose = sub.add_parser('compose', help='restore the original head into a saved generated frame')
     compose.add_argument('--source', type=Path, required=True)
     compose.add_argument('--generated', type=Path, required=True)
@@ -52,7 +53,7 @@ def main(argv=None):
     failed = False
     if args.command == 'styles':
         for option in make_style_samples(sources,args.sample,args.character,args.root,config,
-                brief=args.brief,size=args.size,progress=progress):
+                brief=args.brief,size=args.size,progress=progress,creative_direction=args.creative_direction):
             failed |= option['status'] != 'complete'
             print(json.dumps(option,ensure_ascii=False,indent=2),flush=True)
         return int(failed)

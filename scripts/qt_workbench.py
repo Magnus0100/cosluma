@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sys
+import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
@@ -13,11 +15,12 @@ from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QImageR
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
-    QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
+    QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget)
 
 from app_version import VERSION
-from image_io import IMAGE_EXTENSIONS
+from image_io import IMAGE_EXTENSIONS, save_json
+from model_clients import discuss_style
 from photo_pipeline import finish_batch, load_style, make_style_samples
 from settings import default_settings_path, editable_settings, load_settings, save_settings
 
@@ -82,20 +85,39 @@ class StyleWorker(QThread):
     directory_created = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, sources, sample_source, character, brief, root, config):
+    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction=''):
         super().__init__()
         self.sources, self.sample_source = sources, sample_source
         self.character, self.brief = character, brief
         self.root, self.config = root, config
+        self.creative_direction = creative_direction
 
     def run(self):
         try:
             for option in make_style_samples(self.sources,self.sample_source,self.character,self.root,self.config,
                     brief=self.brief,progress=self.progress.emit,planned=self.plans_ready.emit,
-                    sample_progress=self.sample_stage.emit,started=self.directory_created.emit):
+                    sample_progress=self.sample_stage.emit,started=self.directory_created.emit,
+                    creative_direction=self.creative_direction):
                 self.sample_ready.emit(option)
         except Exception as error:
             self.failed.emit(str(error))
+
+
+class StyleChatWorker(QThread):
+    reply_ready = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, sources, character, brief, config, directory, messages, direction, samples, focus):
+        super().__init__()
+        self.arguments = (sources,character,brief,config['prompt_library'],config['llm'],Path(directory),messages)
+        self.direction, self.samples, self.focus = direction, samples, focus
+
+    def run(self):
+        try:
+            result = discuss_style(*self.arguments,direction=self.direction,samples=self.samples,focus=self.focus)
+            self.reply_ready.emit(result)
+        except Exception as error:
+            self.failed.emit(getattr(error,'provider_message','') or str(error))
 
 
 class PhotoPreview(QWidget):
@@ -206,15 +228,24 @@ class PhotoPreview(QWidget):
 
 
 class StylePicker(QDialog):
-    """Let the user choose a real finished sample before submitting the batch."""
-    def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None):
+    """Discuss photographs, compare real samples, then explicitly settle the batch direction."""
+    def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None, discussion=None):
         super().__init__(parent)
-        self.setWindowTitle('为当前角色与原片设计摄影方向')
-        self.resize(1180, 820)
+        self.setWindowTitle('与摄影 Agent 讨论风格 · '+character)
+        self.resize(1440, 850)
         self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
         self.sources, self.character, self.brief = sources, character, brief
         self.config, self.root = config, root
         self.worker = None
+        self.chat_worker = None
+        self.messages = []
+        self.creative_direction = ''
+        self.samples_direction = ''
+        self.discussion_directory = None
+        self.sample_directories = []
+        self.pending_message = None
+        self.frozen_direction = ''
+        self.chosen_file = ''
         self.options = {}
         self.cards = {}
         self.current_option = 0
@@ -222,16 +253,15 @@ class StylePicker(QDialog):
         self.directory = None
         self.failure_message = ''
         layout = QVBoxLayout(self)
-        title = QLabel('根据角色与原片设计方向，再比较三个真实样片')
+        title = QLabel('与摄影 Agent 讨论，比较真实样片后定稿')
         title.setStyleSheet('font-size: 18px; font-weight: 600')
         layout.addWidget(title)
         context = QLabel('当前角色：'+character)
         context.setTextFormat(Qt.PlainText)
         context.setWordWrap(True)
         layout.addWidget(context)
-        explanation = QLabel('先分析当前角色、照片与补充要求，再设计三个适合这组素材的方向。'
-            '三个方案使用同一张原片，各制作一张完整成片。选择后，批量沿用该方向和真实样片；'
-            '这张样片直接收进结果，不再生成一次。')
+        explanation = QLabel('先聊角色、场景和想要的感觉，也可针对样片提出修改；按当前讨论生成三个真实样片。'
+            '定稿后再返回批量制作，选中的样片直接收进结果。')
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
         row = QHBoxLayout()
@@ -245,7 +275,7 @@ class StylePicker(QDialog):
         original = QPushButton('查看这张原片')
         original.clicked.connect(lambda:self.inspect(self.current_option))
         row.addWidget(original)
-        self.generate = QPushButton('设计方向并生成三个样片')
+        self.generate = QPushButton('按当前讨论生成三个样片')
         self.generate.setMinimumHeight(34)
         self.generate.clicked.connect(self.generate_samples)
         row.addWidget(self.generate)
@@ -268,15 +298,19 @@ class StylePicker(QDialog):
         back = QPushButton('返回三个方案')
         back.clicked.connect(self.inspector.accept)
         inspector_layout.addWidget(back)
-        choices = QHBoxLayout()
+        workspace = QSplitter(Qt.Horizontal)
+        sample_panel = QWidget()
+        choices = QHBoxLayout(sample_panel)
+        choices.setContentsMargins(0,0,0,0)
         for index in range(3):
             panel = QGroupBox(f'方案 {index+1}')
             card = QVBoxLayout(panel)
             thumbnail = QToolButton()
             thumbnail.setText('等待生成样片')
             thumbnail.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-            thumbnail.setIconSize(QSize(310,330))
-            thumbnail.setMinimumHeight(350)
+            thumbnail.setIconSize(QSize(230,290))
+            thumbnail.setMinimumHeight(300)
+            thumbnail.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
             thumbnail.setCheckable(True)
             thumbnail.clicked.connect(lambda _checked=False,index=index:self.inspect(index))
             card.addWidget(thumbnail)
@@ -290,14 +324,39 @@ class StylePicker(QDialog):
             stage.setMaximumHeight(40)
             card.addWidget(summary)
             card.addWidget(stage)
-            button = QPushButton('选择这个方向')
+            button = QPushButton('定稿并用于批量')
             button.setEnabled(False)
             button.clicked.connect(lambda _checked=False,index=index:self.choose(index))
             card.addWidget(button)
             self.cards[index] = (summary,stage,button,thumbnail,panel)
             choices.addWidget(panel,1)
-        layout.addLayout(choices)
-        self.message = QPlainTextEdit('点击后分析当前角色与原片，设计方向并生成 3 张完整样片；选定后才制作其余照片。')
+        workspace.addWidget(sample_panel)
+        chat_panel = QWidget()
+        chat_layout = QVBoxLayout(chat_panel)
+        chat_layout.setContentsMargins(10,0,0,0)
+        chat_layout.addWidget(QLabel('与摄影 Agent 讨论'))
+        self.chat_history = QPlainTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setPlaceholderText('可以先聊想法，也可以先试三个方向。Agent 会看到当前角色、原片和已完成样片。')
+        chat_layout.addWidget(self.chat_history,1)
+        self.discussion_summary = QPlainTextEdit()
+        self.discussion_summary.setReadOnly(True)
+        self.discussion_summary.setPlaceholderText('讨论形成的创作要求会显示在这里')
+        self.discussion_summary.setMaximumHeight(88)
+        chat_layout.addWidget(self.discussion_summary)
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setPlaceholderText('例如：方案 2 的氛围对了，但背景太空，想更贴近这个角色的故事。')
+        self.chat_input.setMaximumHeight(85)
+        self.chat_input.textChanged.connect(self.update_creative_actions)
+        chat_layout.addWidget(self.chat_input)
+        self.send = QPushButton('发送给 Agent')
+        self.send.clicked.connect(self.send_message)
+        chat_layout.addWidget(self.send)
+        chat_panel.setMinimumWidth(310)
+        workspace.addWidget(chat_panel)
+        workspace.setSizes([1000,360])
+        layout.addWidget(workspace,1)
+        self.message = QPlainTextEdit('可以先与 Agent 聊想法，再主动生成样片；只有你定稿后，才进入批量制作。')
         self.message.setReadOnly(True)
         self.message.setMaximumHeight(60)
         layout.addWidget(self.message)
@@ -311,12 +370,129 @@ class StylePicker(QDialog):
         self.cancel.clicked.connect(self.reject)
         footer.addWidget(self.cancel)
         layout.addLayout(footer)
-        if previous is not None:
+        if discussion is not None:
+            try:
+                self.restore_discussion(discussion)
+            except (OSError,ValueError,KeyError,TypeError) as error:
+                self.message.setPlainText('已有创作对话无法读取：'+str(error))
+        elif previous is not None:
             try:
                 self.restore_samples(previous)
+                self.creative_direction = self.samples_direction
+                self.render_conversation()
             except (OSError,ValueError,KeyError,TypeError) as error:
                 self.change_sample_source()
                 self.message.setPlainText('已有样片记录无法读取，请重新选择原片后手动生成：'+str(error))
+        self.update_creative_actions()
+
+    def is_busy(self):
+        return self.worker is not None or self.chat_worker is not None
+
+    def ensure_discussion(self):
+        if self.discussion_directory is None:
+            directory = Path(self.root).expanduser().resolve()/('creative-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+            directory.mkdir(parents=True,exist_ok=False)
+            self.discussion_directory = str(directory)
+
+    def save_discussion(self):
+        if self.discussion_directory is not None:
+            save_json(Path(self.discussion_directory)/'conversation.json',{
+                'character':self.character,'brief':self.brief,'sources':self.sources,
+                'messages':self.messages,'direction':self.creative_direction,
+                'samples_directory':self.directory,'sample_directories':self.sample_directories,
+                'selected_file':self.chosen_file,'frozen_direction':self.frozen_direction,
+                'draft':self.pending_message['content'] if self.pending_message else self.chat_input.toPlainText()})
+
+    def restore_discussion(self, directory):
+        state = json.loads((Path(directory)/'conversation.json').read_text(encoding='utf-8'))
+        if (state['character'],state['brief']) != (self.character,self.brief):
+            raise ValueError('此对话的角色或补充要求与当前输入不同')
+        self.discussion_directory = str(directory)
+        self.messages = state['messages']
+        self.creative_direction = state.get('direction','')
+        self.sample_directories = state.get('sample_directories',[])
+        self.chosen_file = state.get('selected_file','')
+        self.frozen_direction = state.get('frozen_direction','')
+        self.chat_input.setPlainText(state.get('draft',''))
+        if state.get('samples_directory'):
+            self.restore_samples(state['samples_directory'])
+        self.render_conversation()
+
+    def render_conversation(self):
+        self.chat_history.setPlainText('\n\n'.join(('你' if row['role']=='user' else '摄影 Agent')+'\n'+row['content'] for row in self.messages))
+        scrollbar = self.chat_history.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.discussion_summary.setPlainText(self.creative_direction)
+
+    def update_creative_actions(self):
+        if not hasattr(self,'cancel'):
+            return
+        busy = self.is_busy()
+        self.send.setEnabled(not busy and bool(self.chat_input.toPlainText().strip()))
+        self.chat_input.setEnabled(not busy)
+        self.generate.setEnabled(not busy)
+        self.change_source.setEnabled(not busy)
+        self.cancel.setEnabled(not busy)
+        self.sample_source.setEnabled(not busy and not self.options)
+        for index,card in self.cards.items():
+            card[2].setEnabled(not busy and self.samples_direction==self.creative_direction
+                and self.options.get(index,{}).get('status')=='complete')
+
+    def send_message(self):
+        text = self.chat_input.toPlainText().strip()
+        if self.is_busy() or not text:
+            return
+        try:
+            self.ensure_discussion()
+            self.pending_message = {'role':'user','content':text}
+            self.save_discussion()
+            conversation = [*self.messages,self.pending_message]
+            represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
+            focus = self.options.get(self.current_option,{}).get('title')
+            self.chat_worker = StyleChatWorker(represented,self.character,self.brief,self.config,
+                self.discussion_directory,conversation,self.creative_direction,list(self.options.values()),focus)
+            self.chat_worker.reply_ready.connect(self.receive_reply)
+            self.chat_worker.failed.connect(self.chat_failed)
+            self.chat_worker.finished.connect(self.chat_finished)
+            self.chat_history.setPlainText(self.chat_history.toPlainText()+'\n\n你\n'+text+'\n\n摄影 Agent 正在查看素材并回复…')
+            self.chat_input.clear()
+            self.message.setPlainText('Agent 正在结合角色、原片与已有样片回复；这一步只讨论。')
+            self.update_creative_actions()
+            self.chat_worker.start()
+        except Exception as error:
+            self.chat_worker = None
+            self.message.setPlainText('无法开始对话：'+str(error))
+            self.update_creative_actions()
+
+    def receive_reply(self, reply):
+        self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply']}])
+        self.pending_message = None
+        self.creative_direction = reply['direction']
+        self.render_conversation()
+        try:
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('回复已收到，保存对话失败：'+str(error))
+            return
+        self.message.setPlainText('创作要求已更新。可继续讨论；按当前讨论生成新样片后，再定稿用于批量。' if
+            self.options and self.samples_direction!=self.creative_direction else
+            '可以继续讨论、查看已有样片，或按当前讨论主动生成样片。由你决定何时定稿。')
+
+    def chat_failed(self, error):
+        if self.pending_message is not None:
+            self.chat_input.setPlainText(self.pending_message['content'])
+        self.pending_message = None
+        self.render_conversation()
+        self.message.setPlainText('Agent 回复失败：'+error+'。已保留输入与原有样片，可修改后手动发送。')
+        try:
+            self.save_discussion()
+        except OSError as saved_error:
+            self.message.setPlainText(self.message.toPlainText()+'\n保存对话失败：'+str(saved_error))
+
+    def chat_finished(self):
+        worker,self.chat_worker = self.chat_worker,None
+        self.update_creative_actions()
+        worker.deleteLater()
 
     def inspect(self, index):
         self.show_option(index)
@@ -326,26 +502,30 @@ class StylePicker(QDialog):
         self.inspector.exec()
 
     def change_sample_source(self):
-        if self.worker is not None:
+        if self.is_busy():
             return
         self.options.clear()
         self.directory = None
         self.open_folder.setEnabled(False)
         self.sample_source.setEnabled(True)
-        self.generate.setText('设计方向并生成三个样片')
+        self.generate.setText('按当前讨论生成三个样片')
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
             panel.setTitle(f'方案 {index+1}')
             summary.setText('分析当前角色与照片后，再确定此方向')
+            summary.setToolTip('')
             stage.setText('尚未分析')
             button.setEnabled(False)
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
         self.preview.set_photo(self.sample_source.currentData())
         self.message.setPlainText('选择另一张代表原片后，再点击生成。之前的样片文件仍然保留。')
+        self.save_discussion()
+        self.update_creative_actions()
 
     def restore_samples(self, directory):
         directory = Path(directory)
         state = json.loads((directory/'styles.json').read_text(encoding='utf-8'))
+        self.samples_direction = state.get('creative_direction','')
         index = self.sample_source.findData(state['sample_source'])
         if index < 0:
             self.sample_source.addItem(Path(state['sample_source']).name+'（已有样片原片）',state['sample_source'])
@@ -361,19 +541,26 @@ class StylePicker(QDialog):
                 option = {**saved,'status':'failed','error':str(error)}
             self.show_sample(option)
             self.cards[index][2].setEnabled(option['status']=='complete')
-        self.generate.setText('重新设计并生成三个样片')
+        self.generate.setText('按当前讨论再做三个样片')
         self.message.setPlainText('正在查看为此角色与原片保存的样片，没有调用模型。可直接选择；重新设计会另行制作三张。')
 
     def generate_samples(self):
-        if self.worker is not None:
+        if self.is_busy():
+            return
+        try:
+            self.ensure_discussion()
+        except OSError as error:
+            self.message.setPlainText('无法创建创作文件夹：'+str(error))
             return
         self.options.clear()
         self.failure_message = ''
         self.directory = None
+        self.samples_direction = self.creative_direction
         self.open_folder.setEnabled(False)
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
             panel.setTitle(f'方案 {index+1}')
             summary.setText('正在分析当前角色与照片')
+            summary.setToolTip('')
             stage.setText('设计方向中')
             stage.setToolTip('')
             button.setEnabled(False)
@@ -386,7 +573,7 @@ class StylePicker(QDialog):
         self.cancel.setEnabled(False)
         represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
         self.worker = StyleWorker(represented,self.sample_source.currentData(),self.character,
-            self.brief,self.root,self.config)
+            self.brief,self.root,self.config,creative_direction=self.creative_direction)
         self.worker.progress.connect(self.message.setPlainText)
         self.worker.plans_ready.connect(self.show_plans)
         self.worker.sample_stage.connect(self.show_stage)
@@ -395,17 +582,24 @@ class StylePicker(QDialog):
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.samples_finished)
         self.message.setPlainText('正在结合角色“'+self.character+'”、代表原片与补充要求设计三个方向。其余照片尚未提交。')
+        self.update_creative_actions()
         self.worker.start()
 
     def directory_ready(self, directory):
         self.directory = directory
         self.open_folder.setEnabled(True)
+        if directory not in self.sample_directories:
+            self.sample_directories.append(directory)
+        try:
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('样片已开始制作，保存对话目录失败：'+str(error))
 
     def show_plans(self, plans, directory):
         self.directory = directory
         self.open_folder.setEnabled(True)
         for index,plan in enumerate(plans):
-            self.cards[index][4].setTitle(plan['title'])
+            self.cards[index][4].setTitle(f'方案 {index+1} · '+plan['title'])
             self.cards[index][0].setText(plan['summary'])
             self.cards[index][0].setToolTip(plan['summary'])
 
@@ -446,7 +640,7 @@ class StylePicker(QDialog):
         worker,self.worker = self.worker,None
         self.cancel.setEnabled(True)
         self.change_source.setEnabled(True)
-        self.generate.setText('重新设计并生成三个样片')
+        self.generate.setText('按当前讨论再做三个样片')
         self.generate.setEnabled(True)
         complete = sum(option['status']=='complete' for option in self.options.values())
         for index,option in self.options.items():
@@ -455,24 +649,48 @@ class StylePicker(QDialog):
             if index not in self.options:
                 self.cards[index][1].setText('未完成')
         if self.options:
-            self.message.setPlainText(f'已完成 {complete} 个真实样片。点击缩略图查看大图对比，再选择一个方向；未选择前不会批量制作。' if complete else
+            self.message.setPlainText(f'已完成 {complete} 个真实样片。可以放大对比、继续与 Agent 讨论修改，满意后再定稿；未定稿前不会批量制作。' if complete else
                 '三个样片都未完成。点击方案查看真实错误，已有文件保留；可以返回修改设置后手动再发起。')
         if self.failure_message:
             self.message.setPlainText(self.message.toPlainText()+'\n样片未全部完成：'+self.failure_message)
+        self.update_creative_actions()
         worker.deleteLater()
 
     def choose(self, index):
-        if self.worker is None and self.options.get(index,{}).get('status')=='complete':
-            self.selected_style = self.options[index]
-            self.accept()
+        if self.is_busy() or self.options.get(index,{}).get('status')!='complete':
+            return
+        if self.samples_direction != self.creative_direction:
+            self.message.setPlainText('当前讨论已修改创作要求，请先按当前讨论生成样片，再定稿。已有样片仍可对比查看。')
+            return
+        try:
+            self.ensure_discussion()
+            option = self.options[index]
+            self.chosen_file = option['selection_file']
+            self.frozen_direction = option['art_direction']['direction']
+            save_json(Path(self.discussion_directory)/'chosen-direction.json',{
+                'character':self.character,'brief':self.brief,'selection_file':self.chosen_file,
+                'title':option['title'],'direction':self.frozen_direction,
+                'creative_direction':self.creative_direction,
+                'sample_source':option['sample_source']})
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('无法保存定稿：'+str(error))
+            return
+        self.selected_style = option
+        self.accept()
 
     def reject(self):
-        if self.worker is None:
+        if not self.is_busy():
+            try:
+                self.save_discussion()
+            except OSError as error:
+                self.message.setPlainText('保存对话失败：'+str(error))
+                return
             super().reject()
 
     def closeEvent(self, event):
-        if self.worker is not None:
-            self.message.setPlainText('三个样片仍在制作，可以最小化等待；已有文件会保留，不自动重试。')
+        if self.is_busy():
+            self.message.setPlainText('Agent 回复或样片制作仍在进行，可以最小化等待；已有文件会保留。')
             event.ignore()
         else:
             super().closeEvent(event)
@@ -844,6 +1062,8 @@ class Workbench(QMainWindow):
         self.style_samples_directory = None
         self.style_sample_source = None
         self.style_samples_context = None
+        self.style_discussion_directory = None
+        self.style_discussion_context = None
         self.current_output = None
         self.batch_directory = None
         self.last_batch_directory = self.preferences.value('last_batch_directory', '', type=str)
@@ -1003,11 +1223,11 @@ class Workbench(QMainWindow):
         style_box = QWidget()
         style_layout = QVBoxLayout(style_box)
         style_layout.setContentsMargins(0, 0, 0, 0)
-        self.style_hint = QLabel('先填写角色、添加照片，再为这组素材设计三个方向并生成样片。')
+        self.style_hint = QLabel('先填写角色、添加照片，与 Agent 讨论并试样，定稿后再批量制作。')
         self.style_hint.setWordWrap(True)
         self.style_hint.setTextFormat(Qt.PlainText)
         style_layout.addWidget(self.style_hint)
-        self.style_button = QPushButton('按角色与原片设计样片')
+        self.style_button = QPushButton('与 Agent 讨论风格')
         self.style_button.clicked.connect(self.choose_style)
         style_layout.addWidget(self.style_button)
         queue_layout.addWidget(style_box)
@@ -1030,7 +1250,7 @@ class Workbench(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('等待开始')
         layout.addWidget(self.progress_bar)
-        self.status = QLabel('添加照片、填写角色，按这组素材设计三个方向；比较真实样片后再制作整组。')
+        self.status = QLabel('添加照片、填写角色，与 Agent 讨论方向并比较真实样片，定稿后再制作整组。')
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1060,6 +1280,13 @@ class Workbench(QMainWindow):
 
     def restore_style_selection(self):
         try:
+            discussion_state = None
+            discussion = self.preferences.value('style/discussion','',type=str)
+            if discussion and (Path(discussion)/'conversation.json').is_file():
+                state = json.loads((Path(discussion)/'conversation.json').read_text(encoding='utf-8'))
+                self.style_discussion_directory = discussion
+                self.style_discussion_context = (state['character'],state['brief'])
+                discussion_state = state
             directory = self.preferences.value('style/samples', '', type=str)
             if directory and (Path(directory)/'styles.json').is_file():
                 state = json.loads((Path(directory)/'styles.json').read_text(encoding='utf-8'))
@@ -1069,6 +1296,11 @@ class Workbench(QMainWindow):
             if chosen:
                 self.selected_style = load_style(chosen)
                 self.style_context = (self.selected_style['result']['character'],self.selected_style['result']['brief'])
+                if discussion_state is not None and self.style_discussion_context==self.style_context and (
+                        discussion_state.get('direction','') != self.selected_style['art_direction'].get('creative_direction','')):
+                    self.selected_style = None
+                    self.style_context = None
+                    self.preferences.remove('style/selected')
         except (OSError, ValueError, KeyError, TypeError):
             self.status.setText('上次选中的风格样片已移动或缺失，请重新打开样片选择。')
 
@@ -1099,10 +1331,19 @@ class Workbench(QMainWindow):
             sample = self.sources[row] if 0 <= row < len(self.sources) else self.sources[0]
             self.remember_preferences()
             previous = self.style_samples_directory if self.style_samples_context == context else None
+            discussion = self.style_discussion_directory if self.style_discussion_context == context else None
             dialog = StylePicker(list(self.sources),sample,self.character.text().strip(),
-                self.brief.toPlainText(),self.root.text(),config,self,previous=previous)
+                self.brief.toPlainText(),self.root.text(),config,self,previous=previous,discussion=discussion)
             self.style_dialog = dialog
             accepted = dialog.exec() == QDialog.Accepted
+            if dialog.discussion_directory is not None:
+                self.style_discussion_directory = dialog.discussion_directory
+                self.style_discussion_context = context
+                self.preferences.setValue('style/discussion',dialog.discussion_directory)
+            if self.selected_style is not None and (dialog.creative_direction != self.selected_style['art_direction'].get('creative_direction','')):
+                self.selected_style = None
+                self.style_context = None
+                self.preferences.remove('style/selected')
             if dialog.directory is not None and dialog.options:
                 self.style_samples_directory = dialog.directory
                 self.style_samples_context = context
@@ -1112,7 +1353,7 @@ class Workbench(QMainWindow):
                 self.selected_style = dialog.selected_style
                 self.style_context = context
                 self.preferences.setValue('style/selected',self.selected_style['selection_file'])
-                self.status.setText('已选择“'+self.selected_style['title']+'”。点击批量制作后，选中的完整样片直接复用。')
+                self.status.setText('已定稿“'+self.selected_style['title']+'”。点击批量制作后，沿用此方向并直接复用选中的完整样片。')
             dialog.deleteLater()
             self.style_dialog = None
             self.preferences.sync()
@@ -1134,7 +1375,7 @@ class Workbench(QMainWindow):
             load_settings(filename)
             self.config.setText(filename)
             self.remember_preferences()
-            self.status.setText('已选择已有配置。添加照片、填写角色后，先比较三个风格样片。')
+            self.status.setText('已选择已有配置。添加照片、填写角色后，可与 Agent 讨论风格并试样。')
         except Exception as error:
             self.status.setText('无法导入配置：' + str(error))
 
@@ -1168,7 +1409,7 @@ class Workbench(QMainWindow):
                 self.config.setText(str(dialog.path))
                 self.remember_preferences()
                 self.update_setup_hint()
-                self.status.setText('连接设置已保存。添加照片和角色后，可生成三个真实风格样片。')
+                self.status.setText('连接设置已保存。添加照片和角色后，可与 Agent 讨论风格并试样。')
         except Exception as error:
             self.status.setText('无法打开连接设置：' + str(error))
 
@@ -1322,7 +1563,7 @@ class Workbench(QMainWindow):
         self.start.setEnabled(not running and pending > 0 and has_character and style_ready)
         self.start.setToolTip('请先添加照片' if not has_photos else
             '请填写角色' if not has_character else
-            '请先生成并选择真实风格样片' if not style_ready else
+            '请先与 Agent 讨论、查看真实样片并定稿' if not style_ready else
             '只制作新加入的照片，已有成功与失败照片不会再次提交' if pending else
             '本组照片已处理；添加新照片，或明确选择全部另做一批')
         self.start.setText(f'按选定风格制作新增 {pending} 张' if has_previous and pending else
@@ -1331,10 +1572,11 @@ class Workbench(QMainWindow):
         self.remaining_button.setEnabled(not running and has_photos and has_character and style_ready)
         self.style_button.setEnabled(not running and has_photos and has_character)
         has_samples = self.style_samples_directory is not None and self.style_samples_context == self.current_style_context()
-        self.style_button.setText('查看 / 更换已选风格' if style_ready else '查看已有风格样片' if has_samples else '按角色与原片设计样片')
+        self.style_button.setText('查看定稿 / 继续讨论' if style_ready else '继续与 Agent 讨论' if has_samples or
+            self.style_discussion_context==self.current_style_context() else '与 Agent 讨论风格')
         self.style_hint.setText('已选择：'+self.selected_style['title']+'。'+self.selected_style['summary'] if style_ready else
-            '将结合角色“'+self.character.text().strip()+'”与当前照片设计三个方向，再生成真实样片供选择。'
-            if has_character and has_photos else '先填写角色、添加照片，再为这组素材设计三个方向并生成样片。')
+            '与 Agent 结合角色“'+self.character.text().strip()+'”和当前照片讨论、试样，定稿后再批量制作。'
+            if has_character and has_photos else '先填写角色、添加照片，与 Agent 讨论并试样，定稿后再批量制作。')
         self.last_batch_button.setText('查看上次制作' if self.last_batch_directory else '查看已有结果')
         self.last_batch_button.setEnabled(not running)
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))
@@ -1541,9 +1783,9 @@ class Workbench(QMainWindow):
 
     def closeEvent(self, event):
         self.remember_preferences()
-        if self.style_dialog is not None and self.style_dialog.worker is not None:
+        if self.style_dialog is not None and self.style_dialog.is_busy():
             self.style_dialog.showNormal()
-            self.style_dialog.message.setPlainText('风格样片仍在制作，请在此查看进度；可以最小化等待。')
+            self.style_dialog.message.setPlainText('Agent 回复或样片制作仍在进行，请在此查看进度；可以最小化等待。')
             event.ignore()
             return
         if self.worker is not None and self.worker.isRunning():
