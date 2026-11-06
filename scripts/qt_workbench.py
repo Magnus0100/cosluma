@@ -9,7 +9,7 @@ import sys
 from urllib.parse import urlsplit, urlunsplit
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QImageReader, QPixmap
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
 
 from app_version import VERSION
 from image_io import IMAGE_EXTENSIONS
-from photo_pipeline import finish_batch
+from photo_pipeline import finish_batch, load_style, make_style_samples
 from settings import default_settings_path, editable_settings, load_settings, save_settings
 
 
@@ -45,10 +45,11 @@ class Worker(QThread):
     result_ready = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, sources, character, brief, root, config):
+    def __init__(self, sources, character, brief, root, config, *, style=None):
         super().__init__()
         self.sources, self.character, self.brief = sources, character, brief
         self.root, self.config = root, config
+        self.style = style
         self.succeeded = 0
         self.errors = []
         self.batch_error = ''
@@ -61,7 +62,7 @@ class Worker(QThread):
         try:
             for result in finish_batch(self.sources, self.character, self.root, self.config,
                     brief=self.brief, progress=self.progress.emit,
-                    photo_progress=self.photo_stage.emit, batch_started=started):
+                    photo_progress=self.photo_stage.emit, batch_started=started, style=self.style):
                 self.output_directory = result.get('batch_directory', self.output_directory)
                 if result['status'] == 'complete':
                     self.succeeded += 1
@@ -71,6 +72,30 @@ class Worker(QThread):
         except Exception as error:
             self.batch_error = str(error)
             self.failed.emit(self.batch_error)
+
+
+class StyleWorker(QThread):
+    progress = Signal(str)
+    plans_ready = Signal(list, str)
+    sample_stage = Signal(int, str)
+    sample_ready = Signal(dict)
+    directory_created = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, sources, sample_source, character, brief, root, config):
+        super().__init__()
+        self.sources, self.sample_source = sources, sample_source
+        self.character, self.brief = character, brief
+        self.root, self.config = root, config
+
+    def run(self):
+        try:
+            for option in make_style_samples(self.sources,self.sample_source,self.character,self.root,self.config,
+                    brief=self.brief,progress=self.progress.emit,planned=self.plans_ready.emit,
+                    sample_progress=self.sample_stage.emit,started=self.directory_created.emit):
+                self.sample_ready.emit(option)
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 class PhotoPreview(QWidget):
@@ -178,6 +203,273 @@ class PhotoPreview(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         QTimer.singleShot(0, self.update_preview)
+
+
+class StylePicker(QDialog):
+    """Let the user choose a real finished sample before submitting the batch."""
+    def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None):
+        super().__init__(parent)
+        self.setWindowTitle('先看真实样片，再选择摄影风格')
+        self.resize(1180, 820)
+        self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
+        self.sources, self.character, self.brief = sources, character, brief
+        self.config, self.root = config, root
+        self.worker = None
+        self.options = {}
+        self.cards = {}
+        self.current_option = 0
+        self.selected_style = None
+        self.directory = None
+        self.failure_message = ''
+        layout = QVBoxLayout(self)
+        title = QLabel('选一张代表原片，先看三个真实摄影方向')
+        title.setStyleSheet('font-size: 18px; font-weight: 600')
+        layout.addWidget(title)
+        explanation = QLabel('三个方案使用同一张原片，各制作一张完整成片。选择后，批量沿用该方向和真实样片；'
+            '这张样片直接收进结果，不再生成一次。')
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('样片原片'))
+        self.sample_source = QComboBox()
+        for source in sources:
+            self.sample_source.addItem(Path(source).name, source)
+            self.sample_source.setItemData(self.sample_source.count()-1,source,Qt.ToolTipRole)
+        self.sample_source.setCurrentIndex(max(0,self.sample_source.findData(sample_source)))
+        row.addWidget(self.sample_source,1)
+        original = QPushButton('查看这张原片')
+        original.clicked.connect(lambda:self.inspect(self.current_option))
+        row.addWidget(original)
+        self.generate = QPushButton('生成三个真实样片')
+        self.generate.setMinimumHeight(34)
+        self.generate.clicked.connect(self.generate_samples)
+        row.addWidget(self.generate)
+        self.change_source = QPushButton('换一张原片试风格')
+        self.change_source.clicked.connect(self.change_sample_source)
+        row.addWidget(self.change_source)
+        layout.addLayout(row)
+        self.inspector = QDialog(self)
+        self.inspector.setWindowTitle('样片与原片大图对比')
+        self.inspector.resize(1100,760)
+        inspector_layout = QVBoxLayout(self.inspector)
+        self.preview = PhotoPreview()
+        self.preview.set_photo(self.sample_source.currentData())
+        self.sample_source.currentIndexChanged.connect(lambda: self.preview.set_photo(self.sample_source.currentData()))
+        inspector_layout.addWidget(self.preview,1)
+        self.inspector_details = QPlainTextEdit()
+        self.inspector_details.setReadOnly(True)
+        self.inspector_details.setMaximumHeight(70)
+        inspector_layout.addWidget(self.inspector_details)
+        back = QPushButton('返回三个方案')
+        back.clicked.connect(self.inspector.accept)
+        inspector_layout.addWidget(back)
+        choices = QHBoxLayout()
+        for index in range(3):
+            panel = QGroupBox(f'方案 {index+1}')
+            card = QVBoxLayout(panel)
+            thumbnail = QToolButton()
+            thumbnail.setText('等待生成样片')
+            thumbnail.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            thumbnail.setIconSize(QSize(310,330))
+            thumbnail.setMinimumHeight(350)
+            thumbnail.setCheckable(True)
+            thumbnail.clicked.connect(lambda _checked=False,index=index:self.inspect(index))
+            card.addWidget(thumbnail)
+            summary = QLabel('生成后显示这个方向的场景与氛围说明')
+            summary.setWordWrap(True)
+            summary.setTextFormat(Qt.PlainText)
+            summary.setMaximumHeight(48)
+            stage = QLabel('尚未生成')
+            stage.setWordWrap(True)
+            stage.setTextFormat(Qt.PlainText)
+            stage.setMaximumHeight(40)
+            card.addWidget(summary)
+            card.addWidget(stage)
+            button = QPushButton('选择这个方向')
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False,index=index:self.choose(index))
+            card.addWidget(button)
+            self.cards[index] = (summary,stage,button,thumbnail,panel)
+            choices.addWidget(panel,1)
+        layout.addLayout(choices)
+        self.message = QPlainTextEdit('此操作会调用模型，生成 3 张完整样片；其余照片在选择风格后才会制作。')
+        self.message.setReadOnly(True)
+        self.message.setMaximumHeight(60)
+        layout.addWidget(self.message)
+        footer = QHBoxLayout()
+        self.open_folder = QPushButton('打开样片文件夹')
+        self.open_folder.setEnabled(False)
+        self.open_folder.clicked.connect(lambda:BatchResults.open_path(self.directory))
+        footer.addWidget(self.open_folder)
+        footer.addStretch(1)
+        self.cancel = QPushButton('返回照片队列')
+        self.cancel.clicked.connect(self.reject)
+        footer.addWidget(self.cancel)
+        layout.addLayout(footer)
+        if previous is not None:
+            try:
+                self.restore_samples(previous)
+            except (OSError,ValueError,KeyError,TypeError) as error:
+                self.change_sample_source()
+                self.message.setPlainText('已有样片记录无法读取，请重新选择原片后手动生成：'+str(error))
+
+    def inspect(self, index):
+        self.show_option(index)
+        option = self.options.get(index)
+        self.inspector_details.setPlainText(option['summary'] if option and option['status']=='complete' else
+            option['error'] if option else '这是选中的代表原片，尚未完成此方案。')
+        self.inspector.exec()
+
+    def change_sample_source(self):
+        if self.worker is not None:
+            return
+        self.options.clear()
+        self.directory = None
+        self.open_folder.setEnabled(False)
+        self.sample_source.setEnabled(True)
+        self.generate.setText('生成三个真实样片')
+        for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
+            panel.setTitle(f'方案 {index+1}')
+            summary.setText('请先选择这次试拍的原片')
+            stage.setText('尚未生成')
+            button.setEnabled(False)
+            thumbnail.setIcon(QIcon())
+            thumbnail.setText('等待生成样片')
+        self.preview.set_photo(self.sample_source.currentData())
+        self.message.setPlainText('选择另一张代表原片后，再点击生成。之前的样片文件仍然保留。')
+
+    def restore_samples(self, directory):
+        directory = Path(directory)
+        state = json.loads((directory/'styles.json').read_text(encoding='utf-8'))
+        index = self.sample_source.findData(state['sample_source'])
+        if index < 0:
+            self.sample_source.addItem(Path(state['sample_source']).name+'（已有样片原片）',state['sample_source'])
+            index = self.sample_source.count()-1
+        self.sample_source.setCurrentIndex(index)
+        self.sample_source.setEnabled(False)
+        self.show_plans(json.loads((directory/'style-options.json').read_text(encoding='utf-8')),str(directory))
+        for saved in state['options'].values():
+            index = saved['index']
+            try:
+                option = load_style(directory/f'style-{index+1}.json') if saved['status']=='complete' else saved
+            except (OSError, ValueError, KeyError) as error:
+                option = {**saved,'status':'failed','error':str(error)}
+            self.show_sample(option)
+            self.cards[index][2].setEnabled(option['status']=='complete')
+        self.generate.setText('重新生成三个真实样片')
+        self.message.setPlainText('正在查看已保存样片，没有调用模型。可直接选择；“重新生成”会另行调用模型制作三张。')
+
+    def generate_samples(self):
+        if self.worker is not None:
+            return
+        self.options.clear()
+        self.failure_message = ''
+        self.directory = None
+        self.open_folder.setEnabled(False)
+        for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
+            panel.setTitle(f'方案 {index+1}')
+            summary.setText('正在设计此方向')
+            stage.setText('等待制作')
+            stage.setToolTip('')
+            button.setEnabled(False)
+            thumbnail.setIcon(QIcon())
+            thumbnail.setText('等待生成样片')
+        self.preview.set_photo(self.sample_source.currentData())
+        self.generate.setEnabled(False)
+        self.change_source.setEnabled(False)
+        self.sample_source.setEnabled(False)
+        self.cancel.setEnabled(False)
+        represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
+        self.worker = StyleWorker(represented,self.sample_source.currentData(),self.character,
+            self.brief,self.root,self.config)
+        self.worker.progress.connect(self.message.setPlainText)
+        self.worker.plans_ready.connect(self.show_plans)
+        self.worker.sample_stage.connect(self.show_stage)
+        self.worker.sample_ready.connect(self.show_sample)
+        self.worker.directory_created.connect(self.directory_ready)
+        self.worker.failed.connect(self.failed)
+        self.worker.finished.connect(self.samples_finished)
+        self.message.setPlainText('正在观察代表原片并设计三个不同方向。其余照片尚未提交。')
+        self.worker.start()
+
+    def directory_ready(self, directory):
+        self.directory = directory
+        self.open_folder.setEnabled(True)
+
+    def show_plans(self, plans, directory):
+        self.directory = directory
+        self.open_folder.setEnabled(True)
+        for index,plan in enumerate(plans):
+            self.cards[index][4].setTitle(plan['title'])
+            self.cards[index][0].setText(plan['summary'])
+
+    def show_stage(self, index, stage):
+        self.cards[index][1].setText(stage)
+
+    def show_sample(self, option):
+        self.options[option['index']] = option
+        summary,stage,_button,thumbnail,_panel = self.cards[option['index']]
+        summary.setText(option['summary'])
+        stage.setText('样片完成' if option['status']=='complete' else '样片失败：'+option['error'])
+        stage.setToolTip(stage.text())
+        if option['status']=='complete':
+            pixels = self.preview.read_preview(option['result']['files']['jpeg'])
+            if pixels is not None:
+                thumbnail.setIcon(QIcon(pixels))
+            thumbnail.setText('点击查看大图对比')
+        else:
+            thumbnail.setText('样片未完成，点击查看原因')
+        if self.current_option == option['index']:
+            self.show_option(option['index'])
+
+    def show_option(self, index):
+        self.current_option = index
+        for number,card in self.cards.items():
+            card[3].setChecked(number==index)
+        option = self.options.get(index)
+        output = option['result']['files']['jpeg'] if option and option['status']=='complete' else None
+        self.preview.set_photo(self.sample_source.currentData(),output)
+        if option and option['status']!='complete':
+            self.message.setPlainText(option['error'])
+
+    def failed(self, error):
+        self.failure_message = error
+        self.message.setPlainText('样片未完成：'+error)
+
+    def samples_finished(self):
+        worker,self.worker = self.worker,None
+        self.cancel.setEnabled(True)
+        self.change_source.setEnabled(True)
+        self.generate.setText('重新生成三个真实样片')
+        self.generate.setEnabled(True)
+        complete = sum(option['status']=='complete' for option in self.options.values())
+        for index,option in self.options.items():
+            self.cards[index][2].setEnabled(option['status']=='complete')
+        for index in self.cards:
+            if index not in self.options:
+                self.cards[index][1].setText('未完成')
+        if self.options:
+            self.message.setPlainText(f'已完成 {complete} 个真实样片。点击缩略图查看大图对比，再选择一个方向；未选择前不会批量制作。' if complete else
+                '三个样片都未完成。点击方案查看真实错误，已有文件保留；可以返回修改设置后手动再发起。')
+        if self.failure_message:
+            self.message.setPlainText(self.message.toPlainText()+'\n样片未全部完成：'+self.failure_message)
+        worker.deleteLater()
+
+    def choose(self, index):
+        if self.worker is None and self.options.get(index,{}).get('status')=='complete':
+            self.selected_style = self.options[index]
+            self.accept()
+
+    def reject(self):
+        if self.worker is None:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.worker is not None:
+            self.message.setPlainText('三个样片仍在制作，可以最小化等待；已有文件会保留，不自动重试。')
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
 
 class BatchResults(QDialog):
@@ -540,6 +832,12 @@ class Workbench(QMainWindow):
         self.worker = None
         self.close_after_finish = False
         self.tray = None
+        self.selected_style = None
+        self.style_context = None
+        self.style_dialog = None
+        self.style_samples_directory = None
+        self.style_sample_source = None
+        self.style_samples_context = None
         self.current_output = None
         self.batch_directory = None
         self.last_batch_directory = self.preferences.value('last_batch_directory', '', type=str)
@@ -665,8 +963,10 @@ class Workbench(QMainWindow):
         self.character.textChanged.connect(self.update_actions)
         self.brief.setPlaceholderText('可以留空；有希望保留的景物、场景想法或偏好时再补充')
         self.brief.setMaximumHeight(65)
+        self.brief.textChanged.connect(self.update_actions)
         form.addRow('补充要求', self.brief)
         self.root = QLineEdit(str(root))
+        self.root.textChanged.connect(self.update_actions)
         output_row = self.path_row(self.root, directory=True)
         form.addRow('保存到', output_row)
         queue_layout.addLayout(form)
@@ -683,8 +983,10 @@ class Workbench(QMainWindow):
         advanced_form = QFormLayout(advanced_panel)
         self.config = QLineEdit(str(config))
         self.config.textChanged.connect(self.update_setup_hint)
+        self.config.textChanged.connect(self.update_actions)
         advanced_form.addRow('配置文件', self.path_row(self.config))
         self.edge = QLineEdit(self.preferences.value('output_edge', '', type=str))
+        self.edge.textChanged.connect(self.update_actions)
         self.edge.setPlaceholderText('留空使用配置；默认请求长边 6000')
         advanced_form.addRow('请求长边', self.edge)
         advanced_layout.addWidget(advanced_panel)
@@ -692,6 +994,17 @@ class Workbench(QMainWindow):
         advanced_toggle.toggled.connect(advanced_panel.setVisible)
         advanced_toggle.toggled.connect(lambda checked: advanced_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow))
         queue_layout.addWidget(advanced)
+        style_box = QWidget()
+        style_layout = QVBoxLayout(style_box)
+        style_layout.setContentsMargins(0, 0, 0, 0)
+        self.style_hint = QLabel('批量前，先用一张原片比较三个真实风格样片。')
+        self.style_hint.setWordWrap(True)
+        self.style_hint.setTextFormat(Qt.PlainText)
+        style_layout.addWidget(self.style_hint)
+        self.style_button = QPushButton('先看三个风格样片')
+        self.style_button.clicked.connect(self.choose_style)
+        style_layout.addWidget(self.style_button)
+        queue_layout.addWidget(style_box)
         controls = QHBoxLayout()
         self.start = QPushButton('开始制作')
         self.start.setMinimumHeight(38)
@@ -711,13 +1024,15 @@ class Workbench(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('等待开始')
         layout.addWidget(self.progress_bar)
-        self.status = QLabel('添加照片，填写角色后开始。每张照片的进度会显示在列表中。')
+        self.status = QLabel('添加照片、填写角色，先比较三个真实风格样片，再按选择制作整组。')
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
         self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button, self.import_button])
+        self.inputs.append(style_box)
         self.update_setup_hint()
+        self.restore_style_selection()
         self.update_actions()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
@@ -730,6 +1045,75 @@ class Workbench(QMainWindow):
     @staticmethod
     def source_key(source):
         return os.path.normcase(str(Path(source).expanduser().resolve()))
+
+    def current_style_context(self):
+        return (self.character.text().strip(),self.brief.toPlainText())
+
+    def style_is_current(self):
+        return self.selected_style is not None and self.style_context == self.current_style_context()
+
+    def restore_style_selection(self):
+        try:
+            directory = self.preferences.value('style/samples', '', type=str)
+            if directory and (Path(directory)/'styles.json').is_file():
+                state = json.loads((Path(directory)/'styles.json').read_text(encoding='utf-8'))
+                self.style_samples_directory = directory
+                self.style_samples_context = (state['character'],state['brief'])
+            chosen = self.preferences.value('style/selected', '', type=str)
+            if chosen:
+                self.selected_style = load_style(chosen)
+                self.style_context = (self.selected_style['result']['character'],self.selected_style['result']['brief'])
+        except (OSError, ValueError, KeyError, TypeError):
+            self.status.setText('上次选中的风格样片已移动或缺失，请重新打开样片选择。')
+
+    def desktop_config(self):
+        config = load_settings(self.config.text())
+        if self.edge.text().strip():
+            edge = int(self.edge.text())
+            if edge <= 0:
+                raise ValueError('请求长边应为正整数')
+            config['output_long_edge'] = edge
+        return config
+
+    def choose_style(self):
+        if self.worker is not None:
+            return
+        try:
+            if not self.sources or not self.character.text().strip():
+                raise ValueError('请先添加照片并填写角色')
+            if not self.root.text().strip():
+                raise ValueError('请选择保存目录')
+            if not Path(self.config.text()).expanduser().is_file():
+                self.configure_services()
+                if not Path(self.config.text()).expanduser().is_file():
+                    return
+            config = self.desktop_config()
+            context = self.current_style_context()
+            row = self.listing.currentRow()
+            sample = self.sources[row] if 0 <= row < len(self.sources) else self.sources[0]
+            self.remember_preferences()
+            previous = self.style_samples_directory if self.style_samples_context == context else None
+            dialog = StylePicker(list(self.sources),sample,self.character.text().strip(),
+                self.brief.toPlainText(),self.root.text(),config,self,previous=previous)
+            self.style_dialog = dialog
+            accepted = dialog.exec() == QDialog.Accepted
+            if dialog.directory is not None and dialog.options:
+                self.style_samples_directory = dialog.directory
+                self.style_samples_context = context
+                self.style_sample_source = dialog.sample_source.currentData()
+                self.preferences.setValue('style/samples',dialog.directory)
+            if accepted:
+                self.selected_style = dialog.selected_style
+                self.style_context = context
+                self.preferences.setValue('style/selected',self.selected_style['selection_file'])
+                self.status.setText('已选择“'+self.selected_style['title']+'”。点击批量制作后，选中的完整样片直接复用。')
+            dialog.deleteLater()
+            self.style_dialog = None
+            self.preferences.sync()
+            self.update_actions()
+        except Exception as error:
+            self.style_dialog = None
+            self.status.setText('无法生成风格样片：'+str(error))
 
     def update_setup_hint(self):
         exists = Path(self.config.text()).expanduser().is_file()
@@ -744,7 +1128,7 @@ class Workbench(QMainWindow):
             load_settings(filename)
             self.config.setText(filename)
             self.remember_preferences()
-            self.status.setText('已选择已有配置。选择照片和角色后开始制作。')
+            self.status.setText('已选择已有配置。添加照片、填写角色后，先比较三个风格样片。')
         except Exception as error:
             self.status.setText('无法导入配置：' + str(error))
 
@@ -778,7 +1162,7 @@ class Workbench(QMainWindow):
                 self.config.setText(str(dialog.path))
                 self.remember_preferences()
                 self.update_setup_hint()
-                self.status.setText('连接设置已保存。服务会在实际制作时调用。')
+                self.status.setText('连接设置已保存。添加照片和角色后，可生成三个真实风格样片。')
         except Exception as error:
             self.status.setText('无法打开连接设置：' + str(error))
 
@@ -920,21 +1304,30 @@ class Workbench(QMainWindow):
         self.update_actions()
 
     def update_actions(self):
+        if not hasattr(self,'style_hint'):
+            return
         running = self.worker is not None
         has_photos = bool(self.sources)
         has_character = bool(self.character.text().strip())
         has_previous = bool(self.results or any(stage == '未完成' for stage in self.stages.values()))
         pending = sum(self.source_key(source) not in self.results and self.source_key(source) not in self.stages
             for source in self.sources)
-        self.start.setEnabled(not running and pending > 0 and has_character)
+        style_ready = self.style_is_current()
+        self.start.setEnabled(not running and pending > 0 and has_character and style_ready)
         self.start.setToolTip('请先添加照片' if not has_photos else
             '请填写角色' if not has_character else
+            '请先生成并选择真实风格样片' if not style_ready else
             '只制作新加入的照片，已有成功与失败照片不会再次提交' if pending else
             '本组照片已处理；添加新照片，或明确选择全部另做一批')
-        self.start.setText(f'制作新增 {pending} 张' if has_previous and pending else
-            '本组已处理' if has_previous else '开始制作')
+        self.start.setText(f'按选定风格制作新增 {pending} 张' if has_previous and pending else
+            '本组已处理' if has_previous else '按选定风格批量制作')
         self.remaining_button.setVisible(has_previous)
-        self.remaining_button.setEnabled(not running and has_photos and has_character)
+        self.remaining_button.setEnabled(not running and has_photos and has_character and style_ready)
+        self.style_button.setEnabled(not running and has_photos and has_character)
+        has_samples = self.style_samples_directory is not None and self.style_samples_context == self.current_style_context()
+        self.style_button.setText('查看 / 更换已选风格' if style_ready else '查看已有风格样片' if has_samples else '先看三个风格样片')
+        self.style_hint.setText('已选择：'+self.selected_style['title']+'。'+self.selected_style['summary'] if style_ready else
+            '批量前，先用一张原片比较三个真实风格样片。角色或补充要求改变后重新选择。')
         self.last_batch_button.setText('查看上次制作' if self.last_batch_directory else '查看已有结果')
         self.last_batch_button.setEnabled(not running)
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))
@@ -997,16 +1390,15 @@ class Workbench(QMainWindow):
                 raise ValueError('请添加照片并填写角色')
             if not self.root.text().strip():
                 raise ValueError('请选择保存目录')
+            if not self.style_is_current():
+                self.choose_style()
+                return
             if not Path(self.config.text()).expanduser().is_file():
                 self.configure_services()
                 if not Path(self.config.text()).expanduser().is_file():
                     return
-            config = load_settings(self.config.text())
-            if self.edge.text().strip():
-                edge = int(self.edge.text())
-                if edge <= 0:
-                    raise ValueError('请求长边应为正整数')
-                config['output_long_edge'] = edge
+            config = self.desktop_config()
+            load_style(self.selected_style['selection_file'])
             self.remember_preferences()
             sources = [source for source in self.sources if not only_pending or (
                 self.source_key(source) not in self.results and self.source_key(source) not in self.stages)]
@@ -1026,7 +1418,7 @@ class Workbench(QMainWindow):
             self.progress_bar.setFormat('已处理 %v / %m 张')
             self.open_folder_button.setEnabled(False)
             self.worker = Worker(sources, self.character.text().strip(), self.brief.toPlainText(),
-                self.root.text(), config)
+                self.root.text(), config,style=self.selected_style['selection_file'])
             self.worker.progress.connect(self.status.setText)
             self.worker.photo_stage.connect(self.set_photo_stage)
             self.worker.batch_created.connect(self.batch_started)
@@ -1038,7 +1430,7 @@ class Workbench(QMainWindow):
             self.start.setEnabled(False)
             self.remaining_button.setEnabled(False)
             self.last_batch_button.setEnabled(False)
-            self.status.setText('正在设计整组场景与光色')
+            self.status.setText('沿用选中的摄影方向，开始制作本批次')
             self.worker.start()
         except Exception as error:
             self.status.setText('无法开始：' + str(error))
@@ -1142,6 +1534,11 @@ class Workbench(QMainWindow):
 
     def closeEvent(self, event):
         self.remember_preferences()
+        if self.style_dialog is not None and self.style_dialog.worker is not None:
+            self.style_dialog.showNormal()
+            self.style_dialog.message.setPlainText('风格样片仍在制作，请在此查看进度；可以最小化等待。')
+            event.ignore()
+            return
         if self.worker is not None and self.worker.isRunning():
             if self.tray is not None:
                 self.close_after_finish = True

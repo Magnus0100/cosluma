@@ -53,13 +53,15 @@ def post_json(url, payload, *, key=None, response_path=None):
     return json.loads(data)
 
 
-def multipart(fields, name, filename, data, content_type='image/png'):
+def multipart(fields, name, filename, data, content_type='image/png', *, additional_files=()):
     boundary = 'cosluma-' + uuid.uuid4().hex
     parts = []
     for key, value in fields.items():
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode('utf-8'))
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode('utf-8'))
-    parts.extend([data, f'\r\n--{boundary}--\r\n'.encode('ascii')])
+    for field, file, pixels, mime in [(name,filename,data,content_type),*additional_files]:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{file}"\r\nContent-Type: {mime}\r\n\r\n'.encode('utf-8'))
+        parts.extend([pixels,b'\r\n'])
+    parts.append(f'--{boundary}--\r\n'.encode('ascii'))
     return b''.join(parts), 'multipart/form-data; boundary=' + boundary
 
 
@@ -81,7 +83,7 @@ def _describe(instruction, images, config, response_path):
     return json.loads(content)
 
 
-def plan_photos(sources, character, brief, library_path, config, directory):
+def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None):
     """Choose one shared photographic direction and relevant library examples."""
     entries = load_library(library_path)
     count = min(6,len(sources))
@@ -90,13 +92,20 @@ def plan_photos(sources, character, brief, library_path, config, directory):
     for source in selected:
         with open_rgb(source) as image:
             images.append((Path(source).name,preview_data_url(image,1280)))
+    if option_count is None:
+        task = ('直接定一个有角色氛围、精致、真实且可执行的整组摄影方向，不反问、不列候选。'
+            '返回 JSON，只有 direction 和 reference_ids。')
+    else:
+        task = (f'为用户设计 {option_count} 个可供真实样片比较的整组摄影方向。'
+            '方向应在场景叙事、材质、配色或情绪上有可辨认的差异，不能只是给同一场景换滤镜或改名称。'
+            '每个方向都适合这组角色、服装与原片受光，不为凑差异选择无法自然融合的极暗夜景。'
+            f'返回 JSON，只有 options，值为恰好 {option_count} 个对象。每个对象包含 title、summary、direction、reference_ids。'
+            'title 为便于用户选择的简短中文名称，summary 用一到两句话说明画面、光感和氛围；不包含模型或算法术语。')
     instruction = (
-        '你负责 COS 摄影后期的审美决策。用户只提供原片和角色，不知道怎样修；'
-        '请观察这组代表原片，直接定一个有角色氛围、精致、真实且可执行的整组摄影方向，不反问、不列候选。'
+        '你负责 COS 摄影后期的审美决策。请观察这组代表原片。' + task +
         '成片应有明确的摄影创作意图，不能只清除几个杂物、改成灰蓝色就结束。'
-        '返回 JSON，只有 direction 和 reference_ids。direction 用约 300 到 600 字说明这组的具体场景、'
-        '时间氛围、色彩、曝光层次、自然光来源、背景取舍和特效原则；reference_ids 从下方目录中'
-        '选取少量最相关的条目编号，通常 2 到 4 条，不需要特效时不要为了用素材而选特效。'
+        'direction 用约 300 到 600 字说明具体场景、时间氛围、色彩、曝光层次、自然光来源、背景取舍和特效原则；'
+        'reference_ids 从下方目录选取少量最相关的条目编号，通常 2 到 4 条，不需要特效时不要为了用素材而选特效。'
         '用户补充要求优先。没有补充要求时，由你依据角色的可靠常识、原片场地、实物妆造和受光决定；'
         '角色常识用于环境与情绪，不用于改变原片实物服装，不确定的角色设定不要编造。'
         '分清原拍摄场地与适合角色的创作场景：保留机位、尺度、人物支撑和接触几何，'
@@ -119,20 +128,33 @@ def plan_photos(sources, character, brief, library_path, config, directory):
         'direction 只确定特效的适用理由与视觉语言，不替所有照片统一决定全部添加或全部禁用。'
         '目录仅供场景、布光和色彩灵感；条目里其他人物、换装、广告版式和固定画幅均不适用。'
         f'\n角色：{character}\n补充要求：{brief or "无，由你决定"}\n提示词目录：\n'+catalogue(entries))
-    description = _describe(instruction,images,config,directory/'art-direction-response.json')
-    direction = description['direction']
-    if not isinstance(direction,str) or not direction.strip():
-        raise ValueError('The prompt writer returned no photographic direction')
-    indices = list(dict.fromkeys(description['reference_ids']))
-    if any(type(index) is not int or index<0 or index>=len(entries) for index in indices):
-        raise ValueError('The prompt writer selected an unknown library reference')
-    plan = {'direction':direction,'references':[entries[index] for index in indices],
-        'representative_sources':[str(source) for source in selected]}
-    save_json(directory/'art-direction.json',plan)
-    return plan
+    name = 'style-options' if option_count is not None else 'art-direction'
+    description = _describe(instruction,images,config,directory/(name+'-response.json'))
+    descriptions = description['options'] if option_count is not None else [description]
+    if not isinstance(descriptions, list) or (option_count is not None and len(descriptions) != option_count):
+        raise ValueError('提示词服务没有返回请求数量的摄影方向；原始响应已保存')
+    plans = []
+    for item in descriptions:
+        direction = item['direction']
+        if not isinstance(direction,str) or not direction.strip():
+            raise ValueError('The prompt writer returned no photographic direction')
+        indices = list(dict.fromkeys(item['reference_ids']))
+        if any(type(index) is not int or index<0 or index>=len(entries) for index in indices):
+            raise ValueError('The prompt writer selected an unknown library reference')
+        plan = {'direction':direction,'references':[entries[index] for index in indices],
+            'representative_sources':[str(source) for source in selected]}
+        if option_count is not None:
+            for key in ('title', 'summary'):
+                if not isinstance(item.get(key), str) or not item[key].strip():
+                    raise ValueError('摄影方向缺少名称或画面说明；原始响应已保存')
+                plan[key] = item[key].strip()
+        plans.append(plan)
+    result = plans if option_count is not None else plans[0]
+    save_json(directory/(name+'.json'),result)
+    return result
 
 
-def write_prompt(source, character, brief, library, config, directory, *, direction=''):
+def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None):
     instruction = (
         '你为没有修图灵感的用户设计 COS 摄影后期。观察原片，结合用户给出的角色、要求和下面的提示词库，'
         '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。prompt 是可交给图像编辑模型的完整提示词。'
@@ -140,6 +162,11 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         '边界框完整包住脸、假发和头饰，保留少量周围空间；不选择水面倒影、屏幕或照片中的次要人像。'
         '当镜中清晰正脸是作品主体时选择该头部，不选择前景背对镜头的后脑。'
         '提供了整组方向时，本张只据构图、姿态和原片光向细化，不另起一套场景或影调。'
+        '提供用户选定的真实样片时，以它的场景语义、材质、配色、曝光层次和光质为视觉参照；'
+        '本张仍按第一张本张原片的构图、姿态与受光细化，不照搬样片机位或人物动作。'
+        '生图模型也会收到原片作为第一张输入、风格样片作为第二张输入；有样片时在 prompt 中明确这两个职责，'
+        '第二张仅参考摄影风格，不复制其中人物、姿态、脸型或构图。'
+        'head_box 只定位本张原片的主体，不能从风格样片取坐标；样片不是身份回贴素材。'
         '复用已有生成图且未提供方向时，只确定原片主体头部，不重新设计场景。'
         '近景保持真实景深，俯拍不硬加地平线；倒影、镜像、必要的前景虚焦人物和接触关系均完整保留。'
         '提示词库只提供场景、光色、材质和特效灵感；其中其他角色的妆造、换脸塑形、换衣、'
@@ -164,13 +191,17 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         f'\n角色：{character}\n用户要求：{brief}\n整组摄影方向：{direction}\n选定参考：\n'
         + '\n\n'.join(item['title'] + '\n' + item['text'] for item in library))
     save_json(directory / 'prompt-sources.json', library)
-    description = _describe(instruction,[('本张原片',preview_data_url(source))],config,directory/'llm-response.json')
+    images = [('本张原片，头部定位只依据此图',preview_data_url(source))]
+    if style_reference is not None:
+        with open_rgb(style_reference) as image:
+            images.append(('用户选定的真实风格样片，仅参考摄影风格',preview_data_url(image,1280)))
+    description = _describe(instruction,images,config,directory/'llm-response.json')
     if not isinstance(description['prompt'],str) or len(description['head_box'])!=4:
         raise ValueError('The LLM did not return an edit prompt and one head box')
     return description
 
 
-def edit_image(source, prompt, config, directory, *, name='generated'):
+def edit_image(source, prompt, config, directory, *, name='generated', style_reference=None):
     # Send an oriented sRGB JPEG of the full frame for scene design. The
     # final compositing uses the full-resolution source pixels.
     stream = BytesIO()
@@ -178,7 +209,16 @@ def edit_image(source, prompt, config, directory, *, name='generated'):
     image_bytes = stream.getvalue()
     (directory / (name + '-input.jpg')).write_bytes(image_bytes)
     fields = {**config.get('parameters', {}), 'model': config['model'], 'prompt': prompt, 'n': 1}
-    body, content_type = multipart(fields, 'image[]', 'original.jpg', image_bytes, 'image/jpeg')
+    references = []
+    if style_reference is not None:
+        with open_rgb(style_reference) as reference:
+            reference.thumbnail((1280,1280))
+            buffer = BytesIO()
+            reference.save(buffer,format='JPEG',quality=95,subsampling=0,icc_profile=SRGB)
+        pixels = buffer.getvalue()
+        (directory/(name+'-style-reference.jpg')).write_bytes(pixels)
+        references.append(('image[]','selected-style.jpg',pixels,'image/jpeg'))
+    body, content_type = multipart(fields, 'image[]', 'original.jpg', image_bytes, 'image/jpeg',additional_files=references)
     headers = {'Content-Type': content_type}
     key = credential(config)
     if key:

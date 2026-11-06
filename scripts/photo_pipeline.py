@@ -1,9 +1,11 @@
 """One finishing chain shared by desktop, CLI and HTTP."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections import Counter
+from copy import deepcopy
 from datetime import datetime
+import json
 from pathlib import Path
 import shutil
 import uuid
@@ -55,7 +57,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         stage('编写提示词与确定主体头部')
         library = art_direction['references'] if art_direction is not None else []
         description = write_prompt(source_image,character,brief,library,config['llm'],directory,
-            direction=art_direction['direction'] if art_direction is not None else '')
+            direction=art_direction['direction'] if art_direction is not None else '',
+            style_reference=art_direction.get('style_reference') if art_direction is not None else None)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         prompt_path = directory/'prompt.txt'
@@ -63,7 +66,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         record['files']['prompt'] = str(prompt_path)
         if generated is None:
             stage('生成画面')
-            generated = edit_image(source_image,prompt,config['image'],directory)
+            generated = edit_image(source_image,prompt,config['image'],directory,
+                style_reference=art_direction.get('style_reference') if art_direction is not None else None)
         else:
             generated = Path(generated).expanduser().resolve()
             record['existing_generated'] = str(generated)
@@ -122,13 +126,129 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         raise failure from None
 
 
+def _failed_photo(source, error):
+    result = {'source':str(source),'status':'failed','error':str(error)}
+    if getattr(error, 'directory', None):
+        result['directory'] = str(error.directory)
+        result['stage'] = getattr(error, 'stage', '')
+    return result
+
+
+def _relocate_sample(value, original, target):
+    if isinstance(value,dict):
+        return {key:_relocate_sample(item,original,target) for key,item in value.items()}
+    if isinstance(value,list):
+        return [_relocate_sample(item,original,target) for item in value]
+    if isinstance(value,str) and (value==str(original) or value.startswith(str(original)+'\\') or value.startswith(str(original)+'/')):
+        return str(target)+value[len(str(original)):]
+    return value
+
+
+def _reuse_style_sample(selected, directory):
+    original = Path(selected['result']['directory'])
+    target = directory/(original.name+'-selected')
+    shutil.copytree(original,target)
+    result = _relocate_sample(deepcopy(selected['result']),original,target)
+    result.update(style_sample_reused=True,sample_origin=str(original),batch_directory=str(directory))
+    save_json(target/'run.json',result)
+    return result
+
+
+def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
+        progress=None, planned=None, sample_progress=None, started=None):
+    """Render three real styles through finish_photo, once per option."""
+    report = progress or (lambda message: None)
+    sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
+    sample_source = Path(sample_source).expanduser().resolve()
+    if sample_source not in sources:
+        raise ValueError('样片原片须从当前照片队列中选择')
+    directory = Path(root).expanduser().resolve()/('styles-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+    directory.mkdir(parents=True,exist_ok=False)
+    state = {'status':'planning','sample_source':str(sample_source),'sources':[str(source) for source in sources],
+        'character':character,'brief':brief,'options':{},
+        'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
+    save_json(directory/'styles.json',state)
+    if started is not None:
+        started(str(directory))
+    report('设计三个不同的摄影方向')
+    try:
+        represented = [sample_source] + [source for source in sources if source != sample_source]
+        plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,option_count=3)
+    except Exception as error:
+        message = getattr(error,'provider_message','') or str(error)
+        state.update(status='failed',error=message)
+        save_json(directory/'styles.json',state)
+        raise RuntimeError(f'设计风格样片：{message}。目录：{directory}') from None
+    state.update(status='rendering')
+    save_json(directory/'styles.json',state)
+    if planned is not None:
+        planned(plans,str(directory))
+    def produce(index, plan):
+        def stage(message):
+            if sample_progress is not None:
+                sample_progress(index,message)
+        option = {'index':index,'title':plan['title'],'summary':plan['summary'],'art_direction':plan,
+            'sample_source':str(sample_source),'styles_directory':str(directory),
+            'selection_file':str(directory/f'style-{index+1}.json'),
+            'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
+        try:
+            result = finish_photo(sample_source,character,directory,config,brief=brief,size=size,
+                art_direction=plan,progress=stage)
+        except Exception as error:
+            result = _failed_photo(sample_source,error)
+        option.update(status=result['status'],result=result)
+        if result['status'] != 'complete':
+            option['error'] = result['error']
+        save_json(option['selection_file'],option)
+        return option
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = {pool.submit(produce,index,plan) for index,plan in enumerate(plans)}
+        for future in as_completed(pending):
+            pending.remove(future)
+            option = future.result()
+            state['options'][str(option['index'])] = option
+            save_json(directory/'styles.json',state)
+            yield option
+    state['status'] = 'complete' if all(option['status']=='complete' for option in state['options'].values()) else 'unfinished'
+    save_json(directory/'styles.json',state)
+
+
+def load_style(path):
+    """Load an explicitly chosen sample, including a moved styles directory."""
+    path = Path(path).expanduser().resolve()
+    option = json.loads(path.read_text(encoding='utf-8-sig'))
+    if option.get('status') != 'complete' or option.get('result',{}).get('status') != 'complete':
+        raise ValueError('所选风格样片没有保存完整成片；请选择已完成的方案')
+    previous = Path(option['styles_directory'])
+    def locate(value):
+        value = Path(value)
+        try:
+            return str(path.parent/value.relative_to(previous))
+        except ValueError:
+            return str(value if value.is_absolute() else path.parent/value)
+    result = deepcopy(option['result'])
+    result['directory'] = locate(option['result']['directory'])
+    result['files'] = {key:locate(value) for key,value in option['result']['files'].items()}
+    if 'sr' in result:
+        result['sr'] = _relocate_sample(result['sr'],previous,path.parent)
+    option['result'] = result
+    for key in ('final', 'jpeg'):
+        if not Path(result['files'][key]).is_file():
+            raise FileNotFoundError(f'所选样片的成片文件不存在：{result["files"][key]}')
+    option.update(styles_directory=str(path.parent),selection_file=str(path))
+    return option
+
+
 def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None,
-        progress=None, photo_progress=None, batch_started=None):
+        progress=None, photo_progress=None, batch_started=None, style=None):
     """Run independent photos through finish_photo; each photo is attempted once."""
     report = progress or (lambda message: None)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
     if not sources:
         raise ValueError('No photographs were selected')
+    selected = load_style(style) if style is not None else None
+    if selected is not None and (selected['result']['character'] != character or selected['result']['brief'] != brief):
+        raise ValueError('角色或补充要求与所选样片不同，请按当前要求生成样片后选择')
     names = Counter(source.stem.casefold() for source in sources)
     directory = Path(root).expanduser().resolve()/('batch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
@@ -137,14 +257,28 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
     save_json(directory/'batch.json',state)
     if batch_started is not None:
         batch_started(str(directory))
-    report('设计整组场景与光色方向')
-    try:
-        art_direction = plan_photos(sources,character,brief,config['prompt_library'],config['llm'],directory)
-    except Exception as error:
-        message = getattr(error,'provider_message','') or str(error)
-        state.update(status='failed',error=message)
-        save_json(directory/'batch.json',state)
-        raise RuntimeError(f'设计整组场景与光色方向：{message}。目录：{directory}') from None
+    if selected is None:
+        report('设计整组场景与光色方向')
+        try:
+            art_direction = plan_photos(sources,character,brief,config['prompt_library'],config['llm'],directory)
+        except Exception as error:
+            message = getattr(error,'provider_message','') or str(error)
+            state.update(status='failed',error=message)
+            save_json(directory/'batch.json',state)
+            raise RuntimeError(f'设计整组场景与光色方向：{message}。目录：{directory}') from None
+    else:
+        report('沿用选中的风格与样片')
+        try:
+            reference = directory/'selected-style.jpg'
+            shutil.copyfile(selected['result']['files']['jpeg'],reference)
+            art_direction = deepcopy(selected['art_direction'])
+            art_direction['style_reference'] = str(reference)
+            save_json(directory/'art-direction.json',art_direction)
+        except Exception as error:
+            state.update(status='failed',stage='准备选中风格',error=str(error))
+            save_json(directory/'batch.json',state)
+            raise RuntimeError(f'准备选中风格：{error}。目录：{directory}') from None
+        state['selected_style'] = {key:selected[key] for key in ('title','summary','selection_file','sample_source')}
     state.update(stage='制作照片',direction=art_direction['direction'])
     save_json(directory/'batch.json',state)
     workers = config.get('workers', 4) if workers is None else workers
@@ -159,13 +293,25 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
         except Exception as error:
             # Return the error text so a Future does not retain a traceback
             # and the full-resolution image buffers in the failed call.
-            result = {'source':str(source),'status':'failed','error':str(error)}
-            if getattr(error, 'directory', None):
-                result['directory'] = str(error.directory)
-                result['stage'] = getattr(error, 'stage', '')
-            return result
+            return _failed_photo(source,error)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {pool.submit(produce, source): source for source in sources}
+        pending = {}
+        sample_source = Path(selected['result']['source']).resolve() if selected is not None else None
+        for source in sources:
+            if source == sample_source:
+                future = Future()
+                try:
+                    result = _reuse_style_sample(selected,directory)
+                except Exception as error:
+                    result = {'source':str(source),'status':'failed','stage':'整理选中样片',
+                        'error':f'整理选中样片：{error}。完整样片仍保留在 {selected["result"]["directory"]}',
+                        'directory':selected['result']['directory']}
+                future.set_result(result)
+                if photo_progress is not None:
+                    photo_progress(str(source),'复用选中的完整样片')
+            else:
+                future = pool.submit(produce, source)
+            pending[future] = source
         for future in as_completed(pending):
             source = pending.pop(future)
             result = future.result()
