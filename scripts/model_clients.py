@@ -203,7 +203,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
     return result
 
 
-def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None):
+def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None, creative_direction=''):
     instruction = (
         '你为没有修图灵感的用户设计 COS 摄影后期。观察原片，结合用户给出的角色、要求和下面的提示词库，'
         '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。prompt 是可交给图像编辑模型的完整提示词。'
@@ -237,7 +237,7 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         '完成一张人物与环境受光协调的精致摄影成片，生成头部的光色将作为原片整头融合参考。'
         '不要换人、改衣、移动人物或强改拍摄视角，不要输出多个候选、对比图、文字或水印。'
         'prompt 是直接编辑照片的简洁指令，不向图像模型解释后续程序、抠图和融合算法。'
-        f'\n角色：{character}\n用户要求：{brief}\n整组摄影方向：{direction}\n选定参考：\n'
+        f'\n角色：{character}\n用户要求：{brief}\n双方定稿的创作要求：{creative_direction}\n整组摄影方向：{direction}\n选定参考：\n'
         + '\n\n'.join(item['title'] + '\n' + item['text'] for item in library))
     save_json(directory / 'prompt-sources.json', library)
     images = [('本张原片，头部定位只依据此图',preview_data_url(source))]

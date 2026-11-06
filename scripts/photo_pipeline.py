@@ -58,7 +58,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         library = art_direction['references'] if art_direction is not None else []
         description = write_prompt(source_image,character,brief,library,config['llm'],directory,
             direction=art_direction['direction'] if art_direction is not None else '',
-            style_reference=art_direction.get('style_reference') if art_direction is not None else None)
+            style_reference=art_direction.get('style_reference') if art_direction is not None else None,
+            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '')
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         prompt_path = directory/'prompt.txt'
