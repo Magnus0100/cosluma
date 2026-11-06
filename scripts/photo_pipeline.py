@@ -148,9 +148,14 @@ def _relocate_sample(value, original, target):
 def _reuse_style_sample(selected, directory):
     original = Path(selected['result']['directory'])
     target = directory/(original.name+'-selected')
-    shutil.copytree(original,target)
-    result = _relocate_sample(deepcopy(selected['result']),original,target)
-    result.update(style_sample_reused=True,sample_origin=str(original),batch_directory=str(directory))
+    target.mkdir()
+    result = deepcopy(selected['result'])
+    for key in ('final','jpeg'):
+        photo = Path(result['files'][key])
+        copied = target/photo.name
+        shutil.copyfile(photo,copied)
+        result['files'][key] = str(copied)
+    result.update(directory=str(target),style_sample_reused=True,sample_origin=str(original),batch_directory=str(directory))
     save_json(target/'run.json',result)
     return result
 

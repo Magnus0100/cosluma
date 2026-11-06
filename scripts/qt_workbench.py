@@ -10,7 +10,7 @@ import sys
 import uuid
 from urllib.parse import urlsplit, urlunsplit
 
-from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QKeySequence, QPainter, QPalette, QPixmap, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QHeaderView,
@@ -409,6 +409,26 @@ class PhotoCanvas(QGraphicsView):
             painter.restore()
 
 
+class PreviewSignals(QObject):
+    loaded = Signal(object)
+
+
+class PreviewLoader(QRunnable):
+    """Decode native display pixels in the pool; create pixmaps on the GUI thread."""
+    def __init__(self, keys):
+        super().__init__()
+        self.keys = keys
+        self.signals = PreviewSignals()
+
+    def run(self):
+        images = {}
+        for key in self.keys:
+            reader = QImageReader(key[0])
+            reader.setAutoTransform(True)
+            images[key] = reader.read()
+        self.signals.loaded.emit(images)
+
+
 class PhotoPreview(QWidget):
     """Read display previews independently of the untouched production images."""
     cache = {}
@@ -419,6 +439,12 @@ class PhotoPreview(QWidget):
         self.output = None
         self.choice = 'compare'
         self.images = {}
+        self.keys = {}
+        self.loader = None
+        self.load_timer = QTimer(self)
+        self.load_timer.setSingleShot(True)
+        self.load_timer.setInterval(80)
+        self.load_timer.timeout.connect(self.load_pending)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         toolbar = QHBoxLayout()
@@ -491,12 +517,40 @@ class PhotoPreview(QWidget):
 
     def set_photo(self, source=None, output=None):
         self.source, self.output = source, output
-        self.images = {'source': self.read_preview(source,full=True), 'output': self.read_preview(output,full=True)}
+        self.keys = {}
+        for kind,path in (('source',source),('output',output)):
+            if path:
+                try:
+                    self.keys[kind] = (str(path),Path(path).stat().st_mtime_ns,True)
+                except OSError:
+                    self.keys[kind] = None
+        self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice if output else 'source'))
         self.mode.setEnabled(bool(output))
         self.mode.blockSignals(False)
         self.update_preview()
+        self.load_timer.start()
+
+    def load_pending(self):
+        if self.loader is not None:
+            return
+        missing = list(dict.fromkeys(key for key in self.keys.values() if key is not None and key not in self.cache))
+        if missing:
+            self.loader = PreviewLoader(missing)
+            self.loader.signals.loaded.connect(self.previews_loaded)
+            QThreadPool.globalInstance().start(self.loader)
+
+    @Slot(object)
+    def previews_loaded(self, images):
+        self.loader = None
+        for key,image in images.items():
+            self.cache[key] = QPixmap.fromImage(image) if not image.isNull() else None
+        while len(self.cache) > 6:
+            self.cache.pop(next(iter(self.cache)))
+        self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
+        self.update_preview()
+        self.load_pending()
 
     def change_mode(self):
         if self.output:
@@ -517,6 +571,8 @@ class PhotoPreview(QWidget):
                 label.setPixmap(pixels)
             elif not self.source:
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
+            elif self.keys.get(kind) is not None and self.keys[kind] not in self.cache:
+                label.setText('正在读取照片…')
             elif kind == 'output':
                 label.setText('成片暂时无法预览\n可打开成片或批次文件夹查看文件')
             elif not Path(self.source).is_file():
@@ -630,8 +686,6 @@ class StylePicker(QDialog):
         self.inspector.resize(1100,760)
         inspector_layout = QVBoxLayout(self.inspector)
         self.preview = PhotoPreview()
-        self.preview.set_photo(self.sample_source.currentData())
-        self.sample_source.currentIndexChanged.connect(lambda:self.show_option(self.current_option))
         inspector_layout.addWidget(self.preview,1)
         self.inspector_details = QPlainTextEdit()
         self.inspector_details.setReadOnly(True)
@@ -763,6 +817,15 @@ class StylePicker(QDialog):
                 self.change_sample_source()
                 self.message.setPlainText('已有样片记录无法读取，请重新选择原片后手动生成：'+str(error))
         self.update_creative_actions()
+        self.sample_source.currentIndexChanged.connect(self.change_representative)
+
+    def change_representative(self):
+        self.show_option(self.current_option)
+        try:
+            self.ensure_discussion()
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('保存代表原片选择失败：'+str(error))
 
     def is_busy(self):
         return self.worker is not None or self.chat_worker is not None
@@ -777,6 +840,7 @@ class StylePicker(QDialog):
         if self.discussion_directory is not None:
             save_json(Path(self.discussion_directory)/'conversation.json',{
                 'character':self.character,'brief':self.brief,'sources':self.sources,
+                'sample_source':self.sample_source.currentData(),
                 'messages':self.messages,'direction':self.creative_direction,
                 'samples_directory':self.directory,'sample_directories':self.sample_directories,
                 'selected_file':self.chosen_file,'frozen_direction':self.frozen_direction,
@@ -803,6 +867,9 @@ class StylePicker(QDialog):
         self.chosen_file = state.get('selected_file','')
         self.frozen_direction = state.get('frozen_direction','')
         self.chat_input.setPlainText(state.get('draft',''))
+        if state.get('sample_source') in self.sources:
+            self.sample_source.setCurrentIndex(self.sample_source.findData(state['sample_source']))
+            self.canvas.set_photo(self.sample_source.currentData())
         if state.get('samples_directory'):
             self.restore_samples(state['samples_directory'])
         self.render_conversation()
@@ -889,6 +956,7 @@ class StylePicker(QDialog):
 
     def inspect(self, index):
         self.show_option(index)
+        self.preview.set_photo(self.canvas.source,self.canvas.output)
         option = self.options.get(index)
         self.inspector_details.setPlainText(option['summary'] if option and option['status']=='complete' else
             option['error'] if option else '这是选中的代表原片，尚未完成此方案。')
@@ -912,7 +980,6 @@ class StylePicker(QDialog):
             button.setEnabled(False)
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
-        self.preview.set_photo(self.sample_source.currentData())
         self.canvas.set_photo(self.sample_source.currentData())
         self.active_caption.setText('原片')
         self.message.setPlainText('选择另一张代表原片后，再点击生成。之前的样片文件仍然保留。')
@@ -969,7 +1036,6 @@ class StylePicker(QDialog):
             button.setEnabled(False)
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
-        self.preview.set_photo(self.sample_source.currentData())
         self.canvas.set_photo(self.sample_source.currentData())
         self.active_caption.setText('原片 · 正在设计三个方向')
         self.generate.setEnabled(False)
@@ -1037,7 +1103,6 @@ class StylePicker(QDialog):
             card[3].setChecked(number==index)
         option = self.options.get(index)
         output = option['result']['files']['jpeg'] if option and option['status']=='complete' else None
-        self.preview.set_photo(self.sample_source.currentData(),output)
         self.canvas.set_photo(self.sample_source.currentData(),output)
         self.active_caption.setText(f'方案 {index+1} · '+option['title']+'  '+option['summary'] if option else '原片')
         if option and option['status']!='complete':
@@ -1704,7 +1769,7 @@ class Workbench(QMainWindow):
 
     @staticmethod
     def source_key(source):
-        return os.path.normcase(str(Path(source).expanduser().resolve()))
+        return os.path.normcase(str(source))
 
     def schedule_workspace_save(self):
         if not self.workspace_restoring:
@@ -1736,10 +1801,7 @@ class Workbench(QMainWindow):
             return
         try:
             state = json.loads(saved)
-            if not isinstance(state,dict) or not isinstance(state.get('sources'),list):
-                raise ValueError('照片队列记录格式不正确')
-            self.sources = list(dict.fromkeys(str(Path(source).expanduser().resolve()) for source in state['sources']
-                if isinstance(source,str) and Path(source).suffix.lower() in IMAGE_EXTENSIONS))
+            self.sources = state['sources']
             known = {self.source_key(source) for source in self.sources}
             self.character.setText(state.get('character',self.character.text()))
             self.brief_character = self.character.text().strip()
@@ -1747,36 +1809,22 @@ class Workbench(QMainWindow):
             self.batch_directory = state.get('batch_directory')
             self.batch_error = state.get('batch_error','')
             self.photo_errors = {key:str(error) for key,error in state.get('photo_errors',{}).items() if key in known}
+            self.results = {self.source_key(result['source']):result for result in state['results']
+                if self.source_key(result['source']) in known}
             for key,stage in state.get('stages',{}).items():
-                if key in known:
+                if key in known and key not in self.results:
                     self.stages[key] = '未完成'
                     self.photo_errors.setdefault(key,'上次停在“'+stage+'”。未自动继续制作；如需重做，请明确选择“全部另做一批”。')
-            results = list(state.get('results',[]))
-            record_note = ''
-            if self.batch_directory:
-                record = Path(self.batch_directory)/'batch.json'
-                if record.is_file():
-                    try:
-                        batch = json.loads(record.read_text(encoding='utf-8'))
-                        results.extend(batch.get('items',{}).values())
-                        if batch.get('status')=='failed':
-                            self.batch_error = batch.get('error',self.batch_error)
-                    except (OSError,ValueError,TypeError,AttributeError):
-                        record_note = '批次文件暂时无法读取，已保留本机记住的状态。'
-            for result in results:
-                key = self.source_key(result['source'])
-                if key not in known:
-                    continue
-                if result.get('status')=='complete' and (not result.get('files',{}).get('jpeg') or
-                        len(result.get('output_dimensions',[]))!=2):
-                    self.results.pop(key,None)
-                    self.stages[key] = '未完成'
-                    self.photo_errors[key] = '上次的成片记录不完整，请从“查看已有结果”打开批次文件夹。'
-                    continue
-                if result.get('status') in ('complete','failed'):
-                    self.results[key] = result
-                    self.stages.pop(key,None)
-                    self.photo_errors.pop(key,None)
+            if self.batch_directory and self.stages:
+                batch = json.loads((Path(self.batch_directory)/'batch.json').read_text(encoding='utf-8'))
+                for result in batch['items'].values():
+                    key = self.source_key(result['source'])
+                    if key in self.stages and result['status'] in ('complete','failed'):
+                        self.results[key] = result
+                        self.stages.pop(key)
+                        self.photo_errors.pop(key,None)
+                if batch['status']=='failed':
+                    self.batch_error = batch['error']
             self.refresh_queue()
             selected = state.get('selected_source')
             if selected and self.source_key(selected) in self.rows:
@@ -1787,13 +1835,8 @@ class Workbench(QMainWindow):
             if self.sources:
                 self.status.setText(f'已恢复 {len(self.sources)} 张照片和已有制作状态。'+
                     (f'{interrupted} 张上次未完成，未自动重做。' if interrupted else '')+
-                    (f'{missing} 张原片已移动或缺失，请移除后重新添加。' if missing else '')+record_note)
-        except (OSError,ValueError,KeyError,TypeError,AttributeError) as error:
-            for source in self.sources:
-                key = self.source_key(source)
-                if key not in self.results:
-                    self.stages[key] = '未完成'
-                    self.photo_errors[key] = '上次记录无法读取，请从“查看已有结果”打开保存的批次；没有自动重新提交。'
+                    (f'{missing} 张原片已移动或缺失，请移除后重新添加。' if missing else ''))
+        except (OSError,ValueError,KeyError) as error:
             self.refresh_queue()
             self.status.setText('上次工作区记录无法完整恢复：'+str(error)+'。已有成片可从“查看已有结果”打开。')
 
@@ -1994,6 +2037,7 @@ class Workbench(QMainWindow):
         known = {self.source_key(source) for source in self.sources}
         added = duplicates = skipped = 0
         for path in candidates:
+            path = path.resolve()
             key = self.source_key(path)
             if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
                 skipped += 1
@@ -2237,7 +2281,6 @@ class Workbench(QMainWindow):
         self.batch_directory = directory
         self.last_batch_directory = directory
         self.preferences.setValue('last_batch_directory', directory)
-        self.preferences.sync()
         self.open_folder_button.setEnabled(True)
         self.show_selected()
         self.save_workspace()
@@ -2246,6 +2289,8 @@ class Workbench(QMainWindow):
     def show_result(self, result):
         key = self.source_key(result['source'])
         self.results[key] = result
+        self.stages.pop(key,None)
+        self.photo_errors.pop(key,None)
         self.batch_directory = result.get('batch_directory', self.batch_directory)
         self.listing.item(self.rows[key], 1).setText('完成' if result['status'] == 'complete' else '失败')
         self.listing.item(self.rows[key], 1).setToolTip('' if result['status'] == 'complete' else str(result['error']))
