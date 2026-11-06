@@ -11,9 +11,9 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QKeySequence, QPalette, QPixmap, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
     QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget)
@@ -23,6 +23,196 @@ from image_io import IMAGE_EXTENSIONS, save_json
 from model_clients import discuss_style
 from photo_pipeline import finish_batch, load_style, make_style_samples
 from settings import default_settings_path, editable_settings, load_settings, save_settings
+
+
+def apply_theme(app):
+    """Keep the desktop, creative workspace and native popup colours consistent."""
+    app.setStyle('Fusion')
+    palette = QPalette()
+    for role, colour in ((QPalette.Window,'#eef1f4'),(QPalette.WindowText,'#243244'),
+            (QPalette.Base,'#ffffff'),(QPalette.AlternateBase,'#f2f5f8'),
+            (QPalette.Text,'#243244'),(QPalette.Button,'#ffffff'),
+            (QPalette.ButtonText,'#243244'),(QPalette.Highlight,'#315f87'),
+            (QPalette.HighlightedText,'#ffffff'),(QPalette.PlaceholderText,'#778197'),
+            (QPalette.ToolTipBase,'#ffffff'),(QPalette.ToolTipText,'#243244')):
+        palette.setColor(role,QColor(colour))
+    palette.setColor(QPalette.Disabled,QPalette.Text,QColor('#96a1ae'))
+    palette.setColor(QPalette.Disabled,QPalette.ButtonText,QColor('#96a1ae'))
+    app.setPalette(palette)
+    app.setStyleSheet('''
+        QWidget { color: #243244; font-size: 13px; }
+        QMainWindow, QDialog { background: #eef1f4; }
+        QLabel { background: transparent; }
+        QLabel[role="title"] { font-size: 24px; font-weight: 600; }
+        QLabel[role="heading"] { font-size: 16px; font-weight: 600; }
+        QLabel[role="muted"] { color: #657588; }
+        QLabel[role="eyebrow"] { color: #56799b; font-size: 11px; font-weight: 600; }
+        QLabel[role="badge"] { color: #315f87; background: #e5eef6; border-radius: 8px; padding: 5px 10px; }
+        QFrame[role="panel"], QWidget[role="panel"] { background: #ffffff; border: 1px solid #dbe2e9; border-radius: 12px; }
+        QFrame[role="composer"] { background: #ffffff; border: 1px solid #cfd9e3; border-radius: 12px; }
+        QFrame[role="userBubble"] { background: #e2edf6; border-radius: 11px; }
+        QFrame[role="agentBubble"] { background: #f1f4f7; border-radius: 11px; }
+        QFrame[role="welcome"] { background: #f2f6fa; border: 1px solid #d8e3ed; border-radius: 12px; }
+        QFrame[role="sampleCard"] { background: #f7f9fb; border: 1px solid #d5dfe8; border-radius: 11px; }
+        QLabel[role="message"] { font-size: 13px; }
+        QLabel[role="messageAuthor"] { color: #6a7c8e; font-size: 11px; font-weight: 600; }
+        QPushButton, QToolButton { background: #ffffff; border: 1px solid #cfd9e3; border-radius: 8px; padding: 8px 12px; }
+        QPushButton:hover, QToolButton:hover { background: #edf3f8; border-color: #a4b8c9; }
+        QPushButton:pressed, QToolButton:pressed { background: #e1eaf2; }
+        QPushButton:focus, QToolButton:focus { border-color: #426f98; }
+        QPushButton:disabled, QToolButton:disabled { color: #8d9baa; background: #eaf0f4; border-color: #dbe4eb; }
+        QPushButton[kind="primary"] { background: #315f87; color: #ffffff; border: 1px solid #315f87; font-weight: 600; }
+        QPushButton[kind="primary"]:hover { background: #3c719e; }
+        QPushButton[kind="primary"]:pressed { background: #244a6c; }
+        QPushButton[kind="primary"]:disabled { background: #dce5ec; color: #8b9ba9; border-color: #d1dce5; }
+        QPushButton[kind="quiet"], QToolButton[kind="quiet"] { background: transparent; border-color: transparent; color: #586e83; }
+        QPushButton[kind="quiet"]:hover, QToolButton[kind="quiet"]:hover { color: #234c70; background: #e5edf4; }
+        QLineEdit, QPlainTextEdit, QComboBox { background: #ffffff; border: 1px solid #d2dce6; border-radius: 8px; padding: 8px; selection-background-color: #315f87; }
+        QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-color: #426f98; }
+        QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled { color: #8596a5; border-color: #ffffff; }
+        QPlainTextEdit[role="composer"] { border: none; background: transparent; padding: 0; }
+        QPlainTextEdit[role="summary"] { border: none; background: #f1f5f8; padding: 10px; }
+        QComboBox { padding-right: 26px; }
+        QComboBox::drop-down { width: 22px; border: none; }
+        QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #b7c9d8; selection-background-color: #d8e8f5; padding: 4px; outline: 0; }
+        QScrollArea { border: none; background: transparent; }
+        QScrollArea > QWidget > QWidget { background: transparent; }
+        QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
+        QScrollBar::handle:vertical { background: #b7c7d5; border-radius: 3px; min-height: 28px; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        QScrollBar:horizontal { background: transparent; height: 8px; }
+        QScrollBar::handle:horizontal { background: #b7c7d5; border-radius: 3px; min-width: 28px; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+        QGroupBox { border: 1px solid #d7e1ea; border-radius: 10px; margin-top: 12px; padding: 15px 12px 12px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #4b657d; }
+        QTableWidget, QListWidget { background: #ffffff; border: 1px solid #d5e0e9; border-radius: 10px; gridline-color: #e9eef3; outline: 0; }
+        QTableWidget::item, QListWidget::item { padding: 9px; border: none; }
+        QTableWidget::item:selected, QListWidget::item:selected { background: #e3edf6; color: #234b6e; }
+        QHeaderView::section { background: #f7f9fb; color: #647a8e; border: none; border-bottom: 1px solid #dce5ed; padding: 9px; }
+        QTabWidget::pane { border: 1px solid #d9e3ec; border-radius: 10px; padding: 10px; }
+        QTabBar::tab { background: #e8eef4; color: #5d7287; padding: 10px 14px; border-radius: 7px; margin: 2px; }
+        QTabBar::tab:selected { background: #ffffff; color: #254f73; }
+        QProgressBar { background: #e1e9f0; border: none; border-radius: 5px; text-align: center; color: #345573; min-height: 16px; }
+        QProgressBar::chunk { background: #88a9c4; border-radius: 5px; }
+        QSplitter::handle { background: transparent; width: 10px; }
+        QSplitter::handle:hover { background: #cfdfec; }
+        QMenu { background: #ffffff; border: 1px solid #d4dfe8; padding: 5px; }
+        QMenu::item { padding: 8px 18px; border-radius: 5px; }
+        QMenu::item:selected { background: #e6eff6; }
+        QToolTip { color: #243244; background: #ffffff; border: 1px solid #c1d1df; padding: 7px; }
+        QToolButton[role="samplePreview"] { background: #12151d; border: 1px solid #303849; border-radius: 9px; color: #a7b8c8; padding: 8px; }
+        QToolButton[role="samplePreview"]:hover { border-color: #8cb4d4; }
+        QToolButton[role="samplePreview"]:checked { border: 2px solid #5e9bca; background: #243b50; }
+        QLabel[role="photoCanvas"] { background: #202934; color: #a9b9c8; border: 1px solid #202934; border-radius: 10px; padding: 8px; }
+    ''')
+
+
+def ui_label(text, role='muted'):
+    label = QLabel(text)
+    label.setProperty('role',role)
+    label.setTextFormat(Qt.PlainText)
+    return label
+
+
+class StatusText(QLabel):
+    def __init__(self, text='', parent=None):
+        super().__init__(text,parent)
+        self.setWordWrap(True)
+        self.setTextFormat(Qt.PlainText)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.setProperty('role','muted')
+
+    def setPlainText(self, text):
+        self.setText(text)
+        self.setToolTip(text)
+
+    def toPlainText(self):
+        return self.text()
+
+
+class SamplePreview(QToolButton):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setIconSize(QSize(max(80,self.width()-22),max(40,self.height()-24)))
+
+
+class SampleCard(QFrame):
+    def __init__(self, number, parent=None):
+        super().__init__(parent)
+        self.setProperty('role','sampleCard')
+        self.column = QVBoxLayout(self)
+        self.column.setContentsMargins(10,10,10,10)
+        self.column.setSpacing(6)
+        self.title = ui_label(f'方案 {number}','heading')
+        self.full_title = f'方案 {number}'
+        self.title.setFixedHeight(20)
+        self.column.addWidget(self.title)
+
+    def setTitle(self, text):
+        self.full_title = text
+        self.title.setText(self.title.fontMetrics().elidedText(text,Qt.ElideRight,max(60,self.width()-22)))
+        self.title.setToolTip(text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setTitle(self.full_title)
+
+
+class ConversationView(QScrollArea):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.content = QWidget()
+        self.rows = QVBoxLayout(self.content)
+        self.rows.setContentsMargins(0,0,6,0)
+        self.rows.setSpacing(14)
+        self.setWidget(self.content)
+        self.show_messages([])
+
+    def show_messages(self, messages, pending=None):
+        while self.rows.count():
+            item = self.rows.takeAt(0)
+            if item.widget() is not None:
+                item.widget().hide()
+                item.widget().deleteLater()
+        if not messages and pending is None:
+            welcome = QFrame()
+            welcome.setProperty('role','welcome')
+            column = QVBoxLayout(welcome)
+            column.setContentsMargins(18,20,18,20)
+            column.setSpacing(12)
+            column.addWidget(ui_label('从这组照片聊起','heading'))
+            note = ui_label('说说你想保留的细节、角色的气质，或让 Agent 先看看原片。')
+            note.setWordWrap(True)
+            column.addWidget(note)
+            self.rows.addWidget(welcome)
+        for row in [*messages,*([pending] if pending else [])]:
+            user = row['role']=='user'
+            bubble = QFrame()
+            bubble.setProperty('role','userBubble' if user else 'agentBubble')
+            column = QVBoxLayout(bubble)
+            column.setContentsMargins(14,12,14,14)
+            column.setSpacing(7)
+            column.addWidget(ui_label('你' if user else '摄影 Agent','messageAuthor'))
+            body = QLabel()
+            body.setProperty('role','message')
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse|Qt.LinksAccessibleByMouse)
+            if user:
+                body.setTextFormat(Qt.PlainText)
+                body.setText(row['content'])
+            else:
+                document = QTextDocument()
+                document.setDefaultFont(QApplication.font())
+                document.setMarkdown(row['content'])
+                body.setTextFormat(Qt.RichText)
+                body.setText(document.toHtml())
+            column.addWidget(body)
+            self.rows.addWidget(bubble)
+        self.rows.addStretch(1)
+        QTimer.singleShot(0,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
 
 
 def endpoint_url(value, service):
@@ -164,7 +354,7 @@ class PhotoPreview(QWidget):
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumSize(100, 160)
         label.setWordWrap(True)
-        label.setStyleSheet('background: #f3f5f7; color: #526170; border: 1px solid #d6dde3; padding: 4px')
+        label.setProperty('role','photoCanvas')
         return label
 
     def read_preview(self, path):
@@ -232,7 +422,8 @@ class StylePicker(QDialog):
     def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None, discussion=None):
         super().__init__(parent)
         self.setWindowTitle('与摄影 Agent 讨论风格 · '+character)
-        self.resize(1440, 850)
+        self.resize(1400, 880)
+        self.setMinimumSize(1080,720)
         self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
         self.sources, self.character, self.brief = sources, character, brief
         self.config, self.root = config, root
@@ -253,43 +444,62 @@ class StylePicker(QDialog):
         self.directory = None
         self.failure_message = ''
         layout = QVBoxLayout(self)
-        title = QLabel('与摄影 Agent 讨论，比较真实样片后定稿')
-        title.setStyleSheet('font-size: 18px; font-weight: 600')
-        layout.addWidget(title)
-        context = QLabel('当前角色：'+character)
-        context.setTextFormat(Qt.PlainText)
-        context.setWordWrap(True)
-        layout.addWidget(context)
-        explanation = QLabel('先聊角色、场景和想要的感觉，也可针对样片提出修改；按当前讨论生成三个真实样片。'
-            '定稿后再返回批量制作，选中的样片直接收进结果。')
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        layout.setContentsMargins(24,22,24,18)
+        layout.setSpacing(18)
+        header = QHBoxLayout()
+        heading = QVBoxLayout()
+        heading.setSpacing(5)
+        heading.addWidget(ui_label('创作工作室','title'))
+        heading.addWidget(ui_label('从原片出发，一起找到这组照片的方向。'))
+        header.addLayout(heading,1)
+        context = ui_label(character,'badge')
+        context.setToolTip('当前角色：'+character)
+        header.addWidget(context,0,Qt.AlignVCenter)
+        layout.addLayout(header)
+        workspace = QSplitter(Qt.Horizontal)
+        workspace.setHandleWidth(14)
+        workspace.setChildrenCollapsible(False)
+        sample_panel = QFrame()
+        sample_panel.setProperty('role','panel')
+        sample_layout = QVBoxLayout(sample_panel)
+        sample_layout.setContentsMargins(18,18,18,18)
+        sample_layout.setSpacing(12)
         row = QHBoxLayout()
-        row.addWidget(QLabel('样片原片'))
+        row.setSpacing(8)
+        row.addWidget(ui_label('代表原片'))
         self.sample_source = QComboBox()
         for source in sources:
             self.sample_source.addItem(Path(source).name, source)
             self.sample_source.setItemData(self.sample_source.count()-1,source,Qt.ToolTipRole)
         self.sample_source.setCurrentIndex(max(0,self.sample_source.findData(sample_source)))
         row.addWidget(self.sample_source,1)
-        original = QPushButton('查看这张原片')
+        original = QPushButton('放大对比')
+        original.setProperty('kind','quiet')
         original.clicked.connect(lambda:self.inspect(self.current_option))
         row.addWidget(original)
         self.generate = QPushButton('按当前讨论生成三个样片')
-        self.generate.setMinimumHeight(34)
+        self.generate.setProperty('kind','primary')
+        self.generate.setMinimumHeight(38)
         self.generate.clicked.connect(self.generate_samples)
-        row.addWidget(self.generate)
-        self.change_source = QPushButton('换一张原片试风格')
+        self.change_source = QPushButton('更换原片')
+        self.change_source.setProperty('kind','quiet')
         self.change_source.clicked.connect(self.change_sample_source)
         row.addWidget(self.change_source)
-        layout.addLayout(row)
+        sample_layout.addLayout(row)
+        self.canvas = PhotoPreview()
+        self.canvas.set_photo(self.sample_source.currentData())
+        sample_layout.addWidget(self.canvas,1)
+        self.active_caption = ui_label('原片')
+        self.active_caption.setWordWrap(True)
+        self.active_caption.setMaximumHeight(40)
+        sample_layout.addWidget(self.active_caption)
         self.inspector = QDialog(self)
         self.inspector.setWindowTitle('样片与原片大图对比')
         self.inspector.resize(1100,760)
         inspector_layout = QVBoxLayout(self.inspector)
         self.preview = PhotoPreview()
         self.preview.set_photo(self.sample_source.currentData())
-        self.sample_source.currentIndexChanged.connect(lambda: self.preview.set_photo(self.sample_source.currentData()))
+        self.sample_source.currentIndexChanged.connect(lambda:self.show_option(self.current_option))
         inspector_layout.addWidget(self.preview,1)
         self.inspector_details = QPlainTextEdit()
         self.inspector_details.setReadOnly(True)
@@ -298,77 +508,112 @@ class StylePicker(QDialog):
         back = QPushButton('返回三个方案')
         back.clicked.connect(self.inspector.accept)
         inspector_layout.addWidget(back)
-        workspace = QSplitter(Qt.Horizontal)
-        sample_panel = QWidget()
-        choices = QHBoxLayout(sample_panel)
+        self.sample_strip = QWidget()
+        self.sample_strip.setFixedHeight(228)
+        choices = QHBoxLayout(self.sample_strip)
         choices.setContentsMargins(0,0,0,0)
+        choices.setSpacing(10)
         for index in range(3):
-            panel = QGroupBox(f'方案 {index+1}')
-            card = QVBoxLayout(panel)
-            thumbnail = QToolButton()
+            panel = SampleCard(index+1)
+            card = panel.column
+            thumbnail = SamplePreview()
+            thumbnail.setProperty('role','samplePreview')
             thumbnail.setText('等待生成样片')
             thumbnail.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-            thumbnail.setIconSize(QSize(230,290))
-            thumbnail.setMinimumHeight(300)
+            thumbnail.setFixedHeight(92)
             thumbnail.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
             thumbnail.setCheckable(True)
-            thumbnail.clicked.connect(lambda _checked=False,index=index:self.inspect(index))
+            thumbnail.clicked.connect(lambda _checked=False,index=index:self.show_option(index))
             card.addWidget(thumbnail)
             summary = QLabel('分析当前角色与照片后，再确定此方向')
             summary.setWordWrap(True)
             summary.setTextFormat(Qt.PlainText)
-            summary.setMaximumHeight(48)
-            stage = QLabel('尚未分析')
+            summary.setFixedHeight(28)
+            stage = ui_label('尚未分析')
             stage.setWordWrap(True)
             stage.setTextFormat(Qt.PlainText)
-            stage.setMaximumHeight(40)
+            stage.setFixedHeight(16)
             card.addWidget(summary)
             card.addWidget(stage)
-            button = QPushButton('定稿并用于批量')
+            button = QPushButton('放大对比')
+            button.setProperty('kind','quiet')
+            button.setFixedHeight(28)
+            button.setStyleSheet('padding: 2px 8px')
             button.setEnabled(False)
-            button.clicked.connect(lambda _checked=False,index=index:self.choose(index))
+            button.clicked.connect(lambda _checked=False,index=index:self.inspect(index))
             card.addWidget(button)
             self.cards[index] = (summary,stage,button,thumbnail,panel)
             choices.addWidget(panel,1)
+        self.sample_strip.hide()
+        sample_layout.addWidget(self.sample_strip)
+        self.empty_hint = ui_label('还没有样片。先聊想法，或让 Agent 根据角色和原片探索三个方向。')
+        self.empty_hint.setWordWrap(True)
+        sample_layout.addWidget(self.empty_hint)
         workspace.addWidget(sample_panel)
-        chat_panel = QWidget()
+        chat_panel = QFrame()
+        chat_panel.setProperty('role','panel')
         chat_layout = QVBoxLayout(chat_panel)
-        chat_layout.setContentsMargins(10,0,0,0)
-        chat_layout.addWidget(QLabel('与摄影 Agent 讨论'))
-        self.chat_history = QPlainTextEdit()
-        self.chat_history.setReadOnly(True)
-        self.chat_history.setPlaceholderText('可以先聊想法，也可以先试三个方向。Agent 会看到当前角色、原片和已完成样片。')
+        chat_layout.setContentsMargins(18,18,18,18)
+        chat_layout.setSpacing(12)
+        chat_layout.addWidget(ui_label('一起构思','heading'))
+        chat_layout.addWidget(ui_label('摄影 Agent 会结合原片与样片回应。'))
+        self.chat_history = ConversationView()
         chat_layout.addWidget(self.chat_history,1)
+        chat_layout.addWidget(ui_label('当前创作要求'))
         self.discussion_summary = QPlainTextEdit()
+        self.discussion_summary.setProperty('role','summary')
         self.discussion_summary.setReadOnly(True)
         self.discussion_summary.setPlaceholderText('讨论形成的创作要求会显示在这里')
-        self.discussion_summary.setMaximumHeight(88)
+        self.discussion_summary.setFixedHeight(72)
         chat_layout.addWidget(self.discussion_summary)
+        composer = QFrame()
+        composer.setProperty('role','composer')
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(12,12,12,10)
+        composer_layout.setSpacing(8)
         self.chat_input = QPlainTextEdit()
-        self.chat_input.setPlaceholderText('例如：方案 2 的氛围对了，但背景太空，想更贴近这个角色的故事。')
-        self.chat_input.setMaximumHeight(85)
+        self.chat_input.setProperty('role','composer')
+        self.chat_input.setPlaceholderText('聊聊你想要的感觉，或指出样片里想改的地方…')
+        self.chat_input.setFixedHeight(66)
         self.chat_input.textChanged.connect(self.update_creative_actions)
-        chat_layout.addWidget(self.chat_input)
-        self.send = QPushButton('发送给 Agent')
+        composer_layout.addWidget(self.chat_input)
+        send_row = QHBoxLayout()
+        send_row.addWidget(ui_label('Ctrl + Enter 发送'))
+        send_row.addStretch(1)
+        self.send = QPushButton('发送')
         self.send.clicked.connect(self.send_message)
-        chat_layout.addWidget(self.send)
-        chat_panel.setMinimumWidth(310)
+        send_row.addWidget(self.send)
+        composer_layout.addLayout(send_row)
+        chat_layout.addWidget(composer)
+        self.send_shortcut = QShortcut(QKeySequence('Ctrl+Return'),self.chat_input)
+        self.send_shortcut.activated.connect(self.send_message)
+        self.keypad_send_shortcut = QShortcut(QKeySequence('Ctrl+Enter'),self.chat_input)
+        self.keypad_send_shortcut.activated.connect(self.send_message)
+        chat_layout.addWidget(self.generate)
+        chat_panel.setMinimumWidth(330)
+        sample_panel.setMinimumWidth(620)
         workspace.addWidget(chat_panel)
-        workspace.setSizes([1000,360])
+        workspace.setStretchFactor(0,2)
+        workspace.setStretchFactor(1,1)
+        workspace.setSizes([900,400])
         layout.addWidget(workspace,1)
-        self.message = QPlainTextEdit('可以先与 Agent 聊想法，再主动生成样片；只有你定稿后，才进入批量制作。')
-        self.message.setReadOnly(True)
-        self.message.setMaximumHeight(60)
-        layout.addWidget(self.message)
         footer = QHBoxLayout()
+        self.message = StatusText('先讨论和试样，满意后再定稿。')
+        self.message.setMaximumHeight(42)
+        footer.addWidget(self.message,1)
         self.open_folder = QPushButton('打开样片文件夹')
+        self.open_folder.setProperty('kind','quiet')
         self.open_folder.setEnabled(False)
         self.open_folder.clicked.connect(lambda:BatchResults.open_path(self.directory))
         footer.addWidget(self.open_folder)
-        footer.addStretch(1)
         self.cancel = QPushButton('返回照片队列')
         self.cancel.clicked.connect(self.reject)
         footer.addWidget(self.cancel)
+        self.finalize = QPushButton('定稿并用于批量')
+        self.finalize.setProperty('kind','primary')
+        self.finalize.setMinimumHeight(38)
+        self.finalize.clicked.connect(lambda:self.choose(self.current_option))
+        footer.addWidget(self.finalize)
         layout.addLayout(footer)
         if discussion is not None:
             try:
@@ -419,9 +664,7 @@ class StylePicker(QDialog):
         self.render_conversation()
 
     def render_conversation(self):
-        self.chat_history.setPlainText('\n\n'.join(('你' if row['role']=='user' else '摄影 Agent')+'\n'+row['content'] for row in self.messages))
-        scrollbar = self.chat_history.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self.chat_history.show_messages(self.messages)
         self.discussion_summary.setPlainText(self.creative_direction)
 
     def update_creative_actions(self):
@@ -435,8 +678,9 @@ class StylePicker(QDialog):
         self.cancel.setEnabled(not busy)
         self.sample_source.setEnabled(not busy and not self.options)
         for index,card in self.cards.items():
-            card[2].setEnabled(not busy and self.samples_direction==self.creative_direction
-                and self.options.get(index,{}).get('status')=='complete')
+            card[2].setEnabled(index in self.options)
+        self.finalize.setEnabled(not busy and self.samples_direction==self.creative_direction
+            and self.options.get(self.current_option,{}).get('status')=='complete')
 
     def send_message(self):
         text = self.chat_input.toPlainText().strip()
@@ -454,7 +698,7 @@ class StylePicker(QDialog):
             self.chat_worker.reply_ready.connect(self.receive_reply)
             self.chat_worker.failed.connect(self.chat_failed)
             self.chat_worker.finished.connect(self.chat_finished)
-            self.chat_history.setPlainText(self.chat_history.toPlainText()+'\n\n你\n'+text+'\n\n摄影 Agent 正在查看素材并回复…')
+            self.chat_history.show_messages(conversation,{'role':'assistant','content':'正在查看原片与样片…'})
             self.chat_input.clear()
             self.message.setPlainText('Agent 正在结合角色、原片与已有样片回复；这一步只讨论。')
             self.update_creative_actions()
@@ -506,6 +750,8 @@ class StylePicker(QDialog):
             return
         self.options.clear()
         self.directory = None
+        self.sample_strip.hide()
+        self.empty_hint.show()
         self.open_folder.setEnabled(False)
         self.sample_source.setEnabled(True)
         self.generate.setText('按当前讨论生成三个样片')
@@ -518,6 +764,8 @@ class StylePicker(QDialog):
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
         self.preview.set_photo(self.sample_source.currentData())
+        self.canvas.set_photo(self.sample_source.currentData())
+        self.active_caption.setText('原片')
         self.message.setPlainText('选择另一张代表原片后，再点击生成。之前的样片文件仍然保留。')
         self.save_discussion()
         self.update_creative_actions()
@@ -556,6 +804,8 @@ class StylePicker(QDialog):
         self.failure_message = ''
         self.directory = None
         self.samples_direction = self.creative_direction
+        self.sample_strip.show()
+        self.empty_hint.hide()
         self.open_folder.setEnabled(False)
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
             panel.setTitle(f'方案 {index+1}')
@@ -567,6 +817,8 @@ class StylePicker(QDialog):
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
         self.preview.set_photo(self.sample_source.currentData())
+        self.canvas.set_photo(self.sample_source.currentData())
+        self.active_caption.setText('原片 · 正在设计三个方向')
         self.generate.setEnabled(False)
         self.change_source.setEnabled(False)
         self.sample_source.setEnabled(False)
@@ -598,6 +850,8 @@ class StylePicker(QDialog):
     def show_plans(self, plans, directory):
         self.directory = directory
         self.open_folder.setEnabled(True)
+        self.sample_strip.show()
+        self.empty_hint.hide()
         for index,plan in enumerate(plans):
             self.cards[index][4].setTitle(f'方案 {index+1} · '+plan['title'])
             self.cards[index][0].setText(plan['summary'])
@@ -605,6 +859,7 @@ class StylePicker(QDialog):
 
     def show_stage(self, index, stage):
         self.cards[index][1].setText(stage)
+        self.cards[index][1].setToolTip(stage)
 
     def show_sample(self, option):
         self.options[option['index']] = option
@@ -616,7 +871,8 @@ class StylePicker(QDialog):
             pixels = self.preview.read_preview(option['result']['files']['jpeg'])
             if pixels is not None:
                 thumbnail.setIcon(QIcon(pixels))
-            thumbnail.setText('点击查看大图对比')
+            thumbnail.setText('' if pixels is not None else '无法预览，点击查看')
+            thumbnail.setToolTip('点击在画布中查看；“放大对比”可打开大图')
         else:
             thumbnail.setText('样片未完成，点击查看原因')
         if self.current_option == option['index']:
@@ -629,8 +885,11 @@ class StylePicker(QDialog):
         option = self.options.get(index)
         output = option['result']['files']['jpeg'] if option and option['status']=='complete' else None
         self.preview.set_photo(self.sample_source.currentData(),output)
+        self.canvas.set_photo(self.sample_source.currentData(),output)
+        self.active_caption.setText(f'方案 {index+1} · '+option['title']+'  '+option['summary'] if option else '原片')
         if option and option['status']!='complete':
             self.message.setPlainText(option['error'])
+        self.update_creative_actions()
 
     def failed(self, error):
         self.failure_message = error
@@ -1084,11 +1343,12 @@ class Workbench(QMainWindow):
         title = QLabel('CosLuma')
         title.setStyleSheet('font-size: 26px; font-weight: 600')
         header.addWidget(title)
-        header.addWidget(QLabel('照片与角色，交给整组摄影设计'), 1)
-        header.addWidget(QLabel(VERSION))
+        header.addWidget(ui_label('照片、角色与共同创作'), 1)
+        header.addWidget(ui_label(VERSION,'badge'))
         layout.addLayout(header)
         setup = QHBoxLayout()
         self.setup_hint = QLabel('')
+        self.setup_hint.setProperty('role','muted')
         self.setup_hint.setWordWrap(True)
         setup.addWidget(self.setup_hint, 1)
         self.import_button = QPushButton('导入已有配置')
@@ -1119,10 +1379,11 @@ class Workbench(QMainWindow):
         layout.addLayout(toolbar)
         self.inputs.append(self.last_batch_button)
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(16)
         self.queue_pages = QStackedWidget()
         empty = QLabel('把照片或文件夹拖到这里\n\n支持 JPEG、PNG、TIFF 和相机 RAW')
         empty.setAlignment(Qt.AlignCenter)
-        empty.setStyleSheet('background: #f3f5f7; color: #526170; border: 1px dashed #b8c2cc; padding: 25px')
+        empty.setStyleSheet('background: #f7f9fb; color: #6c8094; border: 1px dashed #c7d5e0; border-radius: 12px; padding: 25px')
         self.queue_pages.addWidget(empty)
         self.listing = QTableWidget(0, 2)
         self.listing.setHorizontalHeaderLabels(['照片', '制作进度'])
@@ -1136,9 +1397,10 @@ class Workbench(QMainWindow):
         self.listing.viewport().setAcceptDrops(False)
         self.listing.itemSelectionChanged.connect(self.show_selected)
         self.queue_pages.addWidget(self.listing)
-        queue_panel = QWidget()
+        queue_panel = QFrame()
+        queue_panel.setProperty('role','panel')
         queue_layout = QVBoxLayout(queue_panel)
-        queue_layout.setContentsMargins(0, 0, 0, 0)
+        queue_layout.setContentsMargins(14,14,14,14)
         queue_layout.setSpacing(12)
         queue_layout.addWidget(self.queue_pages, 1)
         splitter.addWidget(queue_panel)
@@ -1228,11 +1490,13 @@ class Workbench(QMainWindow):
         self.style_hint.setTextFormat(Qt.PlainText)
         style_layout.addWidget(self.style_hint)
         self.style_button = QPushButton('与 Agent 讨论风格')
+        self.style_button.setProperty('kind','primary')
         self.style_button.clicked.connect(self.choose_style)
         style_layout.addWidget(self.style_button)
         queue_layout.addWidget(style_box)
         controls = QHBoxLayout()
         self.start = QPushButton('开始制作')
+        self.start.setProperty('kind','primary')
         self.start.setMinimumHeight(38)
         self.start.clicked.connect(lambda: self.produce(only_pending=True))
         controls.addWidget(self.start, 1)
@@ -1575,7 +1839,7 @@ class Workbench(QMainWindow):
         self.style_button.setText('查看定稿 / 继续讨论' if style_ready else '继续与 Agent 讨论' if has_samples or
             self.style_discussion_context==self.current_style_context() else '与 Agent 讨论风格')
         self.style_hint.setText('已选择：'+self.selected_style['title']+'。'+self.selected_style['summary'] if style_ready else
-            '与 Agent 结合角色“'+self.character.text().strip()+'”和当前照片讨论、试样，定稿后再批量制作。'
+            '为“'+self.character.text().strip()+'”讨论摄影方向，满意后定稿。'
             if has_character and has_photos else '先填写角色、添加照片，与 Agent 讨论并试样，定稿后再批量制作。')
         self.last_batch_button.setText('查看上次制作' if self.last_batch_directory else '查看已有结果')
         self.last_batch_button.setEnabled(not running)
@@ -1819,6 +2083,7 @@ def main():
     parser.add_argument('--config', type=Path)
     args = parser.parse_args()
     app = QApplication(sys.argv)
+    apply_theme(app)
     if sys.platform == 'win32':
         font = Path(os.environ['SystemRoot']) / 'Fonts/msyh.ttc'
         font_id = QFontDatabase.addApplicationFont(str(font))
