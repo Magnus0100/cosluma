@@ -209,7 +209,7 @@ class StylePicker(QDialog):
     """Let the user choose a real finished sample before submitting the batch."""
     def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None):
         super().__init__(parent)
-        self.setWindowTitle('先看真实样片，再选择摄影风格')
+        self.setWindowTitle('为当前角色与原片设计摄影方向')
         self.resize(1180, 820)
         self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
         self.sources, self.character, self.brief = sources, character, brief
@@ -222,10 +222,15 @@ class StylePicker(QDialog):
         self.directory = None
         self.failure_message = ''
         layout = QVBoxLayout(self)
-        title = QLabel('选一张代表原片，先看三个真实摄影方向')
+        title = QLabel('根据角色与原片设计方向，再比较三个真实样片')
         title.setStyleSheet('font-size: 18px; font-weight: 600')
         layout.addWidget(title)
-        explanation = QLabel('三个方案使用同一张原片，各制作一张完整成片。选择后，批量沿用该方向和真实样片；'
+        context = QLabel('当前角色：'+character)
+        context.setTextFormat(Qt.PlainText)
+        context.setWordWrap(True)
+        layout.addWidget(context)
+        explanation = QLabel('先分析当前角色、照片与补充要求，再设计三个适合这组素材的方向。'
+            '三个方案使用同一张原片，各制作一张完整成片。选择后，批量沿用该方向和真实样片；'
             '这张样片直接收进结果，不再生成一次。')
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -240,7 +245,7 @@ class StylePicker(QDialog):
         original = QPushButton('查看这张原片')
         original.clicked.connect(lambda:self.inspect(self.current_option))
         row.addWidget(original)
-        self.generate = QPushButton('生成三个真实样片')
+        self.generate = QPushButton('设计方向并生成三个样片')
         self.generate.setMinimumHeight(34)
         self.generate.clicked.connect(self.generate_samples)
         row.addWidget(self.generate)
@@ -275,11 +280,11 @@ class StylePicker(QDialog):
             thumbnail.setCheckable(True)
             thumbnail.clicked.connect(lambda _checked=False,index=index:self.inspect(index))
             card.addWidget(thumbnail)
-            summary = QLabel('生成后显示这个方向的场景与氛围说明')
+            summary = QLabel('分析当前角色与照片后，再确定此方向')
             summary.setWordWrap(True)
             summary.setTextFormat(Qt.PlainText)
             summary.setMaximumHeight(48)
-            stage = QLabel('尚未生成')
+            stage = QLabel('尚未分析')
             stage.setWordWrap(True)
             stage.setTextFormat(Qt.PlainText)
             stage.setMaximumHeight(40)
@@ -292,7 +297,7 @@ class StylePicker(QDialog):
             self.cards[index] = (summary,stage,button,thumbnail,panel)
             choices.addWidget(panel,1)
         layout.addLayout(choices)
-        self.message = QPlainTextEdit('此操作会调用模型，生成 3 张完整样片；其余照片在选择风格后才会制作。')
+        self.message = QPlainTextEdit('点击后分析当前角色与原片，设计方向并生成 3 张完整样片；选定后才制作其余照片。')
         self.message.setReadOnly(True)
         self.message.setMaximumHeight(60)
         layout.addWidget(self.message)
@@ -327,11 +332,11 @@ class StylePicker(QDialog):
         self.directory = None
         self.open_folder.setEnabled(False)
         self.sample_source.setEnabled(True)
-        self.generate.setText('生成三个真实样片')
+        self.generate.setText('设计方向并生成三个样片')
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
             panel.setTitle(f'方案 {index+1}')
-            summary.setText('请先选择这次试拍的原片')
-            stage.setText('尚未生成')
+            summary.setText('分析当前角色与照片后，再确定此方向')
+            stage.setText('尚未分析')
             button.setEnabled(False)
             thumbnail.setIcon(QIcon())
             thumbnail.setText('等待生成样片')
@@ -356,8 +361,8 @@ class StylePicker(QDialog):
                 option = {**saved,'status':'failed','error':str(error)}
             self.show_sample(option)
             self.cards[index][2].setEnabled(option['status']=='complete')
-        self.generate.setText('重新生成三个真实样片')
-        self.message.setPlainText('正在查看已保存样片，没有调用模型。可直接选择；“重新生成”会另行调用模型制作三张。')
+        self.generate.setText('重新设计并生成三个样片')
+        self.message.setPlainText('正在查看为此角色与原片保存的样片，没有调用模型。可直接选择；重新设计会另行制作三张。')
 
     def generate_samples(self):
         if self.worker is not None:
@@ -368,8 +373,8 @@ class StylePicker(QDialog):
         self.open_folder.setEnabled(False)
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
             panel.setTitle(f'方案 {index+1}')
-            summary.setText('正在设计此方向')
-            stage.setText('等待制作')
+            summary.setText('正在分析当前角色与照片')
+            stage.setText('设计方向中')
             stage.setToolTip('')
             button.setEnabled(False)
             thumbnail.setIcon(QIcon())
@@ -389,7 +394,7 @@ class StylePicker(QDialog):
         self.worker.directory_created.connect(self.directory_ready)
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.samples_finished)
-        self.message.setPlainText('正在观察代表原片并设计三个不同方向。其余照片尚未提交。')
+        self.message.setPlainText('正在结合角色“'+self.character+'”、代表原片与补充要求设计三个方向。其余照片尚未提交。')
         self.worker.start()
 
     def directory_ready(self, directory):
@@ -402,6 +407,7 @@ class StylePicker(QDialog):
         for index,plan in enumerate(plans):
             self.cards[index][4].setTitle(plan['title'])
             self.cards[index][0].setText(plan['summary'])
+            self.cards[index][0].setToolTip(plan['summary'])
 
     def show_stage(self, index, stage):
         self.cards[index][1].setText(stage)
@@ -440,7 +446,7 @@ class StylePicker(QDialog):
         worker,self.worker = self.worker,None
         self.cancel.setEnabled(True)
         self.change_source.setEnabled(True)
-        self.generate.setText('重新生成三个真实样片')
+        self.generate.setText('重新设计并生成三个样片')
         self.generate.setEnabled(True)
         complete = sum(option['status']=='complete' for option in self.options.values())
         for index,option in self.options.items():
@@ -997,11 +1003,11 @@ class Workbench(QMainWindow):
         style_box = QWidget()
         style_layout = QVBoxLayout(style_box)
         style_layout.setContentsMargins(0, 0, 0, 0)
-        self.style_hint = QLabel('批量前，先用一张原片比较三个真实风格样片。')
+        self.style_hint = QLabel('先填写角色、添加照片，再为这组素材设计三个方向并生成样片。')
         self.style_hint.setWordWrap(True)
         self.style_hint.setTextFormat(Qt.PlainText)
         style_layout.addWidget(self.style_hint)
-        self.style_button = QPushButton('先看三个风格样片')
+        self.style_button = QPushButton('按角色与原片设计样片')
         self.style_button.clicked.connect(self.choose_style)
         style_layout.addWidget(self.style_button)
         queue_layout.addWidget(style_box)
@@ -1024,7 +1030,7 @@ class Workbench(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('等待开始')
         layout.addWidget(self.progress_bar)
-        self.status = QLabel('添加照片、填写角色，先比较三个真实风格样片，再按选择制作整组。')
+        self.status = QLabel('添加照片、填写角色，按这组素材设计三个方向；比较真实样片后再制作整组。')
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1325,9 +1331,10 @@ class Workbench(QMainWindow):
         self.remaining_button.setEnabled(not running and has_photos and has_character and style_ready)
         self.style_button.setEnabled(not running and has_photos and has_character)
         has_samples = self.style_samples_directory is not None and self.style_samples_context == self.current_style_context()
-        self.style_button.setText('查看 / 更换已选风格' if style_ready else '查看已有风格样片' if has_samples else '先看三个风格样片')
+        self.style_button.setText('查看 / 更换已选风格' if style_ready else '查看已有风格样片' if has_samples else '按角色与原片设计样片')
         self.style_hint.setText('已选择：'+self.selected_style['title']+'。'+self.selected_style['summary'] if style_ready else
-            '批量前，先用一张原片比较三个真实风格样片。角色或补充要求改变后重新选择。')
+            '将结合角色“'+self.character.text().strip()+'”与当前照片设计三个方向，再生成真实样片供选择。'
+            if has_character and has_photos else '先填写角色、添加照片，再为这组素材设计三个方向并生成样片。')
         self.last_batch_button.setText('查看上次制作' if self.last_batch_directory else '查看已有结果')
         self.last_batch_button.setEnabled(not running)
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))

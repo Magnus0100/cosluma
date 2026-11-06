@@ -84,7 +84,7 @@ def _describe(instruction, images, config, response_path):
 
 
 def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None):
-    """Choose one shared photographic direction and relevant library examples."""
+    """Design directions for the supplied character and photos, using library references."""
     entries = load_library(library_path)
     count = min(6,len(sources))
     selected = [sources[round(index*(len(sources)-1)/max(1,count-1))] for index in range(count)]
@@ -100,18 +100,20 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             '方向应在场景叙事、材质、配色或情绪上有可辨认的差异，不能只是给同一场景换滤镜或改名称。'
             '每个方向都适合这组角色、服装与原片受光，不为凑差异选择无法自然融合的极暗夜景。'
             f'返回 JSON，只有 options，值为恰好 {option_count} 个对象。每个对象包含 title、summary、direction、reference_ids。'
-            'title 为便于用户选择的简短中文名称，summary 用一到两句话说明画面、光感和氛围；不包含模型或算法术语。')
+            'title 根据本次设计命名，不能使用固定风格菜单；'
+            'summary 用一到两句话说明画面、光感、氛围，以及为什么适合当前角色和原片；不包含模型或算法术语。')
     instruction = (
-        '你负责 COS 摄影后期的审美决策。请观察这组代表原片。' + task +
+        '你负责 COS 摄影后期的审美决策。先结合本次用户填写的角色、补充要求和这组代表原片，'
+        '观察实物服装、道具、构图与受光，再为当前素材设计摄影方向。'
+        '方向与名称均在看过这些输入之后形成，不预先指定场景或固定几类风格。' + task +
         '成片应有明确的摄影创作意图，不能只清除几个杂物、改成灰蓝色就结束。'
         'direction 用约 300 到 600 字说明具体场景、时间氛围、色彩、曝光层次、自然光来源、背景取舍和特效原则；'
         'reference_ids 从下方目录选取少量最相关的条目编号，通常 2 到 4 条，不需要特效时不要为了用素材而选特效。'
         '用户补充要求优先。没有补充要求时，由你依据角色的可靠常识、原片场地、实物妆造和受光决定；'
         '角色常识用于环境与情绪，不用于改变原片实物服装，不确定的角色设定不要编造。'
         '分清原拍摄场地与适合角色的创作场景：保留机位、尺度、人物支撑和接触几何，'
-        '不必保留缺少主题的公园、水池或城市背景。角色与海洋有明确联系时，优先设计可辨认的海岸、'
-        '海湾或潮汐景物，水色、岸线和远景必须体现海的特征，不以普通池塘或湖岸敷衍；'
-        '保留脚下浅水台阶或岸边平台并不妨碍远景成为真实海湾。'
+        '创作场景的语义和具体景物应依据当前角色与素材确定，不必保留缺少主题的原背景。'
+        '未知角色只依据用户输入与照片可见信息设计，不把推测当成角色设定。'
         '场景必须在实拍透视、尺度、材质和景深上成立，不能用泛泛的梦幻背景或游戏概念图敷衍。'
         '先判断照片里的主光软硬、明暗和色温，再选择相容的场景与时间；除非用户明确要求，'
         '不把普通白天人像强改成极暗夜景，不引入原片没有的强烈条纹光或遮脸树影。'
@@ -126,7 +128,9 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         '通透来自清楚的明暗层次，不来自蒙白、全图染青、磨皮或毫无来由地提亮人物。'
         'COS 精致感优先来自光色、干净背景与材质；特效按单张手势、视线、情绪、留白判断，允许完全不加。'
         'direction 只确定特效的适用理由与视觉语言，不替所有照片统一决定全部添加或全部禁用。'
-        '目录仅供场景、布光和色彩灵感；条目里其他人物、换装、广告版式和固定画幅均不适用。'
+        '目录仅供场景、布光和色彩灵感，是参考素材而不是候选风格菜单，也不限制可设计的场景范围；'
+        '先确定适合当前角色与原片的创作意图，再选能帮助实现它的具体参考，不把参考标题直接凑成候选。'
+        '条目里其他人物、换装、广告版式和固定画幅均不适用。'
         f'\n角色：{character}\n补充要求：{brief or "无，由你决定"}\n提示词目录：\n'+catalogue(entries))
     name = 'style-options' if option_count is not None else 'art-direction'
     description = _describe(instruction,images,config,directory/(name+'-response.json'))
