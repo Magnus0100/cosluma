@@ -1,0 +1,118 @@
+name: Windows release
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows build
+    runs-on: windows-2025
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      QT_QPA_PLATFORM: offscreen
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12.14"
+      - name: Install build dependencies
+        run: python -m pip install -r scripts/requirements-build.txt
+      - name: Check source and image processing
+        run: |
+          @'
+          import ast, sys, tempfile
+          from pathlib import Path
+          import cv2
+          import numpy as np
+          sys.path.insert(0, "scripts")
+          from head_composite import _colour_match
+          from image_io import open_photo, save_image
+          for path in Path("scripts").glob("*.py"):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          cv2.SIFT_create()
+          source = np.random.default_rng(0).uniform(.1, .8, (16, 16, 3)).astype(np.float32)
+          matched = _colour_match(source, source * .8 + .1, np.ones((16, 16), np.float32))
+          assert matched.dtype == np.float32 and np.isfinite(matched).all()
+          with tempfile.TemporaryDirectory() as directory:
+              path = Path(directory) / "float.png"
+              save_image(source, path)
+              assert path.read_bytes()[24] == 16
+              assert np.max(np.abs(open_photo(path) - source)) < 1 / 65535
+          '@ | python -B -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B scripts/project_cli.py --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B scripts/backend_server.py --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build portable application
+        run: python -m PyInstaller --noconfirm --distpath "$env:RUNNER_TEMP/package" --workpath "$env:RUNNER_TEMP/build" CosLuma.spec
+      - name: Check packaged application
+        run: |
+          @'
+          import json, os, socket, subprocess, sys, tempfile, time, urllib.request
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from app_version import VERSION
+          executable = Path(os.environ["RUNNER_TEMP"]) / "package/CosLuma/CosLuma.exe"
+          for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
+              subprocess.run([str(executable), *arguments], check=True)
+          process = subprocess.Popen([str(executable)])
+          try:
+              time.sleep(3)
+              assert process.poll() is None, "The desktop exited during startup"
+          finally:
+              if process.poll() is None:
+                  process.terminate()
+              process.wait()
+          with tempfile.TemporaryDirectory() as directory:
+              with socket.socket() as reservation:
+                  reservation.bind(("127.0.0.1", 0))
+                  port = reservation.getsockname()[1]
+              process = subprocess.Popen([str(executable), "--server", "--root", directory,
+                  "--config", str(Path("providers/settings.example.json").resolve()), "--port", str(port)])
+              try:
+                  time.sleep(3)
+                  assert process.poll() is None, "The HTTP adapter exited during startup"
+                  with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=10) as response:
+                      assert json.load(response)["version"] == VERSION
+              finally:
+                  if process.poll() is None:
+                      process.terminate()
+                  process.wait()
+          '@ | python -B -
+      - name: Prepare release archives
+        run: |
+          @'
+          import hashlib, os, shutil, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from app_version import VERSION
+          output = Path(os.environ["RUNNER_TEMP"]) / "release"
+          output.mkdir()
+          windows = output / f"CosLuma-{VERSION}-windows-x64"
+          shutil.make_archive(str(windows), "zip", Path(os.environ["RUNNER_TEMP"]) / "package", "CosLuma")
+          source = output / f"CosLuma-{VERSION}-source.zip"
+          subprocess.run(["git", "archive", "--format=zip", f"--prefix=CosLuma-{VERSION}/",
+              "-o", str(source), "HEAD"], check=True)
+          sums = []
+          for path in sorted(output.glob("*.zip")):
+              with path.open("rb") as stream:
+                  sums.append(f"{hashlib.file_digest(stream, 'sha256').hexdigest()}  {path.name}")
+          (output / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
+          '@ | python -B -
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CosLuma-windows-release
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error

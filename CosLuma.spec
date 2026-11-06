@@ -1,5 +1,6 @@
 # Build with the configured Python: python -m PyInstaller CosLuma.spec
 from pathlib import Path
+from importlib.metadata import distributions
 import shutil
 from PyInstaller.utils.win32.versioninfo import (FixedFileInfo,StringFileInfo,
     StringStruct,StringTable,VarFileInfo,VarStruct,VSVersionInfo)
@@ -46,3 +47,19 @@ for name in ('README.md','AGENTS.md','LICENSE'):
     shutil.copyfile(root/name,destination/name)
 for name in ('LICENSES','providers'):
     shutil.copytree(root/name,destination/name,dirs_exist_ok=True)
+# Include notices from the versions actually present in the build, including
+# optional modules collected by upstream PyInstaller hooks.
+licensed = {'numpy','pillow','opencv-python-headless','pyside6','pyside6-essentials',
+    'shiboken6','rawpy','scipy','color-matcher','docutils','ddt','imageio','packaging',
+    'setuptools','charset-normalizer','cffi','pycparser','pyyaml','psutil','pyinstaller'}
+for distribution in distributions():
+    name = distribution.metadata['Name']
+    if name.casefold().replace('_','-') not in licensed:
+        continue
+    for entry in distribution.files or ():
+        if '.dist-info' in str(entry) and Path(entry).name.lower().startswith(('license','copying','notice')):
+            source = Path(distribution.locate_file(entry))
+            if source.is_file():
+                target = destination/'LICENSES'/(name+'-'+distribution.version)/str(entry)
+                target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copyfile(source,target)

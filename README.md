@@ -1,6 +1,6 @@
 # CosLuma
 
-当前版本：**0.9.0**，Windows x64。
+当前版本：**0.9.1**，Windows x64；源码使用 Python 3.12。
 
 给原片和角色，自动设计 COS 后期，并将原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
@@ -144,6 +144,14 @@ PNG 是 16 位成片，JPEG 是同一结果的 8 位查看副本。
 项目不商用、不盈利，依赖和权重仍遵循各自许可。项目许可见 [LICENSE](LICENSE)，
 第三方许可见 [LICENSES](LICENSES/README.md)。
 
-构建 Windows 发布目录使用已有、安装了 PyInstaller 的 Python 运行 `python -m PyInstaller CosLuma.spec`。
+构建依赖为 `scripts/requirements-build.txt`，使用已有 Python 安装后运行 `python -m PyInstaller CosLuma.spec`。
 可用 `--distpath`、`--workpath` 将产物放在仓库外。版本统一定义在 `scripts/app_version.py`；
 桌面、CLI 与 HTTP 启动命令均支持 `--version`。发布包需随附同版本源码与第三方许可。
+
+GitHub Actions 在 Windows 上安装公开依赖、检查源码和浮点图像保存、构建发布目录，
+并启动桌面与 HTTP 接口；成功后提供 Windows 包、同一提交的源码包和 SHA256 校验文件。
+这些检查不调用付费模型，不验证审美或远端服务的可用性。仓库启用了 CodeQL、Dependabot 漏洞提醒、
+密钥扫描和推送保护；制作过程仍按上面的单次链执行。
+
+欢迎通过 GitHub Issues 报告问题，通过 Pull Requests 提交修改。说明实际问题、修改后的行为和必要验证即可；
+请勿上传私人照片、配置、模型权重或服务凭据。安全漏洞使用仓库 Security 页的私密报告入口。

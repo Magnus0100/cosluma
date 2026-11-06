@@ -10,4 +10,3 @@
 # Preserved license text hashes must survive Git checkout byte-for-byte.
 LICENSE -text
 LICENSES/** -text
-scripts/third_party/** -text
