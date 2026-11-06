@@ -11,9 +11,9 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QSize, QTimer
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QKeySequence, QPalette, QPixmap, QShortcut, QTextDocument
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader, QKeySequence, QPainter, QPalette, QPixmap, QShortcut, QTextDocument
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
     QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget)
@@ -104,7 +104,7 @@ def apply_theme(app):
         QToolButton[role="samplePreview"] { background: #12151d; border: 1px solid #303849; border-radius: 9px; color: #a7b8c8; padding: 8px; }
         QToolButton[role="samplePreview"]:hover { border-color: #8cb4d4; }
         QToolButton[role="samplePreview"]:checked { border: 2px solid #5e9bca; background: #243b50; }
-        QLabel[role="photoCanvas"] { background: #202934; color: #a9b9c8; border: 1px solid #202934; border-radius: 10px; padding: 8px; }
+        QGraphicsView[role="photoCanvas"] { background: #202934; border: 1px solid #202934; border-radius: 10px; }
     ''')
 
 
@@ -310,14 +310,114 @@ class StyleChatWorker(QThread):
             self.failed.emit(getattr(error,'provider_message','') or str(error))
 
 
+class PhotoCanvas(QGraphicsView):
+    zoom_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProperty('role','photoCanvas')
+        self.setMinimumSize(100,160)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setBackgroundBrush(QColor('#202934'))
+        self.setRenderHint(QPainter.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setToolTip('滚轮缩放，按住鼠标拖动；双击或按 0 适应窗口，按 1 查看 100%')
+        self.setScene(QGraphicsScene(self))
+        self.photo = self.scene().addPixmap(QPixmap())
+        self.fitting = True
+        self.empty_message = ''
+
+    def setPixmap(self, pixels):
+        if self.photo.pixmap().cacheKey() == pixels.cacheKey():
+            return
+        self.empty_message = ''
+        self.photo.setPixmap(pixels)
+        self.setSceneRect(self.photo.boundingRect())
+        self.fit_photo()
+
+    def setText(self, text):
+        self.photo.setPixmap(QPixmap())
+        self.setSceneRect(0,0,0,0)
+        self.empty_message = text
+        self.viewport().update()
+
+    def fit_photo(self):
+        self.fitting = True
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        if not self.photo.pixmap().isNull():
+            self.fitInView(self.photo,Qt.KeepAspectRatio)
+        self.zoom_changed.emit()
+
+    def set_zoom(self, scale):
+        if self.photo.pixmap().isNull():
+            return
+        self.fitting = False
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        factor = max(.01,min(8.0/self.devicePixelRatioF(),scale))/self.transform().m11()
+        self.scale(factor,factor)
+        self.zoom_changed.emit()
+
+    def actual_size(self):
+        self.set_zoom(1.0/self.devicePixelRatioF())
+
+    def wheelEvent(self, event):
+        if not self.photo.pixmap().isNull() and event.angleDelta().y():
+            self.set_zoom(self.transform().m11()*1.2**(event.angleDelta().y()/120))
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.fit_photo()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_0:
+            self.fit_photo()
+        elif event.key() == Qt.Key_1:
+            self.actual_size()
+        elif event.key() in (Qt.Key_Plus,Qt.Key_Equal):
+            self.set_zoom(self.transform().m11()*1.2)
+        elif event.key() == Qt.Key_Minus:
+            self.set_zoom(self.transform().m11()/1.2)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self,'photo') and self.fitting:
+            self.fit_photo()
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter,rect)
+        if self.empty_message:
+            painter.save()
+            painter.resetTransform()
+            painter.setPen(QColor('#a9b9c8'))
+            painter.drawText(self.viewport().rect().adjusted(16,16,-16,-16),
+                Qt.AlignCenter|Qt.TextWordWrap,self.empty_message)
+            painter.restore()
+
+
 class PhotoPreview(QWidget):
     """Read display previews independently of the untouched production images."""
+    cache = {}
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.source = None
         self.output = None
         self.choice = 'compare'
-        self.cache = {}
         self.images = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -346,29 +446,41 @@ class PhotoPreview(QWidget):
             row.addLayout(column, 1)
         self.pages.addWidget(comparison)
         layout.addWidget(self.pages, 1)
+        tools = QHBoxLayout()
+        self.zoom_label = ui_label('滚轮缩放，拖动查看')
+        tools.addWidget(self.zoom_label,1)
+        fit = QToolButton()
+        fit.setProperty('kind','quiet')
+        fit.setText('适应窗口')
+        fit.clicked.connect(lambda:self.zoom_views('fit_photo'))
+        tools.addWidget(fit)
+        actual = QToolButton()
+        actual.setProperty('kind','quiet')
+        actual.setText('100%')
+        actual.setToolTip('按图片原始像素查看细节')
+        actual.clicked.connect(lambda:self.zoom_views('actual_size'))
+        tools.addWidget(actual)
+        layout.addLayout(tools)
+        for view in (self.preview,self.before,self.after):
+            view.zoom_changed.connect(self.update_zoom_label)
         self.set_photo()
 
     @staticmethod
     def image_label():
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
-        label.setMinimumSize(100, 160)
-        label.setWordWrap(True)
-        label.setProperty('role','photoCanvas')
-        return label
+        return PhotoCanvas()
 
-    def read_preview(self, path):
+    def read_preview(self, path, *, full=False):
         if not path:
             return None
         try:
-            key = (str(path), Path(path).stat().st_mtime_ns)
+            key = (str(path), Path(path).stat().st_mtime_ns,full)
         except OSError:
             return None
         if key not in self.cache:
             reader = QImageReader(str(path))
             reader.setAutoTransform(True)
             size = reader.size()
-            if size.isValid():
+            if size.isValid() and not full:
                 size.scale(QSize(1600, 1600), Qt.KeepAspectRatio)
                 reader.setScaledSize(size)
             image = reader.read()
@@ -379,7 +491,7 @@ class PhotoPreview(QWidget):
 
     def set_photo(self, source=None, output=None):
         self.source, self.output = source, output
-        self.images = {'source': self.read_preview(source), 'output': self.read_preview(output)}
+        self.images = {'source': self.read_preview(source,full=True), 'output': self.read_preview(output,full=True)}
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice if output else 'source'))
         self.mode.setEnabled(bool(output))
@@ -402,7 +514,7 @@ class PhotoPreview(QWidget):
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
-                label.setPixmap(pixels.scaled(label.size() - QSize(10, 10), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                label.setPixmap(pixels)
             elif not self.source:
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
             elif kind == 'output':
@@ -411,6 +523,20 @@ class PhotoPreview(QWidget):
                 label.setText('原片不在原来的位置\n已保存的成片仍可查看')
             else:
                 label.setText('此原片暂不支持预览\n仍可制作，也可使用“打开原片”查看')
+        self.update_zoom_label()
+
+    def zoom_views(self, action):
+        views = (self.before,self.after) if self.pages.currentIndex() else (self.preview,)
+        for view in views:
+            getattr(view,action)()
+
+    def update_zoom_label(self):
+        if not hasattr(self,'zoom_label'):
+            return
+        views = (self.before,self.after) if self.pages.currentIndex() else (self.preview,)
+        zooms = [f'{view.transform().m11()*view.devicePixelRatioF():.0%}' for view in views
+            if not view.photo.pixmap().isNull()]
+        self.zoom_label.setText(' / '.join(zooms)+' · 滚轮缩放' if zooms else '滚轮缩放，拖动查看')
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -419,6 +545,8 @@ class PhotoPreview(QWidget):
 
 class StylePicker(QDialog):
     """Discuss photographs, compare real samples, then explicitly settle the batch direction."""
+    discussion_saved = Signal(str)
+
     def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None, discussion=None):
         super().__init__(parent)
         self.setWindowTitle('与摄影 Agent 讨论风格 · '+character)
@@ -443,6 +571,10 @@ class StylePicker(QDialog):
         self.selected_style = None
         self.directory = None
         self.failure_message = ''
+        self.draft_timer = QTimer(self)
+        self.draft_timer.setSingleShot(True)
+        self.draft_timer.setInterval(400)
+        self.draft_timer.timeout.connect(self.save_draft)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24,22,24,18)
         layout.setSpacing(18)
@@ -576,10 +708,12 @@ class StylePicker(QDialog):
         self.chat_input.setPlaceholderText('聊聊你想要的感觉，或指出样片里想改的地方…')
         self.chat_input.setFixedHeight(66)
         self.chat_input.textChanged.connect(self.update_creative_actions)
+        self.chat_input.textChanged.connect(lambda:self.draft_timer.start())
         composer_layout.addWidget(self.chat_input)
         send_row = QHBoxLayout()
-        send_row.addWidget(ui_label('Ctrl + Enter 发送'))
-        send_row.addStretch(1)
+        self.input_hint = ui_label('Ctrl + Enter 发送')
+        self.input_hint.setWordWrap(True)
+        send_row.addWidget(self.input_hint,1)
         self.send = QPushButton('发送')
         self.send.clicked.connect(self.send_message)
         send_row.addWidget(self.send)
@@ -647,6 +781,16 @@ class StylePicker(QDialog):
                 'samples_directory':self.directory,'sample_directories':self.sample_directories,
                 'selected_file':self.chosen_file,'frozen_direction':self.frozen_direction,
                 'draft':self.pending_message['content'] if self.pending_message else self.chat_input.toPlainText()})
+            self.discussion_saved.emit(self.discussion_directory)
+
+    def save_draft(self):
+        if self.discussion_directory is None and not self.chat_input.toPlainText().strip():
+            return
+        try:
+            self.ensure_discussion()
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('输入仍保留在窗口中，自动保存草稿失败：'+str(error))
 
     def restore_discussion(self, directory):
         state = json.loads((Path(directory)/'conversation.json').read_text(encoding='utf-8'))
@@ -671,15 +815,20 @@ class StylePicker(QDialog):
         if not hasattr(self,'cancel'):
             return
         busy = self.is_busy()
-        self.send.setEnabled(not busy and bool(self.chat_input.toPlainText().strip()))
+        draft = bool(self.chat_input.toPlainText().strip())
+        self.send.setEnabled(not busy and draft)
         self.chat_input.setEnabled(not busy)
-        self.generate.setEnabled(not busy)
+        self.generate.setEnabled(not busy and not draft)
+        self.input_hint.setText('尚未发送 · Ctrl + Enter 发送' if draft and not busy else 'Ctrl + Enter 发送')
+        draft_note = '这段输入尚未发送。请先发给 Agent，或清空输入，再按已经讨论的要求试样或定稿。'
+        self.generate.setToolTip(draft_note if draft else '结合当前已讨论的创作要求，制作三个真实样片')
+        self.finalize.setToolTip(draft_note if draft else '将当前完整样片保存为这组照片的最终方向')
         self.change_source.setEnabled(not busy)
         self.cancel.setEnabled(not busy)
         self.sample_source.setEnabled(not busy and not self.options)
         for index,card in self.cards.items():
             card[2].setEnabled(index in self.options)
-        self.finalize.setEnabled(not busy and self.samples_direction==self.creative_direction
+        self.finalize.setEnabled(not busy and not draft and self.samples_direction==self.creative_direction
             and self.options.get(self.current_option,{}).get('status')=='complete')
 
     def send_message(self):
@@ -794,6 +943,10 @@ class StylePicker(QDialog):
 
     def generate_samples(self):
         if self.is_busy():
+            return
+        if self.chat_input.toPlainText().strip():
+            self.message.setPlainText('输入框中还有尚未发送的内容。先发送给 Agent，或清空输入，再按已经讨论的要求生成样片。')
+            self.chat_input.setFocus()
             return
         try:
             self.ensure_discussion()
@@ -918,6 +1071,10 @@ class StylePicker(QDialog):
     def choose(self, index):
         if self.is_busy() or self.options.get(index,{}).get('status')!='complete':
             return
+        if self.chat_input.toPlainText().strip():
+            self.message.setPlainText('这段输入尚未发送，未纳入当前创作要求。先发送或清空输入，再决定是否定稿。')
+            self.chat_input.setFocus()
+            return
         if self.samples_direction != self.creative_direction:
             self.message.setPlainText('当前讨论已修改创作要求，请先按当前讨论生成样片，再定稿。已有样片仍可对比查看。')
             return
@@ -941,6 +1098,9 @@ class StylePicker(QDialog):
     def reject(self):
         if not self.is_busy():
             try:
+                self.draft_timer.stop()
+                if self.chat_input.toPlainText().strip():
+                    self.ensure_discussion()
                 self.save_discussion()
             except OSError as error:
                 self.message.setPlainText('保存对话失败：'+str(error))
@@ -1307,6 +1467,11 @@ class Workbench(QMainWindow):
     def __init__(self, root=None, config=None):
         super().__init__()
         self.preferences = QSettings(str(Path.home() / 'CosplayWorkbench/config/desktop.ini'), QSettings.IniFormat)
+        self.workspace_restoring = True
+        self.workspace_timer = QTimer(self)
+        self.workspace_timer.setSingleShot(True)
+        self.workspace_timer.setInterval(400)
+        self.workspace_timer.timeout.connect(self.save_workspace)
         root = root if root is not None else self.preferences.value('output_root', str(Path.home() / 'CosLuma/output'), type=str)
         config = config or os.environ.get('COSLUMA_CONFIG') or self.preferences.value('config_path', str(default_settings_path()), type=str)
         self.setWindowTitle('CosLuma ' + VERSION)
@@ -1521,8 +1686,13 @@ class Workbench(QMainWindow):
         layout.addWidget(self.status)
         self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button, self.import_button])
         self.inputs.append(style_box)
+        for edit in (self.character,self.root,self.config,self.edge):
+            edit.textChanged.connect(self.schedule_workspace_save)
+        self.brief.textChanged.connect(self.schedule_workspace_save)
         self.update_setup_hint()
+        self.restore_workspace()
         self.restore_style_selection()
+        self.workspace_restoring = False
         self.update_actions()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
@@ -1535,6 +1705,97 @@ class Workbench(QMainWindow):
     @staticmethod
     def source_key(source):
         return os.path.normcase(str(Path(source).expanduser().resolve()))
+
+    def schedule_workspace_save(self):
+        if not self.workspace_restoring:
+            self.workspace_timer.start()
+
+    def save_workspace(self):
+        if self.workspace_restoring:
+            return
+        self.workspace_timer.stop()
+        fields = ('source','status','directory','batch_directory','files','exports',
+            'output_dimensions','output_adjustment','stage','error')
+        row = self.listing.currentRow()
+        state = {'sources':self.sources,'character':self.character.text(),'brief':self.brief.toPlainText(),
+            'selected_source':self.sources[row] if 0<=row<len(self.sources) else None,
+            'results':[{name:result[name] for name in fields if name in result} for result in self.results.values()],
+            'stages':self.stages,'photo_errors':self.photo_errors,
+            'batch_directory':self.batch_directory,'batch_error':self.batch_error}
+        self.preferences.setValue('workspace',json.dumps(state,ensure_ascii=False))
+        for key,value in (('output_root',self.root.text()),('config_path',self.config.text()),('output_edge',self.edge.text())):
+            if value.strip() or key=='output_edge':
+                self.preferences.setValue(key,value.strip())
+        self.preferences.sync()
+        if self.preferences.status() != QSettings.NoError:
+            self.status.setText('工作区未能保存到本机，请检查配置目录的写入权限。已有照片结果仍保留在保存目录。')
+
+    def restore_workspace(self):
+        saved = self.preferences.value('workspace','',type=str)
+        if not saved:
+            return
+        try:
+            state = json.loads(saved)
+            if not isinstance(state,dict) or not isinstance(state.get('sources'),list):
+                raise ValueError('照片队列记录格式不正确')
+            self.sources = list(dict.fromkeys(str(Path(source).expanduser().resolve()) for source in state['sources']
+                if isinstance(source,str) and Path(source).suffix.lower() in IMAGE_EXTENSIONS))
+            known = {self.source_key(source) for source in self.sources}
+            self.character.setText(state.get('character',self.character.text()))
+            self.brief_character = self.character.text().strip()
+            self.brief.setPlainText(state.get('brief',self.brief.toPlainText()))
+            self.batch_directory = state.get('batch_directory')
+            self.batch_error = state.get('batch_error','')
+            self.photo_errors = {key:str(error) for key,error in state.get('photo_errors',{}).items() if key in known}
+            for key,stage in state.get('stages',{}).items():
+                if key in known:
+                    self.stages[key] = '未完成'
+                    self.photo_errors.setdefault(key,'上次停在“'+stage+'”。未自动继续制作；如需重做，请明确选择“全部另做一批”。')
+            results = list(state.get('results',[]))
+            record_note = ''
+            if self.batch_directory:
+                record = Path(self.batch_directory)/'batch.json'
+                if record.is_file():
+                    try:
+                        batch = json.loads(record.read_text(encoding='utf-8'))
+                        results.extend(batch.get('items',{}).values())
+                        if batch.get('status')=='failed':
+                            self.batch_error = batch.get('error',self.batch_error)
+                    except (OSError,ValueError,TypeError,AttributeError):
+                        record_note = '批次文件暂时无法读取，已保留本机记住的状态。'
+            for result in results:
+                key = self.source_key(result['source'])
+                if key not in known:
+                    continue
+                if result.get('status')=='complete' and (not result.get('files',{}).get('jpeg') or
+                        len(result.get('output_dimensions',[]))!=2):
+                    self.results.pop(key,None)
+                    self.stages[key] = '未完成'
+                    self.photo_errors[key] = '上次的成片记录不完整，请从“查看已有结果”打开批次文件夹。'
+                    continue
+                if result.get('status') in ('complete','failed'):
+                    self.results[key] = result
+                    self.stages.pop(key,None)
+                    self.photo_errors.pop(key,None)
+            self.refresh_queue()
+            selected = state.get('selected_source')
+            if selected and self.source_key(selected) in self.rows:
+                self.listing.selectRow(self.rows[self.source_key(selected)])
+            self.open_folder_button.setEnabled(bool(self.batch_directory))
+            interrupted = len(self.stages)
+            missing = sum(not Path(source).is_file() for source in self.sources)
+            if self.sources:
+                self.status.setText(f'已恢复 {len(self.sources)} 张照片和已有制作状态。'+
+                    (f'{interrupted} 张上次未完成，未自动重做。' if interrupted else '')+
+                    (f'{missing} 张原片已移动或缺失，请移除后重新添加。' if missing else '')+record_note)
+        except (OSError,ValueError,KeyError,TypeError,AttributeError) as error:
+            for source in self.sources:
+                key = self.source_key(source)
+                if key not in self.results:
+                    self.stages[key] = '未完成'
+                    self.photo_errors[key] = '上次记录无法读取，请从“查看已有结果”打开保存的批次；没有自动重新提交。'
+            self.refresh_queue()
+            self.status.setText('上次工作区记录无法完整恢复：'+str(error)+'。已有成片可从“查看已有结果”打开。')
 
     def current_style_context(self):
         return (self.character.text().strip(),self.brief.toPlainText())
@@ -1561,6 +1822,7 @@ class Workbench(QMainWindow):
                 self.selected_style = load_style(chosen)
                 self.style_context = (self.selected_style['result']['character'],self.selected_style['result']['brief'])
                 if discussion_state is not None and self.style_discussion_context==self.style_context and (
+                        discussion_state.get('draft','').strip() or
                         discussion_state.get('direction','') != self.selected_style['art_direction'].get('creative_direction','')):
                     self.selected_style = None
                     self.style_context = None
@@ -1598,13 +1860,20 @@ class Workbench(QMainWindow):
             discussion = self.style_discussion_directory if self.style_discussion_context == context else None
             dialog = StylePicker(list(self.sources),sample,self.character.text().strip(),
                 self.brief.toPlainText(),self.root.text(),config,self,previous=previous,discussion=discussion)
+            def remember_discussion(directory):
+                self.style_discussion_directory = directory
+                self.style_discussion_context = context
+                self.preferences.setValue('style/discussion',directory)
+                self.preferences.sync()
+            dialog.discussion_saved.connect(remember_discussion)
             self.style_dialog = dialog
             accepted = dialog.exec() == QDialog.Accepted
             if dialog.discussion_directory is not None:
                 self.style_discussion_directory = dialog.discussion_directory
                 self.style_discussion_context = context
                 self.preferences.setValue('style/discussion',dialog.discussion_directory)
-            if self.selected_style is not None and (dialog.creative_direction != self.selected_style['art_direction'].get('creative_direction','')):
+            if self.selected_style is not None and (dialog.chat_input.toPlainText().strip() or
+                    dialog.creative_direction != self.selected_style['art_direction'].get('creative_direction','')):
                 self.selected_style = None
                 self.style_context = None
                 self.preferences.remove('style/selected')
@@ -1813,6 +2082,7 @@ class Workbench(QMainWindow):
         self.listing.blockSignals(False)
         self.show_selected()
         self.update_actions()
+        self.schedule_workspace_save()
 
     def update_actions(self):
         if not hasattr(self,'style_hint'):
@@ -1857,6 +2127,7 @@ class Workbench(QMainWindow):
             self.status.setText('无法添加照片：' + str(error))
 
     def show_selected(self):
+        self.schedule_workspace_save()
         row = self.listing.currentRow()
         if row < 0 or row >= len(self.sources):
             self.preview_key = None
@@ -1923,6 +2194,8 @@ class Workbench(QMainWindow):
                 self.photo_errors.clear()
             self.batch_error = ''
             self.batch_directory = None
+            for source in sources:
+                self.stages[self.source_key(source)] = '等待制作'
             self.refresh_queue()
             self.active_sources = {self.source_key(source) for source in sources}
             self.active_processed = 0
@@ -1944,6 +2217,7 @@ class Workbench(QMainWindow):
             self.remaining_button.setEnabled(False)
             self.last_batch_button.setEnabled(False)
             self.status.setText('沿用选中的摄影方向，开始制作本批次')
+            self.save_workspace()
             self.worker.start()
         except Exception as error:
             self.status.setText('无法开始：' + str(error))
@@ -1956,6 +2230,7 @@ class Workbench(QMainWindow):
             self.listing.item(self.rows[key], 1).setText(stage)
             if self.listing.currentRow() == self.rows[key]:
                 self.show_selected()
+            self.schedule_workspace_save()
 
     @Slot(str)
     def batch_started(self, directory):
@@ -1965,6 +2240,7 @@ class Workbench(QMainWindow):
         self.preferences.sync()
         self.open_folder_button.setEnabled(True)
         self.show_selected()
+        self.save_workspace()
 
     @Slot(dict)
     def show_result(self, result):
@@ -1977,6 +2253,7 @@ class Workbench(QMainWindow):
         self.progress_bar.setValue(self.active_processed)
         self.open_folder_button.setEnabled(bool(self.batch_directory))
         self.show_selected()
+        self.save_workspace()
 
     @Slot(str)
     def show_failure(self, message):
@@ -2004,6 +2281,7 @@ class Workbench(QMainWindow):
         self.update_actions()
         self.open_folder_button.setEnabled(bool(self.batch_directory))
         self.show_selected()
+        self.save_workspace()
         worker.deleteLater()
         if self.tray is not None:
             self.tray.hide()
@@ -2047,6 +2325,7 @@ class Workbench(QMainWindow):
 
     def closeEvent(self, event):
         self.remember_preferences()
+        self.save_workspace()
         if self.style_dialog is not None and self.style_dialog.is_busy():
             self.style_dialog.showNormal()
             self.style_dialog.message.setPlainText('Agent 回复或样片制作仍在进行，请在此查看进度；可以最小化等待。')
