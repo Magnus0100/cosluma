@@ -8,13 +8,71 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColorSpace, QImage, QImageReader
 
 Image.MAX_IMAGE_PIXELS = None
 QImageReader.setAllocationLimit(0)
 SRGB = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
-RAW_EXTENSIONS = {'.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.rw2', '.dng'}
-IMAGE_EXTENSIONS = RAW_EXTENSIONS | {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp'}
+RAW_EXTENSIONS = {'.arw', '.crw', '.cr2', '.cr3', '.nef', '.nrw', '.orf', '.raf',
+    '.rw2', '.rwl', '.dng', '.pef', '.srw', '.sr2', '.srf'}
+HEIF_EXTENSIONS = {'.heic', '.heif', '.hif'}
+IMAGE_EXTENSIONS = RAW_EXTENSIONS | HEIF_EXTENSIONS | {
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.tif', '.tiff', '.webp', '.bmp'}
+
+
+def _heif_image(path):
+    """Decode the primary HEIF image once, retaining 10/12-bit camera data."""
+    import pillow_heif
+    decoded = pillow_heif.open_heif(path, convert_hdr_to_8bit=False, hdr_to_16bit=True)
+    pixels = np.asarray(decoded)
+    if pixels.ndim == 2:
+        image_format = QImage.Format_Grayscale16 if pixels.dtype == np.uint16 else QImage.Format_Grayscale8
+    elif pixels.dtype == np.uint16:
+        if pixels.shape[2] == 3:
+            pixels = np.dstack((pixels, np.full(pixels.shape[:2], 65535, np.uint16)))
+            image_format = QImage.Format_RGBX64
+        else:
+            image_format = QImage.Format_RGBA64
+    else:
+        image_format = QImage.Format_RGB888 if pixels.shape[2] == 3 else QImage.Format_RGBA8888
+    image = QImage(pixels.data, decoded.size[0], decoded.size[1], pixels.strides[0], image_format).copy()
+    profile = decoded.info.get('icc_profile')
+    nclx = decoded.info.get('nclx_profile')
+    if profile:
+        image.setColorSpace(QColorSpace.fromIccProfile(profile))
+    elif nclx and nclx['color_primaries'] != 2 and nclx['transfer_characteristics'] != 2:
+        transfer = {1:QColorSpace.TransferFunction.Bt2020, 6:QColorSpace.TransferFunction.Bt2020,
+            8:QColorSpace.TransferFunction.Linear, 13:QColorSpace.TransferFunction.SRgb,
+            14:QColorSpace.TransferFunction.Bt2020, 15:QColorSpace.TransferFunction.Bt2020,
+            16:QColorSpace.TransferFunction.St2084, 18:QColorSpace.TransferFunction.Hlg}[nclx['transfer_characteristics']]
+        points = [QPointF(nclx['color_primary_'+name+'_x'], nclx['color_primary_'+name+'_y'])
+            for name in ('white', 'red', 'green', 'blue')]
+        image.setColorSpace(QColorSpace(*points, transfer))
+    return image
+
+
+def _read_image(path, max_edge=None):
+    path = Path(path)
+    if path.suffix.lower() in HEIF_EXTENSIONS:
+        image = _heif_image(path)
+        if max_edge is not None and max(image.width(), image.height()) > max_edge:
+            image = image.scaled(max_edge, max_edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    else:
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if max_edge is not None and size.isValid() and max(size.width(), size.height()) > max_edge:
+            size.scale(max_edge, max_edge, Qt.KeepAspectRatio)
+            reader.setScaledSize(size)
+        image = reader.read()
+        if image.isNull():
+            raise OSError(f'Cannot read {path}: {reader.errorString()}')
+    if not image.colorSpace().isValid():
+        if image.format() == QImage.Format_CMYK8888:
+            image = image.convertToFormat(QImage.Format_RGB888)
+        image.setColorSpace(QColorSpace(QColorSpace.SRgb))
+    return image
 
 
 def open_photo(path):
@@ -26,13 +84,7 @@ def open_photo(path):
             pixels = raw.postprocess(use_camera_wb=True, no_auto_bright=True,
                 output_color=rawpy.ColorSpace.sRGB, output_bps=16, gamma=(2.4, 12.92))
         return pixels.astype(np.float32) / 65535.0
-    reader = QImageReader(str(path))
-    reader.setAutoTransform(True)
-    image = reader.read()
-    if image.isNull():
-        raise OSError(f'Cannot read {path}: {reader.errorString()}')
-    if not image.colorSpace().isValid():
-        image.setColorSpace(QColorSpace(QColorSpace.SRgb))
+    image = _read_image(path)
     image = image.convertedToColorSpace(QColorSpace(QColorSpace.SRgb), QImage.Format_RGBX32FPx4)
     if image.isNull():
         raise ValueError(f'Cannot convert the colour profile of {path} to sRGB')
@@ -75,21 +127,25 @@ def to_preview(pixels, max_edge=None):
     return Image.fromarray(np.uint8(np.clip(pixels, 0, 1) * 255.0 + .5))
 
 
-def open_rgb(path, *, max_edge=None):
+def open_display(path, *, max_edge=None):
+    """Read oriented, colour-managed display pixels; never upscale a preview."""
     path = Path(path)
     if path.suffix.lower() in RAW_EXTENSIONS:
-        return to_preview(open_photo(path),max_edge)
-    with Image.open(path) as opened:
-        if max_edge is not None:
-            opened.draft('RGB',(max_edge,max_edge))
-        image = ImageOps.exif_transpose(opened)
-        if max_edge is not None:
-            image.thumbnail((max_edge,max_edge),Image.Resampling.LANCZOS)
-        profile = image.info.get('icc_profile')
-        if profile:
-            return ImageCms.profileToProfile(image, ImageCms.ImageCmsProfile(BytesIO(profile)),
-                ImageCms.createProfile('sRGB'), outputMode='RGB')
-        return image.convert('RGB')
+        pixels = np.asarray(to_preview(open_photo(path), max_edge))
+        image = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
+        image.setColorSpace(QColorSpace(QColorSpace.SRgb))
+        return image
+    image = _read_image(path, max_edge)
+    image = image.convertedToColorSpace(QColorSpace(QColorSpace.SRgb), QImage.Format_RGB888)
+    if image.isNull():
+        raise ValueError(f'Cannot convert the colour profile of {path} to sRGB')
+    return image
+
+
+def open_rgb(path, *, max_edge=None):
+    image = open_display(path, max_edge=max_edge)
+    pixels = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
+    return Image.fromarray(pixels[:, :image.width() * 3].reshape(image.height(), image.width(), 3).copy())
 
 
 def save_image(image, path):

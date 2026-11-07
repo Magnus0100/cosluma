@@ -88,6 +88,10 @@ jobs:
               dialog.close()
           for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
               subprocess.run([str(executable), *arguments], check=True)
+          heif = next((executable.parent / "_internal").glob("_pillow_heif*.pyd"))
+          subprocess.run([sys.executable, "-I", "-S", "-c",
+              "import ctypes, os, sys; dlls = os.add_dll_directory(sys.argv[1]); ctypes.WinDLL(sys.argv[2])",
+              str(heif.parent), str(heif)], check=True)
           process = subprocess.Popen([str(executable)])
           try:
               time.sleep(3)

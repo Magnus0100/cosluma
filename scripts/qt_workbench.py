@@ -550,7 +550,7 @@ class Workbench(QMainWindow):
         queue_layout.setContentsMargins(14, 14, 14, 14)
         queue_layout.setSpacing(12)
         self.queue_pages = QStackedWidget()
-        empty = QLabel('一次拖入多张照片或多个文件夹\n勾选“包含子文件夹”可连同各层照片导入\n\nJPEG、PNG、TIFF 和相机 RAW')
+        empty = QLabel('一次拖入多张照片或多个文件夹\n勾选“包含子文件夹”可连同各层照片导入\n\nJPEG、PNG、TIFF、HEIC / HEIF、WebP、BMP 和相机 RAW')
         empty.setAlignment(Qt.AlignCenter)
         empty.setWordWrap(True)
         empty.setProperty('role', 'dropArea')

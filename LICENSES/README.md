@@ -3,7 +3,7 @@
 项目代码许可见根目录 [LICENSE](../LICENSE)。本目录中的上游许可证与版权声明
 保持原文，各组件版权归其作者所有。
 
-当前代码直接使用 PySide6/Qt、NumPy、Pillow、OpenCV、SciPy、rawpy/LibRaw、
+当前代码直接使用 PySide6/Qt、NumPy、Pillow、pillow-heif/libheif、OpenCV、SciPy、rawpy/LibRaw、
 color-matcher。相关依赖的许可文本保存在各组件目录中。
 Windows 发布包同时包含 Python 与 PyInstaller 引导程序及其许可；发布源码包含构建配置。
 当前 OpenCV 依赖为 `opencv-python-headless`，桌面界面由 PySide6 提供。
@@ -21,6 +21,8 @@ Qt/PySide、LibRaw 等组件保留各自许可。Windows 包使用独立的动�
 | PySide 6.11.2 | https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.2-src/ |
 | rawpy 0.27.1 与其 LibRaw 子模块 | https://github.com/letmaik/rawpy/tree/v0.27.1 |
 | color-matcher 0.6.0 | https://pypi.org/project/color-matcher/0.6.0/#files |
+| pillow-heif 1.8.1 | https://github.com/bigcat88/pillow_heif/tree/v1.8.1 |
+| libheif 1.23.6、libde265 1.1.3、x265 4.3 | https://github.com/strukturag/libheif/tree/v1.23.6 · https://github.com/strukturag/libde265/tree/v1.1.3 · https://github.com/Multicorewareinc/x265/tree/4.3 |
 
 整头分割和超分通过仓库外安装的 ComfyUI 服务调用。SAM3.1 权重使用随权重提供的 SAM License；
 转换为服务可读取的权重格式后仍保留原许可。ComfyUI、SAM3.1、PyTorch 和超分模型的许可

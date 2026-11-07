@@ -1,14 +1,14 @@
 # CosLuma
 
-**0.16.0 · Windows x64 · 源码使用 Python 3.12**
+**0.16.1 · Windows x64 · 源码使用 Python 3.12**
 
 提供照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.16.0/CosLuma-0.16.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.16.0)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.16.1/CosLuma-0.16.1-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.16.1)
 
-Windows 用户下载 Release 中的 `CosLuma-0.16.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.16.1-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -35,6 +35,9 @@ Windows 用户下载 Release 中的 `CosLuma-0.16.0-windows-x64.zip`，完整解
 切换页面保留当前照片、对话、草稿与已有样片，不发起模型调用，也不会自动开始制作。
 
 照片页的“批量导入”菜单提供“选择照片（可多选）”和“导入文件夹”，也可同时把多张照片与多个文件夹拖入窗口。
+支持 JPEG（JPG/JPEG/JPE/JFIF）、PNG、TIFF、WebP、BMP、HEIC/HEIF（含 HIF 扩展名），以及 rawpy/LibRaw 支持的相机 RAW（ARW、CRW/CR2/CR3、NEF/NRW、ORF、RAF、RW2/RWL、DNG、PEF、SRW、SR2/SRF）；具体机型取决于随包 LibRaw 的支持。
+不同像素尺寸、横图、竖图和方图可以混合导入，不用预先统一分辨率；读取拍摄朝向并转换为 sRGB。预览和 Agent 分析按用途缩小，主图制作读取完整原片，PNG/TIFF 的 16 位及 HEIC/HEIF 的 10/12 位数据不先压成 8 位。
+HEIC/HEIF 使用主图，附属深度图、HDR 增益图与实况视频不参与制作；当前交付为 sRGB 静态照片。
 “包含子文件夹”默认关闭，开启后才递归导入。导入文件夹或同时拖入多个文件夹都遵循此选项，直接多选照片不受影响。
 软件在后台整理导入，按路径去重，原片只读；完成后说明新增、重复和不支持的项目数量，并保留当前预览。选错照片可以“移除高亮照片”或清空。
 新加入的照片默认全部勾选，列表的勾选决定实际进入创作、试样和批量制作的照片；“全选”“全不选”可统一调整，也可逐张勾选。
@@ -100,7 +103,7 @@ Agent 回复、试样或批量制作时，可以切页查看原片和已有成�
 点击“适应窗口”、双击画布或按 0 恢复全图，画布中按 1 查看 100%，加减键缩放。并排时可分别查看两侧细节。
 可打开原片或此照片的工作文件夹。照片页和成片页均提供“打开 JPEG”和“打开 16 位 PNG”，直接打开选中结果的查看副本或 PNG 成片。
 分割前或整组方向设计失败时，也能打开本批次文件夹查看已保留文件。
-RAW 不支持桌面预览时仍可进入制作，最终读取由 rawpy/LibRaw 完成；分析预览不参与整头回贴。
+RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用图像读取模块，读取失败时显示实际错误。分析预览不参与整头回贴。
 
 完成后添加新照片，主按钮变为“按选定风格制作新增 N 张”，只制作当前勾选的新增照片，已有成功与失败照片都不自动重做；同一要求下沿用当前选定方向。
 “勾选照片另做一批”只将当前勾选的照片重新提交为新批次，未勾选照片的已有结果和状态保留；勾选包含样片原片时，仍复用选中的完整样片。原有结果另存保留。

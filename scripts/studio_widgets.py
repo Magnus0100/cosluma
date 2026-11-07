@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QSize, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QImageReader, QPainter, QPalette, QPixmap, QTextDocument
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap, QTextDocument
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
     QVBoxLayout, QWidget)
+
+from image_io import open_display
 
 
 def apply_theme(app):
@@ -418,9 +420,10 @@ class PreviewLoader(QRunnable):
     def run(self):
         images = {}
         for key in self.keys:
-            reader = QImageReader(key[0])
-            reader.setAutoTransform(True)
-            images[key] = reader.read()
+            try:
+                images[key] = (open_display(key[0]), '')
+            except Exception as error:
+                images[key] = (None, str(error))
         self.signals.loaded.emit(images)
 
 
@@ -428,6 +431,7 @@ class PreviewLoader(QRunnable):
 class PhotoPreview(QWidget):
     """Read display previews independently of the untouched production images."""
     cache = {}
+    errors = {}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -499,16 +503,15 @@ class PhotoPreview(QWidget):
         except OSError:
             return None
         if key not in self.cache:
-            reader = QImageReader(str(path))
-            reader.setAutoTransform(True)
-            size = reader.size()
-            if size.isValid() and not full:
-                size.scale(QSize(1600, 1600), Qt.KeepAspectRatio)
-                reader.setScaledSize(size)
-            image = reader.read()
-            self.cache[key] = QPixmap.fromImage(image) if not image.isNull() else None
+            try:
+                self.cache[key] = QPixmap.fromImage(open_display(path, max_edge=None if full else 1600))
+            except Exception as error:
+                self.cache[key] = None
+                self.errors[key] = str(error)
             if len(self.cache) > 6:
-                self.cache.pop(next(iter(self.cache)))
+                removed = next(iter(self.cache))
+                self.cache.pop(removed)
+                self.errors.pop(removed, None)
         return self.cache[key]
 
     def set_photo(self, source=None, output=None):
@@ -540,10 +543,14 @@ class PhotoPreview(QWidget):
     @Slot(object)
     def previews_loaded(self, images):
         self.loader = None
-        for key,image in images.items():
-            self.cache[key] = QPixmap.fromImage(image) if not image.isNull() else None
+        for key,(image,error) in images.items():
+            self.cache[key] = QPixmap.fromImage(image) if image is not None else None
+            if error:
+                self.errors[key] = error
         while len(self.cache) > 6:
-            self.cache.pop(next(iter(self.cache)))
+            removed = next(iter(self.cache))
+            self.cache.pop(removed)
+            self.errors.pop(removed, None)
         self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
         self.update_preview()
         self.load_pending()
@@ -569,12 +576,14 @@ class PhotoPreview(QWidget):
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
             elif self.keys.get(kind) is not None and self.keys[kind] not in self.cache:
                 label.setText('正在读取照片…')
+            elif self.keys.get(kind) in self.errors:
+                label.setText(('读取成片失败\n' if kind == 'output' else '读取原片失败\n')+self.errors[self.keys[kind]])
             elif kind == 'output':
                 label.setText('成片暂时无法预览\n可打开成片或批次文件夹查看文件')
             elif not Path(self.source).is_file():
                 label.setText('原片不在原来的位置\n已保存的成片仍可查看')
             else:
-                label.setText('此原片暂不支持预览\n仍可制作，也可使用“打开原片”查看')
+                label.setText('原片暂时无法预览\n可使用“打开原片”查看文件')
         self.update_zoom_label()
 
     def zoom_views(self, action):

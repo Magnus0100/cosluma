@@ -49,7 +49,7 @@ for name in ('LICENSES','providers'):
     shutil.copytree(root/name,destination/name,dirs_exist_ok=True)
 # Include notices from the versions actually present in the build, including
 # optional modules collected by upstream PyInstaller hooks.
-licensed = {'numpy','pillow','opencv-python-headless','pyside6','pyside6-essentials',
+licensed = {'numpy','pillow','pillow-heif','opencv-python-headless','pyside6','pyside6-essentials',
     'shiboken6','rawpy','scipy','color-matcher','docutils','ddt','imageio','packaging',
     'setuptools','charset-normalizer','cffi','pycparser','pyyaml','psutil','pyinstaller'}
 for distribution in distributions():
