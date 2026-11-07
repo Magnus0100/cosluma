@@ -361,6 +361,7 @@ class Workbench(QMainWindow):
         self.style_discussion_directory = None
         self.style_discussion_context = None
         self.current_output = None
+        self.current_png = None
         self.batch_directory = None
         self.last_batch_directory = self.preferences.value('last_batch_directory', '', type=str)
         self.batch_error = ''
@@ -510,7 +511,8 @@ class Workbench(QMainWindow):
         photo_controls = QHBoxLayout()
         for name, text, action in (('open_source_button', '打开原片', self.open_source),
                 ('open_work_button', '打开此照片文件夹', self.open_work_directory),
-                ('open_photo_button', '打开选中成片', self.open_selected_output)):
+                ('open_photo_button', '打开 JPEG', self.open_selected_output),
+                ('open_png_button', '打开 16 位 PNG', self.open_selected_png)):
             button = QPushButton(text)
             button.setProperty('kind', 'quiet')
             button.setEnabled(False)
@@ -571,7 +573,7 @@ class Workbench(QMainWindow):
         self.last_batch_button.setMenu(saved_menu)
         self.last_batch_button.clicked.connect(self.open_last_batch)
         results_header.addWidget(self.last_batch_button)
-        self.open_folder_button = QPushButton('打开本次结果')
+        self.open_folder_button = QPushButton('打开当前批次文件夹')
         self.open_folder_button.setProperty('kind', 'quiet')
         self.open_folder_button.setEnabled(False)
         self.open_folder_button.clicked.connect(self.open_results)
@@ -596,6 +598,7 @@ class Workbench(QMainWindow):
         self.result_views.addWidget(self.results_empty)
         results_layout.addWidget(self.result_views, 1)
         decision = QFrame()
+        self.decision_bar = decision
         decision.setProperty('role', 'decisionBar')
         decision_layout = QHBoxLayout(decision)
         decision_layout.setContentsMargins(14, 12, 14, 12)
@@ -1064,7 +1067,10 @@ class Workbench(QMainWindow):
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))
         view = self.result_views.currentWidget()
         archived = self.archive_view is not None and view is self.archive_view
-        self.return_current.setVisible(archived and self.current_batch_view is not None)
+        self.return_current.setVisible(archived)
+        self.decision_bar.setVisible(not archived)
+        self.readiness.setVisible(not archived)
+        self.open_folder_button.setEnabled(isinstance(view, BatchResults))
         self.results_caption.setText('已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
     def dragEnterEvent(self, event):
@@ -1084,27 +1090,33 @@ class Workbench(QMainWindow):
         if row < 0 or row >= len(self.sources):
             self.preview_key = None
             self.current_output = None
+            self.current_png = None
             self.photo_preview.set_photo()
             self.output_info.clear()
             self.open_source_button.setEnabled(False)
             self.open_work_button.setEnabled(False)
             self.open_photo_button.setEnabled(False)
+            self.open_png_button.setEnabled(False)
             return
         source = self.sources[row]
         result = self.results.get(self.source_key(source))
         self.current_output = None
+        self.current_png = None
         self.open_photo_button.setEnabled(False)
+        self.open_png_button.setEnabled(False)
         self.open_source_button.setEnabled(Path(source).is_file())
         if result and result['status'] == 'complete':
             path = result.get('exports', {}).get('JPEG', result['files']['jpeg'])
             self.current_output = path
+            self.current_png = result.get('exports', {}).get('PNG', result['files']['final'])
             width, height = result['output_dimensions']
             self.output_info.setText(f'{Path(source).name} · 成片 {width} × {height}\n16 位 PNG 和 JPEG 已保存')
             if result.get('output_adjustment'):
                 self.output_info.setText(self.output_info.text() + '\n已按模型实际覆盖范围输出。')
             self.open_photo_button.setEnabled(Path(path).is_file())
+            self.open_png_button.setEnabled(Path(self.current_png).is_file())
             if not self.open_photo_button.isEnabled():
-                self.output_info.setText(self.output_info.text() + '\n成片文件已移动或删除，请在照片文件夹中查找。')
+                self.output_info.setText(self.output_info.text() + '\nJPEG 文件已移动或删除，请在照片文件夹中查找。')
         else:
             path = source
             error = result.get('error') if result else self.photo_errors.get(self.source_key(source))
@@ -1209,7 +1221,6 @@ class Workbench(QMainWindow):
         self.listing.item(self.rows[key], 1).setToolTip('' if result['status'] == 'complete' else str(result['error']))
         self.active_processed += 1
         self.progress_bar.setValue(self.active_processed)
-        self.open_folder_button.setEnabled(bool(self.batch_directory))
         self.show_selected()
         if self.current_batch_view is not None:
             self.current_batch_view.update_result(result)
@@ -1239,7 +1250,6 @@ class Workbench(QMainWindow):
         if self.current_batch_view is not None:
             self.current_batch_view.refresh()
         self.update_actions()
-        self.open_folder_button.setEnabled(bool(self.batch_directory))
         self.show_selected()
         self.save_workspace()
         worker.deleteLater()
@@ -1248,6 +1258,10 @@ class Workbench(QMainWindow):
     def open_selected_output(self):
         if self.current_output:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_output))
+
+    def open_selected_png(self):
+        if self.current_png:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_png))
 
     def open_source(self):
         row = self.listing.currentRow()
@@ -1263,8 +1277,9 @@ class Workbench(QMainWindow):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def open_results(self):
-        if self.batch_directory:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.batch_directory)))
+        view = self.result_views.currentWidget()
+        if isinstance(view, BatchResults):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(view.directory)))
 
     def restore_window(self):
         self.close_after_finish = False
@@ -1316,7 +1331,8 @@ class Workbench(QMainWindow):
         elif index == 2 and self.current_batch_view is None and self.batch_directory:
             try:
                 self.current_batch_view = self.make_results_view(self.batch_directory)
-                self.result_views.setCurrentWidget(self.current_batch_view)
+                if self.result_views.currentWidget() is self.results_empty:
+                    self.result_views.setCurrentWidget(self.current_batch_view)
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('读取本次结果失败：' + str(error))
         self.pages.setCurrentIndex(index)
@@ -1352,7 +1368,7 @@ class Workbench(QMainWindow):
             workspace = CreativeWorkspace(sources, source, context[0], context[1],
                 self.root.text(), config, self.creative_page, previous=previous, discussion=discussion)
             self.creative_workspace = workspace
-            if chosen is not None:
+            if chosen is not None and workspace.chosen_file != chosen['selection_file']:
                 workspace.show_selected_style(chosen)
             workspace.discussion_saved.connect(self.remember_discussion)
             workspace.style_selected.connect(self.select_style)
@@ -1398,7 +1414,7 @@ class Workbench(QMainWindow):
         self.preferences.setValue('style/selected', option['selection_file'])
         self.preferences.sync()
         self.status.setText('已定稿“' + option['title'] + '”。确认这张真实样片后，单独点击批量制作。')
-        self.navigate(2)
+        self.show_current_batch()
 
 
     def view_chosen(self):
@@ -1415,8 +1431,7 @@ class Workbench(QMainWindow):
 
 
     def show_current_batch(self):
-        if self.current_batch_view is not None:
-            self.result_views.setCurrentWidget(self.current_batch_view)
+        self.result_views.setCurrentWidget(self.current_batch_view or self.results_empty)
         self.navigate(2)
 
 
