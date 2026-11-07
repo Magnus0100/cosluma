@@ -100,21 +100,25 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
             images.append(('原片：'+Path(source).name,preview_data_url(image,1280)))
     descriptions = []
     for option in samples:
-        descriptions.append({key:option[key] for key in ('index','title','summary','status')})
+        description = {key:option[key] for key in ('index','title','summary','status')}
+        description['role'] = '已定稿样片' if option.get('selected') else '本轮候选'
+        descriptions.append(description)
         if option['status']=='complete':
             with open_rgb(option['result']['files']['jpeg']) as image:
-                images.append((f'方案 {option["index"]+1} 的真实样片：'+option['title'],preview_data_url(image,1280)))
+                label = '已定稿真实样片：' if option.get('selected') else f'本轮方案 {option["index"]+1} 的真实样片：'
+                images.append((label+option['title'],preview_data_url(image,1280)))
     instruction = (
         '你是与用户共同创作 COS 摄影后期的摄影 Agent，现在处于讨论与试样阶段。'
         '用自然的中文对话，先观察本次角色和原片的妆造、道具、构图、受光，结合完整对话与已生成样片讨论。'
         '用户可以提想法、问问题、比较样片并修改要求；需要关键的角色信息时简短提问，不懂的角色设定不要编造。'
+        '已定稿样片可能来自先前轮次，与本轮候选分开理解；用户查看或比较其他候选不代表更换定稿。'
         '不提供固定风格菜单，不预设三个场景，不把提示词目录标题凑成候选。'
         '回复具体说明适合这组素材的场景、色彩、情绪与光感；有样片时应针对实际画面交流，分清原片和样片编号。'
         '保留原片身份、脸型、机位、姿态与实物服装结构；整头会回贴，摄影方向须与原片受光相容。'
         '明度和色温可以调整，但不能用曲线冒充空间重打光。特效按单张动作、视线和留白决定，不设整组开关。'
         '本次调用只讨论，不运行生图、超分、分割或批量。'
         '需要试样时请用户点击“按当前讨论生成三个样片”；修改后仍由用户主动生成，不声称已经完成未执行的动作。'
-        '最终方向只能由用户点击样片的“定稿并用于批量”决定；不要自行宣布定稿或开始批量。'
+        '最终方向只能由用户明确点击样片的定稿按钮决定；不要自行宣布定稿或开始批量。'
         '返回 JSON，只有 reply 和 direction。reply 是直接显示给用户的自然对话，不包含 JSON 或算法术语。'
         'direction 是当前双方讨论形成的创作要求，供下一次样片设计使用；保留此前未取消的要求，未知内容保持未定。'
         '只有用户增加或修改影响画面的要求时才更新 direction；只是询问、比较或选择已有样片时保持原值。'
