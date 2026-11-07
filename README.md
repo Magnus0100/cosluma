@@ -1,14 +1,14 @@
 # CosLuma
 
-**0.17.0 · Windows x64 · 源码使用 Python 3.12**
+**0.17.1 · Windows x64 · 源码使用 Python 3.12**
 
 提供照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.17.0/CosLuma-0.17.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.17.0)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.17.1/CosLuma-0.17.1-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.17.1)
 
-Windows 用户下载 Release 中的 `CosLuma-0.17.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.17.1-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -122,6 +122,7 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 1. “瘦脸”可直接在 0–100 间调整，收窄下颌两侧，固定眼、鼻、嘴和外侧边界。
 2. 点击“生成美肤基础”后，BeautyGRPO 生成本张人脸的调整基础；成功时从 30 的强度开始预览，可继续调到 0–100。
    美肤仅应用于皮肤，保护眼睛、眉毛与嘴唇。滑杆复用当前基础，不再请求生图；“重新生成美肤基础”是你主动另做一次，旧文件保留。
+   “查看模型原始输出”直接打开未经皮肤选择、强度混合或五官保护的官方推理 PNG；滑杆调节的是此后应用到成片的强度，不改模型权重或推理步骤。
 3. 在“美化前 / 美化后”并排查看，也可单独切换，放大检查皮肤和妆容；滑杆更新时保留缩放。“全部归零”恢复基础成片的像素。
 4. 满意后点击“另存美化版”，保存同尺寸 16 位 PNG 和同一结果的 8 位 JPEG。成片页的“美化版”勾选可随时切回基础成片；
    打开 PNG/JPEG 跟随当前版本。基础成片和批次原有 `PNG`、`JPEG` 导出目录保留。
@@ -132,7 +133,8 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 分析或生图失败显示实际错误与文件目录，保留基础成片、已有模型文件和上次成功预览，不自动重试或换模型。
 
 美化保持原尺寸 float32 成片作为像素基础，只叠加皮肤调整差值；瘦脸对局部采样一次。
-模型处理的是 1024 像素、8 位人脸，FaceXFormer 的分析输入为 224 像素，蒙版经 8 位 PNG 传输。
+模型输入直接从完整尺寸的成片裁取人脸，按官方方式用双线性缩放到 1024 像素、8 位 RGB；不从分析缩略图放大获得。
+推理为完整 BF16，官方 PIL 输出仍为 8 位 PNG；FaceXFormer 的分析输入为 224 像素，蒙版经 8 位 PNG 传输。
 16 位另存不会补回模型环节没有的色阶；生成模型也可能调整皮肤纹理，效果由你对比并选择强度。
 
 “打开当前批次文件夹”定位正在查看的批次。`PNG` 与 `JPEG` 子目录按原片名保存成片：
@@ -210,13 +212,19 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 ### 可选美化服务
 
 使用已有 ComfyUI 的 Python 环境与模型目录，将随包 `providers/comfyui_cosluma_beauty` 整个文件夹复制到
-`ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors 和 MediaPipe；桌面端不安装或加载这些模型运行库。
+`ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors、MediaPipe、Diffusers、Transformers、Accelerate 与 PEFT；桌面端不安装或加载这些模型运行库。
 在已有 ComfyUI 的 Python 中执行 `python -m pip install -r <CosLuma目录>/providers/comfyui_cosluma_beauty/requirements.txt` 后重启服务。
 
 美肤使用 [BeautyGRPO（CVPR 2026）](https://github.com/vivoCameraResearch/BeautyGRPO) 的官方 FLUX Kontext LoRA。
 其[论文](https://arxiv.org/abs/2603.01163)报告了 1,000 张自然人像上的 FID 2.23、LPIPS 0.049 与身份相似度 0.952；
 这是面部修饰任务的选型依据，不表示它在所有身份指标领先，也不是 COS 妆造效果的保证。
-服务默认使用 Comfy-Org 的 FP8 scaled Kontext 底座，28 步、guidance 2.5、seed 42；该精度与本文叠加差值的方式均不同于论文完整评测设置。
+美肤节点按[官方推理源码](https://github.com/vivoCameraResearch/BeautyGRPO/blob/80fcf466d6bfc3b3a05e1cbedd11e3a3ced2bcb9/src/inference/infer.py)
+调用 `FluxKontextPipeline.from_pretrained(..., torch_dtype=torch.bfloat16)`，加载完整 BeautyGRPO LoRA，沿用模型目录中的官方调度器、tokenizer、文本编码器与 VAE。
+固定 1024 输入、28 步、guidance 2.5、seed 42；提示词为官方脚本的 `Beautify this person's face while maintaining a natural and realistic appearance.`，不追加提示词。
+不使用 FP8/INT8/GGUF 权重，不以 ComfyUI KSampler 近似官方流程，不跳过 LoRA 加载错误。
+推理时使用独立 PyTorch 运行的默认计算精度，关闭宿主额外启用的 TF32 矩阵乘法和半精度 math SDP 累加。
+节点直接保存官方 Pipeline 返回的 PIL 图，完整原始输出可独立查看；皮肤差值、五官保护与强度调节在模型输出之后进行。
+这复现的是官方公开推理方法；论文的训练、奖励模型与整套测试集指标不因单张推理而被重新复现。
 瘦脸使用 [MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) 的 478 点定位，包含眼睑与虹膜；
 下颌轮廓收缩由 SciPy 薄板样条计算，眼鼻唇等五官范围的形变场为零。皮肤范围使用 [FaceXFormer](https://github.com/Kartik-3004/facexformer) 的面部解析，不使用其 68 点定位。
 
@@ -226,11 +234,12 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 | --- | --- | --- |
 | `beauty.analysis_model` | `models/cosluma_face/facexformer.safetensors` | [FaceXFormer 的 ckpts/model.pt](https://huggingface.co/kartiknarayan/facexformer)，按下方命令无损提取 |
 | `beauty.landmark_model` | `models/cosluma_face/face_landmarker.task` | [Google 官方 float16/1 模型](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task) |
-| `beauty.model` | `models/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors` | [Comfy-Org Kontext](https://huggingface.co/Comfy-Org/Flux-1-Kontext-Dev) |
-| `beauty.lora` | `models/loras/beautygrpo.safetensors` | [BeautyGRPO](https://huggingface.co/Sehnsucht24/BeautyGRPO) 的 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放入 |
-| `beauty.clip_l` | `models/text_encoders/clip_l.safetensors` | [Flux 文本编码器](https://huggingface.co/comfyanonymous/flux_text_encoders) |
-| `beauty.t5` | `models/text_encoders/t5xxl_fp16.safetensors` | 同上 |
-| `beauty.vae` | `models/vae/ae.safetensors` | [FLUX.1 的 VAE](https://huggingface.co/black-forest-labs/FLUX.1-schnell) |
+| `beauty.model` | 完整目录 `models/diffusers/FLUX.1-Kontext-dev`，也可填写服务机器上的绝对目录 | [BFL 官方 FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev/tree/24e9dedc4ef646698dc8eb4e18ae2cec3c9fea0d) 的完整 Diffusers 组件 |
+| `beauty.lora` | `models/loras/beautygrpo.safetensors` | [BeautyGRPO 官方权重](https://huggingface.co/Sehnsucht24/BeautyGRPO/tree/241d57903834ba55cb544b665686eb5d494b3dcf) 的 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放入 |
+
+完整 Kontext 目录须包含 `model_index.json`、`transformer`、`text_encoder`、`text_encoder_2`、`vae`、`scheduler`、`tokenizer` 和 `tokenizer_2`。
+这些组件均取自同一官方版本，不用其它发布包中同名文件替代；重复的单文件整合版不是 Diffusers 目录的一部分。
+BFL 权重需要有权限的 Hugging Face 账号下载，服务运行时只读取本机完整目录，不联网下载、不读取 Hugging Face 凭据。
 
 在已有 ComfyUI Python 中执行：
 
@@ -241,7 +250,14 @@ python <CosLuma目录>/providers/convert_facexformer.py <下载目录>/ckpts/mod
 转换只提取 `state_dict_backbone`，不量化或改动张量；节点严格加载完整权重，不另外下载 ImageNet 初始化参数。
 美化页首次连接的地址默认沿用整头服务，可改为单独服务；`beauty.analysis_device` 为 FaceXFormer 皮肤解析明确选择 `cuda:0` 或 `cpu`。
 MediaPipe 定位在当前 Windows 服务使用 CPU/XNNPACK；两个分析模块均不自动切换设备。
-当前模型组合约需 22 GB 权重磁盘空间，GPU 与内存由 ComfyUI 管理；权重保存在服务机器，未随桌面包分发。
+`beauty.inference_device` 为明确的 `cuda:0`。`beauty.memory` 可选择 `group_offload` 或 `cuda`；16 GB 显存使用前者，
+由 Diffusers 按一个 block 分组在 CPU 内存与 GPU 间搬运完整 BF16 参数，不量化、不改变采样和步数。
+`cuda` 将整套模型放入显存，需要足够显存；两种布局均事先明确配置，失败不会自动切换。
+本机 Windows 服务使用原生 PyTorch allocator，并关闭 ComfyUI DynamicVRAM 的 CUDA hooks，由 Diffusers 管理美肤参数卸载。
+启动服务时明确设置 `PYTORCH_ALLOC_CONF=backend:native` 和 `PYTORCH_CUDA_ALLOC_CONF=backend:native`，并加上 `--disable-dynamic-vram --disable-cuda-malloc`；
+不在推理失败后更换内存管理方式。
+完整底座与 LoRA 共约 34 GB 权重，运行还需要足够系统内存；权重保存在服务机器，未随桌面包分发。
+已有美肤基础保留其实际推理配置；界面会说明此前的配置，主动重新生成才使用当前官方 BF16 方法，旧图片不会改写。
 FLUX.1-dev 模型受其非商业许可约束，BeautyGRPO 权重与其他组件分别遵循上游条款，见 [第三方许可](LICENSES/README.md)。
 
 ### 自定义提示词库

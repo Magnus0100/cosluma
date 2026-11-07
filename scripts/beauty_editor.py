@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
     QVBoxLayout, QWidget)
@@ -35,8 +36,7 @@ class BeautyConnection(QDialog):
         form = QFormLayout()
         self.fields = {}
         for key,label in (('url','ComfyUI 地址'),('analysis_model','FaceXFormer 模型'),
-                ('landmark_model','面部定位模型'),('model','美肤底座'),('lora','美肤 LoRA'),
-                ('clip_l','CLIP-L'),('t5','T5'),('vae','VAE')):
+                ('landmark_model','面部定位模型'),('model','完整 Kontext 模型目录'),('lora','BeautyGRPO LoRA')):
             field = QLineEdit(str(values[key]))
             form.addRow(label,field)
             self.fields[key] = field
@@ -45,8 +45,13 @@ class BeautyConnection(QDialog):
             self.device.addItem(device)
         self.device.setCurrentText(values['analysis_device'])
         form.addRow('皮肤分析设备',self.device)
+        self.memory = QComboBox()
+        self.memory.addItem('完整 BF16 · 分组卸载到内存','group_offload')
+        self.memory.addItem('完整 BF16 · 全部放入显存','cuda')
+        self.memory.setCurrentIndex(self.memory.findData(values['memory']))
+        form.addRow('美肤内存布局',self.memory)
         layout.addLayout(form)
-        self.message = ui_label('模型名填写 ComfyUI 模型目录中的实际文件名；模型与权重均在仓库外。')
+        self.message = ui_label('Kontext 目录包含完整未量化的 Diffusers 模型、编码器、VAE 和调度器；美肤使用 cuda:0，内存布局由你明确选择。')
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         buttons = QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
@@ -64,6 +69,8 @@ class BeautyConnection(QDialog):
                 raise ValueError('请填写实际模型文件名')
             values['url'] = values['url'].rstrip('/')
             values['analysis_device'] = self.device.currentText()
+            values['inference_device'] = 'cuda:0'
+            values['memory'] = self.memory.currentData()
             self.config['beauty'] = values
             save_json(self.path,self.config)
             self.accept()
@@ -172,9 +179,14 @@ class BeautyEditor(QWidget):
         self.skin_button.setEnabled(False)
         self.skin_button.clicked.connect(lambda:self.start('skin'))
         controls.addWidget(self.skin_button)
-        description = ui_label('美肤基础只按你的操作生成。之后调整强度与瘦脸使用当前基础。')
-        description.setWordWrap(True)
-        controls.addWidget(description)
+        self.source_note = ui_label('生成完整 BF16 模型输出后，再调整应用强度。模型原始输出单独保留，可直接查看。')
+        self.source_note.setWordWrap(True)
+        controls.addWidget(self.source_note)
+        self.raw_button = QPushButton('查看模型原始输出')
+        self.raw_button.setProperty('kind','quiet')
+        self.raw_button.setEnabled(False)
+        self.raw_button.clicked.connect(self.open_raw)
+        controls.addWidget(self.raw_button)
         self.reset_button = QPushButton('全部归零')
         self.reset_button.setProperty('kind','quiet')
         self.reset_button.clicked.connect(self.reset_parameters)
@@ -287,6 +299,11 @@ class BeautyEditor(QWidget):
         self.set_parameters(BeautyParameters())
         self.parameters_changed()
 
+    def open_raw(self):
+        if self.session is not None and self.session.state.get('skin_ready'):
+            path = self.session.directory/self.session.state['skin_file']
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def parameters_changed(self):
         for key,slider in self.sliders.items():
             self.values[key].setText(str(slider.value()))
@@ -319,6 +336,13 @@ class BeautyEditor(QWidget):
         self.sliders['skin'].setEnabled(self.session is not None and self.session.delta is not None and (not busy or rendering))
         self.skin_button.setEnabled(self.session is not None and not busy)
         self.skin_button.setText('重新生成美肤基础' if self.session is not None and self.session.delta is not None else '生成美肤基础')
+        self.raw_button.setEnabled(self.session is not None and self.session.delta is not None)
+        if self.session is not None and self.session.delta is not None:
+            official = self.session.state.get('skin',{}).get('engine')=='diffusers.FluxKontextPipeline'
+            self.source_note.setText('当前基础：官方 BF16 推理。滑杆调整应用强度；模型原始输出单独保留。' if official else
+                '当前基础来自此前的推理配置。主动重新生成后使用官方 BF16 方法，旧文件保留。')
+        else:
+            self.source_note.setText('生成完整 BF16 模型输出后，再调整应用强度。模型原始输出单独保留，可直接查看。')
         self.analyze_button.setEnabled(not busy)
         self.connection_button.setEnabled(not busy)
         self.reset_button.setEnabled(self.session is not None and (not busy or rendering))

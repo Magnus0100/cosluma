@@ -13,6 +13,7 @@ import uuid
 
 import cv2
 import numpy as np
+from PIL import Image
 from scipy.interpolate import RBFInterpolator
 
 from image_io import open_photo, open_rgb, save_image, save_jpeg, save_json, to_preview
@@ -20,8 +21,8 @@ from model_clients import multipart, post_json, request
 
 BEAUTY_DEFAULTS = {'url':'http://127.0.0.1:8188', 'analysis_model':'facexformer.safetensors',
     'landmark_model':'face_landmarker.task', 'analysis_device':'cuda:0',
-    'model':'flux1-dev-kontext_fp8_scaled.safetensors', 'lora':'beautygrpo.safetensors',
-    'clip_l':'clip_l.safetensors', 't5':'t5xxl_fp16.safetensors', 'vae':'ae.safetensors'}
+    'model':'FLUX.1-Kontext-dev', 'lora':'beautygrpo.safetensors',
+    'inference_device':'cuda:0','memory':'group_offload'}
 
 # MediaPipe's anatomical contours; eyelids and iris centres come from the
 # dedicated 478-point landmarker, independently of skin segmentation.
@@ -92,7 +93,7 @@ class BeautySession:
         if self.state.get('skin_ready'):
             with open_rgb(self.directory/self.state['skin_file']) as image:
                 retouched = np.asarray(image, np.float32)/255
-            with open_rgb(self.directory/'face-input.png') as image:
+            with open_rgb(self.directory/self.state.get('skin_input','face-input.png')) as image:
                 original = np.asarray(image, np.float32)/255
             self.delta = retouched-original
 
@@ -121,13 +122,18 @@ def prepare_face(base, region, root, config, progress=None):
         '3':{'class_type':'SaveImage','inputs':{'images':['2',0],'filename_prefix':prefix+'-face'}},
         '4':{'class_type':'MaskToImage','inputs':{'mask':['2',1]}},
         '5':{'class_type':'SaveImage','inputs':{'images':['4',0],'filename_prefix':prefix+'-skin'}}}
-    result = _run(graph, {'3':'face-input.png','5':'skin.png'}, config, directory, 'analysis')
+    result = _run(graph, {'3':'analysis-face.png','5':'skin.png'}, config, directory, 'analysis')
     analysis = result['outputs']['2']['face'][0]
     scale = np.array([x1-x0, y1-y0])/np.array(preview.size)
     box = np.rint(np.array(analysis['box'])*np.tile(scale, 2)+[x0,y0,x0,y0]).astype(int)
     box = np.clip(box, [0,0,0,0], [width,height,width,height])
+    # Model RGB comes from the native completed photograph, independently of
+    # the smaller analysis image. Match the official 1024 bilinear input.
+    left,top,right,bottom = box
+    to_preview(pixels[top:bottom,left:right]).resize((1024,1024),Image.Resampling.BILINEAR).save(directory/'face-input.png')
     state = {'base':os.path.relpath(Path(base).resolve(), directory), 'box':box.tolist(),
         'landmarks':analysis['landmarks'], 'source_dimensions':[width,height], 'skin_ready':False,
+        'face_input':'native completed RGB; official 1024 bilinear resize',
         'analysis':{'model':analysis['analysis_model'],'landmark_model':analysis['landmark_model'],
             'landmark_device':analysis['landmark_device'],'device':analysis['device']}}
     save_json(directory/'session.json', state)
@@ -136,38 +142,25 @@ def prepare_face(base, region, root, config, progress=None):
 
 def prepare_skin(session, config, progress=None):
     report = progress or (lambda message:None)
-    with open_rgb(session.directory/'face-input.png') as image:
-        filename = _upload(image, config)
-    report('BeautyGRPO 生成美肤基础')
     directory = session.directory/('skin-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
-    prompt = "Beautify this person's face while maintaining a natural and realistic appearance. Preserve the identity, facial geometry, eyes, expression and intentional makeup."
+    report('从完整成片准备官方 1024 像素输入')
+    pixels = open_photo(session.base_path)
+    left,top,right,bottom = session.box
+    image = to_preview(pixels[top:bottom,left:right]).resize((1024,1024),Image.Resampling.BILINEAR)
+    del pixels
+    image.save(directory/'input.png')
+    filename = _upload(image, config)
+    report('BeautyGRPO 官方 BF16 完整推理 · 28 步')
     graph = {
         '1':{'class_type':'LoadImage','inputs':{'image':filename}},
-        '2':{'class_type':'UNETLoader','inputs':{'unet_name':config['model'],'weight_dtype':'default'}},
-        '3':{'class_type':'DualCLIPLoader','inputs':{'clip_name1':config['clip_l'],
-            'clip_name2':config['t5'],'type':'flux','device':'default'}},
-        '4':{'class_type':'VAELoader','inputs':{'vae_name':config['vae']}},
-        '5':{'class_type':'LoraLoaderModelOnly','inputs':{'model':['2',0],
-            'lora_name':config['lora'],'strength_model':1.0}},
-        '6':{'class_type':'CLIPTextEncode','inputs':{'clip':['3',0],'text':prompt}},
-        '7':{'class_type':'FluxGuidance','inputs':{'conditioning':['6',0],'guidance':2.5}},
-        '8':{'class_type':'VAEEncode','inputs':{'pixels':['1',0],'vae':['4',0]}},
-        '9':{'class_type':'ReferenceLatent','inputs':{'conditioning':['7',0],'latent':['8',0]}},
-        '10':{'class_type':'ConditioningZeroOut','inputs':{'conditioning':['6',0]}},
-        '11':{'class_type':'EmptySD3LatentImage','inputs':{'width':1024,'height':1024,'batch_size':1}},
-        '12':{'class_type':'ModelSamplingFlux','inputs':{'model':['5',0], 'max_shift':1.15,
-            'base_shift':.5,'width':1024,'height':1024}},
-        '13':{'class_type':'KSampler','inputs':{'model':['12',0], 'positive':['9',0], 'negative':['10',0],
-            'latent_image':['11',0], 'seed':42, 'steps':28, 'cfg':1.0,
-            'sampler_name':'euler','scheduler':'simple','denoise':1.0}},
-        '14':{'class_type':'VAEDecode','inputs':{'samples':['13',0],'vae':['4',0]}},
-        '15':{'class_type':'SaveImage','inputs':{'images':['14',0],
-            'filename_prefix':'CosLuma/beauty-'+uuid.uuid4().hex}}}
-    _run(graph, {'15':'skin-result.png'}, config, directory, 'skin')
+        '2':{'class_type':'CosLumaBeautyGRPO','inputs':{'image':['1',0],
+            'model':config['model'],'lora':config['lora'],'device':config['inference_device'],
+            'memory':config['memory'],'filename_prefix':'CosLuma/beauty-'+uuid.uuid4().hex}}}
+    result = _run(graph, {'2':'skin-result.png'}, config, directory, 'skin')
     session.state.update(skin_ready=True, skin_file=os.path.relpath(directory/'skin-result.png',session.directory),
-        skin={'model':config['model'],'lora':config['lora'],
-        'clip_l':config['clip_l'],'t5':config['t5'],'vae':config['vae'],'steps':28,'guidance':2.5,'seed':42})
+        skin_input=os.path.relpath(directory/'input.png',session.directory),
+        skin=result['outputs']['2']['beauty'][0])
     save_json(session.directory/'session.json', session.state)
     return BeautySession(session.directory)
 

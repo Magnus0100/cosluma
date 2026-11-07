@@ -13,6 +13,7 @@ import folder_paths
 import comfy.model_management
 
 from .facexformer import FaceXFormer
+from .beautygrpo import CosLumaBeautyGRPO
 
 folder_paths.add_model_folder_path('cosluma_face', str(Path(folder_paths.models_dir)/'cosluma_face'))
 
@@ -93,5 +94,6 @@ class CosLumaFaceAnalysis:
         return {'ui': {'face':[metadata]}, 'result':(face, torch.from_numpy(crop_mask)[None])}
 
 
-NODE_CLASS_MAPPINGS = {'CosLumaFaceAnalysis':CosLumaFaceAnalysis}
-NODE_DISPLAY_NAME_MAPPINGS = {'CosLumaFaceAnalysis':'CosLuma · 皮肤解析与面部定位'}
+NODE_CLASS_MAPPINGS = {'CosLumaFaceAnalysis':CosLumaFaceAnalysis,'CosLumaBeautyGRPO':CosLumaBeautyGRPO}
+NODE_DISPLAY_NAME_MAPPINGS = {'CosLumaFaceAnalysis':'CosLuma · 皮肤解析与面部定位',
+    'CosLumaBeautyGRPO':'CosLuma · BeautyGRPO 官方 BF16 推理'}
