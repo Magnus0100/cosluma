@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sys
 from urllib.parse import urlsplit, urlunsplit
+import uuid
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
     QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
@@ -21,6 +23,7 @@ from studio_widgets import apply_theme, ui_label, PhotoPreview
 from creative_workspace import CreativeWorkspace
 from batch_results import BatchResults
 from image_io import IMAGE_EXTENSIONS
+from model_clients import select_photos
 from photo_pipeline import finish_batch, load_style
 from settings import default_settings_path, editable_settings, load_settings, save_settings
 
@@ -39,6 +42,65 @@ def endpoint_url(value, service):
     else:
         parsed = parsed._replace(path=parsed.path.rstrip('/'))
     return urlunsplit(parsed)
+
+
+class ImportWorker(QThread):
+    ready = Signal(list, int)
+    progress = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, paths, recursive):
+        super().__init__()
+        self.paths = list(paths)
+        self.recursive = recursive
+
+    def run(self):
+        def scan_error(error):
+            raise error
+        try:
+            photos, skipped = [], 0
+            for value in self.paths:
+                path = Path(value).expanduser().resolve()
+                if path.is_dir():
+                    for parent, directories, files in os.walk(path, onerror=scan_error):
+                        if not self.recursive:
+                            directories.clear()
+                        directories.sort(key=str.casefold)
+                        for name in sorted(files, key=str.casefold):
+                            candidate = Path(parent)/name
+                            if candidate.suffix.lower() in IMAGE_EXTENSIONS:
+                                photos.append(str(candidate.resolve()))
+                            else:
+                                skipped += 1
+                        self.progress.emit(f'正在整理导入，已找到 {len(photos)} 张照片…')
+                elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                    photos.append(str(path))
+                else:
+                    skipped += 1
+            self.ready.emit(photos,skipped)
+        except OSError as error:
+            self.failed.emit('批量导入失败：'+str(error))
+
+
+class SelectionWorker(QThread):
+    ready = Signal(dict, str)
+    progress = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, sources, character, brief, selection_brief, root, config):
+        super().__init__()
+        self.sources, self.character, self.brief = list(sources), character, brief
+        self.selection_brief, self.root, self.config = selection_brief, root, config
+
+    def run(self):
+        directory = Path(self.root).expanduser().resolve()/('selection-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+        try:
+            directory.mkdir(parents=True,exist_ok=False)
+            result = select_photos(self.sources,self.character,self.brief,self.config,directory,
+                selection_brief=self.selection_brief,progress=self.progress.emit)
+            self.ready.emit(result,str(directory))
+        except Exception as error:
+            self.failed.emit('Agent 选片失败：'+(getattr(error,'provider_message','') or str(error))+f'。已有勾选保留，文件：{directory}')
 
 
 class Worker(QThread):
@@ -364,6 +426,8 @@ class Workbench(QMainWindow):
         self.setMinimumSize(1080, 680)
         self.setAcceptDrops(True)
         self.worker = None
+        self.import_worker = None
+        self.selection_worker = None
         self.creative_workspace = None
         self.creative_context = None
         self.creative_direction = ''
@@ -389,6 +453,11 @@ class Workbench(QMainWindow):
         self.stages = {}
         self.preview_key = None
         self.sources = []
+        self.excluded_sources = set()
+        self.representative_source = None
+        self.photo_selection = None
+        self.photo_selection_directory = None
+        self.photo_selection_error = ''
         self.results = {}
         self.rows = {}
         self.inputs = []
@@ -434,8 +503,22 @@ class Workbench(QMainWindow):
         photos_layout.setContentsMargins(0, 0, 0, 0)
         photos_layout.setSpacing(10)
         toolbar = QHBoxLayout()
-        for title, action in (('添加照片', self.select_sources), ('添加文件夹', self.select_folder),
-                              ('移除选中', self.remove_selected), ('清空', self.clear_sources)):
+        import_photos = QToolButton()
+        import_photos.setText('批量导入')
+        import_photos.setPopupMode(QToolButton.InstantPopup)
+        import_menu = QMenu(import_photos)
+        import_menu.addAction('选择照片（可多选）',self.select_sources)
+        import_menu.addAction('导入文件夹',self.select_folder)
+        import_photos.setMenu(import_menu)
+        toolbar.addWidget(import_photos)
+        self.inputs.append(import_photos)
+        self.import_recursive = QCheckBox('包含子文件夹')
+        self.import_recursive.setToolTip('导入或拖入文件夹时，连同其中各层子文件夹的照片一起添加')
+        self.import_recursive.toggled.connect(self.schedule_workspace_save)
+        toolbar.addWidget(self.import_recursive)
+        self.inputs.append(self.import_recursive)
+        for title, action in (('移除高亮照片', self.remove_selected), ('清空', self.clear_sources),
+                ('全选',lambda:self.set_all_included(True)), ('全不选',lambda:self.set_all_included(False))):
             button = QPushButton(title)
             button.clicked.connect(action)
             toolbar.addWidget(button)
@@ -443,6 +526,21 @@ class Workbench(QMainWindow):
         self.count = ui_label('尚未添加照片')
         toolbar.addWidget(self.count, 1)
         photos_layout.addLayout(toolbar)
+        selection_row = QHBoxLayout()
+        selection_row.addWidget(ui_label('选片要求'))
+        self.selection_brief = QLineEdit()
+        self.selection_brief.setPlaceholderText('可留空；例如选 8 张，近景和全身都要，连拍只留一张')
+        self.selection_brief.textChanged.connect(self.schedule_workspace_save)
+        selection_row.addWidget(self.selection_brief,1)
+        self.selection_button = QPushButton('Agent 帮我选片')
+        self.selection_button.setToolTip('查看全部导入照片，重新给出选片建议；可继续手动调整勾选')
+        self.selection_button.clicked.connect(self.request_photo_selection)
+        selection_row.addWidget(self.selection_button)
+        self.inputs.append(self.selection_brief)
+        photos_layout.addLayout(selection_row)
+        self.selection_summary = ui_label('勾选用于制作，点击行查看原片；Agent 会查看全部导入照片。')
+        self.selection_summary.setWordWrap(True)
+        photos_layout.addWidget(self.selection_summary)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(14)
@@ -452,14 +550,14 @@ class Workbench(QMainWindow):
         queue_layout.setContentsMargins(14, 14, 14, 14)
         queue_layout.setSpacing(12)
         self.queue_pages = QStackedWidget()
-        empty = QLabel('把照片或文件夹拖到这里\n\nJPEG、PNG、TIFF 和相机 RAW')
+        empty = QLabel('一次拖入多张照片或多个文件夹\n勾选“包含子文件夹”可连同各层照片导入\n\nJPEG、PNG、TIFF 和相机 RAW')
         empty.setAlignment(Qt.AlignCenter)
         empty.setWordWrap(True)
         empty.setProperty('role', 'dropArea')
         self.queue_pages.addWidget(empty)
         self.listing = QTableWidget(0, 2)
-        self.listing.setHorizontalHeaderLabels(['照片', '制作进度'])
-        self.listing.verticalHeader().hide()
+        self.listing.setHorizontalHeaderLabels(['勾选制作 · 点击查看', '制作进度'])
+        self.listing.verticalHeader().setVisible(True)
         self.listing.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.listing.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.listing.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -468,6 +566,7 @@ class Workbench(QMainWindow):
         self.listing.setAcceptDrops(False)
         self.listing.viewport().setAcceptDrops(False)
         self.listing.itemSelectionChanged.connect(self.show_selected)
+        self.listing.itemChanged.connect(self.photo_check_changed)
         self.queue_pages.addWidget(self.listing)
         queue_layout.addWidget(self.queue_pages, 1)
         form_host = QWidget()
@@ -528,11 +627,17 @@ class Workbench(QMainWindow):
         details.setMaximumHeight(70)
         details.setWidget(self.output_info)
         preview_layout.addWidget(details)
+        self.selection_reason = ui_label('')
+        self.selection_reason.setWordWrap(True)
+        self.selection_reason.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.selection_reason.hide()
+        preview_layout.addWidget(self.selection_reason)
         photo_controls = QHBoxLayout()
         for name, text, action in (('open_source_button', '打开原片', self.open_source),
                 ('open_work_button', '打开此照片文件夹', self.open_work_directory),
                 ('open_photo_button', '打开 JPEG', self.open_selected_output),
-                ('open_png_button', '打开 16 位 PNG', self.open_selected_png)):
+                ('open_png_button', '打开 16 位 PNG', self.open_selected_png),
+                ('representative_button', '设为试样原片', self.set_representative)):
             button = QPushButton(text)
             button.setProperty('kind', 'quiet')
             button.setEnabled(False)
@@ -659,7 +764,7 @@ class Workbench(QMainWindow):
         self.start.setMinimumHeight(40)
         self.start.clicked.connect(lambda: self.produce(only_pending=True))
         controls.addWidget(self.start)
-        self.remaining_button = QPushButton('全部另做一批')
+        self.remaining_button = QPushButton('勾选照片另做一批')
         self.remaining_button.setProperty('kind', 'quiet')
         self.remaining_button.clicked.connect(self.produce)
         self.remaining_button.hide()
@@ -717,6 +822,10 @@ class Workbench(QMainWindow):
             'output_dimensions','output_adjustment','stage','error')
         row = self.listing.currentRow()
         state = {'sources':self.sources,'character':self.character.text(),'brief':self.brief.toPlainText(),
+            'excluded_sources':sorted(self.excluded_sources),'representative_source':self.representative_source,
+            'import_recursive':self.import_recursive.isChecked(),
+            'selection_brief':self.selection_brief.text(),'photo_selection':self.photo_selection,
+            'photo_selection_directory':self.photo_selection_directory,'photo_selection_error':self.photo_selection_error,
             'page':self.pages.currentIndex(),
             'selected_source':self.sources[row] if 0<=row<len(self.sources) else None,
             'results':[{name:result[name] for name in fields if name in result} for result in self.results.values()],
@@ -739,6 +848,13 @@ class Workbench(QMainWindow):
             self.restored_page = state.get('page', 0)
             self.sources = state['sources']
             known = {self.source_key(source) for source in self.sources}
+            self.excluded_sources = set(state.get('excluded_sources',[])) & known
+            self.import_recursive.setChecked(state.get('import_recursive',False))
+            self.representative_source = state.get('representative_source')
+            self.selection_brief.setText(state.get('selection_brief',''))
+            self.photo_selection = state.get('photo_selection')
+            self.photo_selection_directory = state.get('photo_selection_directory')
+            self.photo_selection_error = state.get('photo_selection_error','')
             self.character.setText(state.get('character',self.character.text()))
             self.brief_character = self.character.text().strip()
             self.brief.setPlainText(state.get('brief',self.brief.toPlainText()))
@@ -750,7 +866,7 @@ class Workbench(QMainWindow):
             for key,stage in state.get('stages',{}).items():
                 if key in known and key not in self.results:
                     self.stages[key] = '未完成'
-                    self.photo_errors.setdefault(key,'上次停在“'+stage+'”。未自动继续制作；如需重做，请明确选择“全部另做一批”。')
+                    self.photo_errors.setdefault(key,'上次停在“'+stage+'”。未自动继续制作；如需重做，请明确选择“勾选照片另做一批”。')
             if self.batch_directory and self.stages:
                 batch = json.loads((Path(self.batch_directory)/'batch.json').read_text(encoding='utf-8'))
                 for result in batch['items'].values():
@@ -890,9 +1006,12 @@ class Workbench(QMainWindow):
     def prepare_creative(self):
         context = self.current_style_context()
         chosen = self.selected_style if self.style_context==context else None
-        if not self.sources and chosen is None:
-            self.select_sources()
-            self.navigate(1)
+        if not self.included_sources() and chosen is None:
+            if self.sources:
+                self.navigate(0)
+                self.status.setText('请先勾选要制作的照片，或让 Agent 选片。')
+            else:
+                self.select_sources()
         elif not context[0]:
             self.navigate(0)
             self.character.setFocus()
@@ -936,25 +1055,24 @@ class Workbench(QMainWindow):
     def add_sources(self, paths):
         if self.work_in_progress() or not paths:
             return
-        candidates = []
-        try:
-            for value in paths:
-                path = Path(value).expanduser().resolve()
-                candidates.extend(sorted(path.iterdir()) if path.is_dir() else [path])
-        except OSError as error:
-            self.status.setText('无法添加照片：' + str(error))
-            return
+        self.import_worker = ImportWorker(paths,self.import_recursive.isChecked())
+        self.import_worker.ready.connect(self.import_ready)
+        self.import_worker.progress.connect(self.status.setText)
+        self.import_worker.failed.connect(self.status.setText)
+        self.import_worker.finished.connect(self.import_finished)
+        self.status.setText('正在批量导入照片'+('，包含各层子文件夹…' if self.import_recursive.isChecked() else '…'))
+        self.update_actions()
+        self.import_worker.start()
+
+    def import_ready(self, candidates, skipped):
         known = {self.source_key(source) for source in self.sources}
-        added = duplicates = skipped = 0
-        for path in candidates:
-            path = path.resolve()
-            key = self.source_key(path)
-            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
-                skipped += 1
-            elif key in known:
+        added = duplicates = 0
+        for source in candidates:
+            key = self.source_key(source)
+            if key in known:
                 duplicates += 1
             else:
-                self.sources.append(str(path))
+                self.sources.append(source)
                 known.add(key)
                 added += 1
         self.refresh_queue()
@@ -965,13 +1083,22 @@ class Workbench(QMainWindow):
             notes.append(f'{skipped} 项不是支持的照片，已跳过')
         self.status.setText('；'.join(notes) + '。')
 
+    def import_finished(self):
+        worker,self.import_worker = self.import_worker,None
+        if self.pages.currentIndex()==1:
+            self.navigate(1)
+        self.update_actions()
+        self.finish_background_work()
+        worker.deleteLater()
+
     def select_sources(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, '添加原片', '',
+        paths, _ = QFileDialog.getOpenFileNames(self, '批量导入原片（可多选）', '',
             '照片 (' + ' '.join('*' + suffix for suffix in sorted(IMAGE_EXTENSIONS)) + ')')
         self.add_sources(paths)
 
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, '添加文件夹中的照片')
+        folder = QFileDialog.getExistingDirectory(self,
+            '导入文件夹及其子文件夹中的照片' if self.import_recursive.isChecked() else '导入文件夹中的照片')
         if folder:
             self.add_sources([folder])
 
@@ -987,7 +1114,121 @@ class Workbench(QMainWindow):
             return
         self.sources.clear()
         self.results.clear()
+        self.photo_selection = None
+        self.photo_selection_directory = None
+        self.photo_selection_error = ''
         self.refresh_queue()
+
+    def included_sources(self):
+        return [source for source in self.sources if self.source_key(source) not in self.excluded_sources]
+
+    def sync_creative_sources(self):
+        sources = self.included_sources()
+        if self.representative_source not in sources:
+            self.representative_source = sources[0] if sources else None
+        representative = self.representative_source
+        workspace = self.creative_workspace
+        if workspace is not None and (workspace.character,workspace.brief)==self.current_style_context():
+            workspace.sync_sources(sources)
+            self.representative_source = representative
+            if representative:
+                workspace.sample_source.setCurrentIndex(workspace.sample_source.findData(representative))
+
+    def photo_check_changed(self, item):
+        if item.column()!=0 or self.work_in_progress():
+            return
+        key = self.source_key(item.data(Qt.UserRole))
+        included = item.checkState()==Qt.Checked
+        if included==(key not in self.excluded_sources):
+            return
+        self.excluded_sources.discard(key) if included else self.excluded_sources.add(key)
+        self.refresh_queue()
+
+    def set_all_included(self, included):
+        if self.work_in_progress():
+            return
+        self.excluded_sources = set() if included else {self.source_key(source) for source in self.sources}
+        self.refresh_queue()
+
+    def set_representative(self):
+        if self.work_in_progress():
+            return
+        row = self.listing.currentRow()
+        if row<0 or row>=len(self.sources):
+            return
+        source = self.sources[row]
+        if self.source_key(source) in self.excluded_sources:
+            return
+        self.representative_source = source
+        self.sync_creative_sources()
+        self.refresh_queue()
+        self.status.setText('试样原片已设为 '+Path(source).name+'，查看其他照片不会改变它。')
+
+    def request_photo_selection(self):
+        if self.work_in_progress() or not self.sources:
+            return
+        try:
+            if not Path(self.config.text()).expanduser().is_file():
+                self.configure_services()
+                if not Path(self.config.text()).expanduser().is_file():
+                    return
+            config = load_settings(self.config.text())
+            if not self.root.text().strip():
+                raise ValueError('请选择选片记录的保存目录')
+            self.selection_worker = SelectionWorker(self.sources,self.character.text().strip(),self.brief.toPlainText(),
+                self.selection_brief.text().strip(),self.root.text(),config['llm'])
+            self.selection_worker.ready.connect(self.photo_selection_ready)
+            self.selection_worker.progress.connect(self.status.setText)
+            self.selection_worker.failed.connect(self.photo_selection_failed)
+            self.selection_worker.finished.connect(self.photo_selection_finished)
+            self.photo_selection_error = ''
+            self.status.setText('Agent 正在查看全部导入照片；选片后可继续调整勾选。')
+            self.update_actions()
+            self.selection_worker.start()
+        except Exception as error:
+            self.selection_worker = None
+            self.photo_selection_failed('无法开始选片：'+str(error))
+            self.update_actions()
+
+    def photo_selection_ready(self, result, directory):
+        self.photo_selection = result
+        self.photo_selection_directory = directory
+        self.photo_selection_error = ''
+        self.excluded_sources = {self.source_key(photo['source']) for photo in result['photos'] if not photo['selected']}
+        self.representative_source = result['representative']
+        self.refresh_queue()
+        if self.representative_source:
+            self.listing.selectRow(self.rows[self.source_key(self.representative_source)])
+        self.status.setText('Agent 选片建议已应用，可逐张调整勾选，或进入创作讨论。')
+        self.save_workspace()
+
+    def photo_selection_failed(self, error):
+        self.photo_selection_error = error
+        self.status.setText(error)
+        self.update_selection_summary()
+        self.schedule_workspace_save()
+
+    def photo_selection_finished(self):
+        worker,self.selection_worker = self.selection_worker,None
+        self.update_actions()
+        self.finish_background_work()
+        worker.deleteLater()
+
+    def update_selection_summary(self):
+        if self.photo_selection_error:
+            text = self.photo_selection_error
+        elif self.photo_selection is not None:
+            result = self.photo_selection
+            selected = sum(photo['selected'] for photo in result['photos'])
+            text = f'Agent 建议 {selected}/{len(result["photos"])} 张。'+result['summary']
+            if self.representative_source:
+                text += ' 试样原片：'+Path(self.representative_source).name+'。'
+        else:
+            text = '勾选用于制作，点击行查看原片；Agent 会查看全部导入照片。'
+            if self.representative_source:
+                text += ' 试样原片：'+Path(self.representative_source).name+'。'
+        self.selection_summary.setText(text)
+        self.selection_summary.setToolTip(text)
 
     def refresh_queue(self):
         selected = [self.listing.item(row, 0).data(Qt.UserRole) for row in sorted(
@@ -997,29 +1238,42 @@ class Workbench(QMainWindow):
         self.listing.blockSignals(True)
         self.rows.clear()
         keys = {self.source_key(source) for source in self.sources}
+        self.excluded_sources.intersection_update(keys)
+        included = self.included_sources()
+        if self.representative_source not in included:
+            self.representative_source = included[0] if included else None
         self.results = {key: result for key, result in self.results.items() if key in keys}
         self.stages = {key: stage for key, stage in self.stages.items() if key in keys}
         self.photo_errors = {key: error for key, error in self.photo_errors.items() if key in keys}
         self.listing.clearSelection()
         self.listing.setRowCount(len(self.sources))
+        selection_numbers = ({self.source_key(photo['source']):index for index,photo in enumerate(self.photo_selection['photos'],1)}
+            if self.photo_selection is not None else None)
         for row, source in enumerate(self.sources):
             key = self.source_key(source)
             self.rows[key] = row
-            name = QTableWidgetItem(Path(source).name)
+            number = str(selection_numbers[key]) if selection_numbers is not None and key in selection_numbers else (
+                '新' if selection_numbers is not None else str(row+1))
+            header = QTableWidgetItem(number)
+            header.setToolTip('上次 Agent 选片总览中的编号' if selection_numbers is not None and key in selection_numbers else '尚未经过 Agent 选片')
+            self.listing.setVerticalHeaderItem(row,header)
+            name = QTableWidgetItem(('★ ' if source==self.representative_source else '')+Path(source).name)
             name.setData(Qt.UserRole, source)
             name.setToolTip(source)
+            name.setCheckState(Qt.Unchecked if key in self.excluded_sources else Qt.Checked)
             self.listing.setItem(row, 0, name)
             result = self.results.get(key)
-            stage = ('完成' if result['status'] == 'complete' else '失败') if result else self.stages.get(key, '等待制作')
+            stage = ('完成' if result['status'] == 'complete' else '失败') if result else self.stages.get(key,
+                '未勾选' if key in self.excluded_sources else '等待制作')
             cell = QTableWidgetItem(stage)
             if result and result.get('error'):
                 cell.setToolTip(str(result['error']))
             self.listing.setItem(row, 1, cell)
         self.queue_pages.setCurrentIndex(1 if self.sources else 0)
-        self.count.setText(f'{len(self.sources)} 张照片' if self.sources else '尚未添加照片')
+        self.count.setText(f'已勾选 {len(included)} / 导入 {len(self.sources)} 张' if self.sources else '尚未添加照片')
         if self.worker is None:
-            self.progress_bar.setRange(0, max(1, len(self.sources)))
-            self.progress_bar.setValue(sum(self.source_key(source) in self.results for source in self.sources))
+            self.progress_bar.setRange(0, max(1, len(included)))
+            self.progress_bar.setValue(sum(self.source_key(source) in self.results for source in included))
             self.progress_bar.setFormat('已处理 %v / %m 张' if self.results else '等待开始')
         self.preview_key = None
         selected_keys = {self.source_key(source) for source in selected}
@@ -1035,43 +1289,59 @@ class Workbench(QMainWindow):
                 self.listing.selectRow(row)
         self.listing.blockSignals(False)
         self.show_selected()
-        if self.creative_workspace is not None and (
-                self.creative_workspace.character, self.creative_workspace.brief) == self.current_style_context():
-            self.creative_workspace.sync_sources(list(self.sources))
+        self.sync_creative_sources()
         self.update_actions()
         self.schedule_workspace_save()
 
     def update_actions(self):
         running = self.work_in_progress()
-        self.progress_bar.setVisible(self.worker is not None)
+        choosing = self.import_worker is not None or self.selection_worker is not None
+        self.progress_bar.setVisible(self.worker is not None or choosing)
+        if choosing:
+            self.progress_bar.setRange(0,0)
         for widget in self.inputs:
             widget.setEnabled(not running)
+        for row in range(self.listing.rowCount()):
+            item = self.listing.item(row,0)
+            flags = item.flags()
+            item.setFlags(flags & ~Qt.ItemIsUserCheckable if running else flags | Qt.ItemIsUserCheckable)
+        self.selection_button.setEnabled(not running and bool(self.sources))
+        row = self.listing.currentRow()
+        source = self.sources[row] if 0<=row<len(self.sources) else None
+        self.representative_button.setEnabled(not running and source is not None and
+            self.source_key(source) not in self.excluded_sources and source!=self.representative_source)
+        self.update_selection_summary()
         if self.creative_workspace is not None:
-            self.creative_workspace.set_production_busy(self.worker is not None)
-        has_photos = bool(self.sources)
+            self.creative_workspace.set_production_busy(self.worker is not None or choosing)
+        included = self.included_sources()
+        has_photos = bool(included)
         has_character = bool(self.character.text().strip())
         has_config = Path(self.config.text()).expanduser().is_file()
         context = self.current_style_context()
         has_previous = bool(self.results or any(stage == '未完成' for stage in self.stages.values()))
         pending = sum(self.source_key(source) not in self.results and self.source_key(source) not in self.stages
-            for source in self.sources)
+            for source in included)
         chosen = self.selected_style if self.style_context == context else None
         ready = self.style_is_current()
         self.start.setEnabled(not running and pending > 0 and has_character and ready)
         self.start.setText(f'按选定风格制作新增 {pending} 张' if has_previous and pending else
-            '本组已处理' if has_previous and not pending else '按选定风格批量制作')
+            '勾选照片已处理' if has_photos and has_previous and not pending else f'按选定风格制作 {pending} 张')
         self.remaining_button.setVisible(has_previous)
         self.remaining_button.setEnabled(not running and has_photos and has_character and ready)
-        self.style_button.setEnabled(has_photos and has_character)
+        self.style_button.setEnabled((has_photos or chosen is not None) and has_character)
         self.style_button.setText('继续创作' if self.style_discussion_context == context or chosen else '与 Agent 讨论风格')
         self.view_chosen_button.setEnabled(chosen is not None)
-        self.workspace_context.setText((context[0] + ' · ' if has_character else '') + f'{len(self.sources)} 张原片')
-        if not has_photos:
-            next_step = '先在照片页添加原片。'
+        self.workspace_context.setText((context[0] + ' · ' if has_character else '') + f'已选 {len(included)}/{len(self.sources)} 张')
+        if self.worker is not None:
+            next_step = '正在按定稿制作，可切页查看原片、样片和已有成片。'
+        elif self.import_worker is not None:
+            next_step = '正在整理导入的照片和子文件夹，可切页查看已有内容。'
+        elif self.selection_worker is not None:
+            next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
+        elif not has_photos:
+            next_step = '先勾选要制作的照片，或让 Agent 从已导入照片中选片。' if self.sources else '先在照片页批量导入原片。'
         elif not has_character:
             next_step = '先填写角色，补充要求可以留空。'
-        elif self.worker is not None:
-            next_step = '正在按定稿制作，可切页查看原片、样片和已有成片。'
         elif running:
             next_step = 'Agent 或样片正在处理中，可切页浏览，完成后再决定下一步。'
         elif not has_config:
@@ -1083,9 +1353,9 @@ class Workbench(QMainWindow):
         elif chosen is None:
             next_step = '到创作页讨论并比较三个真实样片，选定一张后再批量制作。'
         elif not pending:
-            next_step = '本组照片已处理。可添加新照片，或明确选择“全部另做一批”。'
+            next_step = '勾选照片已处理。可添加新照片，或明确选择“勾选照片另做一批”。'
         else:
-            next_step = f'已定稿。当前队列有 {pending} 张尚未制作，点击批量后才会开始。'
+            next_step = f'已定稿。勾选照片中有 {pending} 张尚未制作，点击制作后才会开始。'
         self.readiness.setText(next_step)
         self.style_hint.setText(next_step)
         self.start.setToolTip(next_step)
@@ -1141,12 +1411,23 @@ class Workbench(QMainWindow):
             self.current_png = None
             self.photo_preview.set_photo()
             self.output_info.clear()
+            self.selection_reason.clear()
+            self.selection_reason.hide()
+            self.representative_button.setEnabled(False)
             self.open_source_button.setEnabled(False)
             self.open_work_button.setEnabled(False)
             self.open_photo_button.setEnabled(False)
             self.open_png_button.setEnabled(False)
             return
         source = self.sources[row]
+        key = self.source_key(source)
+        self.representative_button.setEnabled(not self.work_in_progress() and key not in self.excluded_sources
+            and source!=self.representative_source)
+        self.representative_button.setText('当前试样原片' if source==self.representative_source else '设为试样原片')
+        advice = (next((photo for photo in self.photo_selection['photos'] if self.source_key(photo['source'])==key),None)
+            if self.photo_selection is not None else None)
+        self.selection_reason.setText(('Agent 建议保留：' if advice['selected'] else 'Agent 本轮未选：')+advice['reason'] if advice else '')
+        self.selection_reason.setVisible(advice is not None)
         result = self.results.get(self.source_key(source))
         self.current_output = None
         self.current_png = None
@@ -1170,9 +1451,11 @@ class Workbench(QMainWindow):
             error = result.get('error') if result else self.photo_errors.get(self.source_key(source))
             self.output_info.setText(f'{Path(source).name} · 制作失败\n{error}' if error else
                 f'{Path(source).name} · {self.stages.get(self.source_key(source), "等待制作")}')
-        work_directory = result.get('directory') if result else None
-        self.open_work_button.setText('打开此照片文件夹' if work_directory else '打开本批次文件夹')
-        self.open_work_button.setEnabled(bool(work_directory or (result or {}).get('batch_directory') or self.batch_directory))
+        self.output_info.setText(self.output_info.text()+'\n'+('本次已勾选' if key not in self.excluded_sources else '本次未勾选')+
+            (' · 当前试样原片' if source==self.representative_source else ''))
+        work_directory,folder_label = self.source_work_directory(source)
+        self.open_work_button.setText(folder_label)
+        self.open_work_button.setEnabled(bool(work_directory))
         preview_key = (source, self.current_output)
         if preview_key != self.preview_key:
             self.photo_preview.set_photo(source, self.current_output)
@@ -1182,8 +1465,9 @@ class Workbench(QMainWindow):
         if self.work_in_progress():
             return
         try:
-            if not self.sources or not self.character.text().strip():
-                raise ValueError('请添加照片并填写角色')
+            included = self.included_sources()
+            if not included or not self.character.text().strip():
+                raise ValueError('请勾选要制作的照片并填写角色')
             if not self.root.text().strip():
                 raise ValueError('请选择保存目录')
             if not self.style_is_current():
@@ -1196,14 +1480,16 @@ class Workbench(QMainWindow):
             config = self.desktop_config()
             load_style(self.selected_style['selection_file'])
             self.remember_preferences()
-            sources = [source for source in self.sources if not only_pending or (
+            sources = [source for source in included if not only_pending or (
                 self.source_key(source) not in self.results and self.source_key(source) not in self.stages)]
             if not sources:
                 return
             if not only_pending:
-                self.results.clear()
-                self.stages.clear()
-                self.photo_errors.clear()
+                for source in sources:
+                    key = self.source_key(source)
+                    self.results.pop(key,None)
+                    self.stages.pop(key,None)
+                    self.photo_errors.pop(key,None)
             self.batch_error = ''
             self.batch_directory = None
             if self.current_batch_view is not None:
@@ -1319,10 +1605,18 @@ class Workbench(QMainWindow):
     def open_work_directory(self):
         row = self.listing.currentRow()
         if 0 <= row < len(self.sources):
-            result = self.results.get(self.source_key(self.sources[row]), {})
-            directory = result.get('directory') or result.get('batch_directory') or self.batch_directory
+            directory,_label = self.source_work_directory(self.sources[row])
             if directory:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def source_work_directory(self, source):
+        result = self.results.get(self.source_key(source),{})
+        if result.get('directory'):
+            return result['directory'],'打开此照片文件夹'
+        directory = result.get('batch_directory') or self.batch_directory
+        if directory:
+            return directory,'打开本批次文件夹'
+        return self.photo_selection_directory,'打开选片记录'
 
     def open_results(self):
         view = self.result_views.currentWidget()
@@ -1355,7 +1649,7 @@ class Workbench(QMainWindow):
                 QApplication.instance().setQuitOnLastWindowClosed(False)
                 self.tray.show()
                 self.hide()
-                self.tray.showMessage('CosLuma 继续处理', 'Agent、样片或批量会继续并保存。点击托盘返回；保持托盘时完成后退出。')
+                self.tray.showMessage('CosLuma 继续处理', '导入、选片与制作会继续并保存。点击托盘返回；保持托盘时完成后退出。')
             else:
                 self.status.setText('仍在处理中，可以最小化等待；完成后可关闭。')
                 self.showMinimized()
@@ -1376,6 +1670,8 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('打开创作页失败：' + str(error))
                 return
+        elif index == 0:
+            self.refresh_queue()
         elif index == 2 and self.current_batch_view is None and self.batch_directory:
             try:
                 self.current_batch_view = self.make_results_view(self.batch_directory)
@@ -1393,15 +1689,16 @@ class Workbench(QMainWindow):
     def ensure_creative(self):
         context = self.current_style_context()
         chosen = self.selected_style if self.style_context == context else None
-        missing_photos = not self.sources and chosen is None
+        selected_sources = self.included_sources()
+        missing_photos = not selected_sources and chosen is None
         missing_character = not context[0]
         missing_config = not Path(self.config.text()).expanduser().is_file()
         if missing_photos or missing_character or missing_config:
             self.creative_empty.show()
-            self.creative_next.setText('先添加这组照片。' if missing_photos else
+            self.creative_next.setText(('请先在照片页勾选要制作的照片，或让 Agent 选片。' if self.sources else '先批量导入这组照片。') if missing_photos else
                 '请填写角色，补充要求可以留空。' if missing_character else
                 '照片与角色已准备好。连接模型服务或导入已有配置后，即可开始讨论。')
-            self.creative_prepare.setText('添加照片' if missing_photos else '填写角色' if missing_character else '连接设置')
+            self.creative_prepare.setText(('返回照片选片' if self.sources else '批量导入照片') if missing_photos else '填写角色' if missing_character else '连接设置')
             self.creative_import.setVisible(not missing_photos and not missing_character and missing_config)
             if self.creative_workspace is not None:
                 self.creative_workspace.hide()
@@ -1414,9 +1711,8 @@ class Workbench(QMainWindow):
                     return
                 self.creative_layout.removeWidget(workspace)
                 workspace.deleteLater()
-            row = self.listing.currentRow()
-            sources = list(self.sources) if self.sources else [chosen['sample_source']]
-            source = sources[row] if 0 <= row < len(sources) else sources[0]
+            sources = selected_sources if selected_sources else [chosen['sample_source']]
+            source = self.representative_source if self.representative_source in sources else sources[0]
             previous = self.style_samples_directory if self.style_samples_context == context else None
             discussion = self.style_discussion_directory if self.style_discussion_context == context else None
             workspace = CreativeWorkspace(sources, source, context[0], context[1],
@@ -1429,9 +1725,9 @@ class Workbench(QMainWindow):
             workspace.state_changed.connect(self.creative_state_changed)
             workspace.back_requested.connect(lambda: self.navigate(0))
             self.creative_layout.addWidget(workspace)
-            workspace.sync_sources(list(self.sources))
+            self.sync_creative_sources()
         else:
-            workspace.sync_sources(list(self.sources))
+            self.sync_creative_sources()
             workspace.config, workspace.root = config, self.root.text()
         self.creative_empty.hide()
         workspace.show()
@@ -1453,6 +1749,9 @@ class Workbench(QMainWindow):
         self.creative_context = (workspace.character, workspace.brief)
         self.creative_direction = workspace.creative_direction
         self.creative_draft = bool(workspace.chat_input.toPlainText().strip() or workspace.pending_message)
+        source = workspace.sample_source.currentData()
+        if source in self.included_sources():
+            self.representative_source = source
         if workspace.directory is not None and workspace.options:
             self.style_samples_directory = workspace.directory
             self.style_samples_context = self.creative_context
@@ -1490,7 +1789,8 @@ class Workbench(QMainWindow):
 
 
     def work_in_progress(self):
-        return self.worker is not None or (self.creative_workspace is not None and self.creative_workspace.is_busy())
+        return (self.worker is not None or self.import_worker is not None or self.selection_worker is not None or
+            (self.creative_workspace is not None and self.creative_workspace.is_busy()))
 
 
     def finish_background_work(self):

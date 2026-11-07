@@ -75,12 +75,16 @@ def to_preview(pixels, max_edge=None):
     return Image.fromarray(np.uint8(np.clip(pixels, 0, 1) * 255.0 + .5))
 
 
-def open_rgb(path):
+def open_rgb(path, *, max_edge=None):
     path = Path(path)
     if path.suffix.lower() in RAW_EXTENSIONS:
-        return to_preview(open_photo(path))
+        return to_preview(open_photo(path),max_edge)
     with Image.open(path) as opened:
+        if max_edge is not None:
+            opened.draft('RGB',(max_edge,max_edge))
         image = ImageOps.exif_transpose(opened)
+        if max_edge is not None:
+            image.thumbnail((max_edge,max_edge),Image.Resampling.LANCZOS)
         profile = image.info.get('icc_profile')
         if profile:
             return ImageCms.profileToProfile(image, ImageCms.ImageCmsProfile(BytesIO(profile)),

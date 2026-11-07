@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
 from image_io import SRGB, open_rgb, preview_data_url, save_json, to_preview
 from prompt_library import catalogue, load_library
 from settings import credential
@@ -86,6 +88,91 @@ def _describe(instruction, images, config, response_path, *, conversation=()):
     if content.startswith('```'):
         content = content.split('\n',1)[1].rsplit('```',1)[0].strip()
     return json.loads(content)
+
+
+def _selection_sheets(sources, directory, report):
+    """Decode each original once into numbered, uncropped sRGB contact sheets."""
+    images = []
+    font = ImageFont.load_default(size=24)
+    for start in range(0,len(sources),12):
+        page = start//12+1
+        with Image.new('RGB',(2560,1536),'#eef1f4') as sheet:
+            draw = ImageDraw.Draw(sheet)
+            for cell,source in enumerate(sources[start:start+12]):
+                number = start+cell+1
+                report(f'准备选片预览 {number}/{len(sources)}')
+                x,y = cell%4*640,cell//4*512
+                draw.rectangle((x,y,x+639,y+31),fill='#202934')
+                draw.text((x+12,y+16),str(number),font=font,fill='white',anchor='lm')
+                with open_rgb(source,max_edge=640) as image:
+                    thumbnail = ImageOps.contain(image,(640,480),method=Image.Resampling.LANCZOS)
+                    sheet.paste(thumbnail,(x+(640-thumbnail.width)//2,y+32+(480-thumbnail.height)//2))
+                    thumbnail.close()
+            stream = BytesIO()
+            sheet.save(stream,format='JPEG',quality=93,subsampling=0,icc_profile=SRGB)
+            pixels = stream.getvalue()
+        (directory/f'selection-sheet-{page}.jpg').write_bytes(pixels)
+        label = f'选片总览第 {page} 页，编号 {start+1}–{min(start+12,len(sources))}'
+        images.append((label,'data:image/jpeg;base64,'+base64.b64encode(pixels).decode('ascii')))
+    return images
+
+
+def _selection_result(result, sources):
+    """Resolve a complete, unambiguous numbered response back to import order."""
+    if not isinstance(result['summary'],str) or not isinstance(result['photos'],list):
+        raise ValueError('选片响应的 summary 须为文本、photos 须为数组；原始响应已保存')
+    if len(result['photos'])!=len(sources):
+        raise ValueError(f'选片响应须逐张覆盖全部 {len(sources)} 张原片；原始响应已保存')
+    photos = {}
+    for photo in result['photos']:
+        number = photo['id']
+        if type(number) is not int or not 1<=number<=len(sources) or number in photos:
+            raise ValueError('选片编号须逐张对应原片，不得重复或超出范围；原始响应已保存')
+        if type(photo['selected']) is not bool or not isinstance(photo['reason'],str):
+            raise ValueError('选片记录的 selected 须为布尔值、reason 须为文本；原始响应已保存')
+        photos[number] = photo
+    representative = result['representative_id']
+    if any(photo['selected'] for photo in photos.values()):
+        if type(representative) is not int or representative not in photos or not photos[representative]['selected']:
+            raise ValueError('代表原片必须引用一张已勾选的照片；原始响应已保存')
+    elif representative is not None:
+        raise ValueError('没有勾选照片时，代表原片须为 null；原始响应已保存')
+    return {'summary':result['summary'],
+        'photos':[{'source':source,'selected':photos[index]['selected'],'reason':photos[index]['reason']}
+            for index,source in enumerate(sources,1)],
+        'representative':sources[representative-1] if representative is not None else None}
+
+
+def select_photos(sources, character, brief, config, directory, *, selection_brief='', progress=None):
+    """Suggest a selection from every imported photo using one vision request."""
+    sources = [str(source) for source in sources]
+    if not sources:
+        raise ValueError('没有可供选片的原片')
+    directory = Path(directory)
+    report = progress or (lambda message:None)
+    images = _selection_sheets(sources,directory,report)
+    files = [{'id':index,'filename':Path(source).name} for index,source in enumerate(sources,1)]
+    instruction = (
+        '你是帮助用户整理 COS 摄影原片的选片 Agent，只提出保留建议，不制作或修改照片。'
+        '总览图覆盖本次全部原片，按数字编号对应下方文件名表，未编号的空白格不是照片。'
+        '请跨页比较全组，而非每页独立选片。结合选片要求，比较表情、构图、姿态、服装与道具可见性，'
+        '识别连拍中表达近似的重复画面，并保留有价值的近景、中景、远景与动作多样性。'
+        '不评分，不设分数阈值或固定保留比例；建议保留与不保留都要给出简短、具体的画面理由。'
+        '角色与补充要求可为空；未知角色设定不编造，只依据用户说明和照片中可见内容。'
+        '这些是按朝向整理的 8 位 sRGB 缩略总览，不能据此断言原像素锐度、精确对焦或细微清晰度。'
+        '返回 JSON，包含且只有 summary、photos、representative_id。summary 是本组取舍的简短中文总结；'
+        f'photos 按编号逐张返回全部 {len(sources)} 张，每张恰好一条，不能遗漏、重复或自行增加编号。'
+        '每条包含且只有 id（原片整数编号）、selected（JSON 布尔值）、reason（中文理由）。'
+        'representative_id 是一张 selected 为 true、适合作为后续创作试样代表的原片编号；'
+        '优先考虑妆造、服装与道具表达清楚、能代表本组的照片。全部不选时 representative_id 必须为 null。'
+        f'\n角色：{character or "未填写"}\n补充要求：{brief or "无"}\n选片要求：{selection_brief or "按本组画面表现与多样性给出建议"}\n'
+        '编号与文件名表：\n'+json.dumps(files,ensure_ascii=False))
+    report('Agent 正在选片')
+    result = _describe(instruction,images,config,directory/'selection-response.json')
+    selection = _selection_result(result,sources)
+    save_json(directory/'selection.json',{'character':character,'brief':brief,'selection_brief':selection_brief,
+        'sources':sources,**selection})
+    return selection
 
 
 def _representatives(sources, *, required=()):
