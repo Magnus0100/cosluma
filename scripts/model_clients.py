@@ -88,9 +88,11 @@ def _describe(instruction, images, config, response_path, *, conversation=()):
     return json.loads(content)
 
 
-def _representatives(sources):
-    count = min(6,len(sources))
-    return [sources[round(index*(len(sources)-1)/max(1,count-1))] for index in range(count)]
+def _representatives(sources, *, required=()):
+    selected = list(dict.fromkeys(required))
+    remaining = [source for source in sources if source not in selected]
+    count = min(6-len(selected),len(remaining))
+    return selected + [remaining[round(index*(len(remaining)-1)/max(1,count-1))] for index in range(count)]
 
 
 @lru_cache(maxsize=16)
@@ -105,24 +107,73 @@ def discussion_preview(path):
     return _discussion_preview(str(path),path.stat().st_mtime_ns)
 
 
-def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', samples=(), focus=None):
+def _discussion_samples(context, conversation):
+    """Keep stable IDs for all candidates available during successful discussions."""
+    samples = {sample['id']:sample for sample in context['samples']}
+    for row in conversation:
+        if row['role']!='user' or row.get('status')=='failed' or 'context' not in row:
+            continue
+        previous = row['context']
+        for sample in previous['samples']:
+            if sample['id'] not in samples:
+                samples[sample['id']] = sample
+    return [dict(sample,selected=sample['id']==context['selected_sample']) for sample in samples.values()]
+
+
+def _discussion_messages(conversation):
+    """Project local records to provider messages, keeping each turn's visual referents."""
+    messages = []
+    for row in conversation:
+        if row.get('status')=='failed':
+            continue
+        content = row['content']
+        if row['role']=='user' and 'context' in row:
+            context = row['context']
+            anchors = {key:context[key] for key in ('label','viewed_source','viewed_sample',
+                'view_mode','next_sample_source','selected_sample')}
+            anchors['samples'] = [{key:sample[key] for key in ('id','label','source','status')} for sample in context['samples']]
+            content = '本条消息发送时的讨论对象（之后切换画面不改变此指代）：\n'+json.dumps(anchors,ensure_ascii=False)+'\n用户原文：\n'+content
+        messages.append({'role':row['role'],'content':content})
+    return messages
+
+
+def _discussion_image_ids(context, conversation):
+    ids = {sample['id'] for sample in context['samples']}
+    for row in conversation:
+        if row['role']=='user' and row.get('status')!='failed' and 'context' in row:
+            ids.update((row['context']['viewed_sample'],row['context']['selected_sample']))
+    return ids
+
+
+def _sample_images(samples, image_ids):
+    return [('真实样片：'+sample['label']+'；样片 ID：'+sample['id'],discussion_preview(sample['image']))
+        for sample in samples if sample['status']=='complete' and sample['id'] in image_ids]
+
+
+def _discussion_details(context, samples, image_ids):
+    details = {key:value for key,value in context.items() if key!='samples'}
+    details['samples'] = [dict({key:value for key,value in sample.items() if key!='image'},
+        has_image=sample['status']=='complete' and sample['id'] in image_ids) for sample in samples]
+    return json.dumps(details,ensure_ascii=False)
+
+
+def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None):
     """Discuss the current photographs and samples without submitting production."""
     images = []
-    for source in _representatives(sources):
-        images.append(('原片：'+Path(source).name,discussion_preview(source)))
-    descriptions = []
-    for option in samples:
-        description = {key:option[key] for key in ('index','title','summary','status')}
-        description['role'] = '已定稿样片' if option.get('selected') else '本轮候选'
-        descriptions.append(description)
-        if option['status']=='complete':
-            label = '已定稿真实样片：' if option.get('selected') else f'本轮方案 {option["index"]+1} 的真实样片：'
-            images.append((label+option['title'],discussion_preview(option['result']['files']['jpeg'])))
+    selected = _representatives(sources) if context is None else context['sources']
+    for source in selected:
+        images.append(('原片：'+Path(source).name+'；素材 ID：'+str(source),discussion_preview(source)))
+    samples = [] if context is None else _discussion_samples(context,conversation)
+    image_ids = set() if context is None else _discussion_image_ids(context,conversation)
+    images.extend(_sample_images(samples,image_ids))
     instruction = (
         '你是与用户共同创作 COS 摄影后期的摄影 Agent，现在处于讨论与试样阶段。'
         '用自然的中文对话，先观察本次角色和原片的妆造、道具、构图、受光，结合完整对话与已生成样片讨论。'
         '用户可以提想法、问问题、比较样片并修改要求；需要关键的角色信息时简短提问，不懂的角色设定不要编造。'
         '已定稿样片可能来自先前轮次，与本轮候选分开理解；用户查看或比较其他候选不代表更换定稿。'
+        '每条用户消息附有发送当时的画面对象、轮次、样片 ID 与实际预览模式；“这张”“第二张”按那条消息的上下文理解，'
+        '不能把历史轮次的方案编号套到当前轮次。原片、成片和并排查看要分清；本次附图均有素材或样片 ID。'
+        'has_image 表示本次是否提供该样片实图；未附图的历史候选只有已有方向资料，不声称观察过未提供的画面细节。'
         '不提供固定风格菜单，不预设三个场景，不把提示词目录标题凑成候选。'
         '回复具体说明适合这组素材的场景、色彩、情绪与光感；有样片时应针对实际画面交流，分清原片和样片编号。'
         '保留原片身份、脸型、机位、姿态与实物服装结构；整头会回贴，摄影方向须与原片受光相容。'
@@ -130,27 +181,35 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '本次调用只讨论，不运行生图、超分、分割或批量。'
         '需要试样时请用户点击“按当前讨论生成三个样片”；修改后仍由用户主动生成，不声称已经完成未执行的动作。'
         '最终方向只能由用户明确点击样片的定稿按钮决定；不要自行宣布定稿或开始批量。'
-        '返回 JSON，只有 reply 和 direction。reply 是直接显示给用户的自然对话，不包含 JSON 或算法术语。'
-        'direction 是当前双方讨论形成的创作要求，供下一次样片设计使用；保留此前未取消的要求，未知内容保持未定。'
-        '只有用户增加或修改影响画面的要求时才更新 direction；只是询问、比较或选择已有样片时保持原值。'
-        'direction 只写实际创作要求，不写对话过程、打招呼、试样操作或用户尚未作出的选择。'
+        '返回 JSON，必须包含且只有 reply 和 direction_update。reply 是直接显示给用户的自然对话，不包含 JSON 或算法术语。'
+        'direction_update 为 null 表示不修改当前创作要求；为字符串表示替换为完整的新要求，空字符串表示用户明确清空要求。'
+        '只有本条用户消息明确增加、修改、取消影响画面的要求，或明确采纳此前建议时，才返回新的要求字符串。'
+        '询问建议、比较画面、询问原因、浏览或选择已有样片时返回 null，不重写、润色或补全旧要求。'
+        '你提出但用户尚未采纳的建议只写进 reply，不写进 direction_update；不能替用户作出创作决定。'
+        '更新时保留未取消的要求，未知内容保持未定；写清被沿用样片的轮次、名称和实际画面，不只写“第二张”。'
+        '用户后续明确要求覆盖最初补充要求中的冲突，不得恢复已取消的要求。'
+        '新要求只写实际创作意图，不写对话过程、打招呼、试样操作或用户尚未作出的选择。'
+        '要求会直接显示给用户，用轮次与样片名称指代参考，不写样片 ID、文件路径、接口字段或算法流程；内部 ID 由上下文关联。'
         f'\n角色：{character}\n用户最初补充要求：{brief or "无"}\n当前创作要求：{direction}\n'
-        f'当前讨论对象：{focus or "整组创作方向"}\n已有样片：{json.dumps(descriptions,ensure_ascii=False)}\n'
+        f'当前讨论上下文：{_discussion_details(context,samples,image_ids) if context is not None else "整组创作方向，尚无样片"}\n'
         '提示词目录仅供摄影参考，不限制场景范围：\n'+catalogue(load_library(library_path)))
-    result = _describe(instruction,images,config,directory/('chat-'+uuid.uuid4().hex[:8]+'-response.json'),conversation=conversation)
-    if not isinstance(result.get('reply'),str) or not result['reply'].strip() or not isinstance(result.get('direction'),str):
+    result = _describe(instruction,images,config,directory/('chat-'+uuid.uuid4().hex[:8]+'-response.json'),conversation=_discussion_messages(conversation))
+    update = result['direction_update']
+    if not isinstance(result.get('reply'),str) or not result['reply'].strip() or (update is not None and not isinstance(update,str)):
         raise ValueError('摄影 Agent 没有返回有效的回复与创作要求；原始响应已保存')
-    return {'reply':result['reply'].strip(),'direction':result['direction'].strip()}
+    return {'reply':result['reply'].strip(),'direction_update':update.strip() if update is not None else None}
 
 
-def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction=''):
+def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction='', discussion=None):
     """Design directions for the supplied character and photos, using library references."""
     entries = load_library(library_path)
-    selected = _representatives(sources)
+    selected = (_representatives(sources) if discussion is None else
+        _representatives(discussion['context']['sources'],required=(str(sources[0]),)))
     images = []
-    for source in selected:
+    for index,source in enumerate(selected):
         with open_rgb(source) as image:
-            images.append((Path(source).name,preview_data_url(image,1280)))
+            label = ('本次试样原片：' if index==0 else '讨论对照原片：') if discussion is not None else '原片：'
+            images.append((label+Path(source).name+'；素材 ID：'+str(source),preview_data_url(image,1280)))
     if option_count is None:
         task = ('直接定一个有角色氛围、精致、真实且可执行的整组摄影方向，不反问、不列候选。'
             '返回 JSON，只有 direction 和 reference_ids。')
@@ -161,6 +220,22 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             f'返回 JSON，只有 options，值为恰好 {option_count} 个对象。每个对象包含 title、summary、direction、reference_ids。'
             'title 根据本次设计命名，不能使用固定风格菜单；'
             'summary 用一到两句话说明画面、光感、氛围，以及为什么适合当前角色和原片；不包含模型或算法术语。')
+    samples = []
+    if discussion is not None:
+        samples = _discussion_samples(discussion['context'],discussion['messages'])
+        image_ids = _discussion_image_ids(discussion['context'],discussion['messages'])
+        images.extend(_sample_images(samples,image_ids))
+        task += (
+            '每个方向还必须包含 sample_reference_id，取值为 null 或下方一张已完成真实样片的完整 ID。'
+            '只有用户明确要求以某张真实样片为基础、保留其场景或风格时，才填写对应 ID；'
+            '这张图随后会作为生图第二张风格参考，第一张始终是本次试样原片，身份和构图只来自第一张。'
+            '单纯浏览、比较或 Agent 尚未被采纳的建议不代表采用参考，未明确沿用时填写 null。'
+            '引用时依据原消息的轮次和 ID，不把旧轮的“第二张”换成当前轮第二张。'
+            'has_image 为 false 的历史候选本次只有方向资料，不能声称观察过未附图的细节；完整样片 ID 仍可解析为实际生图参考。'
+            '用户要求保留某样片的场景时，三个方向在该场景与要求范围内探索有区别的摄影表达，不另起矛盾场景。'
+            '本次讨论上下文：\n'+_discussion_details(discussion['context'],samples,image_ids)+
+            '\n成功讨论记录（只用于理解指代、角色信息和已被用户采纳的意图；旧建议不能覆盖当前要求）：\n'+
+            json.dumps(_discussion_messages(discussion['messages']),ensure_ascii=False))
     instruction = (
         '你负责 COS 摄影后期的审美决策。先结合本次用户填写的角色、补充要求和这组代表原片，'
         '观察实物服装、道具、构图与受光，再为当前素材设计摄影方向。'
@@ -168,7 +243,8 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         '成片应有明确的摄影创作意图，不能只清除几个杂物、改成灰蓝色就结束。'
         'direction 用约 300 到 600 字说明具体场景、时间氛围、色彩、曝光层次、自然光来源、背景取舍和特效原则；'
         'reference_ids 从下方目录选取少量最相关的条目编号，通常 2 到 4 条，不需要特效时不要为了用素材而选特效。'
-        '用户补充要求优先。没有补充要求时，由你依据角色的可靠常识、原片场地、实物妆造和受光决定；'
+        '用户明确要求优先；后续讨论形成的当前创作要求覆盖最初补充要求中的冲突，不恢复用户已取消的内容。'
+        '没有明确要求时，由你依据角色的可靠常识、原片场地、实物妆造和受光决定；'
         '角色常识用于环境与情绪，不用于改变原片实物服装，不确定的角色设定不要编造。'
         '分清原拍摄场地与适合角色的创作场景：保留机位、尺度、人物支撑和接触几何，'
         '创作场景的语义和具体景物应依据当前角色与素材确定，不必保留缺少主题的原背景。'
@@ -207,6 +283,14 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             raise ValueError('The prompt writer selected an unknown library reference')
         plan = {'direction':direction,'references':[entries[index] for index in indices],
             'representative_sources':[str(source) for source in selected],'creative_direction':creative_direction}
+        if discussion is not None:
+            reference_id = item['sample_reference_id']
+            plan['sample_reference_id'] = reference_id
+            if reference_id is not None:
+                reference = next((sample for sample in samples if sample['id']==reference_id and sample['status']=='complete'),None)
+                if reference is None:
+                    raise ValueError('摄影方向引用了未提供的完整样片；原始响应已保存')
+                plan['style_reference'] = reference['image']
         if option_count is not None:
             for key in ('title', 'summary'):
                 if not isinstance(item.get(key), str) or not item[key].strip():
@@ -228,6 +312,8 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         '提供了整组方向时，本张只据构图、姿态和原片光向细化，不另起一套场景或影调。'
         '提供用户选定的真实样片时，以它的场景语义、材质、配色、曝光层次和光质为视觉参照；'
         '本张仍按第一张本张原片的构图、姿态与受光细化，不照搬样片机位或人物动作。'
+        '初始补充要求与后续定稿创作要求冲突时，以后续要求为准，不恢复用户已取消的内容。'
+        '样片中与本次方向不符的景物、光色或特效按本次方向修改；沿用参考不等于照抄旧画面。'
         '生图模型也会收到原片作为第一张输入、风格样片作为第二张输入；有样片时在 prompt 中明确这两个职责，'
         '第二张仅参考摄影风格，不复制其中人物、姿态、脸型或构图。'
         'head_box 只定位本张原片的主体，不能从风格样片取坐标；样片不是身份回贴素材。'

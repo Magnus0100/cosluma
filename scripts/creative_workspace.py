@@ -1,6 +1,7 @@
 """A persistent creative workspace for discussion, real samples and user direction."""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QPlainTex
     QPushButton, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from image_io import save_json
-from model_clients import discuss_style
+from model_clients import _representatives, discuss_style
 from photo_pipeline import load_style, make_style_samples
 from studio_widgets import ui_label, StatusText, SampleCard, ConversationView, PhotoPreview
 
@@ -25,19 +26,20 @@ class StyleWorker(QThread):
     directory_created = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction=''):
+    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction='', discussion=None):
         super().__init__()
         self.sources, self.sample_source = sources, sample_source
         self.character, self.brief = character, brief
         self.root, self.config = root, config
         self.creative_direction = creative_direction
+        self.discussion = discussion
 
     def run(self):
         try:
             for option in make_style_samples(self.sources,self.sample_source,self.character,self.root,self.config,
                     brief=self.brief,progress=self.progress.emit,planned=self.plans_ready.emit,
                     sample_progress=self.sample_stage.emit,started=self.directory_created.emit,
-                    creative_direction=self.creative_direction):
+                    creative_direction=self.creative_direction,discussion=self.discussion):
                 self.sample_ready.emit(option)
         except Exception as error:
             self.failed.emit(str(error))
@@ -47,14 +49,14 @@ class StyleChatWorker(QThread):
     reply_ready = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, sources, character, brief, config, directory, messages, direction, samples, focus):
+    def __init__(self, sources, character, brief, config, directory, messages, direction, context):
         super().__init__()
         self.arguments = (sources,character,brief,config['prompt_library'],config['llm'],Path(directory),messages)
-        self.direction, self.samples, self.focus = direction, samples, focus
+        self.direction, self.context = direction, context
 
     def run(self):
         try:
-            result = discuss_style(*self.arguments,direction=self.direction,samples=self.samples,focus=self.focus)
+            result = discuss_style(*self.arguments,direction=self.direction,context=self.context)
             self.reply_ready.emit(result)
         except Exception as error:
             self.failed.emit(getattr(error,'provider_message','') or str(error))
@@ -227,7 +229,11 @@ class CreativeWorkspace(QWidget):
         chat_layout.setContentsMargins(12,12,12,12)
         chat_layout.setSpacing(8)
         chat_layout.addWidget(ui_label('一起构思','heading'))
-        chat_layout.addWidget(ui_label('摄影 Agent 会结合原片与样片回应。'))
+        self.discussion_target = ui_label('')
+        self.discussion_target.setTextFormat(Qt.PlainText)
+        self.discussion_target.setWordWrap(True)
+        self.discussion_target.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred)
+        chat_layout.addWidget(self.discussion_target)
         self.chat_history = ConversationView()
         chat_layout.addWidget(self.chat_history,1)
         chat_layout.addWidget(ui_label('当前创作要求'))
@@ -303,6 +309,7 @@ class CreativeWorkspace(QWidget):
                 self.message.setPlainText('已有样片记录无法读取，请重新选择原片后手动生成：'+str(error))
         self.update_creative_actions()
         self.sample_source.currentIndexChanged.connect(self.change_representative)
+        self.canvas.mode.currentIndexChanged.connect(self.refresh_discussion_target)
 
     def sync_sources(self, sources):
         if list(sources)==self.sources:
@@ -434,6 +441,52 @@ class CreativeWorkspace(QWidget):
         self.chat_history.show_messages(self.messages)
         self.discussion_summary.setPlainText(self.creative_direction)
 
+    def discussion_sample(self, option):
+        directory = option['styles_directory']
+        round_label = (f'第 {self.sample_directories.index(directory)+1} 轮'
+            if directory in self.sample_directories else '已有样片')
+        sample = {'id':option['selection_file'],
+            'label':f'{round_label} · 方案 {option["index"]+1} · '+option['title'],
+            'index':option['index'],'title':option['title'],'summary':option['summary'],
+            'direction':option['art_direction']['direction'],'source':option['sample_source'],
+            'status':option['status'],'selected':option['selection_file']==self.chosen_file,
+            'image':option['result']['files']['jpeg'] if option['status']=='complete' else None}
+        if option['status']=='failed':
+            sample['error'] = option['error']
+        return sample
+
+    def discussion_context(self):
+        """Describe the actual canvas and related samples without changing creative decisions."""
+        options = [self.options[index] for index in sorted(self.options)]
+        if self.selected_style is not None and not any(
+                option['selection_file']==self.selected_style['selection_file'] for option in options):
+            options.append(self.selected_style)
+        samples = [self.discussion_sample(option) for option in options]
+        option = (self.selected_style if self.viewing_selected else
+            self.options.get(self.current_option) if not self.viewing_original else None)
+        viewed_sample = option['selection_file'] if option is not None else None
+        viewed_source = self.canvas.source
+        next_source = self.sample_source.currentData()
+        selected_source = self.selected_style['sample_source'] if self.selected_style is not None else None
+        required = list(dict.fromkeys(source for source in (viewed_source,next_source,selected_source) if source))
+        sources = _representatives(list(dict.fromkeys([*required,*self.sources])),required=required)
+        mode = self.canvas.mode.currentData()
+        mode_label = {'source':'原片','output':'成片','compare':'原片与成片并排'}[mode]
+        if option is not None:
+            sample = next(sample for sample in samples if sample['id']==viewed_sample)
+            label = ('已定稿 · ' if sample['selected'] else '')+sample['label']+' · '+mode_label
+            label += ' · 原片 '+Path(viewed_source).name
+        else:
+            label = '原片 · '+Path(viewed_source).name if viewed_source else '尚未选择原片'
+        return {'label':label,'viewed_source':viewed_source,'viewed_sample':viewed_sample,'view_mode':mode,
+            'next_sample_source':next_source,'selected_sample':self.chosen_file or None,
+            'sources':sources,'samples':samples}
+
+    def refresh_discussion_target(self):
+        label = '当前讨论：'+self.discussion_context()['label']
+        self.discussion_target.setText(label)
+        self.discussion_target.setToolTip(label)
+
     def update_creative_actions(self):
         busy = self.is_busy() or self.production_busy
         draft = bool(self.chat_input.toPlainText().strip())
@@ -469,6 +522,7 @@ class CreativeWorkspace(QWidget):
         elif self.chosen_file:
             chosen_option = next((item for item in self.options.values() if item.get('selection_file')==self.chosen_file),None)
             self.chosen_label.setText('已定稿：'+chosen_option['title']+'；查看其他方案不会改变定稿。' if chosen_option else '已有定稿，当前正在讨论新的样片。')
+        self.refresh_discussion_target()
 
     def send_message(self):
         text = self.chat_input.toPlainText().strip()
@@ -476,20 +530,13 @@ class CreativeWorkspace(QWidget):
             return
         try:
             self.ensure_discussion()
-            self.pending_message = {'role':'user','content':text}
+            context = deepcopy(self.discussion_context())
+            self.pending_message = {'role':'user','content':text,'context':context}
             self.save_discussion()
             conversation = [row for row in self.messages if row.get('status')!='failed']
             conversation.append(self.pending_message)
-            viewed_source = self.selected_style['sample_source'] if self.viewing_selected else self.viewed_source
-            represented = list(dict.fromkeys(source for source in [viewed_source,self.sample_source.currentData(),*self.sources] if source))
-            focus = (('原片：'+Path(viewed_source).name if viewed_source else '尚未选择下次试样原片') if self.viewing_original else
-                '已定稿样片：'+self.selected_style['title'] if self.viewing_selected else
-                self.options.get(self.current_option,{}).get('title'))
-            samples = [dict(option,selected=option.get('selection_file')==self.chosen_file) for option in self.options.values()]
-            if self.selected_style is not None and not any(option['selected'] for option in samples):
-                samples.append(dict(self.selected_style,selected=True))
-            self.chat_worker = StyleChatWorker(represented,self.character,self.brief,self.config,
-                self.discussion_directory,conversation,self.creative_direction,samples,focus)
+            self.chat_worker = StyleChatWorker(context['sources'],self.character,self.brief,self.config,
+                self.discussion_directory,conversation,self.creative_direction,context)
             self.chat_worker.reply_ready.connect(self.receive_reply)
             self.chat_worker.failed.connect(self.chat_failed)
             self.chat_worker.finished.connect(self.chat_finished)
@@ -507,9 +554,12 @@ class CreativeWorkspace(QWidget):
             self.state_changed.emit()
 
     def receive_reply(self, reply):
-        self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply']}])
+        update = reply['direction_update']
+        changed = update is not None and update!=self.creative_direction
+        self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply'],'direction_update':update}])
         self.pending_message = None
-        self.creative_direction = reply['direction']
+        if update is not None:
+            self.creative_direction = update
         self.render_conversation()
         self.update_creative_actions()
         self.state_changed.emit()
@@ -519,7 +569,7 @@ class CreativeWorkspace(QWidget):
             self.message.setPlainText('回复已收到，保存对话失败：'+str(error))
             return
         self.message.setPlainText('创作要求已更新。可继续讨论；按当前讨论生成新样片后，再定稿用于批量。' if
-            self.options and self.samples_direction!=self.creative_direction else
+            changed and self.options and self.samples_direction!=self.creative_direction else
             '可以继续讨论、查看已有样片，或按当前讨论主动生成样片。由你决定何时定稿。')
 
     def chat_failed(self, error):
@@ -590,6 +640,7 @@ class CreativeWorkspace(QWidget):
         self.canvas.set_photo(self.viewed_source)
         self.active_caption.setText('下次试样原片'+(' · '+Path(self.viewed_source).name if self.viewed_source else ' · 请在照片页添加原片'))
         self.active_caption.setToolTip(self.active_caption.text())
+        self.refresh_discussion_target()
 
     def open_sample_folder(self):
         directory = (self.selected_style['styles_directory'] if self.viewing_selected else self.viewed_directory)
@@ -728,6 +779,8 @@ class CreativeWorkspace(QWidget):
         except OSError as error:
             self.message.setPlainText('无法创建创作文件夹：'+str(error))
             return
+        discussion = deepcopy({'messages':[row for row in self.messages if row.get('status')!='failed'],
+            'context':self.discussion_context()})
         self.active_directory = None
         self.active_plans = []
         self.active_options = {}
@@ -752,7 +805,7 @@ class CreativeWorkspace(QWidget):
         self.sample_source.setEnabled(False)
         represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
         self.worker = StyleWorker(represented,self.sample_source.currentData(),self.character,
-            self.brief,self.root,self.config,creative_direction=self.creative_direction)
+            self.brief,self.root,self.config,creative_direction=self.creative_direction,discussion=discussion)
         self.worker.progress.connect(self.sample_progress)
         self.worker.plans_ready.connect(self.show_plans)
         self.worker.sample_stage.connect(self.show_stage)

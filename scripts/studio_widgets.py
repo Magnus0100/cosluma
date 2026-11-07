@@ -208,6 +208,13 @@ class ConversationView(QScrollArea):
             bubble.copy_button.clicked.connect(lambda _checked=False,text=entry['content']:QApplication.clipboard().setText(text))
             header.addWidget(bubble.copy_button)
         column.addLayout(header)
+        bubble.context_label = None
+        if user and entry.get('context'):
+            bubble.context_label = ui_label('发送时：'+entry['context']['label'])
+            bubble.context_label.setWordWrap(True)
+            bubble.context_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            bubble.context_label.setStyleSheet('font-size: 11px')
+            column.addWidget(bubble.context_label)
         bubble.body = QLabel()
         bubble.body.setProperty('role','message')
         bubble.body.setWordWrap(True)

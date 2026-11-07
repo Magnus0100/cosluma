@@ -161,7 +161,7 @@ def _reuse_style_sample(selected, directory):
 
 
 def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
-        progress=None, planned=None, sample_progress=None, started=None, creative_direction=''):
+        progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None):
     """Render three real styles through finish_photo, once per option."""
     report = progress or (lambda message: None)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -173,6 +173,8 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     state = {'status':'planning','sample_source':str(sample_source),'sources':[str(source) for source in sources],
         'character':character,'brief':brief,'creative_direction':creative_direction,'options':{},
         'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
+    if discussion is not None:
+        state['discussion'] = discussion
     save_json(directory/'styles.json',state)
     if started is not None:
         started(str(directory))
@@ -180,7 +182,7 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     try:
         represented = [sample_source] + [source for source in sources if source != sample_source]
         plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,
-            option_count=3,creative_direction=creative_direction)
+            option_count=3,creative_direction=creative_direction,discussion=discussion)
     except Exception as error:
         message = getattr(error,'provider_message','') or str(error)
         state.update(status='failed',error=message)
