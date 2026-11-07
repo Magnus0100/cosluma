@@ -478,7 +478,8 @@ class CreativeWorkspace(QWidget):
             self.ensure_discussion()
             self.pending_message = {'role':'user','content':text}
             self.save_discussion()
-            conversation = [*self.messages,self.pending_message]
+            conversation = [row for row in self.messages if row.get('status')!='failed']
+            conversation.append(self.pending_message)
             viewed_source = self.selected_style['sample_source'] if self.viewing_selected else self.viewed_source
             represented = list(dict.fromkeys(source for source in [viewed_source,self.sample_source.currentData(),*self.sources] if source))
             focus = (('原片：'+Path(viewed_source).name if viewed_source else '尚未选择下次试样原片') if self.viewing_original else
@@ -492,7 +493,8 @@ class CreativeWorkspace(QWidget):
             self.chat_worker.reply_ready.connect(self.receive_reply)
             self.chat_worker.failed.connect(self.chat_failed)
             self.chat_worker.finished.connect(self.chat_finished)
-            self.chat_history.show_messages(conversation,{'role':'assistant','content':'正在查看原片与样片…'})
+            self.chat_history.show_messages([*self.messages,self.pending_message],
+                {'role':'assistant','content':'正在查看原片与样片…'},scroll_to_bottom=True)
             self.chat_input.clear()
             self.message.setPlainText('Agent 正在结合角色、原片与已有样片回复；这一步只讨论。')
             self.update_creative_actions()
@@ -522,6 +524,7 @@ class CreativeWorkspace(QWidget):
 
     def chat_failed(self, error):
         if self.pending_message is not None:
+            self.messages.append({**self.pending_message,'status':'failed','error':error})
             self.chat_input.setPlainText(self.pending_message['content'])
         self.pending_message = None
         self.render_conversation()

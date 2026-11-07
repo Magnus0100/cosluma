@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
     QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
     QVBoxLayout, QWidget)
@@ -148,12 +148,16 @@ class ServiceSettings(QDialog):
             form.addRow('密钥来源', mode)
             form.addRow('密钥', row)
             if service == 'image':
-                options = QGroupBox('图像参数（可选）')
-                options.setCheckable(True)
-                options.setChecked(False)
+                options = QWidget()
                 options_layout = QVBoxLayout(options)
+                options_layout.setContentsMargins(0,0,0,0)
+                self.image_options_toggle = QToolButton()
+                self.image_options_toggle.setCheckable(True)
+                self.image_options_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                options_layout.addWidget(self.image_options_toggle,0,Qt.AlignLeft)
                 content = QWidget()
                 parameters = QFormLayout(content)
+                parameters.setContentsMargins(0,0,0,0)
                 self.image_options = {}
                 for key, label in (('quality', '质量'), ('size', '生成尺寸'), ('output_format', '图片格式')):
                     edit = QLineEdit(str(provider.get('parameters', {}).get(key, '')) if self.existing else '')
@@ -161,13 +165,29 @@ class ServiceSettings(QDialog):
                     self.image_options[key] = edit
                     parameters.addRow(label, edit)
                 options_layout.addWidget(content)
-                content.hide()
-                options.toggled.connect(content.setVisible)
+                explanation = ui_label('留空才不发送该项；收起只隐藏填写区，不清除已填参数。')
+                explanation.setWordWrap(True)
+                options_layout.addWidget(explanation)
+                def show_parameters(expanded):
+                    content.setVisible(expanded)
+                    self.image_options_toggle.setText('收起图像参数' if expanded else '展开图像参数（可选）')
+                    self.image_options_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+                expanded = any(edit.text().strip() for edit in self.image_options.values())
+                self.image_options_toggle.setChecked(expanded)
+                self.image_options_toggle.toggled.connect(show_parameters)
+                show_parameters(expanded)
                 form.addRow(options)
             description = QLabel('地址填写到 /v1 时，保存会补全兼容接口路径；填写完整地址时原样使用。')
             description.setWordWrap(True)
             form.addRow(description)
-            self.tabs.addTab(panel, title)
+            if service == 'image':
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QFrame.NoFrame)
+                scroll.setWidget(panel)
+                self.tabs.addTab(scroll, title)
+            else:
+                self.tabs.addTab(panel, title)
         panel = QWidget()
         form = QFormLayout(panel)
         form.setVerticalSpacing(12)
@@ -544,10 +564,19 @@ class Workbench(QMainWindow):
         empty_layout.addWidget(ui_label('从你的原片开始', 'title'), 0, Qt.AlignCenter)
         self.creative_next = ui_label('添加照片和角色后，在这里与摄影 Agent 一起确定方向。')
         self.creative_next.setWordWrap(True)
-        empty_layout.addWidget(self.creative_next, 0, Qt.AlignCenter)
-        back = QPushButton('去照片页准备')
-        back.clicked.connect(lambda: self.navigate(0))
-        empty_layout.addWidget(back, 0, Qt.AlignCenter)
+        self.creative_next.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(self.creative_next)
+        preparation = QHBoxLayout()
+        preparation.addStretch(1)
+        self.creative_prepare = QPushButton('添加照片')
+        self.creative_prepare.setProperty('kind','primary')
+        self.creative_prepare.clicked.connect(self.prepare_creative)
+        preparation.addWidget(self.creative_prepare)
+        self.creative_import = QPushButton('导入配置')
+        self.creative_import.clicked.connect(self.import_config)
+        preparation.addWidget(self.creative_import)
+        preparation.addStretch(1)
+        empty_layout.addLayout(preparation)
         empty_layout.addStretch(1)
         self.creative_layout.addWidget(self.creative_empty)
         self.pages.addWidget(self.creative_page)
@@ -805,10 +834,9 @@ class Workbench(QMainWindow):
         try:
             load_settings(filename)
             self.config.setText(filename)
-            if self.creative_workspace is not None:
-                self.creative_workspace.config = self.desktop_config()
             self.remember_preferences()
-            self.status.setText('已选择已有配置。添加照片、填写角色后，可与 Agent 讨论风格并试样。')
+            self.status.setText('已选择已有配置。')
+            self.refresh_creative_preparation()
         except Exception as error:
             self.status.setText('无法导入配置：' + str(error))
 
@@ -846,13 +874,30 @@ class Workbench(QMainWindow):
             dialog = ServiceSettings(self.config.text(), self)
             if dialog.exec() == QDialog.Accepted:
                 self.config.setText(str(dialog.path))
-                if self.creative_workspace is not None:
-                    self.creative_workspace.config = self.desktop_config()
                 self.remember_preferences()
-                self.update_setup_hint()
-                self.status.setText('连接设置已保存。添加照片和角色后，可与 Agent 讨论风格并试样。')
+                self.status.setText('连接设置已保存。')
+                self.refresh_creative_preparation()
         except Exception as error:
             self.status.setText('无法打开连接设置：' + str(error))
+
+    def refresh_creative_preparation(self):
+        self.update_setup_hint()
+        if self.pages.currentIndex()==1:
+            self.navigate(1)
+        else:
+            self.update_actions()
+
+    def prepare_creative(self):
+        context = self.current_style_context()
+        chosen = self.selected_style if self.style_context==context else None
+        if not self.sources and chosen is None:
+            self.select_sources()
+            self.navigate(1)
+        elif not context[0]:
+            self.navigate(0)
+            self.character.setFocus()
+        else:
+            self.configure_services()
 
     def switch_character(self):
         character = self.character.text().strip()
@@ -1005,6 +1050,7 @@ class Workbench(QMainWindow):
             self.creative_workspace.set_production_busy(self.worker is not None)
         has_photos = bool(self.sources)
         has_character = bool(self.character.text().strip())
+        has_config = Path(self.config.text()).expanduser().is_file()
         context = self.current_style_context()
         has_previous = bool(self.results or any(stage == '未完成' for stage in self.stages.values()))
         pending = sum(self.source_key(source) not in self.results and self.source_key(source) not in self.stages
@@ -1028,6 +1074,8 @@ class Workbench(QMainWindow):
             next_step = '正在按定稿制作，可切页查看原片、样片和已有成片。'
         elif running:
             next_step = 'Agent 或样片正在处理中，可切页浏览，完成后再决定下一步。'
+        elif not has_config:
+            next_step = '先连接模型服务：打开“连接设置”或导入已有配置，保存后即可开始讨论。'
         elif self.creative_context == context and self.creative_draft:
             next_step = '创作页还有未发送的输入；发送或清空后，再按当前讨论制作。'
         elif chosen is not None and not ready:
@@ -1345,10 +1393,16 @@ class Workbench(QMainWindow):
     def ensure_creative(self):
         context = self.current_style_context()
         chosen = self.selected_style if self.style_context == context else None
-        if (not self.sources and chosen is None) or not context[0] or not Path(self.config.text()).expanduser().is_file():
+        missing_photos = not self.sources and chosen is None
+        missing_character = not context[0]
+        missing_config = not Path(self.config.text()).expanduser().is_file()
+        if missing_photos or missing_character or missing_config:
             self.creative_empty.show()
-            self.creative_next.setText('请先添加照片、填写角色。' if not self.sources or not self.character.text().strip() else
-                '先用顶部“连接设置”填写模型服务，或导入已有配置。')
+            self.creative_next.setText('先添加这组照片。' if missing_photos else
+                '请填写角色，补充要求可以留空。' if missing_character else
+                '照片与角色已准备好。连接模型服务或导入已有配置后，即可开始讨论。')
+            self.creative_prepare.setText('添加照片' if missing_photos else '填写角色' if missing_character else '连接设置')
+            self.creative_import.setVisible(not missing_photos and not missing_character and missing_config)
             if self.creative_workspace is not None:
                 self.creative_workspace.hide()
             return

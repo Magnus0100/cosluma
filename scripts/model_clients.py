@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from functools import lru_cache
 from io import BytesIO
 import json
 from pathlib import Path
@@ -92,21 +93,31 @@ def _representatives(sources):
     return [sources[round(index*(len(sources)-1)/max(1,count-1))] for index in range(count)]
 
 
+@lru_cache(maxsize=16)
+def _discussion_preview(path, modified_ns):
+    """Reuse display data for unchanged files; the modification time is part of the key."""
+    with open_rgb(path) as image:
+        return preview_data_url(image,1280)
+
+
+def discussion_preview(path):
+    path = Path(path)
+    return _discussion_preview(str(path),path.stat().st_mtime_ns)
+
+
 def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', samples=(), focus=None):
     """Discuss the current photographs and samples without submitting production."""
     images = []
     for source in _representatives(sources):
-        with open_rgb(source) as image:
-            images.append(('原片：'+Path(source).name,preview_data_url(image,1280)))
+        images.append(('原片：'+Path(source).name,discussion_preview(source)))
     descriptions = []
     for option in samples:
         description = {key:option[key] for key in ('index','title','summary','status')}
         description['role'] = '已定稿样片' if option.get('selected') else '本轮候选'
         descriptions.append(description)
         if option['status']=='complete':
-            with open_rgb(option['result']['files']['jpeg']) as image:
-                label = '已定稿真实样片：' if option.get('selected') else f'本轮方案 {option["index"]+1} 的真实样片：'
-                images.append((label+option['title'],preview_data_url(image,1280)))
+            label = '已定稿真实样片：' if option.get('selected') else f'本轮方案 {option["index"]+1} 的真实样片：'
+            images.append((label+option['title'],discussion_preview(option['result']['files']['jpeg'])))
     instruction = (
         '你是与用户共同创作 COS 摄影后期的摄影 Agent，现在处于讨论与试样阶段。'
         '用自然的中文对话，先观察本次角色和原片的妆造、道具、构图、受光，结合完整对话与已生成样片讨论。'

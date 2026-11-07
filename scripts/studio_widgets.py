@@ -152,57 +152,147 @@ class SampleCard(QFrame):
 class ConversationView(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.entries = []
+        self.bubbles = []
+        self.following_latest = True
+        self.updating_messages = False
+        self.next_follow = True
+        self.next_position = 0
+        self.latest_button = QToolButton(self.viewport())
+        self.latest_button.setText('查看最新消息')
+        self.latest_button.clicked.connect(self.scroll_to_latest)
+        self.latest_button.hide()
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.content = QWidget()
         self.rows = QVBoxLayout(self.content)
         self.rows.setContentsMargins(0,0,6,0)
         self.rows.setSpacing(14)
-        self.setWidget(self.content)
-        self.show_messages([])
-
-    def show_messages(self, messages, pending=None):
-        while self.rows.count():
-            item = self.rows.takeAt(0)
-            if item.widget() is not None:
-                item.widget().hide()
-                item.widget().deleteLater()
-        if not messages and pending is None:
-            welcome = QFrame()
-            welcome.setProperty('role','welcome')
-            column = QVBoxLayout(welcome)
-            column.setContentsMargins(18,20,18,20)
-            column.setSpacing(12)
-            column.addWidget(ui_label('从这组照片聊起','heading'))
-            note = ui_label('说说你想保留的细节、角色的气质，或让 Agent 先看看原片。')
-            note.setWordWrap(True)
-            column.addWidget(note)
-            self.rows.addWidget(welcome)
-        for row in [*messages,*([pending] if pending else [])]:
-            user = row['role']=='user'
-            bubble = QFrame()
-            bubble.setProperty('role','userBubble' if user else 'agentBubble')
-            column = QVBoxLayout(bubble)
-            column.setContentsMargins(14,12,14,14)
-            column.setSpacing(7)
-            column.addWidget(ui_label('你' if user else '摄影 Agent','messageAuthor'))
-            body = QLabel()
-            body.setProperty('role','message')
-            body.setWordWrap(True)
-            body.setTextInteractionFlags(Qt.TextSelectableByMouse|Qt.LinksAccessibleByMouse)
-            if user:
-                body.setTextFormat(Qt.PlainText)
-                body.setText(row['content'])
-            else:
-                document = QTextDocument()
-                document.setDefaultFont(QApplication.font())
-                document.setMarkdown(row['content'])
-                body.setTextFormat(Qt.RichText)
-                body.setText(document.toHtml())
-            column.addWidget(body)
-            self.rows.addWidget(bubble)
+        self.welcome = QFrame()
+        self.welcome.setProperty('role','welcome')
+        welcome_layout = QVBoxLayout(self.welcome)
+        welcome_layout.setContentsMargins(18,20,18,20)
+        welcome_layout.setSpacing(12)
+        welcome_layout.addWidget(ui_label('从这组照片聊起','heading'))
+        note = ui_label('说说你想保留的细节、角色的气质，或让 Agent 先看看原片。')
+        note.setWordWrap(True)
+        welcome_layout.addWidget(note)
+        self.rows.addWidget(self.welcome)
         self.rows.addStretch(1)
-        QTimer.singleShot(0,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+        self.setWidget(self.content)
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.finish_message_update)
+        self.verticalScrollBar().valueChanged.connect(self.scroll_position_changed)
+        self.verticalScrollBar().rangeChanged.connect(self.scroll_range_changed)
+
+    def make_bubble(self, entry):
+        user = entry['role']=='user'
+        failed = entry.get('status')=='failed'
+        bubble = QFrame()
+        bubble.setProperty('role','userBubble' if user else 'agentBubble')
+        column = QVBoxLayout(bubble)
+        column.setContentsMargins(14,12,14,14)
+        column.setSpacing(7)
+        header = QHBoxLayout()
+        author = '你' if user else '摄影 Agent'
+        header.addWidget(ui_label(author+'（发送失败）' if failed else author,'messageAuthor'),1)
+        bubble.copy_button = None
+        if not entry.get('_pending'):
+            bubble.copy_button = QToolButton()
+            bubble.copy_button.setText('复制')
+            bubble.copy_button.setToolTip('复制这条消息的完整原文')
+            bubble.copy_button.setProperty('kind','quiet')
+            bubble.copy_button.setFixedHeight(22)
+            bubble.copy_button.setStyleSheet('padding: 2px 6px')
+            bubble.copy_button.clicked.connect(lambda _checked=False,text=entry['content']:QApplication.clipboard().setText(text))
+            header.addWidget(bubble.copy_button)
+        column.addLayout(header)
+        bubble.body = QLabel()
+        bubble.body.setProperty('role','message')
+        bubble.body.setWordWrap(True)
+        bubble.body.setTextInteractionFlags(Qt.TextSelectableByMouse|Qt.LinksAccessibleByMouse)
+        if user:
+            bubble.body.setTextFormat(Qt.PlainText)
+            bubble.body.setText(entry['content'])
+        else:
+            document = QTextDocument()
+            document.setDefaultFont(QApplication.font())
+            document.setMarkdown(entry['content'])
+            bubble.body.setTextFormat(Qt.RichText)
+            bubble.body.setText(document.toHtml())
+        column.addWidget(bubble.body)
+        bubble.error_label = None
+        if failed:
+            bubble.error_label = ui_label(entry['error'])
+            bubble.error_label.setWordWrap(True)
+            bubble.error_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            bubble.error_label.setStyleSheet('color: #a2443e')
+            column.addWidget(bubble.error_label)
+        return bubble
+
+    def show_messages(self, messages, pending=None, *, scroll_to_bottom=False):
+        entries = [dict(entry) for entry in messages]
+        if pending is not None:
+            entries.append(dict(pending,_pending=True))
+        if entries==self.entries:
+            if scroll_to_bottom:
+                self.scroll_to_latest()
+            return
+        self.next_follow = scroll_to_bottom or not self.entries or self.following_latest
+        self.next_position = self.verticalScrollBar().value()
+        self.updating_messages = True
+        prefix = 0
+        while prefix<min(len(entries),len(self.entries)) and entries[prefix]==self.entries[prefix]:
+            prefix += 1
+        for bubble in self.bubbles[prefix:]:
+            self.rows.removeWidget(bubble)
+            bubble.hide()
+            bubble.deleteLater()
+        del self.bubbles[prefix:]
+        self.entries = entries
+        self.welcome.setVisible(not entries)
+        for entry in entries[prefix:]:
+            bubble = self.make_bubble(entry)
+            self.rows.insertWidget(self.rows.count()-1,bubble)
+            self.bubbles.append(bubble)
+        self.update_timer.start(0)
+
+    def finish_message_update(self):
+        self.following_latest = self.next_follow
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum() if self.next_follow else self.next_position)
+        self.updating_messages = False
+        self.scroll_position_changed()
+
+    def scroll_to_latest(self):
+        self.following_latest = True
+        self.next_follow = True
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+        self.update_latest_button()
+
+    def scroll_position_changed(self):
+        if not self.updating_messages:
+            scrollbar = self.verticalScrollBar()
+            self.following_latest = scrollbar.value()==scrollbar.maximum()
+        self.update_latest_button()
+
+    def scroll_range_changed(self, _minimum, maximum):
+        if not self.updating_messages and self.following_latest:
+            self.verticalScrollBar().setValue(maximum)
+        self.update_latest_button()
+
+    def update_latest_button(self):
+        scrollbar = self.verticalScrollBar()
+        self.latest_button.setVisible(scrollbar.maximum()>0 and not self.following_latest)
+        self.latest_button.adjustSize()
+        self.latest_button.move(self.viewport().width()-self.latest_button.width()-8,
+            self.viewport().height()-self.latest_button.height()-8)
+        self.latest_button.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_latest_button()
 
 
 
