@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import sys
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap, QTextDocument
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QTextDocument
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
     QVBoxLayout, QWidget)
@@ -14,6 +16,11 @@ from image_io import open_display
 
 def apply_theme(app):
     """Keep the desktop, creative workspace and native popup colours consistent."""
+    if sys.platform == 'win32':
+        font_id = QFontDatabase.addApplicationFont(str(Path(os.environ['SystemRoot'])/'Fonts/msyh.ttc'))
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        if families:
+            app.setFont(QFont(families[0],10))
     app.setStyle('Fusion')
     palette = QPalette()
     for role, colour in ((QPalette.Window,'#eef1f4'),(QPalette.WindowText,'#243244'),
@@ -88,6 +95,11 @@ def apply_theme(app):
         QTabBar::tab:selected { background: #ffffff; color: #254f73; }
         QProgressBar { background: #e1e9f0; border: none; border-radius: 5px; text-align: center; color: #345573; min-height: 16px; }
         QProgressBar::chunk { background: #88a9c4; border-radius: 5px; }
+        QSlider::groove:horizontal { height: 4px; background: #dce5ed; border-radius: 2px; }
+        QSlider::sub-page:horizontal { background: #315f87; border-radius: 2px; }
+        QSlider::handle:horizontal { background: #ffffff; border: 2px solid #315f87; width: 14px; height: 14px; border-radius: 9px; margin: -7px 0; }
+        QSlider::handle:horizontal:disabled { border-color: #bdcbd7; background: #eef1f4; }
+        QSlider::sub-page:horizontal:disabled { background: #bdcbd7; }
         QSplitter::handle { background: transparent; width: 10px; }
         QSplitter::handle:hover { background: #cfdfec; }
         QMenu { background: #ffffff; border: 1px solid #d4dfe8; padding: 5px; }
@@ -325,13 +337,15 @@ class PhotoCanvas(QGraphicsView):
         self.fitting = True
         self.empty_message = ''
 
-    def setPixmap(self, pixels):
+    def setPixmap(self, pixels, *, preserve_view=False):
         if self.photo.pixmap().cacheKey() == pixels.cacheKey():
             return
+        keep_view = preserve_view and not self.fitting and self.photo.pixmap().size() == pixels.size()
         self.empty_message = ''
         self.photo.setPixmap(pixels)
         self.setSceneRect(self.photo.boundingRect())
-        self.fit_photo()
+        if not keep_view:
+            self.fit_photo()
 
     def setText(self, text):
         self.photo.setPixmap(QPixmap())
@@ -433,10 +447,11 @@ class PhotoPreview(QWidget):
     cache = {}
     errors = {}
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, source_label='原片', output_label='成片'):
         super().__init__(parent)
         self.source = None
         self.output = None
+        self.direct_images = False
         self.choice = 'compare'
         self.images = {}
         self.keys = {}
@@ -450,7 +465,7 @@ class PhotoPreview(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel('照片预览'), 1)
         self.mode = QComboBox()
-        for label, value in (('成片', 'output'), ('原片', 'source'), ('原片 / 成片对比', 'compare')):
+        for label, value in ((output_label, 'output'), (source_label, 'source'), (source_label+' / '+output_label, 'compare')):
             self.mode.addItem(label, value)
         self.mode.currentIndexChanged.connect(self.change_mode)
         toolbar.addWidget(self.mode)
@@ -463,7 +478,7 @@ class PhotoPreview(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         self.before = self.image_label()
         self.after = self.image_label()
-        for label, image in (('原片', self.before), ('成片', self.after)):
+        for label, image in ((source_label, self.before), (output_label, self.after)):
             column = QVBoxLayout()
             caption = QLabel(label)
             caption.setAlignment(Qt.AlignCenter)
@@ -515,6 +530,7 @@ class PhotoPreview(QWidget):
         return self.cache[key]
 
     def set_photo(self, source=None, output=None):
+        self.direct_images = False
         self.source, self.output = source, output
         self.keys = {}
         for kind,path in (('source',source),('output',output)):
@@ -531,8 +547,19 @@ class PhotoPreview(QWidget):
         self.update_preview()
         self.load_timer.start()
 
+    def set_image_pair(self, before, after):
+        """Show the beauty editor's in-memory images with the same native canvas."""
+        self.load_timer.stop()
+        self.direct_images = True
+        self.images = {'source':QPixmap.fromImage(before), 'output':QPixmap.fromImage(after)}
+        self.mode.blockSignals(True)
+        self.mode.setCurrentIndex(self.mode.findData(self.choice))
+        self.mode.setEnabled(True)
+        self.mode.blockSignals(False)
+        self.update_preview()
+
     def load_pending(self):
-        if self.loader is not None:
+        if self.direct_images or self.loader is not None:
             return
         missing = list(dict.fromkeys(key for key in self.keys.values() if key is not None and key not in self.cache))
         if missing:
@@ -551,27 +578,30 @@ class PhotoPreview(QWidget):
             removed = next(iter(self.cache))
             self.cache.pop(removed)
             self.errors.pop(removed, None)
+        if self.direct_images:
+            return
         self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
         self.update_preview()
         self.load_pending()
 
     def change_mode(self):
-        if self.output:
+        if self.output or self.direct_images:
             self.choice = self.mode.currentData()
         self.update_preview()
 
     def update_preview(self):
         mode = self.mode.currentData()
-        page = 1 if mode == 'compare' and self.output else 0
+        has_output = bool(self.output) or self.direct_images
+        page = 1 if mode == 'compare' and has_output else 0
         if self.pages.currentIndex() != page:
             self.pages.setCurrentIndex(page)
             QTimer.singleShot(0, self.update_preview)
         targets = ((self.before, 'source'), (self.after, 'output')) if self.pages.currentIndex() else (
-            (self.preview, mode if self.output else 'source'),)
+            (self.preview, mode if has_output else 'source'),)
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
-                label.setPixmap(pixels)
+                label.setPixmap(pixels, preserve_view=self.direct_images)
             elif not self.source:
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
             elif self.keys.get(kind) is not None and self.keys[kind] not in self.cache:

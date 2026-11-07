@@ -1,14 +1,14 @@
 # CosLuma
 
-**0.16.1 · Windows x64 · 源码使用 Python 3.12**
+**0.17.0 · Windows x64 · 源码使用 Python 3.12**
 
 提供照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.16.1/CosLuma-0.16.1-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.16.1)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.17.0/CosLuma-0.17.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.17.0)
 
-Windows 用户下载 Release 中的 `CosLuma-0.16.1-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.17.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -114,6 +114,27 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 查看已有批次时，当前队列的定稿和制作操作收起；点击“回到本次制作”回到本组结果，尚未开始时回到待制作状态。
 完整移动批次文件夹后仍按其中的相对位置查找成片；缺失的原片或成片会明确显示，不把未完成结果标为完成。
 
+### 成片后的可选人脸美化
+
+基础成片保存后，在“成片”页选中照片，点击“人脸美化”。首次填写美化服务连接，保存后准备主体人脸；
+后续默认恢复这张成片的美化草稿。美化从基础成片开始，默认美肤、瘦脸均为 0，不自动用于样片或整批照片。
+
+1. “瘦脸”可直接在 0–100 间调整，收窄下颌两侧，固定眼、鼻、嘴和外侧边界。
+2. 点击“生成美肤基础”后，BeautyGRPO 生成本张人脸的调整基础；成功时从 30 的强度开始预览，可继续调到 0–100。
+   美肤仅应用于皮肤，保护眼睛、眉毛与嘴唇。滑杆复用当前基础，不再请求生图；“重新生成美肤基础”是你主动另做一次，旧文件保留。
+3. 在“美化前 / 美化后”并排查看，也可单独切换，放大检查皮肤和妆容；滑杆更新时保留缩放。“全部归零”恢复基础成片的像素。
+4. 满意后点击“另存美化版”，保存同尺寸 16 位 PNG 和同一结果的 8 位 JPEG。成片页的“美化版”勾选可随时切回基础成片；
+   打开 PNG/JPEG 跟随当前版本。基础成片和批次原有 `PNG`、`JPEG` 导出目录保留。
+
+参数与美化基础保存在此照片的工作文件夹，切页或重开软件后再次进入可继续；保存前的预览是草稿，不标为已保存的美化版。
+新版本位于 `beauty-*/edit-*`，`beauty-latest.json` 指向最近另存版本，历史版本不覆盖。
+“美化连接”可修改服务地址与实际模型名，下一次主动分析或生成时使用；连接保存本身不调用模型。
+分析或生图失败显示实际错误与文件目录，保留基础成片、已有模型文件和上次成功预览，不自动重试或换模型。
+
+美化保持原尺寸 float32 成片作为像素基础，只叠加皮肤调整差值；瘦脸对局部采样一次。
+模型处理的是 1024 像素、8 位人脸，FaceXFormer 的分析输入为 224 像素，蒙版经 8 位 PNG 传输。
+16 位另存不会补回模型环节没有的色阶；生成模型也可能调整皮肤纹理，效果由你对比并选择强度。
+
 “打开当前批次文件夹”定位正在查看的批次。`PNG` 与 `JPEG` 子目录按原片名保存成片：
 PNG 是带 sRGB 配置的 16 位结果，JPEG 是同一结果的 8 位查看副本。
 不同目录原片重名时使用各自工作目录名区分，不覆盖已有文件；整理失败保留工作目录内的完整成片。
@@ -152,6 +173,7 @@ Agent 回复、试样或批量制作尚未结束时关闭窗口，任务继续�
 | `workers` | 并行照片数，默认 4 |
 | `output_long_edge` | 请求长边，默认 6000；`null` 请求原片尺寸 |
 | `finish_curve` | 可选的归一化 `[输入明度, 输出明度]` 数组，默认不调整 |
+| `beauty` | 可选人脸美化的 ComfyUI 地址、模型名与明确的人脸分析设备；在美化页单独保存，未配置不影响基础制作 |
 | `python` | 源码启动器使用的已有 Python 路径；Windows 包不使用 |
 
 ### 接口约定
@@ -184,6 +206,43 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 将 ComfyUI 根地址填入 `head.url` 和 `sr.url`，同一服务可承担两个阶段。
 客户端使用 `/upload/image`、`/prompt`、`/history/<id>` 和 `/view`；这些端点需从运行 CosLuma 的机器可达。
 这里是服务提供方的安装约定，不是每张照片的评分或放行步骤。
+
+### 可选美化服务
+
+使用已有 ComfyUI 的 Python 环境与模型目录，将随包 `providers/comfyui_cosluma_beauty` 整个文件夹复制到
+`ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors 和 MediaPipe；桌面端不安装或加载这些模型运行库。
+在已有 ComfyUI 的 Python 中执行 `python -m pip install -r <CosLuma目录>/providers/comfyui_cosluma_beauty/requirements.txt` 后重启服务。
+
+美肤使用 [BeautyGRPO（CVPR 2026）](https://github.com/vivoCameraResearch/BeautyGRPO) 的官方 FLUX Kontext LoRA。
+其[论文](https://arxiv.org/abs/2603.01163)报告了 1,000 张自然人像上的 FID 2.23、LPIPS 0.049 与身份相似度 0.952；
+这是面部修饰任务的选型依据，不表示它在所有身份指标领先，也不是 COS 妆造效果的保证。
+服务默认使用 Comfy-Org 的 FP8 scaled Kontext 底座，28 步、guidance 2.5、seed 42；该精度与本文叠加差值的方式均不同于论文完整评测设置。
+瘦脸使用 [MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) 的 478 点定位，包含眼睑与虹膜；
+下颌轮廓收缩由 SciPy 薄板样条计算，眼鼻唇等五官范围的形变场为零。皮肤范围使用 [FaceXFormer](https://github.com/Kartik-3004/facexformer) 的面部解析，不使用其 68 点定位。
+
+按上游许可下载以下推理权重，放在服务机器上；不需要 BeautyGRPO 的训练奖励模型：
+
+| 配置字段 | 服务目录 / 文件名 | 上游 |
+| --- | --- | --- |
+| `beauty.analysis_model` | `models/cosluma_face/facexformer.safetensors` | [FaceXFormer 的 ckpts/model.pt](https://huggingface.co/kartiknarayan/facexformer)，按下方命令无损提取 |
+| `beauty.landmark_model` | `models/cosluma_face/face_landmarker.task` | [Google 官方 float16/1 模型](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task) |
+| `beauty.model` | `models/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors` | [Comfy-Org Kontext](https://huggingface.co/Comfy-Org/Flux-1-Kontext-Dev) |
+| `beauty.lora` | `models/loras/beautygrpo.safetensors` | [BeautyGRPO](https://huggingface.co/Sehnsucht24/BeautyGRPO) 的 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放入 |
+| `beauty.clip_l` | `models/text_encoders/clip_l.safetensors` | [Flux 文本编码器](https://huggingface.co/comfyanonymous/flux_text_encoders) |
+| `beauty.t5` | `models/text_encoders/t5xxl_fp16.safetensors` | 同上 |
+| `beauty.vae` | `models/vae/ae.safetensors` | [FLUX.1 的 VAE](https://huggingface.co/black-forest-labs/FLUX.1-schnell) |
+
+在已有 ComfyUI Python 中执行：
+
+```powershell
+python <CosLuma目录>/providers/convert_facexformer.py <下载目录>/ckpts/model.pt <ComfyUI目录>/models/cosluma_face/facexformer.safetensors
+```
+
+转换只提取 `state_dict_backbone`，不量化或改动张量；节点严格加载完整权重，不另外下载 ImageNet 初始化参数。
+美化页首次连接的地址默认沿用整头服务，可改为单独服务；`beauty.analysis_device` 为 FaceXFormer 皮肤解析明确选择 `cuda:0` 或 `cpu`。
+MediaPipe 定位在当前 Windows 服务使用 CPU/XNNPACK；两个分析模块均不自动切换设备。
+当前模型组合约需 22 GB 权重磁盘空间，GPU 与内存由 ComfyUI 管理；权重保存在服务机器，未随桌面包分发。
+FLUX.1-dev 模型受其非商业许可约束，BeautyGRPO 权重与其他组件分别遵循上游条款，见 [第三方许可](LICENSES/README.md)。
 
 ### 自定义提示词库
 
@@ -229,17 +288,22 @@ python -B scripts/project_cli.py --root D:/CosLuma-output compose --source D:/ph
 # 另有已保存的模型超分图时，显式复用该结果
 python -B scripts/project_cli.py --root D:/CosLuma-output compose --source D:/photos/a.jpg --generated D:/renders/a.png --superresolved D:/renders/a-sr.png
 
+# 对已完成的成片另存美化版；强度为 0–1，默认均为 0
+python -B scripts/project_cli.py --root D:/CosLuma-output beautify --run D:/CosLuma-output/批次/照片/run.json --skin 0.3 --slim 0.2
+
 # 本地 HTTP，默认仅监听 127.0.0.1:8765
 python -B scripts/backend_server.py --root D:/CosLuma-output
 ```
 
 CLI 的 `--config <路径>` 放在子命令前；桌面、CLI、HTTP 均支持 `--version`。
-HTTP 提供 `POST /api/styles`、`POST /api/stylize`、`POST /api/compose`、`GET /api/jobs/<id>` 和 `GET /api/status`。
+HTTP 提供 `POST /api/styles`、`POST /api/stylize`、`POST /api/compose`、`POST /api/beautify`、`GET /api/jobs/<id>` 和 `GET /api/status`。
 `styles` 接受 `sources`、`sample_source`、`character`，可选 `brief`、`size` 和已讨论的 `creative_direction`；CLI 对应 `--creative-direction`。
 完成后返回三个方案及各自 `selection_file`。交互聊天在桌面“创作”页进行；CLI 与 HTTP 可直接使用已定稿的样片。
 `stylize` 接受 `source` 或批量 `sources`、`character`，可选 `brief`、`size` 和选中的 `style` 文件路径；
 使用选中方案时保持相同角色与补充要求，复用样片保留其原有实际尺寸。不传 `style` 的直接调用仍自动设计一个方向。
 `compose` 另需 `generated`，可选 `superresolved`，角色可以留空。
+`beautify` 接受已完成照片的 `run` 路径、0–1 的 `skin`、`slim`，可选已有美化目录 `session`；CLI 对应 `--session`。
+没有传会话时按该成片分析一次；传入该照片的会话可复用已有美肤基础。结果保存在原成片的工作目录，`--root` 不改变此位置。
 
 ```powershell
 $job = Invoke-RestMethod http://127.0.0.1:8765/api/stylize -Method Post -ContentType 'application/json' -Body (@{

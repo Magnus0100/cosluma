@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
@@ -22,6 +22,7 @@ from app_version import VERSION
 from studio_widgets import apply_theme, ui_label, PhotoPreview
 from creative_workspace import CreativeWorkspace
 from batch_results import BatchResults
+from beauty_editor import BeautyConnection, BeautyEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos
 from photo_pipeline import finish_batch, load_style
@@ -434,6 +435,7 @@ class Workbench(QMainWindow):
         self.creative_draft = False
         self.current_batch_view = None
         self.archive_view = None
+        self.beauty_editor = None
         self.chosen_preview_key = None
         self.restored_page = 0
         self.close_after_finish = False
@@ -972,8 +974,10 @@ class Workbench(QMainWindow):
             path = Path(directory).expanduser().resolve()
             if self.current_batch_view is not None and path == self.current_batch_view.directory:
                 view = self.current_batch_view
+                view.refresh()
             elif self.archive_view is not None and path == self.archive_view.directory:
                 view = self.archive_view
+                view.refresh()
             else:
                 view = self.make_results_view(path)
                 if self.archive_view is not None:
@@ -1312,7 +1316,8 @@ class Workbench(QMainWindow):
             self.source_key(source) not in self.excluded_sources and source!=self.representative_source)
         self.update_selection_summary()
         if self.creative_workspace is not None:
-            self.creative_workspace.set_production_busy(self.worker is not None or choosing)
+            self.creative_workspace.set_production_busy(self.worker is not None or choosing or
+                (self.beauty_editor is not None and self.beauty_editor.is_busy()))
         included = self.included_sources()
         has_photos = bool(included)
         has_character = bool(self.character.text().strip())
@@ -1338,6 +1343,8 @@ class Workbench(QMainWindow):
             next_step = '正在整理导入的照片和子文件夹，可切页查看已有内容。'
         elif self.selection_worker is not None:
             next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
+        elif self.beauty_editor is not None and self.beauty_editor.is_busy():
+            next_step = '正在处理可选人脸美化，可切页查看已有照片。'
         elif not has_photos:
             next_step = '先勾选要制作的照片，或让 Agent 从已导入照片中选片。' if self.sources else '先在照片页批量导入原片。'
         elif not has_character:
@@ -1385,11 +1392,13 @@ class Workbench(QMainWindow):
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))
         view = self.result_views.currentWidget()
         archived = self.archive_view is not None and view is self.archive_view
+        beautifying = view is self.beauty_editor and self.beauty_editor is not None
         self.return_current.setVisible(archived)
-        self.decision_bar.setVisible(not archived)
-        self.readiness.setVisible(not archived)
+        self.decision_bar.setVisible(not (archived or beautifying))
+        self.readiness.setVisible(not (archived or beautifying))
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
-        self.results_caption.setText('已有批次：' + self.archive_view.directory.name if archived else '本次制作')
+        self.results_caption.setText('成片后的可选人脸美化' if beautifying else
+            '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
     def dragEnterEvent(self, event):
         if not self.work_in_progress() and event.mimeData().hasUrls():
@@ -1649,7 +1658,7 @@ class Workbench(QMainWindow):
                 QApplication.instance().setQuitOnLastWindowClosed(False)
                 self.tray.show()
                 self.hide()
-                self.tray.showMessage('CosLuma 继续处理', '导入、选片与制作会继续并保存。点击托盘返回；保持托盘时完成后退出。')
+                self.tray.showMessage('CosLuma 继续处理', '导入、选片、制作与美化会继续处理并保存草稿。点击托盘返回；保持托盘时处理结束后退出。')
             else:
                 self.status.setText('仍在处理中，可以最小化等待；完成后可关闭。')
                 self.showMinimized()
@@ -1779,8 +1788,62 @@ class Workbench(QMainWindow):
     def make_results_view(self, directory):
         view = BatchResults(directory, self.result_views)
         view.back_requested.connect(lambda: self.navigate(0))
+        view.beauty_requested.connect(self.open_beauty)
         self.result_views.addWidget(view)
         return view
+
+    def open_beauty(self, context):
+        if self.beauty_editor is not None:
+            if self.beauty_editor.context['directory']==context['directory']:
+                self.result_views.setCurrentWidget(self.beauty_editor)
+                self.navigate(2)
+                return
+            if self.beauty_editor.is_busy():
+                self.status.setText('当前照片正在美化，处理结束后可切换另一张。')
+                return
+        try:
+            config = load_settings(self.config.text())
+            if 'beauty' not in config:
+                dialog = BeautyConnection(self.config.text(),self)
+                if dialog.exec()!=QDialog.Accepted:
+                    return
+                config = load_settings(self.config.text())
+            editor = BeautyEditor(context,config['beauty'],self.result_views)
+            editor.back_requested.connect(self.return_from_beauty)
+            editor.saved.connect(self.beauty_saved)
+            editor.busy_changed.connect(self.beauty_busy_changed)
+            editor.connection_requested.connect(self.configure_beauty)
+            if self.beauty_editor is not None:
+                self.result_views.removeWidget(self.beauty_editor)
+                self.beauty_editor.deleteLater()
+            self.beauty_editor = editor
+            self.result_views.addWidget(editor)
+            self.result_views.setCurrentWidget(editor)
+            self.navigate(2)
+            self.status.setText('基础成片已完成。可分别调整美肤与瘦脸，满意后另存美化版。')
+        except (OSError,ValueError,KeyError) as error:
+            self.status.setText('打开人脸美化失败：'+str(error))
+
+    def configure_beauty(self):
+        try:
+            dialog = BeautyConnection(self.config.text(),self)
+            if dialog.exec()==QDialog.Accepted:
+                self.beauty_editor.config = load_settings(self.config.text())['beauty']
+                self.beauty_editor.message.setText('美化连接已保存，下次主动分析或生成美肤基础时使用。')
+        except (OSError,ValueError,KeyError) as error:
+            self.beauty_editor.message.setText('保存美化连接失败：'+str(error))
+
+    def beauty_busy_changed(self):
+        self.update_actions()
+        self.finish_background_work()
+
+    def return_from_beauty(self):
+        context = self.beauty_editor.context
+        self.show_saved_batch(context['batch_directory'])
+
+    def beauty_saved(self, result):
+        self.return_from_beauty()
+        self.status.setText('已另存美化版：'+result['files']['final'])
 
 
     def show_current_batch(self):
@@ -1790,6 +1853,7 @@ class Workbench(QMainWindow):
 
     def work_in_progress(self):
         return (self.worker is not None or self.import_worker is not None or self.selection_worker is not None or
+            (self.beauty_editor is not None and self.beauty_editor.is_busy()) or
             (self.creative_workspace is not None and self.creative_workspace.is_busy()))
 
 
@@ -1818,12 +1882,6 @@ def main():
     args = parser.parse_args()
     app = QApplication(sys.argv)
     apply_theme(app)
-    if sys.platform == 'win32':
-        font = Path(os.environ['SystemRoot']) / 'Fonts/msyh.ttc'
-        font_id = QFontDatabase.addApplicationFont(str(font))
-        families = QFontDatabase.applicationFontFamilies(font_id)
-        if families:
-            app.setFont(QFont(families[0], 10))
     window = Workbench(args.root, args.config)
     window.show()
     return app.exec()

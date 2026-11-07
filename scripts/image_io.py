@@ -127,14 +127,18 @@ def to_preview(pixels, max_edge=None):
     return Image.fromarray(np.uint8(np.clip(pixels, 0, 1) * 255.0 + .5))
 
 
+def display_image(pixels, *, max_edge=None):
+    pixels = np.asarray(to_preview(pixels, max_edge))
+    image = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
+    image.setColorSpace(QColorSpace(QColorSpace.SRgb))
+    return image
+
+
 def open_display(path, *, max_edge=None):
     """Read oriented, colour-managed display pixels; never upscale a preview."""
     path = Path(path)
     if path.suffix.lower() in RAW_EXTENSIONS:
-        pixels = np.asarray(to_preview(open_photo(path), max_edge))
-        image = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
-        image.setColorSpace(QColorSpace(QColorSpace.SRgb))
-        return image
+        return display_image(open_photo(path), max_edge=max_edge)
     image = _read_image(path, max_edge)
     image = image.convertedToColorSpace(QColorSpace(QColorSpace.SRgb), QImage.Format_RGB888)
     if image.isNull():

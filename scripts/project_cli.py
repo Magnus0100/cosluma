@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 from image_io import IMAGE_EXTENSIONS
-from photo_pipeline import finish_batch, finish_photo, make_style_samples
+from photo_pipeline import beautify_completed, finish_batch, finish_photo, make_style_samples
 from settings import load_settings
 from app_version import VERSION
 
@@ -36,12 +36,22 @@ def main(argv=None):
     compose.add_argument('--generated', type=Path, required=True)
     compose.add_argument('--superresolved', type=Path, help='reuse an existing model SR result')
     compose.add_argument('--character', default='')
+    beauty = sub.add_parser('beautify', help='optional skin retouching and face slimming of a completed photo')
+    beauty.add_argument('--run',type=Path,required=True,help='completed photograph run.json')
+    beauty.add_argument('--skin',type=float,default=0.0,help='skin strength, 0 to 1')
+    beauty.add_argument('--slim',type=float,default=0.0,help='slimming strength, 0 to 1')
+    beauty.add_argument('--session',type=Path,help='reuse this photograph\'s saved beauty session')
     for child in (finish, compose, samples):
         child.add_argument('--brief', default='')
         child.add_argument('--size', type=int, nargs=2, metavar=('WIDTH', 'HEIGHT'))
     args = parser.parse_args(argv)
     config = load_settings(args.config)
     progress = lambda message: print(message, file=sys.stderr, flush=True)
+    if args.command=='beautify':
+        result = beautify_completed(args.run,config,skin=args.skin,slim=args.slim,
+            session=args.session,progress=progress)
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+        return 0
     if args.command == 'compose':
         result = finish_photo(args.source, args.character, args.root, config,
             generated=args.generated,

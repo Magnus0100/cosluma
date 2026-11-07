@@ -135,6 +135,32 @@ def _failed_photo(source, error):
     return result
 
 
+def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, session=None, progress=None):
+    """Explicit post-production edit; the completed production chain is untouched."""
+    from face_beauty import BeautyParameters, BeautySession, prepare_face, prepare_skin, save_beauty
+    parameters = BeautyParameters(skin=skin,slim=slim)
+    if not (skin or slim):
+        raise ValueError('美肤与瘦脸均为零，原成片无需另存')
+    path = Path(run_path).expanduser().resolve()
+    run = json.loads(path.read_text(encoding='utf-8'))
+    if run['status']!='complete':
+        raise ValueError('请提供已完成成片的 run.json')
+    base = path.parent/Path(run['files']['final']).name
+    if session is None:
+        prepared,pixels = prepare_face(base,run['head']['region'],path.parent,config['beauty'],progress)
+    else:
+        prepared = BeautySession(session)
+        if prepared.base_path!=base.resolve():
+            raise ValueError('美化会话对应另一张成片，请使用该成片的会话')
+        pixels = open_photo(base)
+    if skin and prepared.delta is None:
+        prepared = prepare_skin(prepared,config['beauty'],progress)
+    result = save_beauty(pixels,prepared,parameters)
+    save_json(path.parent/'beauty-session.json',{'session':prepared.directory.name,
+        'parameters':{'skin':skin,'slim':slim}})
+    return result
+
+
 def _relocate_sample(value, original, target):
     if isinstance(value,dict):
         return {key:_relocate_sample(item,original,target) for key,item in value.items()}

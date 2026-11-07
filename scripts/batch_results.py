@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLineEdit, QListWidget, QPlainTextEdit,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QListWidget, QPlainTextEdit,
     QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from studio_widgets import PhotoPreview, ui_label
@@ -15,6 +15,7 @@ from studio_widgets import PhotoPreview, ui_label
 class BatchResults(QWidget):
     """Keep the selected photograph visible as this batch receives its results."""
     back_requested = Signal()
+    beauty_requested = Signal(dict)
 
     def __init__(self, directory, parent=None):
         super().__init__(parent)
@@ -25,6 +26,8 @@ class BatchResults(QWidget):
         self.preview_key = None
         self.output_path = None
         self.png_path = None
+        self.base_path = None
+        self.beauty_versions = {}
         self.work_directory = str(self.directory)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
@@ -76,6 +79,13 @@ class BatchResults(QWidget):
         self.details.setMaximumHeight(68)
         layout.addWidget(self.details)
         controls = QHBoxLayout()
+        self.beauty = QPushButton('人脸美化')
+        self.beauty.setToolTip('完成后可选：分别调整美肤与瘦脸，另存美化版')
+        self.beauty.clicked.connect(self.open_beauty)
+        controls.addWidget(self.beauty)
+        self.beauty_version = QCheckBox('美化版')
+        self.beauty_version.toggled.connect(self.change_beauty_version)
+        controls.addWidget(self.beauty_version)
         self.output = QPushButton('打开 JPEG')
         self.output.setToolTip('打开同一结果的 8 位 JPEG 查看副本')
         self.output.clicked.connect(lambda:self.open_path(self.output_path))
@@ -197,6 +207,7 @@ class BatchResults(QWidget):
         if row<0:
             self.output_path = None
             self.png_path = None
+            self.base_path = None
             self.work_directory = None
             if self.preview_key is not None:
                 self.preview.set_photo()
@@ -205,6 +216,8 @@ class BatchResults(QWidget):
             self.png_output.setEnabled(False)
             self.work.setEnabled(False)
             self.work.hide()
+            self.beauty.setEnabled(False)
+            self.beauty_version.hide()
             self.details.setPlainText(self.error if not self.sources else '')
             return
         source = self.sources[row]
@@ -217,6 +230,27 @@ class BatchResults(QWidget):
             self.output_path = None
             self.png_path = None
         self.work_directory = self.saved_path(result,result.get('directory')) or str(self.directory)
+        self.base_path = self.saved_path(result,result.get('files',{}).get('final')) if result.get('status')=='complete' else None
+        self.beauty.setEnabled(bool(self.base_path) and Path(self.base_path).is_file())
+        latest = Path(self.work_directory)/'beauty-latest.json'
+        beauty_error = ''
+        beauty_files = None
+        if latest.is_file():
+            try:
+                state = json.loads(latest.read_text(encoding='utf-8'))
+                beauty_files = {key:str(Path(self.work_directory)/state['files'][key]) for key in ('final','jpeg')}
+                previous = self.beauty_versions.get(source)
+                if previous is None or previous[0]!=beauty_files['final']:
+                    self.beauty_versions[source] = (beauty_files['final'],True)
+            except (OSError,ValueError,KeyError) as error:
+                beauty_error = '\n读取美化版失败：'+str(error)
+        selected_beauty = beauty_files is not None and self.beauty_versions[source][1]
+        self.beauty_version.blockSignals(True)
+        self.beauty_version.setChecked(selected_beauty)
+        self.beauty_version.setVisible(beauty_files is not None)
+        self.beauty_version.blockSignals(False)
+        if selected_beauty:
+            self.png_path,self.output_path = beauty_files['final'],beauty_files['jpeg']
         preview_key = (source,self.output_path)
         if preview_key!=self.preview_key:
             self.preview.set_photo(source,self.output_path)
@@ -227,7 +261,8 @@ class BatchResults(QWidget):
         self.work.setVisible(bool(result.get('directory')))
         if result.get('status')=='complete':
             width,height = result['output_dimensions']
-            message = f'{Path(source).name} · 成片 {width} × {height} · 16 位 PNG 和 JPEG'
+            version = '美化版' if selected_beauty else '基础成片'
+            message = f'{Path(source).name} · {version} {width} × {height} · 16 位 PNG 和 JPEG'+beauty_error
             if not self.output.isEnabled():
                 message += '\nJPEG 文件已移动或删除，请在照片文件夹中查找。'
             if not self.png_output.isEnabled():
@@ -240,3 +275,20 @@ class BatchResults(QWidget):
                 '本批次仍在制作，单张结果完成后会显示在这里。' if self.batch_status=='running' else '未保存完整成片。'))
         if self.details.toPlainText()!=message:
             self.details.setPlainText(message)
+
+    def change_beauty_version(self, checked):
+        row = self.listing.currentRow()
+        if row>=0:
+            source = self.sources[row]
+            path,_ = self.beauty_versions[source]
+            self.beauty_versions[source] = (path,checked)
+            self.show_photo(row)
+
+    def open_beauty(self):
+        try:
+            row = self.listing.currentRow()
+            run = json.loads((Path(self.work_directory)/'run.json').read_text(encoding='utf-8'))
+            self.beauty_requested.emit({'name':Path(self.sources[row]).name,'base':self.base_path,
+                'region':run['head']['region'],'directory':self.work_directory,'batch_directory':str(self.directory)})
+        except (OSError,ValueError,KeyError) as error:
+            self.details.setPlainText('无法打开人脸美化：'+str(error))

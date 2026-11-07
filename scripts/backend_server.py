@@ -8,7 +8,7 @@ from pathlib import Path
 import threading
 import uuid
 
-from photo_pipeline import finish_batch, finish_photo, make_style_samples
+from photo_pipeline import beautify_completed, finish_batch, finish_photo, make_style_samples
 from settings import load_settings
 from app_version import VERSION
 
@@ -22,6 +22,12 @@ def make_server(root, config, host='127.0.0.1', port=8765):
             with lock:
                 jobs[job_id]['stage'] = message
         try:
+            if mode=='beautify':
+                result = beautify_completed(body['run'],config,skin=body.get('skin',0.0),slim=body.get('slim',0.0),
+                    session=body.get('session'),progress=progress)
+                with lock:
+                    jobs[job_id].update(status='complete',stage='美化版已保存',result=result)
+                return
             if mode == 'styles':
                 options = []
                 for option in make_style_samples(body['sources'],body['sample_source'],body['character'],root,config,
@@ -82,7 +88,7 @@ def make_server(root, config, host='127.0.0.1', port=8765):
                 self.reply({'error': 'Not found'}, 404)
 
         def do_POST(self):
-            if self.path not in ('/api/stylize', '/api/compose', '/api/styles'):
+            if self.path not in ('/api/stylize', '/api/compose', '/api/styles', '/api/beautify'):
                 self.reply({'error': 'Not found'}, 404)
                 return
             try:

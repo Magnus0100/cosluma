@@ -27,5 +27,18 @@ Qt/PySide、LibRaw 等组件保留各自许可。Windows 包使用独立的动�
 整头分割和超分通过仓库外安装的 ComfyUI 服务调用。SAM3.1 权重使用随权重提供的 SAM License；
 转换为服务可读取的权重格式后仍保留原许可。ComfyUI、SAM3.1、PyTorch 和超分模型的许可
 随各自安装保留，不随本项目主许可证重新授权。
+
+可选美化节点随附 [FaceXFormer](https://github.com/Kartik-3004/facexformer/tree/10fe8291f8a64e2ca1daf938e3e0007bd860303b)
+的网络与 Transformer 实现，使用 MIT 许可，原文保存在 `FaceXFormer/LICENSE` 和节点目录。
+适配仅取消额外的 ImageNet 初始化下载，随后严格加载完整 FaceXFormer 权重；权重本身位于仓库外，
+按 [官方权重页](https://huggingface.co/kartiknarayan/facexformer)的许可使用，转换为 safetensors 不改变张量或许可。
+
+[BeautyGRPO](https://github.com/vivoCameraResearch/BeautyGRPO) 的公开推理参数用于独立编写 ComfyUI 适配，未复制其推理实现。
+上游代码声明 MIT，同时明确预训练权重与 FLUX.1-Kontext-dev 底座有各自许可；
+不据代码许可推定 BeautyGRPO 权重已重新授权。BeautyGRPO、FLUX、文本编码器、VAE 与 MediaPipe FaceLandmarker 权重
+由服务部署者从上游取得，未随桌面或源码包分发。FLUX.1-dev 底座适用其非商业许可；
+其他权重按各自模型页与随权重条款使用，不受本项目 GPL 许可替代。
+MediaPipe 运行库在服务环境安装，其代码适用 [Apache-2.0](https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE)；
+FaceLandmarker 使用 Google 发布的模型包，未将运行库或模型包随桌面分发。
 随附的 `providers/prompts.example.json` 是本项目原创通用提示词，使用项目的 GPL-3.0-or-later 许可。
 个人提示词库位于仓库外，外部引用条目的来源、作者与许可随该库保留。
