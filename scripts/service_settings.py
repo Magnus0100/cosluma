@@ -75,7 +75,7 @@ class ServiceSettings(QDialog):
         body.addWidget(self.tabs, 1)
         layout.addLayout(body, 1)
         descriptions = {
-            'llm':('让 Agent 看懂你的照片', '用于选片、讨论摄影方向和编写提示词。请选择支持图片输入的图文模型。'),
+            'llm':('让 Agent 看懂你的照片', '用于选片、讨论摄影方向和编写提示词。请选择支持图片输入和工具调用的图文模型，Agent 会按需查阅参考库。'),
             'image':('连接整图生图服务', '用于制作完整真实样片与后续成片。请选择支持原片和风格参考图输入的图像编辑模型。')}
         for service in ('llm', 'image'):
             form = self.add_page(*descriptions[service])
@@ -125,7 +125,7 @@ class ServiceSettings(QDialog):
             self.summary[service] = summary
             form.addRow(label, row)
         count = sum(not entry.get('overview') for entry in load_library())
-        builtin_description = f'已内置 {count} 条摄影参考，随软件直接使用，无需下载或选择词库文件。'
+        builtin_description = f'已内置 {count} 条摄影参考，按任务分类、由 Agent 按需查阅；无需下载或选择词库文件。'
         self.library_status = ui_label('当前使用自定义参考库：\n'+self.values['prompt_library']
             if self.values.get('prompt_library') else builtin_description)
         self.library_status.setWordWrap(True)

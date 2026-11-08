@@ -43,7 +43,7 @@ MODELS = {
         'note': '浏览器下载后将 pytorch_lora_weights.safetensors 重命名为 beautygrpo.safetensors。复制的命令会放到此名称；LoRA 字段填写 beautygrpo.safetensors。'},
     'face': {
         'title': '可选美化 · FaceXFormer',
-        'use': '美肤和瘦脸的人脸分析需要。官方下载 ckpts/model.pt，约 1.1 GB，再无损提取完整推理权重。',
+        'use': '美肤和瘦脸的人脸分析需要。官方下载 ckpts/model.pt，约 1.01 GB，再无损提取完整推理权重。',
         'page': 'https://huggingface.co/kartiknarayan/facexformer',
         'download': 'https://huggingface.co/kartiknarayan/facexformer/resolve/main/ckpts/model.pt',
         'target': 'models/cosluma_face/facexformer.safetensors',
