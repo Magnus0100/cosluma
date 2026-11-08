@@ -15,6 +15,7 @@ from face_beauty import (BEAUTY_DEFAULTS, BeautyParameters, BeautySession,
     prepare_face, prepare_skin, render_beauty, save_beauty)
 from image_io import display_image, open_photo, save_json
 from settings import load_settings
+from model_downloads import ModelDownloads
 from studio_widgets import PhotoPreview, ui_label
 
 
@@ -54,6 +55,9 @@ class BeautyConnection(QDialog):
         self.message = ui_label('Kontext 目录包含完整未量化的 Diffusers 模型、编码器、VAE 和调度器；美肤使用 cuda:0，内存布局由你明确选择。')
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
+        downloads = QPushButton('下载美化模型与查看安装方法')
+        downloads.clicked.connect(lambda: ModelDownloads(self, model='kontext').exec())
+        layout.addWidget(downloads)
         buttons = QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)

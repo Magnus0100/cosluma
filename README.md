@@ -1,14 +1,14 @@
 # CosLuma
 
-**0.18.0 · Windows x64 · 源码使用 Python 3.12**
+**0.18.1 · Windows x64 · 源码使用 Python 3.12**
 
 提供照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；原片整头融合回生成画面，保留本人五官、脸型和相机细节。
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.18.0/CosLuma-0.18.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.18.0)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.18.1/CosLuma-0.18.1-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.18.1)
 
-Windows 用户下载 Release 中的 `CosLuma-0.18.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.18.1-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -25,14 +25,16 @@ Windows 用户下载 Release 中的 `CosLuma-0.18.0-windows-x64.zip`，完整解
    图像参数已有值时默认展开，也可手动展开填写；留空才不发送该项，收起只隐藏填写区，不清除已填参数。
 3. 服务密钥可直接粘贴到密码框。保存时写入用户配置目录内的独立密钥文件，配置 JSON 只记录路径。
    已有的环境变量和密钥文件可继续使用，编辑设置不会读取或显示原密钥。
-4. 最后核对四项服务，选择照片结果的保存文件夹；提示词库默认使用随附通用库，无需另找文件。
-   “查看服务部署说明”打开随包 README；可选美肤和瘦脸在出片后再设置。
+4. 最后核对四项服务，选择照片结果的保存文件夹；软件内置 485 条摄影参考，无需下载、选择或复制词库文件。
+   分割与超分步骤可直接打开对应模型的下载方法；左侧“模型下载”列出所需文件、上游下载页、安装位置和可复制的 PowerShell 命令。
+   “查看服务部署说明”打开随包 README；可选美肤和瘦脸在出片后再设置，其连接设置也提供美化模型下载入口。
    保存后进入照片页，通过“批量导入”添加照片或文件夹，勾选准备制作的照片，也可先用“Agent 帮我选片”整理，再填写角色并进入“创作”页。
    创作页缺照片或尚未勾选时，可直接批量导入或返回照片选片；缺角色或配置时提供“填写角色”“连接设置／导入配置”入口。照片和角色齐备后，在此保存或导入配置即显示讨论区。取消连接设置会保留原有配置和创作输入。
    选择代表原片，与 Agent 聊想法，点击“按当前讨论生成三个样片”。比较或继续讨论修改后，将满意的完整样片定稿，再明确点击批量制作；“成片”页查看结果。
 
 设置只保存本机文件，不连接服务。主动选片、发送讨论、主动试样或批量制作时才调用对应服务，错误会显示在对应步骤，不自动重试或换模型。
-默认配置位于 `~/CosplayWorkbench/config/cosluma.json`；通用库个人副本是同目录的 `prompts.json`，已有库不会被覆盖。
+默认配置位于 `~/CosplayWorkbench/config/cosluma.json`；参考词库直接读取包内 `providers/prompts.json`，不在用户配置目录创建副本。
+已有配置明确指定的自定义词库继续使用，也可在连接设置最后一步点击“改用内置参考库”；保存后生效，原词库文件保留。
 **配置目录可能包含密钥文本，请勿公开或上传。** 凭据文件只在调用对应服务时读取，不写入制作记录。
 
 ## 日常制作
@@ -165,8 +167,9 @@ Agent 回复、试样或批量制作尚未结束时关闭窗口，任务继续�
 新密钥写入配置目录中的独立 `.key` 文件；替换时仅清理由软件创建、且新配置不再引用的旧密钥文件。
 凭据文本由当前 Windows 用户配置目录保护，软件不宣称提供额外的加密保险库。
 
-手动配置可将 [配置示例](providers/settings.example.json) 和 [通用提示词库](providers/prompts.example.json)
-另存为上述 `cosluma.json` 与 `prompts.json`，替换服务地址、模型名和凭据引用。
+手动配置只需将 [配置示例](providers/settings.example.json) 另存为上述 `cosluma.json`，替换服务地址、模型名和凭据引用。
+`prompt_library` 为 `null` 或省略时直接使用内置参考库；需使用自己的库时可在 JSON 中明确填写文件路径，文件缺失时显示错误，不替换为内置库。
+自定义文件须为非空 JSON 数组，每条包含 `title`、`text` 文本与 `source` 来源（文本或对象）。
 `COSLUMA_CONFIG` 或命令行 `--config` 优先于记住的路径；相对资源路径以配置文件目录为准。
 
 | 配置 | 内容 |
@@ -178,7 +181,7 @@ Agent 回复、试样或批量制作尚未结束时关闭窗口，任务继续�
 | `image.parameters` | 服务支持的额外图像参数；界面提供质量、尺寸、格式，其他项可在 JSON 中设置 |
 | `head.url`、`head.model` | ComfyUI 根地址、`models/checkpoints` 中的 SAM3.1 图像分割权重名 |
 | `sr.url`、`sr.model` | ComfyUI 根地址、`models/upscale_models` 中的超分权重名 |
-| `prompt_library` | 提示词 JSON 文件路径 |
+| `prompt_library` | 默认 `null`，直接使用内置参考库；可明确指定自定义 JSON 文件路径 |
 | `workers` | 并行照片数，默认 4 |
 | `output_long_edge` | 请求长边，默认 6000；`null` 请求原片尺寸 |
 | `finish_curve` | 可选的归一化 `[输入明度, 输出明度]` 数组，默认不调整 |
@@ -206,6 +209,24 @@ Agent 回复、试样或批量制作尚未结束时关闭窗口，任务继续�
 将服务加载器支持的 SAM3.1 图像权重放入 `models/checkpoints`，超分权重放入 `models/upscale_models`。
 配置中的模型名须与服务文件名一致；示例名不会触发下载。分割节点实现见[上游源码](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_sam3.py)。
 原始权重与转换格式的许可均随权重保留，不能只改后缀冒充转换。
+
+连接设置的“模型下载”可用浏览器打开上游文件，或修改 ComfyUI 目录后复制下载命令，在服务机器的 PowerShell 执行。
+目录中的 `D:/ComfyUI` 是示例；远端服务的权重也放在远端，桌面不下载到软件包或照片目录。
+
+| 用途 | 下载文件 | 放入 ComfyUI 的位置 | 上游下载 |
+| --- | --- | --- | --- |
+| 整头分割 | `sam3.1_multiplex_fp16.safetensors`，约 1.75 GB | `models/checkpoints/` | [Comfy Org 的 SAM3.1 FP16 文件](https://huggingface.co/Comfy-Org/sam3.1/blob/main/checkpoints/sam3.1_multiplex_fp16.safetensors) |
+| 超分 | `4xNomos2_hq_atd.safetensors`，约 82 MB | `models/upscale_models/` | [模型作者的 Release](https://github.com/Phhofm/models/releases/tag/4xNomos2_hq_atd) |
+
+例如在已有服务环境中下载分割模型：
+
+```powershell
+python -m pip install "huggingface_hub>=1.0"
+hf download Comfy-Org/sam3.1 checkpoints/sam3.1_multiplex_fp16.safetensors --local-dir 'D:/ComfyUI/models'
+```
+
+配置中的 `head.model` 填 `sam3.1_multiplex_fp16.safetensors`，`sr.model` 填 `4xNomos2_hq_atd.safetensors`。
+现有服务采用其他兼容的文件名时保留实际名称；打开下载页或复制命令不会改写连接设置。
 
 当前分割适配需要 SAM3 文本编码器输出 512 维投影。对尚未包含等价修正的服务，在 ComfyUI 目录执行
 `git apply <本项目目录>/providers/patches/comfyui-sam3-clip-projection.patch` 后重启；
@@ -247,6 +268,19 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 完整 Kontext 目录须包含 `model_index.json`、`transformer`、`text_encoder`、`text_encoder_2`、`vae`、`scheduler`、`tokenizer` 和 `tokenizer_2`。
 这些组件均取自同一官方版本，不用其它发布包中同名文件替代；重复的单文件整合版不是 Diffusers 目录的一部分。
 BFL 权重需要有权限的 Hugging Face 账号下载，服务运行时只读取本机完整目录，不联网下载、不读取 Hugging Face 凭据。
+
+美化连接设置的“下载美化模型与查看安装方法”直接提供四项模型的上游文件、目标路径与命令。
+完整 Kontext 组件约 33.75 GB，BeautyGRPO LoRA 约 179 MB，FaceXFormer 原始权重约 1.1 GB，FaceLandmarker 约 3.8 MB；只做基础制作时不需要它们。
+先在 BFL 模型页接受访问条款，再在已有服务环境中登录并下载完整 BF16 组件；下列目录按实际位置修改：
+
+```powershell
+python -m pip install "huggingface_hub>=1.0"
+hf auth login
+hf download black-forest-labs/FLUX.1-Kontext-dev --revision 24e9dedc4ef646698dc8eb4e18ae2cec3c9fea0d --include 'model_index.json' --include 'transformer/*' --include 'text_encoder/*' --include 'text_encoder_2/*' --include 'vae/*' --include 'scheduler/*' --include 'tokenizer/*' --include 'tokenizer_2/*' --include 'LICENSE.md' --local-dir 'D:/ComfyUI/models/diffusers/FLUX.1-Kontext-dev'
+```
+
+LoRA 从上表官方版本下载 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放为 `models/loras/beautygrpo.safetensors`；界面复制的命令会直接按此名称安装。
+FaceLandmarker 可直接下载后放入表中目录；FaceXFormer 下载 `ckpts/model.pt` 后执行转换。
 
 在已有 ComfyUI Python 中执行：
 
@@ -387,6 +421,7 @@ LLM 不保证每张都定位正确或符合审美；镜中清晰正脸是主体�
 | 提示词目录、配置与凭据引用 | `scripts/prompt_library.py`、`scripts/settings.py` |
 | 桌面主窗、导航与首次欢迎 | `scripts/qt_workbench.py` |
 | 服务配置引导与核对 | `scripts/service_settings.py` |
+| 上游模型下载入口、安装位置与命令 | `scripts/model_downloads.py` |
 | 共享照片画布与显示组件 | `scripts/studio_widgets.py` |
 | 对话、试样与用户定稿 | `scripts/creative_workspace.py` |
 | 当前与已有批次的成片浏览 | `scripts/batch_results.py` |

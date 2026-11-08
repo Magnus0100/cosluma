@@ -28,9 +28,8 @@ def load_settings(path=None):
     def resolve(filename):
         value = Path(filename).expanduser()
         return str((value if value.is_absolute() else path.parent / value).resolve())
-    for key in ('prompt_library',):
-        if key in config:
-            config[key] = resolve(config[key])
+    library = config.get('prompt_library')
+    config['prompt_library'] = resolve(library) if library is not None else None
     for service in ('llm', 'image'):
         provider = config.get(service, {})
         if 'api_key_file' in provider:
@@ -43,7 +42,6 @@ def editable_settings(path):
     if path.is_file():
         return load_settings(path)
     config = json.loads(resource_path('providers/settings.example.json').read_text(encoding='utf-8-sig'))
-    config['prompt_library'] = str(path.parent / 'prompts.json')
     if getattr(sys, 'frozen', False):
         config.pop('python', None)
     else:
@@ -54,25 +52,23 @@ def editable_settings(path):
 def save_settings(path, config, keys=None):
     path = Path(path).expanduser().resolve()
     config = deepcopy(config)
-    library = Path(config['prompt_library']).expanduser()
-    library = (library if library.is_absolute() else path.parent / library).resolve()
-    supplied = library == path.parent / 'prompts.json' and not library.exists()
-    if not supplied and not library.is_file():
-        raise ValueError(f'提示词库不存在：{library}。请选择已有 JSON 文件，或使用默认通用库。')
+    library = config.get('prompt_library')
+    if library is not None:
+        library = Path(library).expanduser()
+        library = (library if library.is_absolute() else path.parent / library).resolve()
+        if not library.is_file():
+            raise ValueError(f'自定义参考词库不存在：{library}。请修正路径，或在连接设置中选择内置参考库。')
     try:
-        entries = load_library(resource_path('providers/prompts.example.json') if supplied else library)
+        entries = load_library(library)
     except (ValueError, UnicodeError) as error:
-        raise ValueError('提示词库不是有效的 UTF-8 JSON 文件，请修正或选择通用库。') from error
+        raise ValueError('参考词库不是有效的 UTF-8 JSON 文件，请修正文件。') from error
     if not isinstance(entries, list) or not entries or any(
             not isinstance(item, dict) or not all(isinstance(item.get(key), str) and item[key].strip()
-                for key in ('title', 'text', 'source')) for item in entries):
-        raise ValueError('提示词库须为非空 JSON 数组，每条包含 title、text、source 文本。')
+                for key in ('title', 'text')) or not isinstance(item.get('source'), (str, dict))
+                or not item['source'] for item in entries):
+        raise ValueError('参考词库须为非空 JSON 数组，每条包含 title、text 文本与 source 来源。')
     path.parent.mkdir(parents=True, exist_ok=True)
-    if supplied:
-        content = resource_path('providers/prompts.example.json').read_bytes()
-        with library.open('xb') as stream:
-            stream.write(content)
-    config['prompt_library'] = str(library)
+    config['prompt_library'] = str(library) if library is not None else None
     created = []
     previous = []
     temporary = path.with_name(path.name + '.tmp')

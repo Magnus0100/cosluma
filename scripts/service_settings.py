@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout, QFr
     QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from settings import editable_settings, resource_path, save_settings
+from model_downloads import ModelDownloads
+from prompt_library import load_library
 from studio_widgets import ui_label
 
 
@@ -61,6 +63,9 @@ class ServiceSettings(QDialog):
         self.steps.setObjectName('setupSteps')
         self.steps.addItems(['1  摄影 Agent', '2  整图生图', '3  分割与超分', '4  核对与保存'])
         rail_layout.addWidget(self.steps, 1)
+        downloads = QPushButton('模型下载')
+        downloads.clicked.connect(lambda: ModelDownloads(self).exec())
+        rail_layout.addWidget(downloads)
         help_button = QPushButton('查看服务部署说明')
         help_button.setProperty('kind', 'quiet')
         help_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(resource_path('README.md')))))
@@ -99,6 +104,9 @@ class ServiceSettings(QDialog):
                 form.addRow(reuse)
             self.add_field(form, service, 'url', 'ComfyUI 地址', '例如 http://127.0.0.1:8188')
             self.add_field(form, service, 'model', '模型文件名', '填写服务机器上实际安装的权重文件名')
+            download = QPushButton('下载 SAM3.1 分割模型' if service == 'head' else '下载 Nomos2 超分模型')
+            download.clicked.connect(lambda _checked=False, service=service: ModelDownloads(self, model=service).exec())
+            form.addRow(download)
         info = ui_label('ComfyUI 地址可指向本机或远端。软件包不包含模型服务和权重，请按部署说明准备。')
         info.setWordWrap(True)
         form.addRow(info)
@@ -116,34 +124,20 @@ class ServiceSettings(QDialog):
             row.addWidget(edit)
             self.summary[service] = summary
             form.addRow(label, row)
-        self.library_mode = QComboBox()
-        self.library_mode.addItems(['使用随附通用提示词库', '选择自己的提示词库'])
-        default_library = self.path.parent/'prompts.json'
-        self.library = QLineEdit(self.values.get('prompt_library', str(default_library)))
-        self.library_custom = self.library.text()
-        library_row = QWidget()
-        row = QHBoxLayout(library_row)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(self.library, 1)
-        browse = QPushButton('选择文件')
-        browse.clicked.connect(lambda: self.choose_file(self.library, '选择提示词库', 'JSON (*.json)'))
-        row.addWidget(browse)
-        def switch_library(index):
-            if index == 0:
-                self.library_custom = self.library.text()
-                self.library.setText(str(default_library))
-            else:
-                self.library.setText(self.library_custom)
-            library_row.setVisible(index == 1)
-        custom = Path(self.library.text()).expanduser().resolve() != default_library
-        self.library_mode.setCurrentIndex(1 if custom else 0)
-        library_row.setVisible(custom)
-        self.library_mode.currentIndexChanged.connect(switch_library)
-        form.addRow('提示词参考', self.library_mode)
-        form.addRow(library_row)
-        info = ui_label('通用库可直接使用，首次保存时创建个人副本，已有文件保留。')
-        info.setWordWrap(True)
-        form.addRow(info)
+        count = sum(not entry.get('overview') for entry in load_library())
+        builtin_description = f'已内置 {count} 条摄影参考，随软件直接使用，无需下载或选择词库文件。'
+        self.library_status = ui_label('当前使用自定义参考库：\n'+self.values['prompt_library']
+            if self.values.get('prompt_library') else builtin_description)
+        self.library_status.setWordWrap(True)
+        form.addRow('参考词库', self.library_status)
+        if self.values.get('prompt_library'):
+            builtin = QPushButton('改用内置参考库')
+            def use_builtin():
+                self.values['prompt_library'] = None
+                self.library_status.setText(builtin_description)
+                builtin.setVisible(False)
+            builtin.clicked.connect(use_builtin)
+            form.addRow(builtin)
         self.output_root = QLineEdit(str(output_root or Path.home()/'CosLuma/output'))
         row = QHBoxLayout()
         row.addWidget(self.output_root, 1)
@@ -397,7 +391,6 @@ class ServiceSettings(QDialog):
             if not self.output_root.text().strip():
                 self.output_root.setFocus()
                 raise ValueError('请选择照片结果保存文件夹')
-            values['prompt_library'] = self.library.text().strip()
             self.values = save_settings(self.path, values, keys)
             for _mode, edit in self.credentials.values():
                 edit.clear()

@@ -1,9 +1,9 @@
 {
   "python": "C:/path/to/your/existing/python.exe",
-  "prompt_library": "prompts.json",
+  "prompt_library": null,
   "head": {
     "url": "http://127.0.0.1:8188",
-    "model": "sam3.1-image-fp16.safetensors",
+    "model": "sam3.1_multiplex_fp16.safetensors",
     "input_max_edge": 2048
   },
   "output_long_edge": 6000,

@@ -41,5 +41,14 @@ Qt/PySide、LibRaw 等组件保留各自许可。Windows 包使用独立的动�
 MediaPipe 运行库在服务环境安装，其代码适用 [Apache-2.0](https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE)；
 FaceLandmarker 使用 Google 发布的模型包，未将运行库或模型包随桌面分发。
 Diffusers、Transformers、Accelerate 与 PEFT 仅在模型服务环境安装，各自的 Apache-2.0 许可随安装保留。
-随附的 `providers/prompts.example.json` 是本项目原创通用提示词，使用项目的 GPL-3.0-or-later 许可。
-个人提示词库位于仓库外，外部引用条目的来源、作者与许可随该库保留。
+内置 `providers/prompts.json` 含 485 条摄影参考，每条保留来源；项目原创 4 条使用 GPL-3.0-or-later。
+其余条目来自以下明确授权的上游版本，随附许可证原文，不包含原始图片：
+
+| 来源 | 条数 | 版本 | 许可及本地原文 |
+| --- | --- | --- | --- |
+| [ComfyUI-Prompt-Vault](https://github.com/jeremieLouvaert/ComfyUI-Prompt-Vault) | 78 | `c8dc8787d688a7adf45b55da5087becacafeb176` | MIT；`ComfyUI-Prompt-Vault/LICENSE` |
+| [cos-effect-prompt](https://github.com/Couer869/cos-effect-prompt) | 55 | `b2970e1299eb6e28739fd02ff5f2dd36102ae61e` | MIT；`cos-effect-prompt/LICENSE` |
+| [zsky-prompt-library](https://github.com/zsky-ai/zsky-prompt-library) | 126 | `151b8aa1f10d9638752063cb5491df22967ba359` | MIT；`zsky-prompt-library/LICENSE` |
+| [awesome-gpt-image-2-API-Prompts](https://github.com/Evolink-AI/awesome-gpt-image-2-API-Prompts) | 222 | `e2a269ad1a055a0b4f6c1e170341c6c1aba30faa` | CC0-1.0；`awesome-gpt-image-2-API-Prompts/LICENSE` |
+
+库中条目用于摄影参考，不作为执行规则或预设风格菜单。自定义库位于仓库外，由其提供者保留来源、作者与许可。

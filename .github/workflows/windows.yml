@@ -67,8 +67,8 @@ jobs:
           executable = Path(os.environ["RUNNER_TEMP"]) / "package/CosLuma/CosLuma.exe"
           providers = executable.parent / "providers"
           settings = json.loads((providers / "settings.example.json").read_text(encoding="utf-8"))
-          prompts = json.loads((providers / "prompts.example.json").read_text(encoding="utf-8"))
-          assert settings["prompt_library"] == "prompts.json"
+          prompts = json.loads((providers / "prompts.json").read_text(encoding="utf-8"))
+          assert settings["prompt_library"] is None
           assert prompts and all({"title", "text", "source"} <= item.keys() for item in prompts)
           from PySide6.QtWidgets import QApplication, QDialog
           from qt_workbench import ServiceSettings, endpoint_url
@@ -83,7 +83,8 @@ jobs:
                   dialog.credentials[name][0].setCurrentIndex(dialog.credentials[name][0].findData(""))
               dialog.save()
               assert dialog.result() == QDialog.Accepted, dialog.message.text()
-              assert Path(load_settings(config)["prompt_library"]).is_file()
+              assert load_settings(config)["prompt_library"] is None
+              assert not (config.parent / "prompts.json").exists()
               assert endpoint_url("https://example.invalid/v1", "image").endswith("/v1/images/edits")
               dialog.close()
           for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
