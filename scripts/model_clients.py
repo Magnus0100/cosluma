@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from image_io import SRGB, open_rgb, preview_data_url, save_json, to_preview
 from prompt_library import ReferenceLibrary
 from settings import credential
+from creative_edits import normalise_edits, edit_instructions
 
 
 def request(url, *, data=None, headers=None, response_path=None):
@@ -244,6 +245,7 @@ def _discussion_messages(conversation):
                 'view_mode','next_sample_source','selected_sample')}
             if 'viewed_samples' in context:
                 anchors['viewed_samples'] = context['viewed_samples']
+            anchors['edits'] = normalise_edits(context.get('edits'))
             anchors['samples'] = [{key:sample[key] for key in ('id','label','source','status')} for sample in context['samples']]
             content = '本条消息发送时的讨论对象（之后切换画面不改变此指代）：\n'+json.dumps(anchors,ensure_ascii=False)+'\n用户原文：\n'+content
         messages.append({'role':row['role'],'content':content})
@@ -271,7 +273,7 @@ def _discussion_details(context, samples, image_ids):
     return json.dumps(details,ensure_ascii=False)
 
 
-def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None):
+def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None, edits=None):
     """Discuss the current photographs and samples without submitting production."""
     images = []
     selected = _representatives(sources) if context is None else context['sources']
@@ -292,7 +294,9 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         'has_image 表示本次是否提供该样片实图；未附图的历史候选只有已有方向资料，不声称观察过未提供的画面细节。'
         '不提供固定风格菜单，不预设三个场景，不把提示词目录标题凑成候选。'
         '回复具体说明适合这组素材的场景、色彩、情绪与光感；有样片时应针对实际画面交流，分清原片和样片编号。'
-        '保留原片身份、脸型、机位、姿态与实物服装结构；整头会回贴，摄影方向须与原片受光相容。'
+        '保留原片身份、脸型、机位、姿态与实物服装结构；按本次明确开启的可选制作设置讨论头发与人物光照。'
+        '用户可通过“修发与头发生成”“人物重打光”两个独立开关授权这些变化；对话本身不改变开关。'
+        '未开启的功能可以讨论建议，但须说明实际试样前需要用户开启对应选项，不声称已经生效。'
         '明度和色温可以调整，但不能用曲线冒充空间重打光。特效按单张动作、视线和留白决定，不设整组开关。'
         '本次调用只讨论，不运行生图、超分、分割或批量。'
         '需要试样时请用户点击“按当前讨论生成三个样片”；修改后仍由用户主动生成，不声称已经完成未执行的动作。'
@@ -307,7 +311,8 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '新要求只写实际创作意图，不写对话过程、打招呼、试样操作或用户尚未作出的选择。'
         '要求会直接显示给用户，用轮次与样片名称指代参考，不写样片 ID、文件路径、接口字段或算法流程；内部 ID 由上下文关联。'
         f'\n角色：{character}\n用户最初补充要求：{brief or "无"}\n当前创作要求：{direction}\n'
-        f'当前讨论上下文：{_discussion_details(context,samples,image_ids) if context is not None else "整组创作方向，尚无样片"}\n')
+        f'当前讨论上下文：{_discussion_details(context,samples,image_ids) if context is not None else "整组创作方向，尚无样片"}\n'
+        +edit_instructions(edits))
     result = _describe(instruction,images,config,directory/('chat-'+uuid.uuid4().hex[:8]+'-response.json'),
         conversation=_discussion_messages(conversation), references=ReferenceLibrary(library_path))
     update = result['direction_update']
@@ -316,8 +321,9 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
     return {'reply':result['reply'].strip(),'direction_update':update.strip() if update is not None else None}
 
 
-def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction='', discussion=None):
+def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction='', discussion=None, edits=None):
     """Design directions for the supplied character and photos, using library references."""
+    edits = normalise_edits(edits)
     references = ReferenceLibrary(library_path)
     selected = (_representatives(sources) if discussion is None else
         _representatives(discussion['context']['sources'],required=(str(sources[0]),)))
@@ -332,7 +338,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
     else:
         task = (f'为用户设计 {option_count} 个可供真实样片比较的整组摄影方向。'
             '方向应在场景叙事、材质、配色或情绪上有可辨认的差异，不能只是给同一场景换滤镜或改名称。'
-            '每个方向都适合这组角色、服装与原片受光，不为凑差异选择无法自然融合的极暗夜景。'
+            '每个方向都适合这组角色与服装，按本次是否启用重打光决定能否改变原片光向，不为凑差异让人物与环境曝光失配。'
             f'返回 JSON，只有 options，值为恰好 {option_count} 个对象。每个对象包含 title、summary、direction、reference_ids。'
             'title 根据本次设计命名，不能使用固定风格菜单；'
             'summary 用一到两句话说明画面、光感、氛围，以及为什么适合当前角色和原片；不包含模型或算法术语。')
@@ -367,11 +373,11 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         '创作场景的语义和具体景物应依据当前角色与素材确定，不必保留缺少主题的原背景。'
         '未知角色只依据用户输入与照片可见信息设计，不把推测当成角色设定。'
         '场景必须在实拍透视、尺度、材质和景深上成立，不能用泛泛的梦幻背景或游戏概念图敷衍。'
-        '先判断照片里的主光软硬、明暗和色温，再选择相容的场景与时间；除非用户明确要求，'
-        '不把普通白天人像强改成极暗夜景，不引入原片没有的强烈条纹光或遮脸树影。'
-        '后续会把原片整头（含脸、头发和头饰）整体等比融合回画面，保留生成的身体与环境；'
-        '这不是空间重打光，方向必须让原片头部、颈部、身体、近处景物的曝光和受光自然连续。'
-        '保留光向与软硬不等于保留原片的欠曝、灰雾或色偏；允许整体调整头部曝光和色温，'
+        '先判断照片里的主光软硬、明暗和色温，再结合本次可选设置选择场景与时间；'
+        '重打光关闭时须与原片光向相容，开启时可按目标场景改变人物受光。'
+        '后续会按本次设置将原片整头或保留区整体等比融合回画面，保留生成的身体与环境；'
+        '方向必须让头部、颈部、身体、近处景物的曝光和受光自然连续。'
+        '保留原片的身份与细节不等于保留欠曝、灰雾或色偏；允许协调头部曝光和色温，'
         '让人物与环境共同达到有层次、明净且有真实光感的完成影调。'
         '明确统一场景语义、材质、配色和光质；每张的光线方向适应各自原片，不强行固定同一画面左右。'
         '清理路人、设备、包、垃圾、杂乱标识和破坏主题的现代建筑，保留合理接触、遮挡与必要道具。'
@@ -385,6 +391,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         '条目里其他人物、换装、广告版式和固定画幅均不适用。'
         '双方已讨论的创作要求是本次设计依据，不另起相矛盾的方向；在这些要求内设计可比较的变化。'
         f'\n角色：{character}\n补充要求：{brief or "无，由你决定"}\n双方讨论的创作要求：{creative_direction or "尚无讨论，依据角色与原片设计"}\n')
+    instruction += edit_instructions(edits)
     name = 'style-options' if option_count is not None else 'art-direction'
     description = _describe(instruction,images,config,directory/(name+'-response.json'), references=references)
     descriptions = description['options'] if option_count is not None else [description]
@@ -396,7 +403,8 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
         if not isinstance(direction,str) or not direction.strip():
             raise ValueError('The prompt writer returned no photographic direction')
         plan = {'direction':direction,'references':references.selected(item['reference_ids']),
-            'representative_sources':[str(source) for source in selected],'creative_direction':creative_direction}
+            'representative_sources':[str(source) for source in selected],'creative_direction':creative_direction,
+            'edits':dict(edits)}
         if discussion is not None:
             reference_id = item['sample_reference_id']
             plan['sample_reference_id'] = reference_id
@@ -416,10 +424,13 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
     return result
 
 
-def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None, creative_direction=''):
+def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None, creative_direction='', edits=None):
+    edits = normalise_edits(edits)
+    schema = ('返回一个 JSON 对象，只有 prompt、head_box 和 headwear 三个字段。' if edits['hair'] else
+        '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。')
     instruction = (
         '你为没有修图灵感的用户设计 COS 摄影后期。观察原片，结合用户给出的角色、要求和下面的提示词库，'
-        '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。prompt 是可交给图像编辑模型的完整提示词。'
+        +schema+'prompt 是可交给图像编辑模型的完整提示词。'
         'head_box 是原片中需要保留的一个主体整头的边界框 [左,上,右,下]，坐标归一化到 0 到 1000。'
         '边界框完整包住脸、假发和头饰，保留少量周围空间；不选择水面倒影、屏幕或照片中的次要人像。'
         '当镜中清晰正脸是作品主体时选择该头部，不选择前景背对镜头的后脑。'
@@ -435,13 +446,14 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         '近景保持真实景深，俯拍不硬加地平线；倒影、镜像、必要的前景虚焦人物和接触关系均完整保留。'
         '提示词库只提供场景、光色、材质和特效灵感；其中其他角色的妆造、换脸塑形、换衣、'
         '重新构图、固定画幅、模型参数和运行流程均不适用于本次任务。'
-        '后续将原片整头（脸、假发和头饰）整体等比对齐后融合回生成画面；身体、实物服装和环境保留生成结果。'
+        '后续将原片身份区域整体等比对齐后融合回生成画面；修发关闭时保留整头，开启时保留脸与头饰并使用生成头发；'
+        '身体、实物服装和环境保留生成结果。'
         '必须保持原片的人物位置、大小、姿态、脸型骨相、完整轮廓、实物服装结构和画幅，'
         '统一设计人物与环境的主光、环境反光、接触阴影和景深，使人物自然处于同一场景。'
-        '整头形状、位置、大小和朝向必须贴合原片，场景主光方向应与原片头部受光相容；'
+        '脸与头饰的形状、位置、大小和朝向必须贴合原片，是否改变头发或光向以本次可选制作设置为准；'
         '人物身体、颈部与环境的亮度、色温和阴影深度必须协调；'
         '不能把白天曝光的人物直接放进暗夜背景。主光要有可解释的来源，近处地面和道具承接同一光照。'
-        '允许头部与整体统一调整曝光和色温；保留原片光向、脸部体积和真实细节，不照搬原片欠曝、灰雾与色偏。'
+        '允许头部与整体统一调整曝光和色温；保留脸部体积和真实细节，不照搬原片欠曝、灰雾与色偏。'
         '肤色干净且有血色、眼神清楚，通透依靠明暗层次与材质细节，不等于人物始终高亮，也不以整图染色代替光感。'
         '清理背景中与作品无关的路人、包和器材、垃圾、抢眼标识及零碎干扰，修复被清理区域的纹理与线条，'
         '按用户要求保留或移除具体景物，维护透视、景深与接触关系，不把保留实景理解为照搬杂乱背景。'
@@ -453,7 +465,14 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         '不要换人、改衣、移动人物或强改拍摄视角，不要输出多个候选、对比图、文字或水印。'
         'prompt 是直接编辑照片的简洁指令，不向图像模型解释后续程序、抠图和融合算法。'
         f'\n角色：{character}\n用户要求：{brief}\n双方定稿的创作要求：{creative_direction}\n整组摄影方向：{direction}\n选定参考：\n'
-        + '\n\n'.join(item['title'] + '\n' + item['text'] for item in library))
+        + '\n\n'.join(item['title'] + '\n' + item['text'] for item in library)
+        + edit_instructions(edits))
+    if edits['hair']:
+        instruction += (
+            '\nheadwear 是本张原片中实际可见、须保留的实体头饰的简短英文名数组，例如具体的花冠、发卡、角或帽子；'
+            '按实际照片命名，不预设角色配件，不写 head、hair、person、clothes 或笼统 headdress。'
+            '每项是一个明确物体名称，不含逗号、冒号或参数，没有实体头饰时为空数组。'
+            '宽大的透光头纱按服装材质随生成场景受光处理；只有用户明确要求保留原片头纱时才单独列入。')
     save_json(directory / 'prompt-sources.json', library)
     images = [('本张原片，头部定位只依据此图',preview_data_url(source))]
     if style_reference is not None:
@@ -462,6 +481,11 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
     description = _describe(instruction,images,config,directory/'llm-response.json')
     if not isinstance(description['prompt'],str) or len(description['head_box'])!=4:
         raise ValueError('The LLM did not return an edit prompt and one head box')
+    if edits['hair']:
+        names = description['headwear']
+        if not isinstance(names,list) or any(not isinstance(name,str) or not name.strip() or ',' in name or ':' in name for name in names):
+            raise ValueError('修发定位须返回原片具体头饰的英文名称数组；原始响应已保存')
+        description['headwear'] = list(dict.fromkeys(name.strip() for name in names))
     return description
 
 
@@ -551,8 +575,8 @@ def superresolve(source, target, config, directory, progress):
     return result, records
 
 
-def extract_head_mask(image, config, directory):
-    """Run the configured SAM model once on the original head crop."""
+def extract_head_mask(image, config, directory, *, edit_hair=False, headwear=()):
+    """Extract the whole head and, for authorised hair edits, the protected identity."""
     base = config['url'].rstrip('/')
     stream = BytesIO()
     image.save(stream,format='PNG')
@@ -570,6 +594,24 @@ def extract_head_mask(image, config, directory):
         '5':{'class_type':'MaskToImage','inputs':{'mask':['4',0]}},
         '6':{'class_type':'SaveImage','inputs':{'images':['5',0],
             'filename_prefix':'CosLuma/head-'+uuid.uuid4().hex}}}
+    if edit_hair:
+        graph.update({
+            '7':{'class_type':'CLIPTextEncode','inputs':{'clip':['2',1],
+                'text':'face:1, ear:2'}},
+            '8':{'class_type':'SAM3_Detect','inputs':{'model':['2',0],'image':['1',0],
+                'conditioning':['7',0],'threshold':.5,'refine_iterations':1,'individual_masks':False}},
+            '9':{'class_type':'MaskToImage','inputs':{'mask':['8',0]}},
+            '10':{'class_type':'SaveImage','inputs':{'images':['9',0],
+                'filename_prefix':'CosLuma/face-'+uuid.uuid4().hex}}})
+        if headwear:
+            graph.update({
+                '15':{'class_type':'CLIPTextEncode','inputs':{'clip':['2',1],
+                    'text':', '.join(name+':4' for name in headwear)}},
+                '16':{'class_type':'SAM3_Detect','inputs':{'model':['2',0],'image':['1',0],
+                    'conditioning':['15',0],'threshold':.5,'refine_iterations':1,'individual_masks':False}},
+                '17':{'class_type':'MaskToImage','inputs':{'mask':['16',0]}},
+                '18':{'class_type':'SaveImage','inputs':{'images':['17',0],
+                    'filename_prefix':'CosLuma/headwear-'+uuid.uuid4().hex}}})
     save_json(directory/'head-workflow.json',graph)
     queued = post_json(base+'/prompt',{'prompt':graph,'client_id':'cosluma-'+uuid.uuid4().hex})
     prompt_id = queued['prompt_id']
@@ -582,11 +624,20 @@ def extract_head_mask(image, config, directory):
                 errors = [row[1].get('exception_message','') for row in result['status'].get('messages',[])
                     if row[0]=='execution_error']
                 raise RuntimeError('Head extraction failed: '+'; '.join(errors))
-            images = result.get('outputs',{}).get('6',{}).get('images')
-            if images:
-                path = directory/'head-mask-return.png'
-                path.write_bytes(request(base+'/view?'+urllib.parse.urlencode(images[0])))
-                return open_rgb(path)
+            outputs = result.get('outputs',{})
+            masks = {'head':('6','head-mask-return.png')}
+            if edit_hair:
+                masks['face'] = ('10','face-mask-return.png')
+                if headwear:
+                    masks['headwear'] = ('18','headwear-mask-return.png')
+            if all(outputs.get(node,{}).get('images') for node,_ in masks.values()):
+                returned = {}
+                for name,(node,filename) in masks.items():
+                    path = directory/filename
+                    path.write_bytes(request(base+'/view?'+urllib.parse.urlencode(outputs[node]['images'][0])))
+                    returned[name] = open_rgb(path)
+                return returned
             if result.get('status',{}).get('completed'):
-                raise RuntimeError('Head extraction finished without a mask')
+                missing = [name for name,(node,_) in masks.items() if not outputs.get(node,{}).get('images')]
+                raise RuntimeError('SAM3.1 未返回所需蒙版：'+', '.join(missing))
         time.sleep(1)

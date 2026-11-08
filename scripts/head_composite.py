@@ -4,9 +4,11 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 
 from image_io import save_image, to_preview
 from model_clients import extract_head_mask
+from creative_edits import normalise_edits
 
 
 def _colour_match(source, target, alpha):
@@ -18,6 +20,44 @@ def _colour_match(source, target, alpha):
     matrix = np.real(matcher.transfer_mat)
     offset = np.real(matcher.mu_z-matrix @ matcher.mu_r)
     return np.clip(cv2.transform(source,np.column_stack((matrix,offset)).astype(np.float32)),0,1)
+
+
+def _transfer_lighting(source, target, alpha):
+    """Transfer a spatial illumination ratio in linear RGB, preserving source detail.
+
+    Normalised frequency separation excludes the surrounding background from
+    both illumination estimates. Only light and colour change; no RGB warping,
+    generated facial texture, or additional global colour match is applied.
+    """
+    height,width = alpha.shape
+    scale = min(1.0,768/max(width,height))
+    field_size = (max(1,round(width*scale)),max(1,round(height*scale)))
+    # This resized data estimates low-frequency light, never identity pixels.
+    source_light = cv2.resize(source,field_size,interpolation=cv2.INTER_AREA)
+    target_light = cv2.resize(target,field_size,interpolation=cv2.INTER_AREA)
+    source_linear = np.where(source_light<=.04045,source_light/12.92,((source_light+.055)/1.055)**2.4)
+    target_linear = np.where(target_light<=.04045,target_light/12.92,((target_light+.055)/1.055)**2.4)
+    support = cv2.resize((alpha>.95).astype(np.float32),field_size,interpolation=cv2.INTER_AREA)
+    radius = max(1.0,float(np.sqrt(support.sum()))*.025)
+    weight = cv2.GaussianBlur(support,(0,0),radius)
+    log_source = np.log(np.maximum(source_linear,1/65535))
+    log_target = np.log(np.maximum(target_linear,1/65535))
+    difference = cv2.GaussianBlur((log_target-log_source)*support[...,None],(0,0),radius)
+    np.divide(difference,weight[...,None],out=difference,where=weight[...,None]>1e-6)
+    difference[weight<=1e-6] = 0
+    difference = cv2.resize(difference,(width,height),interpolation=cv2.INTER_LINEAR)
+    result = np.empty_like(source,dtype=np.float32)
+    for channel in range(3):
+        values = source[...,channel]
+        linear = np.where(values<=.04045,values/12.92,((values+.055)/1.055)**2.4)
+        linear *= np.exp(difference[...,channel])
+        np.clip(linear,0,1,out=linear)
+        result[...,channel] = np.where(linear<=.0031308,linear*12.92,1.055*linear**(1/2.4)-.055)
+    return result,{
+        'method':'masked linear-RGB log illumination ratio; frequency separation',
+        'field_dimensions':list(field_size),'radius_in_field_pixels':radius,
+        'guide':'generated full-frame face and body lighting',
+        'source_detail':'camera RGB sampled once with the SIFT similarity transform'}
 
 
 def _align_head(source, target, alpha, source_box, original_size):
@@ -53,8 +93,9 @@ def _align_head(source, target, alpha, source_box, original_size):
     return transform.astype(np.float32),len(good),int(inliers.sum())
 
 
-def restore_head(original, generated, head_box, config, directory, progress):
+def restore_head(original, generated, head_box, config, directory, progress, *, edits=None, headwear=()):
     """Extract one primary head, retain its camera pixels, and blend it once."""
+    edits = normalise_edits(edits)
     height,width = original.shape[:2]
     box = np.rint(np.array(head_box)*np.array([width,height,width,height])/1000).astype(int)
     box = np.maximum(0,np.minimum(box,[width,height,width,height]))
@@ -62,13 +103,26 @@ def restore_head(original, generated, head_box, config, directory, progress):
     if x1<=x0 or y1<=y0:
         raise ValueError('The prompt writer returned an empty head region')
     source = original[y0:y1,x0:x1]
-    progress('提取原片整头')
+    progress('提取原片脸部与具体头饰' if edits['hair'] else '提取原片整头')
     model_input = to_preview(source,config['head'].get('input_max_edge',2048))
-    mask = extract_head_mask(model_input,config['head'],directory)
-    alpha = cv2.resize(np.asarray(mask.convert('L'),np.float32)/255,
+    masks = extract_head_mask(model_input,config['head'],directory,edit_hair=edits['hair'],headwear=headwear)
+    alpha = cv2.resize(np.asarray(masks['head'].convert('L'),np.float32)/255,
         (x1-x0,y1-y0),interpolation=cv2.INTER_LINEAR)
+    if edits['hair']:
+        progress('保留原片脸部与头饰，使用生成的头发')
+        # Face masks can contain holes at dark eyes and brows. Those are still
+        # camera identity pixels; fill only holes enclosed by the face region.
+        face = np.asarray(masks['face'].convert('L'),np.float32)/255
+        face = np.maximum(face,binary_fill_holes(face>.5).astype(np.float32))
+        identity = face
+        if headwear:
+            accessory = np.asarray(masks['headwear'].convert('L'),np.float32)/255
+            identity = np.maximum(identity,accessory)
+        identity = cv2.resize(identity,(x1-x0,y1-y0),interpolation=cv2.INTER_LINEAR)
+        alpha = np.minimum(alpha,identity)
     if not np.any(alpha>.95):
-        raise ValueError('The head extraction model returned no opaque head region')
+        raise ValueError('分割未返回可用的脸部与头饰保留区' if edits['hair'] else
+            'The head extraction model returned no opaque head region')
     progress('整体等比对齐头部')
     transform,matches,inliers = _align_head(source,generated,alpha,box,(width,height))
     corners = np.array([[0,0],[x1-x0,0],[x1-x0,y1-y0],[0,y1-y0]],np.float32)
@@ -91,8 +145,15 @@ def restore_head(original, generated, head_box, config, directory, progress):
     coverage = np.clip(warped_alpha,0,1)
     output = np.asarray(generated,np.float32)/255
     target = output[low[1]:high[1],low[0]:high[0]].copy()
-    progress('匹配头部光色与融合')
-    matched = _colour_match(restored,target,coverage)
+    lighting = None
+    if edits['relight']:
+        progress('迁移面部空间光照，与身体和环境统一')
+        matched,lighting = _transfer_lighting(restored,target,coverage)
+        method = 'SIFT similarity; linear-RGB spatial illumination transfer; float alpha composite'
+    else:
+        progress('匹配头部光色与融合')
+        matched = _colour_match(restored,target,coverage)
+        method = 'SIFT similarity; premultiplied-alpha resampling; one MKL; float alpha composite'
     output[low[1]:high[1],low[0]:high[0]] = matched*coverage[...,None]+target*(1-coverage[...,None])
     global_transform = transform.copy()
     global_transform[:,2] -= transform[:,:2] @ box[:2]
@@ -101,6 +162,10 @@ def restore_head(original, generated, head_box, config, directory, progress):
         'source_head':save_image(restored,directory/'head-original.png'),
         'matched_head':save_image(matched,directory/'head-matched.png'),
         'alpha':save_image(np.repeat(coverage[...,None],3,axis=2),directory/'head-alpha.png'),
-        'blend_bit_depth':32,
-        'method':'SIFT similarity; premultiplied-alpha resampling; one MKL; float alpha composite'}
+        'blend_bit_depth':32,'edits':edits,
+        'headwear':list(headwear) if edits['hair'] else [],
+        'preserved_region':'face, ears and headdress' if edits['hair'] else 'whole original head',
+        'method':method}
+    if lighting is not None:
+        record['lighting'] = lighting
     return output,record

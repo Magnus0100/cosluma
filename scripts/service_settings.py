@@ -76,7 +76,7 @@ class ServiceSettings(QDialog):
         layout.addLayout(body, 1)
         descriptions = {
             'llm':('让 Agent 看懂你的照片', '用于选片、讨论摄影方向和编写提示词。请选择支持图片输入和工具调用的图文模型，Agent 会按需查阅参考库。'),
-            'image':('连接整图生图服务', '用于制作完整真实样片与后续成片。请选择支持原片和风格参考图输入的图像编辑模型。')}
+            'image':('连接整图生图服务', '用于制作完整真实样片与后续成片，也承担用户主动开启的修发和人物光照设计。请选择支持原片和风格参考图输入的图像编辑模型。')}
         for service in ('llm', 'image'):
             form = self.add_page(*descriptions[service])
             if service == 'image':
@@ -95,7 +95,7 @@ class ServiceSettings(QDialog):
             if service == 'image':
                 self.add_image_options(form)
         form = self.add_page('保留本人身份与原片细节',
-            '整头分割提取原片头部；超分补充生成区域的清晰度。这两项由已经部署好模型的 ComfyUI 提供。')
+            '整头分割提取原片头部，修发时另外识别需要保留的脸部与头饰；超分补充生成区域的清晰度。这两项由已经部署好模型的 ComfyUI 提供。')
         for service, label in (('head','整头分割'), ('sr','超分')):
             form.addRow(ui_label(label, 'heading'))
             if service == 'sr':

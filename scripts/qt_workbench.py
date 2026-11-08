@@ -27,6 +27,7 @@ from beauty_editor import BeautyConnection, BeautyEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos
 from photo_pipeline import finish_batch, load_style
+from creative_edits import normalise_edits, edits_match
 from settings import default_settings_path, load_settings
 from service_settings import ServiceSettings, endpoint_url
 from project_store import Project, recent_projects, remember_project
@@ -153,6 +154,7 @@ class Workbench(QMainWindow):
         self.creative_workspace = None
         self.creative_context = None
         self.creative_direction = ''
+        self.creative_edits = normalise_edits()
         self.creative_draft = False
         self.current_batch_view = None
         self.archive_view = None
@@ -737,6 +739,7 @@ class Workbench(QMainWindow):
         self.style_selection_file = project.data['creative'].get('selected') or None
         self.style_samples_directory = self.style_discussion_directory = None
         self.creative_direction = ''
+        self.creative_edits = normalise_edits()
         self.creative_draft = False
         self.sources, self.results, self.stages, self.photo_errors = [], {}, {}, {}
         self.excluded_sources = set()
@@ -890,7 +893,8 @@ class Workbench(QMainWindow):
             return False
         return self.creative_context != self.style_context or (
             not self.creative_draft and
-            self.creative_direction == self.selected_style['art_direction'].get('creative_direction', ''))
+            self.creative_direction == self.selected_style['art_direction'].get('creative_direction', '') and
+            edits_match(self.creative_edits,self.selected_style['art_direction'].get('edits')))
 
     def restore_style_selection(self):
         creative = self.project.data['creative']
@@ -904,6 +908,7 @@ class Workbench(QMainWindow):
                 self.style_discussion_context = (state['character'], state['brief'])
                 self.creative_context = self.style_discussion_context
                 self.creative_direction = state.get('direction', '')
+                self.creative_edits = normalise_edits(state.get('edits'))
                 self.creative_draft = bool(state.get('draft', '').strip())
             directory = creative.get('samples')
             if directory:
@@ -1364,7 +1369,7 @@ class Workbench(QMainWindow):
         elif self.creative_context == context and self.creative_draft:
             next_step = '创作页还有未发送的输入；发送或清空后，再按当前讨论制作。'
         elif chosen is not None and not ready:
-            next_step = '创作要求已改变；原定稿仍可查看，按新要求主动试样后再定稿。'
+            next_step = '创作要求或修发、光照设置已改变；原定稿仍可查看，按当前设置主动试样后再定稿。'
         elif chosen is None:
             next_step = '到创作页讨论并比较三个真实样片，选定一张后再批量制作。'
         elif not pending:
@@ -1776,6 +1781,7 @@ class Workbench(QMainWindow):
         workspace = self.creative_workspace
         self.creative_context = (workspace.character, workspace.brief)
         self.creative_direction = workspace.creative_direction
+        self.creative_edits = workspace.current_edits()
         self.creative_draft = bool(workspace.chat_input.toPlainText().strip() or workspace.pending_message)
         source = workspace.sample_source.currentData()
         if source in self.included_sources():

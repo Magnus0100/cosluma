@@ -32,7 +32,7 @@ def make_server(root, config, host='127.0.0.1', port=8765):
                 options = []
                 for option in make_style_samples(body['sources'],body['sample_source'],body['character'],root,config,
                         brief=body.get('brief',''),size=body.get('size'),progress=progress,
-                        creative_direction=body.get('creative_direction','')):
+                        creative_direction=body.get('creative_direction',''),edits=body.get('edits')):
                     options.append(option)
                     with lock:
                         jobs[job_id].update(options=list(options),styles_directory=option['styles_directory'])
@@ -43,7 +43,7 @@ def make_server(root, config, host='127.0.0.1', port=8765):
             if not compose and ('sources' in body or body.get('style')):
                 results = []
                 for result in finish_batch(body.get('sources') or [body['source']],body['character'],root,config,
-                        brief=body.get('brief',''),size=body.get('size'),progress=progress,style=body.get('style')):
+                        brief=body.get('brief',''),size=body.get('size'),progress=progress,style=body.get('style'),edits=body.get('edits')):
                     results.append(result)
                     with lock:
                         jobs[job_id].update(results=list(results),batch_directory=result['batch_directory'])
@@ -56,7 +56,7 @@ def make_server(root, config, host='127.0.0.1', port=8765):
                 'superresolved': body.get('superresolved')} if compose else {}
             character = body.get('character', '') if compose else body['character']
             result = finish_photo(body['source'], character, root, config, size=body.get('size'),
-                brief=body.get('brief', ''), progress=progress, **arguments)
+                brief=body.get('brief', ''), progress=progress, edits=body.get('edits'), **arguments)
             with lock:
                 jobs[job_id].update(status='complete',stage='完成',result=result)
         except Exception as error:

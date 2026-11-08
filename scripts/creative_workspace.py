@@ -9,12 +9,13 @@ import uuid
 
 from PySide6.QtCore import QThread, Signal, Qt, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QPlainTextEdit,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from image_io import save_json
 from model_clients import _representatives, discuss_style
 from photo_pipeline import load_style, make_style_samples
+from creative_edits import normalise_edits, edits_match
 from studio_widgets import ui_label, StatusText, SampleCard, ConversationView, PhotoPreview, SampleComparison
 
 
@@ -26,20 +27,21 @@ class StyleWorker(QThread):
     directory_created = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction='', discussion=None):
+    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction='', discussion=None, edits=None):
         super().__init__()
         self.sources, self.sample_source = sources, sample_source
         self.character, self.brief = character, brief
         self.root, self.config = root, config
         self.creative_direction = creative_direction
         self.discussion = discussion
+        self.edits = normalise_edits(edits)
 
     def run(self):
         try:
             for option in make_style_samples(self.sources,self.sample_source,self.character,self.root,self.config,
                     brief=self.brief,progress=self.progress.emit,planned=self.plans_ready.emit,
                     sample_progress=self.sample_stage.emit,started=self.directory_created.emit,
-                    creative_direction=self.creative_direction,discussion=self.discussion):
+                    creative_direction=self.creative_direction,discussion=self.discussion,edits=self.edits):
                 self.sample_ready.emit(option)
         except Exception as error:
             self.failed.emit(str(error))
@@ -56,7 +58,7 @@ class StyleChatWorker(QThread):
 
     def run(self):
         try:
-            result = discuss_style(*self.arguments,direction=self.direction,context=self.context)
+            result = discuss_style(*self.arguments,direction=self.direction,context=self.context,edits=self.context.get('edits'))
             self.reply_ready.emit(result)
         except Exception as error:
             self.failed.emit(getattr(error,'provider_message','') or str(error))
@@ -79,6 +81,7 @@ class CreativeWorkspace(QWidget):
         self.messages = []
         self.creative_direction = ''
         self.samples_direction = ''
+        self.samples_edits = normalise_edits()
         self.discussion_directory = None
         self.sample_directories = []
         self.round_sources = {}
@@ -254,6 +257,41 @@ class CreativeWorkspace(QWidget):
         self.discussion_summary.setPlaceholderText('讨论形成的创作要求会显示在这里')
         self.discussion_summary.setFixedHeight(58)
         chat_layout.addWidget(self.discussion_summary)
+        self.edits_button = QToolButton()
+        self.edits_button.setProperty('kind','quiet')
+        self.edits_button.setCheckable(True)
+        self.edits_button.setText('可选修发与光照 · 均未开启')
+        self.edits_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.edits_button.setArrowType(Qt.RightArrow)
+        chat_layout.addWidget(self.edits_button)
+        self.edits_panel = QWidget()
+        edits_layout = QVBoxLayout(self.edits_panel)
+        edits_layout.setContentsMargins(0,0,0,0)
+        edits_layout.setSpacing(6)
+        self.hair = QCheckBox('修发与头发生成')
+        self.hair.setToolTip('生成修整后的头发，保留原片脸部与头饰；具体范围与飘动方式可填写或在对话中说明')
+        edits_layout.addWidget(self.hair)
+        self.hair_brief = QLineEdit()
+        self.hair_brief.setPlaceholderText('如：补齐右侧缺发，保留刘海；长发向身后扬')
+        self.hair_brief.setAccessibleName('修发要求')
+        edits_layout.addWidget(self.hair_brief)
+        self.relight = QCheckBox('人物重打光')
+        self.relight.setToolTip('让面部、身体、服装与背景统一受光，保留脸型和相机细节；不会自动开启人脸美化')
+        edits_layout.addWidget(self.relight)
+        self.lighting_brief = QLineEdit()
+        self.lighting_brief.setPlaceholderText('如：左侧暖主光，右侧承接蓝色环境反光')
+        self.lighting_brief.setAccessibleName('人物光照要求')
+        edits_layout.addWidget(self.lighting_brief)
+        edits_note = ui_label('两项独立。要求可留空或继续与 Agent 讨论；改变后试样再定稿。')
+        edits_note.setWordWrap(True)
+        edits_layout.addWidget(edits_note)
+        self.edits_panel.hide()
+        chat_layout.addWidget(self.edits_panel)
+        self.edits_button.toggled.connect(self.toggle_edits_panel)
+        for checkbox in (self.hair,self.relight):
+            checkbox.toggled.connect(self.edits_changed)
+        for field in (self.hair_brief,self.lighting_brief):
+            field.textChanged.connect(self.edits_changed)
         composer = QFrame()
         composer.setProperty('role','composer')
         composer_layout = QVBoxLayout(composer)
@@ -313,6 +351,7 @@ class CreativeWorkspace(QWidget):
                 self.directory = str(previous)
                 self.restore_samples(previous)
                 self.creative_direction = self.samples_direction
+                self.set_edit_controls(self.samples_edits)
                 self.render_conversation()
                 self.show_round_note()
             except (OSError,ValueError,KeyError,TypeError) as error:
@@ -345,6 +384,36 @@ class CreativeWorkspace(QWidget):
         self.production_busy = busy
         self.update_creative_actions()
 
+    def current_edits(self):
+        return normalise_edits({'hair':self.hair.isChecked(),'hair_brief':self.hair_brief.text(),
+            'relight':self.relight.isChecked(),'lighting_brief':self.lighting_brief.text()})
+
+    def set_edit_controls(self, value):
+        value = normalise_edits(value)
+        for control,key in ((self.hair,'hair'),(self.hair_brief,'hair_brief'),
+                (self.relight,'relight'),(self.lighting_brief,'lighting_brief')):
+            control.blockSignals(True)
+            control.setChecked(value[key]) if isinstance(control,QCheckBox) else control.setText(value[key])
+            control.blockSignals(False)
+        if value['hair'] or value['relight']:
+            self.edits_button.setChecked(True)
+
+    def toggle_edits_panel(self, expanded):
+        self.edits_panel.setVisible(expanded)
+        self.edits_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def edits_changed(self):
+        self.update_creative_actions()
+        if self.viewed_directory is not None:
+            self.show_round_note()
+        else:
+            self.message.setPlainText('可选设置已更新。可以继续讨论，按当前设置试样后再定稿。')
+        self.state_changed.emit()
+        self.draft_timer.start()
+
+    def samples_are_current(self):
+        return self.samples_direction==self.creative_direction and edits_match(self.samples_edits,self.current_edits())
+
     def draft_changed(self):
         self.draft_timer.start()
         self.update_creative_actions()
@@ -354,7 +423,8 @@ class CreativeWorkspace(QWidget):
         self.draft_timer.stop()
         try:
             if self.discussion_directory is None:
-                if not self.chat_input.toPlainText().strip() and self.pending_message is None:
+                if (not self.chat_input.toPlainText().strip() and self.pending_message is None
+                        and self.current_edits()==normalise_edits()):
                     return True
                 self.ensure_discussion()
             self.save_discussion()
@@ -432,6 +502,7 @@ class CreativeWorkspace(QWidget):
                 'character':self.character,'brief':self.brief,'sources':self.sources,
                 'sample_source':self.sample_source.currentData(),
                 'messages':self.messages,'direction':self.creative_direction,
+                'edits':self.current_edits(),
                 'samples_directory':self.directory,'sample_directories':self.sample_directories,
                 'viewed_samples_directory':self.viewed_directory,
                 'viewing_selected':self.viewing_selected,
@@ -452,6 +523,7 @@ class CreativeWorkspace(QWidget):
         self.discussion_directory = str(directory)
         self.messages = state['messages']
         self.creative_direction = state.get('direction','')
+        self.set_edit_controls(state.get('edits'))
         self.sample_directories = state.get('sample_directories',[])
         self.directory = state.get('samples_directory')
         for sample_directory in self.sample_directories:
@@ -497,7 +569,8 @@ class CreativeWorkspace(QWidget):
             'index':option['index'],'title':option['title'],'summary':option['summary'],
             'direction':option['art_direction']['direction'],'source':option['sample_source'],
             'status':option['status'],'selected':option['selection_file']==self.chosen_file,
-            'image':option['result']['files']['jpeg'] if option['status']=='complete' else None}
+            'image':option['result']['files']['jpeg'] if option['status']=='complete' else None,
+            'edits':normalise_edits(option['art_direction'].get('edits'))}
         if option['status']=='failed':
             sample['error'] = option['error']
         return sample
@@ -534,7 +607,7 @@ class CreativeWorkspace(QWidget):
         return {'label':label,'viewed_source':viewed_source,'viewed_sample':viewed_sample,'view_mode':mode,
             'viewed_samples':viewed_samples,
             'next_sample_source':next_source,'selected_sample':self.chosen_file or None,
-            'sources':sources,'samples':samples}
+            'sources':sources,'samples':samples,'edits':self.current_edits()}
 
     def refresh_discussion_target(self):
         label = '当前讨论：'+self.discussion_context()['label']
@@ -546,13 +619,19 @@ class CreativeWorkspace(QWidget):
         draft = bool(self.chat_input.toPlainText().strip())
         self.send.setEnabled(not busy and draft)
         self.chat_input.setEnabled(not busy)
+        self.hair.setEnabled(not busy)
+        self.relight.setEnabled(not busy)
+        self.hair_brief.setEnabled(not busy and self.hair.isChecked())
+        self.lighting_brief.setEnabled(not busy and self.relight.isChecked())
+        enabled = [label for control,label in ((self.hair,'修发'),(self.relight,'重打光')) if control.isChecked()]
+        self.edits_button.setText('可选修发与光照 · '+('、'.join(enabled)+'已开启' if enabled else '均未开启'))
         self.generate.setEnabled(not busy and not draft and bool(self.sample_source.currentData()))
         self.input_hint.setText('尚未发送 · Ctrl + Enter 发送' if draft and not busy else 'Ctrl + Enter 发送')
         draft_note = '这段输入尚未发送。请先发给 Agent，或清空输入，再按已经讨论的要求试样或定稿。'
         source = self.sample_source.currentData()
         self.generate.setToolTip(draft_note if draft else '按当前创作要求，用上方所选原片制作新一轮三个真实样片')
         self.finalize.setToolTip(draft_note if draft else
-            '这一轮使用此前的创作要求，可回看；按当前讨论试样后再定稿' if self.samples_direction!=self.creative_direction else
+            '这一轮使用此前的创作要求或可选设置，可回看；按当前设置试样后再定稿' if not self.samples_are_current() else
             '将当前完整样片保存为这组照片的最终方向')
         self.change_source.setEnabled(bool(source))
         self.sample_source.setEnabled(not busy)
@@ -567,15 +646,16 @@ class CreativeWorkspace(QWidget):
             '正在查看已定稿样片' if self.viewing_selected else '已定稿此样片' if chosen else
             '将“'+option['title']+'”定稿' if option else '选择完整样片后定稿')
         self.finalize.setEnabled(not busy and not draft and not self.compare_button.isChecked()
-            and not self.viewing_original and not self.viewing_selected and self.samples_direction==self.creative_direction
+            and not self.viewing_original and not self.viewing_selected and self.samples_are_current()
             and option.get('status')=='complete')
         if self.selected_style is not None:
-            current = self.selected_style['art_direction'].get('creative_direction','')==self.creative_direction
+            current = (self.selected_style['art_direction'].get('creative_direction','')==self.creative_direction
+                and edits_match(self.selected_style['art_direction'].get('edits'),self.current_edits()))
             if current:
                 self.chosen_label.setText('已定稿：'+self.selected_style['title']+
                     ('；有未发送草稿，请先发送或清空。' if draft else '；查看其他方案不会改变定稿。'))
             else:
-                self.chosen_label.setText('上次定稿：'+self.selected_style['title']+'；创作要求已更新，试样后再定稿。')
+                self.chosen_label.setText('上次定稿：'+self.selected_style['title']+'；创作要求或可选设置已更新，试样后再定稿。')
         elif self.chosen_file:
             chosen_option = next((item for item in self.options.values() if item.get('selection_file')==self.chosen_file),None)
             self.chosen_label.setText('已定稿：'+chosen_option['title']+'；查看其他方案不会改变定稿。' if chosen_option else '已有定稿，当前正在讨论新的样片。')
@@ -770,6 +850,7 @@ class CreativeWorkspace(QWidget):
         if active:
             source = self.worker.sample_source
             direction = self.worker.creative_direction
+            edits = self.worker.edits
             options = self.active_options
             plans = self.active_plans
             error = self.failure_message
@@ -778,6 +859,7 @@ class CreativeWorkspace(QWidget):
             state = json.loads((path/'styles.json').read_text(encoding='utf-8'))
             source = state['sample_source']
             direction = state.get('creative_direction','')
+            edits = normalise_edits(state.get('edits'))
             error = state.get('error','')
             status = state['status']
             plans = (json.loads((path/'style-options.json').read_text(encoding='utf-8'))
@@ -798,6 +880,7 @@ class CreativeWorkspace(QWidget):
         self.viewing_original = False
         self.viewing_selected = False
         self.samples_direction = direction
+        self.samples_edits = dict(edits)
         self.options = options
         self.reset_cards('设计方向中' if active and not plans else '未完成')
         self.display_plans(plans)
@@ -823,8 +906,8 @@ class CreativeWorkspace(QWidget):
     def show_round_note(self, error=''):
         if error:
             self.message.setPlainText('本轮样片未完成：'+error)
-        elif self.samples_direction!=self.creative_direction:
-            self.message.setPlainText('这一轮使用此前的创作要求，仅供回看；按当前讨论试样后再定稿。')
+        elif not self.samples_are_current():
+            self.message.setPlainText('这一轮使用此前的创作要求或修发、光照设置，仅供回看；按当前设置试样后再定稿。')
         elif self.worker is not None and self.viewed_directory==self.active_directory:
             self.message.setPlainText('这一轮正在制作，可切换其他轮次回看；新结果不会改变定稿。')
         else:
@@ -857,6 +940,7 @@ class CreativeWorkspace(QWidget):
         self.viewing_selected = False
         self.failure_message = ''
         self.samples_direction = self.creative_direction
+        self.samples_edits = self.current_edits()
         self.open_folder.setEnabled(False)
         self.reset_cards('设计方向中')
         self.sample_round.blockSignals(True)
@@ -869,7 +953,7 @@ class CreativeWorkspace(QWidget):
         self.sample_source.setEnabled(False)
         represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
         self.worker = StyleWorker(represented,self.sample_source.currentData(),self.character,
-            self.brief,self.root,self.config,creative_direction=self.creative_direction,discussion=discussion)
+            self.brief,self.root,self.config,creative_direction=self.creative_direction,discussion=discussion,edits=self.samples_edits)
         self.worker.progress.connect(self.sample_progress)
         self.worker.plans_ready.connect(self.show_plans)
         self.worker.sample_stage.connect(self.show_stage)
@@ -990,8 +1074,8 @@ class CreativeWorkspace(QWidget):
             self.message.setPlainText('这段输入尚未发送，未纳入当前创作要求。先发送或清空输入，再决定是否定稿。')
             self.chat_input.setFocus()
             return
-        if self.samples_direction != self.creative_direction:
-            self.message.setPlainText('当前讨论已修改创作要求，请先按当前讨论生成样片，再定稿。已有样片仍可对比查看。')
+        if not self.samples_are_current():
+            self.message.setPlainText('创作要求或修发、光照设置已改变，请先按当前设置生成样片，再定稿。已有样片仍可对比查看。')
             return
         try:
             self.ensure_discussion()
@@ -1002,6 +1086,7 @@ class CreativeWorkspace(QWidget):
                 'character':self.character,'brief':self.brief,'selection_file':self.chosen_file,
                 'title':option['title'],'direction':self.frozen_direction,
                 'creative_direction':self.creative_direction,
+                'edits':self.current_edits(),
                 'sample_source':option['sample_source']})
             self.save_discussion()
         except OSError as error:

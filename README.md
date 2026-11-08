@@ -1,15 +1,16 @@
 # CosLuma
 
-**0.22.0 · Windows x64 · 源码使用 Python 3.12**
+**0.23.0 · Windows x64 · 源码使用 Python 3.12**
 
-按项目整理一组照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；原片整头融合回生成画面，保留本人五官、脸型和相机细节。
+按项目整理一组照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；保留本人五官、脸型和相机细节。创作时可独立开启修发与人物重打光，两项默认关闭。
 
 ## 制作流程
 
 ```mermaid
 flowchart TD
     A[新建项目 · 导入原片与角色] --> B[与摄影 Agent 讨论创作要求]
-    B --> C[同一张代表原片 · 制作三个真实样片]
+    B --> I[按需开启修发、人物重打光 · 分别填写要求]
+    I --> C[同一张代表原片 · 制作三个真实样片]
     C --> D{用户比较与选择}
     D -->|继续修改| B
     D -->|明确定稿| E[沿用定稿方向 · 制作勾选照片]
@@ -23,13 +24,13 @@ flowchart TD
 
 每张真实样片与其余原片共用同一条制作链：
 
-**原片与摄影方向 → 按单张构图写提示词 → 整图生图 → 必要时一次模型超分 → SAM3.1 提取原片整头、头发与头饰 → SIFT 整体等比对齐 → MKL 浮点仿色与蒙版融合 → 可选明度曲线 → 保存。**
+**原片与摄影方向、可选设置 → 按单张构图写提示词 → 整图生图 → 必要时一次模型超分 → SAM3.1 提取原片身份保留区 → SIFT 整体等比对齐 → MKL 仿色或已开启的空间光照迁移 → 一次浮点蒙版融合 → 可选明度曲线 → 保存。**
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.22.0/CosLuma-0.22.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.22.0)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.23.0/CosLuma-0.23.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.23.0)
 
-Windows 用户下载 Release 中的 `CosLuma-0.22.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.23.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -183,6 +184,20 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 下方交付记录菜单可查看历次导出的成功张数、实际错误与文件夹，并打开对应交付文件夹；不会把部分失败显示为整组完成。
 所选版本或文件缺失时显示实际错误，保留已导出的文件并继续其他照片，不换用另一版本、不自动重试。
 
+### 创作时的可选修发与人物重打光
+
+在创作页展开“可选修发与光照”，分别勾选需要的功能。两项默认关闭，属于本项目当前创作要求，服务连接仍复用已有整图生图与 SAM3.1，不需要另填一套接口。
+
+- **修发与头发生成**：填写希望修补、保留或调整的位置，例如“补齐右侧缺发，刘海和头饰保留，长发向身后扬”。也可在对话中说明。留空时按原有发型修整露网、缺口、断层与干扰杂发，不自行增加飘发。开启后头发采用生成结果；Agent 按这张原片识别花冠、发卡等具体实体头饰，SAM3.1 分别提取脸部与这些头饰，再保留原片脸部、耳朵与实体头饰。脸部蒙版内封闭的眼睛、眉毛孔洞会补齐；新增头发不跨过保留区。宽大的透光头纱随生成场景受光，明确要求保留原片头纱时才列入保留物体。未修改发束的像素也可能随生成变化，不承诺只改一根发丝。
+- **人物重打光**：填写目标光感，例如“左侧暖主光，右侧承接蓝色环境反光”。留空时 Agent 根据当前摄影方向设计。整图生图共同处理面部、身体、服装、道具与背景的光向、反光和阴影；融合时在线性 RGB 中估计带蒙版的低频对数光照比，将空间光照迁移到已对齐的原片头部，保留原片几何与高频细节。该步骤替换普通 MKL 仿色，不再叠加一次 MKL。
+
+与 Agent 讨论后，主动生成三个真实样片，比较实际修发和光照效果，再定稿用于批量。对话不会替用户打开这两个开关。
+开关与具体要求保存于对话、本轮样片、定稿和逐张制作记录；改变有效设置后需要按新设置试样再定稿。回看旧轮不会修改当前设置。
+两个选项关闭时沿用原有整头回贴与一次 MKL 仿色。批量沿用所选样片的设置，样片原片仍直接复用；处理已有照片请明确“勾选照片另做一批”，旧版保留。
+
+重打光使用当前图像编辑模型生成的整图作为光照依据，融合端使用频率分离，不是额外部署的 DreamLight 或 IC-Light 推理。它不能保证去除原片中锐利的硬阴影或恢复已过曝、纯黑处的细节；强烈条纹光、复杂遮挡和较大的生成几何偏差可能残留原阴影或产生局部光色偏差。SAM3.1 是分割蒙版，不是逐根发丝的透明度估计，头发与头饰相贴处可能有边缘误差。
+模型返回的图像与分割蒙版仍为 8 位；光照估计与最终合成使用 float32，另存 16 位 PNG 不补回模型环节丢失的精度。
+
 ### 成片后的可选人脸美化
 
 基础成片保存后，在“成片”页选中照片，点击“人脸美化”。首次填写美化服务连接，保存后准备主体人脸；
@@ -321,7 +336,7 @@ hf download Comfy-Org/sam3.1 checkpoints/sam3.1_multiplex_fp16.safetensors --loc
 现有服务采用其他兼容的文件名时保留实际名称；打开下载页或复制命令不会改写连接设置。
 
 当前分割适配需要 SAM3 文本编码器输出 512 维投影。对尚未包含等价修正的服务，在 ComfyUI 目录执行
-`git apply <本项目目录>/providers/patches/comfyui-sam3-clip-projection.patch` 后重启；
+`git apply --ignore-space-change <本项目目录>/providers/patches/comfyui-sam3-clip-projection.patch` 后重启；
 上游已修正时不重复应用，补丁与服务源码不匹配时由部署者处理，不自动覆盖。
 GPU、驱动与内存由服务部署者明确配置，客户端不自动切换设备。
 
@@ -422,6 +437,9 @@ Windows 包无需这些步骤，同一 `CosLuma.exe` 使用 `--cli` 或 `--serve
 # 先为同一张代表原片生成三个真实风格样片
 python -B scripts/project_cli.py --root D:/CosLuma-output styles --source D:/photos --sample D:/photos/a.jpg --character "角色名"
 
+# 可选修发、人物重打光先体现在真实样片中，两项可独立使用
+python -B scripts/project_cli.py --root D:/CosLuma-output styles --source D:/photos --sample D:/photos/a.jpg --character "角色名" --hair --hair-brief "保留刘海，修补右侧缺发" --relight --lighting-brief "左侧暖主光，右侧蓝色环境反光"
+
 # 选中一个已完成的 style-N.json，再制作整组；完整样片直接复用
 python -B scripts/project_cli.py --root D:/CosLuma-output stylize --source D:/photos --character "角色名" --style D:/CosLuma-output/styles-时间与编号/style-2.json
 
@@ -451,6 +469,9 @@ HTTP 提供 `POST /api/styles`、`POST /api/stylize`、`POST /api/compose`、`PO
 `stylize` 接受 `source` 或批量 `sources`、`character`，可选 `brief`、`size` 和选中的 `style` 文件路径；
 使用选中方案时保持相同角色与补充要求，复用样片保留其原有实际尺寸。不传 `style` 的直接调用仍自动设计一个方向。
 `compose` 另需 `generated`，可选 `superresolved`，角色可以留空。
+`styles`、`stylize` 与 `compose` 可传 `edits`，格式为 `{"hair":true,"hair_brief":"修发要求","relight":true,"lighting_brief":"人物光照要求"}`，两项默认关闭。
+CLI 对应 `--hair`、`--hair-brief`、`--relight`、`--lighting-brief`；单独提供某项要求也开启该项，显式 `--no-hair` 或 `--no-relight` 则关闭。
+传入 `style` 时不传 `edits` 即完整沿用样片设置；显式设置与定稿不一致会显示错误，须先按新要求试样定稿，不能批量时暗中改变。`compose` 只复用已有生成图，不会按新要求重新修发或重画身体光照。
 `beautify` 接受已完成照片的 `run` 路径、0–1 的 `skin`、`slim`，可选已有美化目录 `session`；CLI 对应 `--session`。
 `protect_features` 默认为 `true`，设为 `false` 允许美肤调整五官；CLI 使用 `--no-protect-features` 关闭，瘦脸位置约束保持。
 没有传会话时按该成片分析一次；传入该照片的会话可复用已有美肤基础。结果保存在原成片的工作目录，`--root` 不改变此位置。
@@ -472,26 +493,27 @@ Invoke-RestMethod "http://127.0.0.1:8765/api/jobs/$($job.id)"
 ```text
 原片 + 角色 + 提示词库 → 用户与 Agent 对话、按讨论试三个真实样片、继续修改 → 用户定稿
 → 复用选中样片；其余按选中方向逐张写提示词与主体整头范围
-→ 整图编辑 → 必要时一次模型超分 → SAM3.1 原片整头/头发/头饰并集
-→ SIFT 整体等比对齐 → 一次 MKL 浮点光色匹配与蒙版融合
+→ 整图编辑（按开启项修发、设计人物与环境光照）→ 必要时一次模型超分
+→ SAM3.1 原片整头；修发开启时另提取脸/耳/头饰保留区
+→ SIFT 整体等比对齐 → MKL 仿色或已开启的空间光照迁移 → 一次浮点蒙版融合
 → 可选整图明度曲线 → 16 位 PNG 与 JPEG
 ```
 
 唯一单张入口是 `scripts/photo_pipeline.py` 的 `finish_photo`。桌面与 CLI 批量使用 `finish_batch`，
 HTTP 单张调用前者，批量调用后者；没有并列的贴脸、全身覆盖、单独背景或人工替代路径。
 样片仍逐张使用同一个 `finish_photo`；对话只整理创作意图，试样由用户主动发起，风格定稿属于用户创作决定，不是成片质量审批。
-选中方向不再次规划，单张据构图和原片受光细化。生成身体、实物服装和环境保留整体空间受光，
-只将原片脸、头发、头饰融合回去。提示词要求保持服装结构，模型仍可能改变衣物细节。
+选中方向不再次规划，单张据构图与定稿设置细化。生成身体、实物服装和环境保留整体空间受光；默认回贴原片整头，
+修发开启时保留原片脸部、耳朵与头饰并使用生成头发。提示词要求保持服装结构，模型仍可能改变衣物细节。
 
 | 环节 | 当前行为与实际限制 |
 | --- | --- |
 | 原片 | Qt 或 rawpy/LibRaw 解码为浮点 sRGB 并校正朝向；原片只读，成片另存 |
 | 生图 | 发送完整画面的 sRGB JPEG，默认输入长边最多 1536，`image.input_max_edge` 可调整；只整图编辑一次 |
 | 超分与尺寸 | 仅一次配置模型，之后只裁切或下采样；覆盖不足使用实际范围并记录，不循环超分或插值扩大交付尺寸 |
-| 头部定位与分割 | LLM 选择一个主体头部；SAM3.1 在原片裁片识别头部、头发、头饰并取同次返回并集；分析默认长边最多 2048，节点内部 1008×1008；不是精细透明度抠图 |
+| 头部定位与分割 | LLM 选择一个主体头部，修发时另列这张原片的具体头饰英文名；SAM3.1 同次请求分别识别整头、脸/耳与列出的头饰；分析默认长边最多 2048，节点内部 1008×1008；不是精细透明度抠图 |
 | 几何 | SIFT 纹理匹配后只拟合一个等比缩放、旋转和平移，不局部变形或非均匀塑脸；纹理不足、头部姿态改变时可能失败或偏移 |
-| 采样与融合 | 原片 RGB 与蒙版预乘后使用同一 Lanczos 变换采样一次；蒙版内部一次 MKL 匹配，float32 RGB 合成；不模糊或生成式重绘脸部 |
-| 光与边界 | MKL 不能重造方向不同的空间光，源头受光相容依赖生图；头发和半透明头纱可能留下接缝或背景色 |
+| 采样与融合 | 原片 RGB 与蒙版预乘后使用同一 Lanczos 变换采样一次；默认一次 MKL，重打光开启时替换为线性 RGB 空间光照迁移，float32 合成；不对原片脸部几何做局部变形 |
+| 光与边界 | MKL 只能做整体光色匹配；可选光照迁移使用最多 768 像素长边的 float32 光照估计，不作为回贴素材，原片高频纹理保留；不能保证消除硬阴影，头发和半透明头纱仍可能留下接缝 |
 | 明度曲线 | 单调三次插值调整整图明度，默认关闭；纯黑按黑点映射中性灰，其余保持 RGB 比例；不提供空间重打光 |
 | 精度 | 原片与 MKL 保持浮点，保存带 sRGB 配置的 16 位 PNG；服务图片和分割蒙版传输为 8 位，16 位保存不能恢复丢失精度，超分纹理不等于相机原生细节 |
 
@@ -516,7 +538,7 @@ LLM 不保证每张都定位正确或符合审美；镜中清晰正脸是主体�
 | 服务配置引导与核对 | `scripts/service_settings.py` |
 | 上游模型下载入口、安装位置与命令 | `scripts/model_downloads.py` |
 | 共享照片画布与显示组件 | `scripts/studio_widgets.py` |
-| 对话、试样与用户定稿 | `scripts/creative_workspace.py` |
+| 对话、试样与用户定稿，可选修发与光照要求 | `scripts/creative_workspace.py`、`scripts/creative_edits.py` |
 | 当前与已有批次的成片浏览 | `scripts/batch_results.py` |
 | 项目作品、版本选择与交付复制 | `scripts/delivery_view.py`、`scripts/delivery_store.py` |
 | CLI 与 HTTP 入口 | `scripts/project_cli.py`、`scripts/backend_server.py` |

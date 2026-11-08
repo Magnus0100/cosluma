@@ -13,6 +13,7 @@ import uuid
 from image_io import apply_tone_curve, fit_generated, open_photo, open_rgb, save_image, save_jpeg, save_json
 from model_clients import edit_image, plan_photos, superresolve, write_prompt
 from head_composite import restore_head
+from creative_edits import normalise_edits, edits_match
 
 
 def _requested_size(source_size, config, explicit):
@@ -30,13 +31,20 @@ def _covered_size(requested, available):
 
 
 def finish_photo(source, character, root, config, *, brief='', size=None, generated=None,
-        superresolved=None, art_direction=None, progress=None):
+        superresolved=None, art_direction=None, edits=None, progress=None):
     report = progress or (lambda message: None)
+    if art_direction is not None:
+        chosen_edits = normalise_edits(art_direction.get('edits'))
+        if edits is not None and not edits_match(edits,chosen_edits):
+            raise ValueError('修发或人物重打光设置与摄影方向不同，请按当前设置重新试样定稿')
+        edits = chosen_edits
+    else:
+        edits = normalise_edits(edits)
     source = Path(source).expanduser().resolve()
     directory = Path(root).expanduser().resolve() / (source.stem+'-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
     record = {'source':str(source),'character':character,'brief':brief,'directory':str(directory),
-        'status':'running','stage':'decode','files':{},'sr':[]}
+        'status':'running','stage':'decode','files':{},'sr':[],'edits':edits}
     def stage(name):
         record['stage'] = name
         save_json(directory/'run.json',record)
@@ -50,7 +58,7 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         record['requested_dimensions'] = list(requested)
         if generated is None and art_direction is None:
             stage('设计场景与光色方向')
-            art_direction = plan_photos([source],character,brief,config['prompt_library'],config['llm'],directory)
+            art_direction = plan_photos([source],character,brief,config['prompt_library'],config['llm'],directory,edits=edits)
         if art_direction is not None:
             save_json(directory/'art-direction.json',art_direction)
             record['direction'] = art_direction['direction']
@@ -59,9 +67,11 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         description = write_prompt(source_image,character,brief,library,config['llm'],directory,
             direction=art_direction['direction'] if art_direction is not None else '',
             style_reference=art_direction.get('style_reference') if art_direction is not None else None,
-            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '')
+            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',edits=edits)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
+        if edits['hair']:
+            record['headwear'] = description['headwear']
         prompt_path = directory/'prompt.txt'
         prompt_path.write_text(prompt,encoding='utf-8')
         record['files']['prompt'] = str(prompt_path)
@@ -94,9 +104,10 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             record['output_adjustment'] = 'single-pass SR coverage'
             report(f'请求 {requested[0]}×{requested[1]}，实际输出 {output_size[0]}×{output_size[1]}')
         stage('准备原片整头')
-        final,record['head'] = restore_head(source_image,frame,record['head_box'],config,directory,stage)
+        final,record['head'] = restore_head(source_image,frame,record['head_box'],config,directory,stage,
+            edits=edits,headwear=record.get('headwear',()))
         del source_image
-        record['head_blending'] = 'whole-head SIFT similarity; one MKL; float32 alpha composite'
+        record['head_blending'] = record['head']['method']
         if config.get('finish_curve'):
             stage('调整整图明度层次')
             final = apply_tone_curve(final, config['finish_curve'])
@@ -187,9 +198,10 @@ def _reuse_style_sample(selected, directory):
 
 
 def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
-        progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None):
+        progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None, edits=None):
     """Render three real styles through finish_photo, once per option."""
     report = progress or (lambda message: None)
+    edits = normalise_edits(edits)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
     sample_source = Path(sample_source).expanduser().resolve()
     if sample_source not in sources:
@@ -197,7 +209,7 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     directory = Path(root).expanduser().resolve()/('styles-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
     state = {'status':'planning','sample_source':str(sample_source),'sources':[str(source) for source in sources],
-        'character':character,'brief':brief,'creative_direction':creative_direction,'options':{},
+        'character':character,'brief':brief,'creative_direction':creative_direction,'edits':edits,'options':{},
         'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
     if discussion is not None:
         state['discussion'] = discussion
@@ -208,7 +220,7 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     try:
         represented = [sample_source] + [source for source in sources if source != sample_source]
         plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,
-            option_count=3,creative_direction=creative_direction,discussion=discussion)
+            option_count=3,creative_direction=creative_direction,discussion=discussion,edits=edits)
     except Exception as error:
         message = getattr(error,'provider_message','') or str(error)
         state.update(status='failed',error=message)
@@ -275,27 +287,34 @@ def load_style(path):
 
 
 def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None,
-        progress=None, photo_progress=None, batch_started=None, style=None):
+        progress=None, photo_progress=None, batch_started=None, style=None, edits=None):
     """Run independent photos through finish_photo; each photo is attempted once."""
     report = progress or (lambda message: None)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
     if not sources:
         raise ValueError('No photographs were selected')
     selected = load_style(style) if style is not None else None
+    if selected is not None:
+        chosen_edits = normalise_edits(selected['art_direction'].get('edits'))
+        if edits is not None and not edits_match(edits,chosen_edits):
+            raise ValueError('修发或人物重打光设置与定稿样片不同，请按当前设置重新试样定稿')
+        edits = chosen_edits
+    else:
+        edits = normalise_edits(edits)
     if selected is not None and (selected['result']['character'] != character or selected['result']['brief'] != brief):
         raise ValueError('角色或补充要求与所选样片不同，请按当前要求生成样片后选择')
     names = Counter(source.stem.casefold() for source in sources)
     directory = Path(root).expanduser().resolve()/('batch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
     state = {'status':'running','stage':'设计整组场景与光色方向','total':len(sources),'sources':[str(source) for source in sources],
-        'character':character,'brief':brief,'items':{}}
+        'character':character,'brief':brief,'edits':edits,'items':{}}
     save_json(directory/'batch.json',state)
     if batch_started is not None:
         batch_started(str(directory))
     if selected is None:
         report('设计整组场景与光色方向')
         try:
-            art_direction = plan_photos(sources,character,brief,config['prompt_library'],config['llm'],directory)
+            art_direction = plan_photos(sources,character,brief,config['prompt_library'],config['llm'],directory,edits=edits)
         except Exception as error:
             message = getattr(error,'provider_message','') or str(error)
             state.update(status='failed',error=message)
