@@ -60,13 +60,18 @@ class Project:
             raise ValueError('项目的工作页面记录错误')
         return cls(path, data)
 
-    def save(self, workspace, creative, batches):
+    def save(self, workspace, creative, batches, *, delivery=None):
         values = {'workspace':workspace, 'creative':creative, 'batches':batches}
-        if all(self.data[key] == value for key, value in values.items()):
+        if delivery is not None:
+            values['delivery'] = delivery
+        if all(self.data.get(key) == value for key, value in values.items()):
             return
         updated = {**self.data, **deepcopy(values), 'updated_at':timestamp()}
         save_json(self.path, updated)
         self.data = updated
+
+    def save_delivery(self, delivery):
+        self.save(self.data['workspace'],self.data['creative'],self.data['batches'],delivery=delivery)
 
     def rename(self, name):
         name = name.strip()

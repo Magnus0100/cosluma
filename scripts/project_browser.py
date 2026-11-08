@@ -246,7 +246,10 @@ class ProjectBrowser(QWidget):
         state = project.data['workspace']
         complete = sum(item['status'] == 'complete' for item in state['results'])
         self.title.setText(project.data['name'])
-        self.info.setText((state.get('character') or '角色待填写')+f' · {len(state["sources"])} 张原片 · {complete} 张已有成片 · {len(project.data["batches"])} 个批次\n'+str(project.path.parent))
+        delivery = project.data.get('delivery',{})
+        included = sum(choice['included'] for choice in delivery.get('choices',{}).values())
+        delivery_info = f'\n已选交付 {included} 张 · 已导出 {len(delivery.get("exports",[]))} 次' if delivery else ''
+        self.info.setText((state.get('character') or '角色待填写')+f' · {len(state["sources"])} 张原片 · {complete} 张已有成片 · {len(project.data["batches"])} 个批次'+delivery_info+'\n'+str(project.path.parent))
         representative = state.get('representative_source')
         source = representative or next(iter(state['sources']), None)
         result = next((item for item in state['results'] if item['source'] == source and item['status'] == 'complete'), None)

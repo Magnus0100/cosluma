@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QLi
     QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from studio_widgets import PhotoPreview, ui_label
+from delivery_store import result_path
 
 
 class BatchResults(QWidget):
@@ -118,18 +119,7 @@ class BatchResults(QWidget):
 
     def saved_path(self, result, value):
         """Rebase batch-owned files when their complete batch folder has moved."""
-        if not value:
-            return None
-        path = Path(value)
-        if not path.is_absolute():
-            return str(self.directory/path)
-        previous = result.get('batch_directory')
-        if previous:
-            try:
-                return str(self.directory/path.relative_to(Path(previous)))
-            except ValueError:
-                pass
-        return str(path)
+        return result_path(self.directory,result,value)
 
     def row_text(self, source):
         result = self.items.get(source,{})

@@ -22,6 +22,7 @@ from app_version import VERSION
 from studio_widgets import apply_theme, ui_label, PhotoPreview
 from creative_workspace import CreativeWorkspace
 from batch_results import BatchResults
+from delivery_view import DeliveryView
 from beauty_editor import BeautyConnection, BeautyEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos
@@ -156,6 +157,8 @@ class Workbench(QMainWindow):
         self.current_batch_view = None
         self.archive_view = None
         self.beauty_editor = None
+        self.delivery_view = None
+        self.beauty_return_delivery = False
         self.chosen_preview_key = None
         self.restored_page = 0
         self.close_after_finish = False
@@ -432,6 +435,10 @@ class Workbench(QMainWindow):
         results_header = QHBoxLayout()
         self.results_caption = ui_label('本次制作', 'heading')
         results_header.addWidget(self.results_caption, 1)
+        self.delivery_button = QPushButton('项目作品 / 交付')
+        self.delivery_button.setProperty('kind','quiet')
+        self.delivery_button.clicked.connect(self.show_delivery)
+        results_header.addWidget(self.delivery_button)
         self.return_current = QPushButton('回到本次制作')
         self.return_current.setProperty('kind', 'quiet')
         self.return_current.clicked.connect(self.show_current_batch)
@@ -703,6 +710,9 @@ class Workbench(QMainWindow):
             if not self.beauty_editor.save_draft():
                 self.status.setText(self.beauty_editor.message.text())
                 return False
+        if self.delivery_view is not None and not self.delivery_view.save_state():
+            self.status.setText(self.delivery_view.message.toPlainText())
+            return False
         return self.save_workspace()
 
     def activate_project(self, project):
@@ -713,11 +723,13 @@ class Workbench(QMainWindow):
             self.creative_layout.removeWidget(self.creative_workspace)
             self.creative_workspace.deleteLater()
             self.creative_workspace = None
-        for view in (self.current_batch_view, self.archive_view, self.beauty_editor):
+        for view in (self.current_batch_view, self.archive_view, self.beauty_editor,self.delivery_view):
             if view is not None:
                 self.result_views.removeWidget(view)
                 view.deleteLater()
         self.current_batch_view = self.archive_view = self.beauty_editor = None
+        self.delivery_view = None
+        self.beauty_return_delivery = False
         self.result_views.setCurrentWidget(self.results_empty)
         self.creative_context = self.style_context = None
         self.style_samples_context = self.style_discussion_context = None
@@ -745,6 +757,9 @@ class Workbench(QMainWindow):
         self.refresh_batch_menu()
         remember_project(self.preferences, project)
         self.refresh_projects()
+        if project.data['workspace'].get('results_view')=='delivery':
+            self.ensure_delivery()
+            self.result_views.setCurrentWidget(self.delivery_view)
         self.navigate(self.restored_page)
         if (not Path(self.config.text()).expanduser().is_file() and not self.sources and not self.last_batch_directory
                 and not self.preferences.value('setup_deferred', False, type=bool)):
@@ -799,6 +814,8 @@ class Workbench(QMainWindow):
             'selection_brief':self.selection_brief.text(),'photo_selection':self.photo_selection,
             'photo_selection_directory':self.photo_selection_directory,'photo_selection_error':self.photo_selection_error,
             'page':self.pages.currentIndex() if self.pages.currentIndex() in (0, 1, 2) else self.restored_page,
+            'results_view':'delivery' if self.result_views.currentWidget() is self.delivery_view or
+                (self.result_views.currentWidget() is self.beauty_editor and self.beauty_return_delivery) else 'batch',
             'selected_source':self.sources[row] if 0<=row<len(self.sources) else None,
             'results':[{name:result[name] for name in fields if name in result} for result in self.results.values()],
             'stages':self.stages,'photo_errors':self.photo_errors,
@@ -1301,6 +1318,11 @@ class Workbench(QMainWindow):
         self.update_selection_summary()
         if self.creative_workspace is not None:
             self.creative_workspace.set_production_busy(self.worker is not None or choosing or
+                (self.delivery_view is not None and self.delivery_view.is_busy()) or
+                (self.beauty_editor is not None and self.beauty_editor.is_busy()))
+        if self.delivery_view is not None:
+            self.delivery_view.set_production_busy(self.worker is not None or choosing or
+                (self.creative_workspace is not None and self.creative_workspace.is_busy()) or
                 (self.beauty_editor is not None and self.beauty_editor.is_busy()))
         included = self.included_sources()
         has_photos = bool(included)
@@ -1329,6 +1351,8 @@ class Workbench(QMainWindow):
             next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
         elif self.beauty_editor is not None and self.beauty_editor.is_busy():
             next_step = '正在处理可选人脸美化，可切页查看已有照片。'
+        elif self.delivery_view is not None and self.delivery_view.is_busy():
+            next_step = '正在复制所选版本到交付文件夹，可切页查看已有照片。'
         elif not has_photos:
             next_step = '先勾选要制作的照片，或让 Agent 从已导入照片中选片。' if self.sources else '先在照片页批量导入原片。'
         elif not has_character:
@@ -1377,11 +1401,15 @@ class Workbench(QMainWindow):
         view = self.result_views.currentWidget()
         archived = self.archive_view is not None and view is self.archive_view
         beautifying = view is self.beauty_editor and self.beauty_editor is not None
-        self.return_current.setVisible(archived)
-        self.decision_bar.setVisible(not (archived or beautifying))
-        self.readiness.setVisible(not (archived or beautifying))
+        delivering = self.delivery_view is not None and view is self.delivery_view
+        self.return_current.setVisible(archived or delivering)
+        self.decision_bar.setVisible(not (archived or beautifying or delivering))
+        self.readiness.setVisible(not (archived or beautifying or delivering))
+        self.delivery_button.setEnabled(has_project)
+        self.delivery_button.setVisible(not delivering)
+        self.open_folder_button.setVisible(not delivering)
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
-        self.results_caption.setText('成片后的可选人脸美化' if beautifying else
+        self.results_caption.setText('项目作品 · 选择版本与交付' if delivering else '成片后的可选人脸美化' if beautifying else
             '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
     def dragEnterEvent(self, event):
@@ -1578,6 +1606,8 @@ class Workbench(QMainWindow):
         self.status.setText(summary + (' 点击失败照片可查看具体原因。' if worker.errors else ''))
         if self.current_batch_view is not None:
             self.current_batch_view.refresh()
+        if self.delivery_view is not None:
+            self.delivery_view.refresh()
         self.update_actions()
         self.show_selected()
         self.save_workspace()
@@ -1642,7 +1672,7 @@ class Workbench(QMainWindow):
                 QApplication.instance().setQuitOnLastWindowClosed(False)
                 self.tray.show()
                 self.hide()
-                self.tray.showMessage('CosLuma 继续处理', '导入、选片、制作与美化会继续处理并保存草稿。点击托盘返回；保持托盘时处理结束后退出。')
+                self.tray.showMessage('CosLuma 继续处理', '导入、选片、制作、美化与交付导出会继续处理并保存。点击托盘返回；保持托盘时处理结束后退出。')
             else:
                 self.status.setText('仍在处理中，可以最小化等待；完成后可关闭。')
                 self.showMinimized()
@@ -1782,14 +1812,15 @@ class Workbench(QMainWindow):
         return view
 
     def open_beauty(self, context):
-        if self.beauty_editor is not None:
-            if self.beauty_editor.context['directory']==context['directory']:
-                self.result_views.setCurrentWidget(self.beauty_editor)
-                self.navigate(2)
-                return
-            if self.beauty_editor.is_busy():
-                self.status.setText('当前照片正在美化，处理结束后可切换另一张。')
-                return
+        same_editor = self.beauty_editor is not None and self.beauty_editor.context['directory']==context['directory']
+        if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
+            self.status.setText('当前项目仍在处理中，结束后可打开另一张照片的人脸美化。')
+            return
+        if same_editor:
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
+            self.result_views.setCurrentWidget(self.beauty_editor)
+            self.navigate(2)
+            return
         try:
             config = load_settings(self.config.text())
             if 'beauty' not in config:
@@ -1806,6 +1837,7 @@ class Workbench(QMainWindow):
                 self.result_views.removeWidget(self.beauty_editor)
                 self.beauty_editor.deleteLater()
             self.beauty_editor = editor
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
             self.result_views.addWidget(editor)
             self.result_views.setCurrentWidget(editor)
             self.navigate(2)
@@ -1827,6 +1859,9 @@ class Workbench(QMainWindow):
         self.finish_background_work()
 
     def return_from_beauty(self):
+        if self.beauty_return_delivery:
+            self.show_delivery()
+            return
         context = self.beauty_editor.context
         self.show_saved_batch(context['batch_directory'])
 
@@ -1839,9 +1874,33 @@ class Workbench(QMainWindow):
         self.result_views.setCurrentWidget(self.current_batch_view or self.results_empty)
         self.navigate(2)
 
+    def ensure_delivery(self):
+        if self.delivery_view is None:
+            self.delivery_view = DeliveryView(self.project,self.result_views)
+            self.delivery_view.beauty_requested.connect(self.open_beauty)
+            self.delivery_view.state_changed.connect(self.update_actions)
+            self.delivery_view.busy_changed.connect(self.delivery_busy_changed)
+            self.result_views.addWidget(self.delivery_view)
+
+    def show_delivery(self):
+        if self.project is None:
+            self.show_projects()
+            return
+        if self.delivery_view is None:
+            self.ensure_delivery()
+        else:
+            self.delivery_view.refresh()
+        self.result_views.setCurrentWidget(self.delivery_view)
+        self.navigate(2)
+
+    def delivery_busy_changed(self):
+        self.update_actions()
+        self.finish_background_work()
+
 
     def work_in_progress(self):
         return (self.worker is not None or self.import_worker is not None or self.selection_worker is not None or
+            (self.delivery_view is not None and self.delivery_view.is_busy()) or
             (self.beauty_editor is not None and self.beauty_editor.is_busy()) or
             (self.creative_workspace is not None and self.creative_workspace.is_busy()))
 

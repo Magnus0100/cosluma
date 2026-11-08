@@ -89,6 +89,10 @@ def apply_theme(app):
         QTableWidget, QListWidget { background: #ffffff; border: 1px solid #d5e0e9; border-radius: 10px; gridline-color: #e9eef3; outline: 0; }
         QTableWidget::item, QListWidget::item { padding: 9px; border: none; }
         QTableWidget::item:selected, QListWidget::item:selected { background: #e3edf6; color: #234b6e; }
+        QListWidget#deliverySheet { background: #f7f9fb; padding: 6px; }
+        QListWidget#deliverySheet::item { background: #ffffff; border: 1px solid transparent; border-radius: 8px; padding: 6px; }
+        QListWidget#deliverySheet::item:hover { border-color: #b7c9d8; }
+        QListWidget#deliverySheet::item:selected { background: #e3edf6; border-color: #7c9db9; }
         QListWidget#setupSteps { background: transparent; border: none; border-radius: 0; }
         QListWidget#setupSteps::item { padding: 14px 10px; border-left: 3px solid transparent; }
         QListWidget#setupSteps::item:selected { background: #e3edf6; border-left-color: #315f87; color: #234b6e; }
