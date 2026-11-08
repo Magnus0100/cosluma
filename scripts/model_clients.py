@@ -242,6 +242,8 @@ def _discussion_messages(conversation):
             context = row['context']
             anchors = {key:context[key] for key in ('label','viewed_source','viewed_sample',
                 'view_mode','next_sample_source','selected_sample')}
+            if 'viewed_samples' in context:
+                anchors['viewed_samples'] = context['viewed_samples']
             anchors['samples'] = [{key:sample[key] for key in ('id','label','source','status')} for sample in context['samples']]
             content = '本条消息发送时的讨论对象（之后切换画面不改变此指代）：\n'+json.dumps(anchors,ensure_ascii=False)+'\n用户原文：\n'+content
         messages.append({'role':row['role'],'content':content})
@@ -253,6 +255,7 @@ def _discussion_image_ids(context, conversation):
     for row in conversation:
         if row['role']=='user' and row.get('status')!='failed' and 'context' in row:
             ids.update((row['context']['viewed_sample'],row['context']['selected_sample']))
+            ids.update(row['context'].get('viewed_samples',[]))
     return ids
 
 
@@ -283,7 +286,9 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '用户可以提想法、问问题、比较样片并修改要求；需要关键的角色信息时简短提问，不懂的角色设定不要编造。'
         '已定稿样片可能来自先前轮次，与本轮候选分开理解；用户查看或比较其他候选不代表更换定稿。'
         '每条用户消息附有发送当时的画面对象、轮次、样片 ID 与实际预览模式；“这张”“第二张”按那条消息的上下文理解，'
-        '不能把历史轮次的方案编号套到当前轮次。原片、成片和并排查看要分清；本次附图均有素材或样片 ID。'
+        '不能把历史轮次的方案编号套到当前轮次。原片、成片、原片与成片并排、三个样片并排要分清；本次附图均有素材或样片 ID。'
+        'view_mode 为 samples 时，用户同时查看该轮三个位置的样片；viewed_samples 列出已完成的可见样片 ID，'
+        'viewed_sample 为空，不把其中一个默认为用户当前选中或采纳的方案。'
         'has_image 表示本次是否提供该样片实图；未附图的历史候选只有已有方向资料，不声称观察过未提供的画面细节。'
         '不提供固定风格菜单，不预设三个场景，不把提示词目录标题凑成候选。'
         '回复具体说明适合这组素材的场景、色彩、情绪与光感；有样片时应针对实际画面交流，分清原片和样片编号。'

@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, 
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QTextDocument
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
-    QVBoxLayout, QWidget)
+    QSizePolicy, QVBoxLayout, QWidget)
 
 from image_io import open_display
 
@@ -322,6 +322,7 @@ class ConversationView(QScrollArea):
 
 class PhotoCanvas(QGraphicsView):
     zoom_changed = Signal()
+    pan_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -390,6 +391,11 @@ class PhotoCanvas(QGraphicsView):
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if event.buttons() & Qt.LeftButton and not self.photo.pixmap().isNull():
+            self.pan_changed.emit()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_0:
@@ -638,4 +644,183 @@ class PhotoPreview(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         QTimer.singleShot(0, self.update_preview)
+
+
+class SampleComparison(QWidget):
+    """Compare one round's three real samples with shared viewing controls."""
+    inspect_requested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.keys = {}
+        self.images = {}
+        self.loader = None
+        self.syncing = False
+        self.views, self.titles, self.stages, self.inspect_buttons = [], [], [], []
+        self.load_timer = QTimer(self)
+        self.load_timer.setSingleShot(True)
+        self.load_timer.setInterval(80)
+        self.load_timer.timeout.connect(self.load_pending)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for index in range(3):
+            column = QVBoxLayout()
+            column.setSpacing(6)
+            title = ui_label(f'方案 {index+1}','heading')
+            title.setWordWrap(True)
+            title.setFixedHeight(40)
+            title.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
+            column.addWidget(title)
+            view = PhotoCanvas()
+            view.setMinimumHeight(100)
+            column.addWidget(view,1)
+            stage = ui_label('尚未生成')
+            stage.setFixedHeight(32)
+            stage.setWordWrap(True)
+            stage.setSizePolicy(title.sizePolicy())
+            column.addWidget(stage)
+            inspect = QToolButton()
+            inspect.setProperty('kind','quiet')
+            inspect.setText('单独查看')
+            inspect.setEnabled(False)
+            inspect.clicked.connect(lambda _checked=False,index=index:self.inspect_requested.emit(index))
+            column.addWidget(inspect)
+            row.addLayout(column,1)
+            self.views.append(view)
+            self.titles.append(title)
+            self.stages.append(stage)
+            self.inspect_buttons.append(inspect)
+            view.zoom_changed.connect(lambda view=view:self.synchronize(view,zoom=True))
+            view.pan_changed.connect(lambda view=view:self.synchronize(view,zoom=False))
+        layout.addLayout(row,1)
+        tools = QHBoxLayout()
+        self.zoom_label = ui_label('滚轮缩放，拖动查看')
+        self.zoom_label.setSizePolicy(self.titles[0].sizePolicy())
+        tools.addWidget(self.zoom_label,1)
+        self.linked = QToolButton()
+        self.linked.setText('联动查看')
+        self.linked.setCheckable(True)
+        self.linked.setChecked(True)
+        self.linked.setToolTip('同步缩放和查看位置；适应窗口时各自显示完整画面')
+        self.linked.toggled.connect(self.link_views)
+        tools.addWidget(self.linked)
+        for text,action in (('适应窗口','fit_photo'),('100%','actual_size')):
+            button = QToolButton()
+            button.setProperty('kind','quiet')
+            button.setText(text)
+            button.clicked.connect(lambda _checked=False,action=action:self.zoom_views(action))
+            tools.addWidget(button)
+        layout.addLayout(tools)
+
+    def set_samples(self, options, plans, stages):
+        keys, images = {}, {}
+        self.syncing = True
+        for index,view in enumerate(self.views):
+            option = options.get(index)
+            plan = plans[index] if index<len(plans) else None
+            description = option or plan
+            self.titles[index].setText(f'方案 {index+1}'+(' · '+description['title'] if description else ''))
+            self.titles[index].setToolTip(description['summary'] if description else '')
+            self.inspect_buttons[index].setEnabled(option is not None)
+            status = stages[index]
+            self.stages[index].setText(status)
+            self.stages[index].setToolTip(status)
+            if option is None or option['status']!='complete':
+                view.setText('样片失败\n'+option['error'] if option is not None else status)
+                continue
+            path = option['result']['files']['jpeg']
+            try:
+                key = (str(path),Path(path).stat().st_mtime_ns,True)
+            except OSError as error:
+                view.setText('读取样片失败\n'+str(error))
+                continue
+            keys[index] = key
+            pixels = self.images.get(index) if self.keys.get(index)==key else PhotoPreview.cache.get(key)
+            if pixels is not None:
+                images[index] = pixels
+                view.setPixmap(pixels)
+            elif key in PhotoPreview.errors:
+                view.setText('读取样片失败\n'+PhotoPreview.errors[key])
+            else:
+                view.setText('正在读取样片…')
+        self.keys, self.images = keys, images
+        self.syncing = False
+        self.update_zoom_label()
+        self.load_timer.start()
+
+    def load_pending(self):
+        if self.loader is not None:
+            return
+        missing = list(dict.fromkeys(key for index,key in self.keys.items()
+            if index not in self.images and key not in PhotoPreview.errors))
+        if missing:
+            self.loader = PreviewLoader(missing)
+            self.loader.signals.loaded.connect(self.previews_loaded)
+            QThreadPool.globalInstance().start(self.loader)
+
+    @Slot(object)
+    def previews_loaded(self, images):
+        self.loader = None
+        self.syncing = True
+        for key,(image,error) in images.items():
+            pixels = QPixmap.fromImage(image) if image is not None else None
+            PhotoPreview.cache[key] = pixels
+            if error:
+                PhotoPreview.errors[key] = error
+            for index,current in self.keys.items():
+                if current==key:
+                    if pixels is not None:
+                        self.images[index] = pixels
+                        self.views[index].setPixmap(pixels)
+                    else:
+                        self.views[index].setText('读取样片失败\n'+error)
+        while len(PhotoPreview.cache)>6:
+            removed = next(iter(PhotoPreview.cache))
+            PhotoPreview.cache.pop(removed)
+            PhotoPreview.errors.pop(removed,None)
+        self.syncing = False
+        self.update_zoom_label()
+        self.load_pending()
+
+    def synchronize(self, source, *, zoom):
+        if self.syncing:
+            return
+        if not self.linked.isChecked() or source.photo.pixmap().isNull():
+            self.update_zoom_label()
+            return
+        center = source.mapToScene(source.viewport().rect().center())
+        pixels = source.photo.pixmap()
+        x,y = center.x()/pixels.width(),center.y()/pixels.height()
+        self.syncing = True
+        for view in self.views:
+            if view is source or view.photo.pixmap().isNull():
+                continue
+            if zoom and source.fitting:
+                view.fit_photo()
+            else:
+                if zoom:
+                    view.set_zoom(source.transform().m11())
+                view.centerOn(x*view.photo.pixmap().width(),y*view.photo.pixmap().height())
+        self.syncing = False
+        self.update_zoom_label()
+
+    def link_views(self, linked):
+        if linked:
+            source = next((view for view in self.views if not view.photo.pixmap().isNull()),None)
+            if source is not None:
+                self.synchronize(source,zoom=True)
+
+    def zoom_views(self, action):
+        self.syncing = True
+        for view in self.views:
+            getattr(view,action)()
+        self.syncing = False
+        self.update_zoom_label()
+
+    def update_zoom_label(self):
+        zooms = [f'{view.transform().m11()*view.devicePixelRatioF():.0%}' for view in self.views
+            if not view.photo.pixmap().isNull()]
+        self.zoom_label.setText(' / '.join(zooms) if zooms else '滚轮缩放，拖动查看')
 
