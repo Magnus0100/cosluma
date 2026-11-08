@@ -7,9 +7,9 @@ from urllib.parse import urlsplit
 
 from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
-    QVBoxLayout, QWidget)
+    QScrollArea, QVBoxLayout, QWidget)
 
 from face_beauty import (BEAUTY_DEFAULTS, BeautyParameters, BeautySession,
     prepare_face, prepare_skin, render_beauty, save_beauty)
@@ -152,8 +152,6 @@ class BeautyEditor(QWidget):
         splitter.addWidget(self.preview)
         panel = QFrame()
         panel.setProperty('role','panel')
-        panel.setMinimumWidth(250)
-        panel.setMaximumWidth(310)
         controls = QVBoxLayout(panel)
         controls.setContentsMargins(18,18,18,18)
         controls.setSpacing(14)
@@ -175,6 +173,15 @@ class BeautyEditor(QWidget):
             slider.valueChanged.connect(self.parameters_changed)
             self.sliders[key],self.values[key] = slider,value
             controls.addWidget(slider)
+            if key=='skin':
+                self.protect_features = QCheckBox('美肤保护五官')
+                self.protect_features.setChecked(True)
+                self.protect_features.setToolTip('开启时仅调整皮肤，保留眼睛、眉毛与嘴唇；关闭后允许模型调整这些部位。瘦脸仍固定五官位置。')
+                self.protect_features.toggled.connect(self.parameters_changed)
+                controls.addWidget(self.protect_features)
+                explanation = ui_label('关闭后允许美肤调整眼睛、眉毛和嘴唇；切换复用当前基础。')
+                explanation.setWordWrap(True)
+                controls.addWidget(explanation)
         self.skin_button = QPushButton('生成美肤基础')
         self.skin_button.setEnabled(False)
         self.skin_button.clicked.connect(lambda:self.start('skin'))
@@ -201,7 +208,12 @@ class BeautyEditor(QWidget):
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(lambda:self.start('save'))
         controls.addWidget(self.save_button)
-        splitter.addWidget(panel)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(270)
+        scroll.setMaximumWidth(330)
+        scroll.setWidget(panel)
+        splitter.addWidget(scroll)
         splitter.setSizes([900,280])
         layout.addWidget(splitter,1)
         self.message = ui_label('正在准备主体人脸，原成片保持可查看。')
@@ -214,7 +226,8 @@ class BeautyEditor(QWidget):
         return self.worker is not None
 
     def parameters(self):
-        return BeautyParameters(*(self.sliders[key].value()/100 for key in ('skin','slim')))
+        return BeautyParameters(skin=self.sliders['skin'].value()/100,
+            slim=self.sliders['slim'].value()/100,protect_features=self.protect_features.isChecked())
 
     def restore_or_prepare(self):
         path = Path(self.context['directory'])/'beauty-session.json'
@@ -294,9 +307,12 @@ class BeautyEditor(QWidget):
             self.sliders[key].setValue(round(getattr(parameters,key)*100))
             self.sliders[key].blockSignals(False)
             self.values[key].setText(str(self.sliders[key].value()))
+        self.protect_features.blockSignals(True)
+        self.protect_features.setChecked(parameters.protect_features)
+        self.protect_features.blockSignals(False)
 
     def reset_parameters(self):
-        self.set_parameters(BeautyParameters())
+        self.set_parameters(BeautyParameters(protect_features=self.protect_features.isChecked()))
         self.parameters_changed()
 
     def open_raw(self):
@@ -325,7 +341,8 @@ class BeautyEditor(QWidget):
         try:
             parameters = self.parameters()
             save_json(Path(self.context['directory'])/'beauty-session.json',
-                {'session':self.session.directory.name,'parameters':{'skin':parameters.skin,'slim':parameters.slim}})
+                {'session':self.session.directory.name,'parameters':{'skin':parameters.skin,'slim':parameters.slim,
+                    'protect_features':parameters.protect_features}})
         except OSError as error:
             self.message.setText('保存美化草稿失败：'+str(error))
 
@@ -334,6 +351,7 @@ class BeautyEditor(QWidget):
         rendering = busy and self.worker.phase == 'render'
         self.sliders['slim'].setEnabled(self.session is not None and (not busy or rendering))
         self.sliders['skin'].setEnabled(self.session is not None and self.session.delta is not None and (not busy or rendering))
+        self.protect_features.setEnabled(self.session is not None and self.session.delta is not None and (not busy or rendering))
         self.skin_button.setEnabled(self.session is not None and not busy)
         self.skin_button.setText('重新生成美肤基础' if self.session is not None and self.session.delta is not None else '生成美肤基础')
         self.raw_button.setEnabled(self.session is not None and self.session.delta is not None)

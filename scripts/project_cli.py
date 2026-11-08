@@ -40,6 +40,8 @@ def main(argv=None):
     beauty.add_argument('--run',type=Path,required=True,help='completed photograph run.json')
     beauty.add_argument('--skin',type=float,default=0.0,help='skin strength, 0 to 1')
     beauty.add_argument('--slim',type=float,default=0.0,help='slimming strength, 0 to 1')
+    beauty.add_argument('--protect-features',action=argparse.BooleanOptionalAction,default=True,
+        help='preserve eyes, brows and lips during skin retouching; enabled by default')
     beauty.add_argument('--session',type=Path,help='reuse this photograph\'s saved beauty session')
     for child in (finish, compose, samples):
         child.add_argument('--brief', default='')
@@ -49,7 +51,7 @@ def main(argv=None):
     progress = lambda message: print(message, file=sys.stderr, flush=True)
     if args.command=='beautify':
         result = beautify_completed(args.run,config,skin=args.skin,slim=args.slim,
-            session=args.session,progress=progress)
+            protect_features=args.protect_features,session=args.session,progress=progress)
         print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0
     if args.command == 'compose':

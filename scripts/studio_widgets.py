@@ -89,6 +89,9 @@ def apply_theme(app):
         QTableWidget, QListWidget { background: #ffffff; border: 1px solid #d5e0e9; border-radius: 10px; gridline-color: #e9eef3; outline: 0; }
         QTableWidget::item, QListWidget::item { padding: 9px; border: none; }
         QTableWidget::item:selected, QListWidget::item:selected { background: #e3edf6; color: #234b6e; }
+        QListWidget#setupSteps { background: transparent; border: none; border-radius: 0; }
+        QListWidget#setupSteps::item { padding: 14px 10px; border-left: 3px solid transparent; }
+        QListWidget#setupSteps::item:selected { background: #e3edf6; border-left-color: #315f87; color: #234b6e; }
         QHeaderView::section { background: #f7f9fb; color: #647a8e; border: none; border-bottom: 1px solid #dce5ed; padding: 9px; }
         QTabWidget::pane { border: 1px solid #d9e3ec; border-radius: 10px; padding: 10px; }
         QTabBar::tab { background: #e8eef4; color: #5d7287; padding: 10px 14px; border-radius: 7px; margin: 2px; }

@@ -7,15 +7,14 @@ import json
 import os
 from pathlib import Path
 import sys
-from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
-    QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton,
+    QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget)
 
 from app_version import VERSION
@@ -26,23 +25,8 @@ from beauty_editor import BeautyConnection, BeautyEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos
 from photo_pipeline import finish_batch, load_style
-from settings import default_settings_path, editable_settings, load_settings, save_settings
-
-
-def endpoint_url(value, service):
-    """Expand an explicitly entered compatible API base when saving settings."""
-    parsed = urlsplit(value.strip())
-    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.hostname == 'api.example.com':
-        raise ValueError('请填写实际服务的 HTTP/HTTPS 地址，替换示例地址')
-    if service in ('llm', 'image'):
-        path = parsed.path.rstrip('/')
-        if path in ('', '/v1'):
-            path = path or '/v1'
-            path += '/chat/completions' if service == 'llm' else '/images/edits'
-            parsed = parsed._replace(path=path)
-    else:
-        parsed = parsed._replace(path=parsed.path.rstrip('/'))
-    return urlunsplit(parsed)
+from settings import default_settings_path, load_settings
+from service_settings import ServiceSettings, endpoint_url
 
 
 class ImportWorker(QThread):
@@ -140,276 +124,6 @@ class Worker(QThread):
             self.failed.emit(self.batch_error)
 
 
-class ServiceSettings(QDialog):
-    def __init__(self, path, parent=None):
-        super().__init__(parent)
-        self.path = Path(path).expanduser().resolve()
-        self.existing = self.path.is_file()
-        self.values = editable_settings(self.path)
-        self.fields = {}
-        self.credentials = {}
-        self.setWindowTitle('连接模型服务')
-        self.resize(760, 590)
-        layout = QVBoxLayout(self)
-        title = QLabel('先连接服务，以后只需照片和角色')
-        title.setStyleSheet('font-size: 18px; font-weight: 600')
-        layout.addWidget(title)
-        hint = QLabel('需要图文提示词服务、图像编辑服务，以及已准备好分割和超分的 ComfyUI。\n'
-            '填写服务方给你的地址、模型名和密钥。密钥存于本机独立文本文件，请勿共享配置目录。')
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs, 1)
-        for service, title in (('llm', '1  提示词服务'), ('image', '2  图像编辑')):
-            panel = QWidget()
-            form = QFormLayout(panel)
-            form.setVerticalSpacing(12)
-            self.add_field(form, service, 'url', '服务地址', '例如 https://服务地址/v1，或完整接口地址')
-            self.add_field(form, service, 'model', '模型名称', '填写服务方实际提供的模型名')
-            if not self.existing:
-                self.fields[service, 'url'].clear()
-                self.fields[service, 'model'].clear()
-            if service == 'image':
-                self.same_service = QPushButton('使用提示词服务的地址和凭据')
-                self.same_service.clicked.connect(self.use_prompt_service)
-                form.addRow(self.same_service)
-            provider = self.values.get(service, {})
-            mode = QComboBox()
-            mode.addItem('粘贴密钥，保存在本机', 'inline')
-            if self.existing and (provider.get('api_key_file') or provider.get('api_key_env')):
-                mode.addItem('保留当前凭据', 'keep')
-            mode.addItem('从环境变量读取', 'api_key_env')
-            mode.addItem('选择已有密钥文件', 'api_key_file')
-            mode.addItem('此服务无需密钥', '')
-            value = QLineEdit()
-            browse = QPushButton('选择文件')
-            browse.clicked.connect(lambda _checked=False, value=value: self.choose_file(value, '选择密钥文件', '所有文件 (*)'))
-            row = QHBoxLayout()
-            row.addWidget(value, 1)
-            row.addWidget(browse)
-            def change_mode(_index, mode=mode, value=value, browse=browse, provider=provider):
-                key = mode.currentData()
-                value.clear()
-                value.setEchoMode(QLineEdit.Password if key == 'inline' else QLineEdit.Normal)
-                value.setEnabled(key not in ('', 'keep'))
-                browse.setVisible(key == 'api_key_file')
-                if key == 'inline':
-                    value.setPlaceholderText('粘贴服务密钥；不会写入配置 JSON 或运行记录')
-                elif key == 'keep':
-                    value.setPlaceholderText('保留已配置的凭据，不读取或显示其内容')
-                elif key == 'api_key_env':
-                    value.setText(provider.get(key, ''))
-                    value.setPlaceholderText('例如 COSLUMA_API_KEY，填写变量名')
-                elif key == 'api_key_file':
-                    value.setText(provider.get(key, ''))
-                    value.setPlaceholderText('选择仓库外已有的密钥文本文件')
-            mode.currentIndexChanged.connect(change_mode)
-            self.credentials[service] = (mode, value)
-            if self.existing:
-                mode.setCurrentIndex(mode.findData('keep') if mode.findData('keep') >= 0 else mode.findData(''))
-            change_mode(0)
-            form.addRow('密钥来源', mode)
-            form.addRow('密钥', row)
-            if service == 'image':
-                options = QWidget()
-                options_layout = QVBoxLayout(options)
-                options_layout.setContentsMargins(0,0,0,0)
-                self.image_options_toggle = QToolButton()
-                self.image_options_toggle.setCheckable(True)
-                self.image_options_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-                options_layout.addWidget(self.image_options_toggle,0,Qt.AlignLeft)
-                content = QWidget()
-                parameters = QFormLayout(content)
-                parameters.setContentsMargins(0,0,0,0)
-                self.image_options = {}
-                for key, label in (('quality', '质量'), ('size', '生成尺寸'), ('output_format', '图片格式')):
-                    edit = QLineEdit(str(provider.get('parameters', {}).get(key, '')) if self.existing else '')
-                    edit.setPlaceholderText('留空则不发送，由服务决定')
-                    self.image_options[key] = edit
-                    parameters.addRow(label, edit)
-                options_layout.addWidget(content)
-                explanation = ui_label('留空才不发送该项；收起只隐藏填写区，不清除已填参数。')
-                explanation.setWordWrap(True)
-                options_layout.addWidget(explanation)
-                def show_parameters(expanded):
-                    content.setVisible(expanded)
-                    self.image_options_toggle.setText('收起图像参数' if expanded else '展开图像参数（可选）')
-                    self.image_options_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-                expanded = any(edit.text().strip() for edit in self.image_options.values())
-                self.image_options_toggle.setChecked(expanded)
-                self.image_options_toggle.toggled.connect(show_parameters)
-                show_parameters(expanded)
-                form.addRow(options)
-            description = QLabel('地址填写到 /v1 时，保存会补全兼容接口路径；填写完整地址时原样使用。')
-            description.setWordWrap(True)
-            form.addRow(description)
-            if service == 'image':
-                scroll = QScrollArea()
-                scroll.setWidgetResizable(True)
-                scroll.setFrameShape(QFrame.NoFrame)
-                scroll.setWidget(panel)
-                self.tabs.addTab(scroll, title)
-            else:
-                self.tabs.addTab(panel, title)
-        panel = QWidget()
-        form = QFormLayout(panel)
-        form.setVerticalSpacing(12)
-        for service, title in (('head', '整头分割'), ('sr', '超分')):
-            self.add_field(form, service, 'url', title + '地址', 'ComfyUI 根地址，例如 http://127.0.0.1:8188')
-            self.add_field(form, service, 'model', title + '模型', '填写服务内实际权重文件名')
-        info = QLabel('这两个阶段由你的 ComfyUI 服务完成，可以使用同一地址。\n'
-            '模型权重由服务部署者准备，软件不下载权重；安装约定见 README 的服务部署部分。')
-        info.setWordWrap(True)
-        form.addRow(info)
-        self.tabs.addTab(panel, '3  分割与超分')
-        panel = QWidget()
-        form = QFormLayout(panel)
-        self.library_mode = QComboBox()
-        self.library_mode.addItems(['使用随附通用提示词库', '选择自己的提示词库'])
-        default_library = self.path.parent / 'prompts.json'
-        self.library = QLineEdit(self.values.get('prompt_library', str(default_library)))
-        self.library_custom = self.library.text()
-        row = QHBoxLayout()
-        row.addWidget(self.library, 1)
-        browse = QPushButton('选择文件')
-        browse.clicked.connect(lambda: self.choose_file(self.library, '选择提示词库', 'JSON (*.json)'))
-        row.addWidget(browse)
-        library_row = QWidget()
-        library_row.setLayout(row)
-        def switch_library(index):
-            if index == 0:
-                self.library_custom = self.library.text()
-                self.library.setText(str(default_library))
-            else:
-                self.library.setText(self.library_custom)
-            library_row.setVisible(index == 1)
-        self.library_mode.currentIndexChanged.connect(switch_library)
-        custom = Path(self.library.text()).expanduser().resolve() != default_library
-        self.library_mode.setCurrentIndex(1 if custom else 0)
-        library_row.setVisible(custom)
-        form.addRow('提示词参考', self.library_mode)
-        form.addRow(library_row)
-        info = QLabel('通用库可直接使用，首次保存时创建个人副本，已有文件不会被覆盖。\n'
-            '自定义库须是已有 JSON 文件；只有确认需要自己的参考库时才切换。')
-        info.setWordWrap(True)
-        form.addRow(info)
-        location = QLabel('配置保存到：' + str(self.path))
-        location.setWordWrap(True)
-        location.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        form.addRow(location)
-        self.tabs.addTab(panel, '提示词与存储')
-        self.message = QLabel('')
-        self.message.setWordWrap(True)
-        layout.addWidget(self.message)
-        navigation = QHBoxLayout()
-        self.previous = QPushButton('上一步')
-        self.next = QPushButton('下一步')
-        self.previous.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.currentIndex()-1))
-        self.next.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.currentIndex()+1))
-        navigation.addWidget(self.previous)
-        navigation.addStretch(1)
-        navigation.addWidget(self.next)
-        layout.addLayout(navigation)
-        self.tabs.currentChanged.connect(self.update_navigation)
-        self.update_navigation()
-        buttons = QDialogButtonBox()
-        buttons.addButton('保存设置', QDialogButtonBox.AcceptRole)
-        buttons.addButton('取消', QDialogButtonBox.RejectRole)
-        buttons.accepted.connect(self.save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def add_field(self, form, service, key, label, placeholder):
-        edit = QLineEdit(self.values.get(service, {}).get(key, ''))
-        edit.setPlaceholderText(placeholder)
-        self.fields[service, key] = edit
-        form.addRow(label, edit)
-
-    def update_navigation(self):
-        self.previous.setEnabled(self.tabs.currentIndex() > 0)
-        self.next.setEnabled(self.tabs.currentIndex() < self.tabs.count()-1)
-
-    def use_prompt_service(self):
-        try:
-            url = urlsplit(endpoint_url(self.fields['llm', 'url'].text(), 'llm'))
-            if not url.path.endswith('/chat/completions'):
-                raise ValueError('提示词接口使用自定义路径，请分别填写两个完整接口地址。')
-            self.fields['image', 'url'].setText(urlunsplit(url._replace(
-                path=url.path[:-len('/chat/completions')] + '/images/edits')))
-            origin_mode, origin_value = self.credentials['llm']
-            target_mode, target_value = self.credentials['image']
-            mode = origin_mode.currentData()
-            if mode == 'keep':
-                provider = self.values['llm']
-                mode = 'api_key_file' if provider.get('api_key_file') else 'api_key_env'
-                value = provider[mode]
-            else:
-                value = origin_value.text()
-            if mode and not value.strip():
-                raise ValueError('请先填写提示词服务的密钥，或选择正确的凭据来源。')
-            target_mode.setCurrentIndex(target_mode.findData(mode))
-            target_value.setText(value)
-            self.message.setText('已填入同一服务的图像编辑地址和凭据；请填写图像模型名称。')
-        except ValueError as error:
-            self.message.setText(str(error))
-
-    def choose_file(self, edit, title, pattern):
-        filename, _ = QFileDialog.getOpenFileName(self, title, edit.text(), pattern)
-        if filename:
-            edit.setText(filename)
-
-    def reject(self):
-        for mode, edit in self.credentials.values():
-            if mode.currentData() == 'inline':
-                edit.clear()
-        super().reject()
-
-    def save(self):
-        try:
-            values = json.loads(json.dumps(self.values))
-            for (service, key), edit in self.fields.items():
-                value = edit.text().strip()
-                if not value:
-                    self.tabs.setCurrentIndex({'llm': 0, 'image': 1, 'head': 2, 'sr': 2}[service])
-                    edit.setFocus()
-                    raise ValueError('请填写服务地址和模型名称')
-                try:
-                    values.setdefault(service, {})[key] = endpoint_url(value, service) if key == 'url' else value
-                except ValueError:
-                    self.tabs.setCurrentIndex({'llm': 0, 'image': 1, 'head': 2, 'sr': 2}[service])
-                    edit.setFocus()
-                    raise
-            keys = {}
-            for service, (mode, edit) in self.credentials.items():
-                source, value = mode.currentData(), edit.text().strip()
-                if source == 'keep':
-                    continue
-                if source and not value:
-                    self.tabs.setCurrentIndex(0 if service == 'llm' else 1)
-                    edit.setFocus()
-                    raise ValueError('请填写密钥，或选择其他凭据来源')
-                if source == 'inline':
-                    keys[service] = value
-                    continue
-                provider = values[service]
-                provider.pop('api_key_env', None)
-                provider.pop('api_key_file', None)
-                if source:
-                    provider[source] = value
-            parameters = values['image'].setdefault('parameters', {})
-            for key, edit in self.image_options.items():
-                if edit.text().strip():
-                    parameters[key] = edit.text().strip()
-                else:
-                    parameters.pop(key, None)
-            values['prompt_library'] = self.library.text().strip()
-            self.values = save_settings(self.path, values, keys)
-            for _mode, edit in self.credentials.values():
-                edit.clear()
-            self.accept()
-        except Exception as error:
-            self.message.setText('未保存：' + str(error))
-
 
 class Workbench(QMainWindow):
     def __init__(self, root=None, config=None):
@@ -494,9 +208,18 @@ class Workbench(QMainWindow):
         self.setup_button.clicked.connect(self.configure_services)
         header.addWidget(self.setup_button)
         layout.addLayout(header)
-        self.setup_hint = ui_label('')
+        self.setup_banner = QFrame()
+        self.setup_banner.setProperty('role', 'decisionBar')
+        setup_row = QHBoxLayout(self.setup_banner)
+        setup_row.setContentsMargins(16, 12, 16, 12)
+        self.setup_hint = ui_label('首次使用：连接模型服务后，即可与 Agent 讨论你的照片。')
         self.setup_hint.setWordWrap(True)
-        layout.addWidget(self.setup_hint)
+        setup_row.addWidget(self.setup_hint, 1)
+        self.setup_guide_button = QPushButton('开始配置')
+        self.setup_guide_button.setProperty('kind', 'primary')
+        self.setup_guide_button.clicked.connect(self.configure_services)
+        setup_row.addWidget(self.setup_guide_button)
+        layout.addWidget(self.setup_banner)
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
 
@@ -778,6 +501,55 @@ class Workbench(QMainWindow):
         results_layout.addWidget(self.readiness)
         self.pages.addWidget(results_page)
 
+        self.welcome_page = QWidget()
+        welcome_layout = QVBoxLayout(self.welcome_page)
+        welcome_layout.setContentsMargins(36, 24, 36, 24)
+        welcome_layout.addStretch(1)
+        welcome_body = QHBoxLayout()
+        welcome_body.setSpacing(44)
+        introduction = QVBoxLayout()
+        introduction.setSpacing(16)
+        introduction.addWidget(ui_label('从你的原片，开始一组创作', 'title'))
+        note = ui_label('先与摄影 Agent 聊想法，比较三个真实样片；\n选定喜欢的方向，再制作整组照片。')
+        note.setWordWrap(True)
+        introduction.addWidget(note)
+        for title, description in (('先讨论', '提供照片和角色，一起确定摄影方向。'),
+                ('看样片', '同一张原片做三个方向，由你决定定稿。'),
+                ('整组出片', '沿用定稿制作，原片和基础成片分别保留。')):
+            introduction.addWidget(ui_label(title, 'heading'))
+            text = ui_label(description)
+            text.setWordWrap(True)
+            introduction.addWidget(text)
+        welcome_body.addLayout(introduction, 1)
+        connection = QFrame()
+        connection.setProperty('role', 'panel')
+        connection.setMaximumWidth(410)
+        connection_layout = QVBoxLayout(connection)
+        connection_layout.setContentsMargins(24, 24, 24, 24)
+        connection_layout.setSpacing(16)
+        connection_layout.addWidget(ui_label('先连接你的模型服务', 'heading'))
+        note = ui_label('你需要图文模型、图像编辑服务，以及已部署分割与超分模型的 ComfyUI。软件包不含服务、账号或模型权重。')
+        note.setWordWrap(True)
+        connection_layout.addWidget(note)
+        begin = QPushButton('开始配置')
+        begin.setProperty('kind', 'primary')
+        begin.clicked.connect(self.configure_services)
+        connection_layout.addWidget(begin)
+        imported = QPushButton('导入已有配置')
+        imported.clicked.connect(self.import_config)
+        connection_layout.addWidget(imported)
+        later = QPushButton('先整理照片，稍后配置')
+        later.setProperty('kind', 'quiet')
+        later.clicked.connect(self.defer_setup)
+        connection_layout.addWidget(later)
+        note = ui_label('保存设置不调用模型。照片只会在你主动选片、发送讨论或制作时交给所配服务。')
+        note.setWordWrap(True)
+        connection_layout.addWidget(note)
+        welcome_body.addWidget(connection, 1)
+        welcome_layout.addLayout(welcome_body)
+        welcome_layout.addStretch(1)
+        self.welcome_index = self.pages.addWidget(self.welcome_page)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
@@ -788,7 +560,8 @@ class Workbench(QMainWindow):
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status.setMaximumHeight(42)
         layout.addWidget(self.status)
-        self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button, self.import_button])
+        self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button,
+            self.import_button, self.setup_guide_button])
         self.character.editingFinished.connect(self.switch_character)
         for edit in (self.character, self.brief, self.root, self.config, self.edge):
             edit.textChanged.connect(self.update_actions)
@@ -799,6 +572,9 @@ class Workbench(QMainWindow):
         self.restore_style_selection()
         self.workspace_restoring = False
         self.navigate(self.restored_page)
+        if (not Path(self.config.text()).expanduser().is_file() and not self.sources and not self.last_batch_directory
+                and not self.preferences.value('setup_deferred', False, type=bool)):
+            self.navigate(self.welcome_index)
         self.update_actions()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
@@ -828,7 +604,7 @@ class Workbench(QMainWindow):
             'import_recursive':self.import_recursive.isChecked(),
             'selection_brief':self.selection_brief.text(),'photo_selection':self.photo_selection,
             'photo_selection_directory':self.photo_selection_directory,'photo_selection_error':self.photo_selection_error,
-            'page':self.pages.currentIndex(),
+            'page':0 if self.pages.currentIndex()==self.welcome_index else self.pages.currentIndex(),
             'selected_source':self.sources[row] if 0<=row<len(self.sources) else None,
             'results':[{name:result[name] for name in fields if name in result} for result in self.results.values()],
             'stages':self.stages,'photo_errors':self.photo_errors,
@@ -940,10 +716,14 @@ class Workbench(QMainWindow):
     def choose_style(self):
         self.navigate(1)
 
+    def defer_setup(self):
+        self.preferences.setValue('setup_deferred', True)
+        self.preferences.sync()
+        self.navigate(0)
+
     def update_setup_hint(self):
         exists = Path(self.config.text()).expanduser().is_file()
-        self.setup_hint.setText('首次使用：导入已有配置，或打开“连接设置”填写模型服务。')
-        self.setup_hint.setVisible(not exists)
+        self.setup_banner.setVisible(not exists and self.pages.currentIndex()!=self.welcome_index)
 
     def import_config(self):
         filename, _ = QFileDialog.getOpenFileName(self, '导入已有服务配置', self.config.text(), 'JSON (*.json)')
@@ -953,7 +733,7 @@ class Workbench(QMainWindow):
             load_settings(filename)
             self.config.setText(filename)
             self.remember_preferences()
-            self.status.setText('已选择已有配置。')
+            self.status.setText('已导入配置。可以导入照片，与 Agent 讨论创作方向。')
             self.refresh_creative_preparation()
         except Exception as error:
             self.status.setText('无法导入配置：' + str(error))
@@ -991,18 +771,23 @@ class Workbench(QMainWindow):
 
     def configure_services(self):
         try:
-            dialog = ServiceSettings(self.config.text(), self)
+            dialog = ServiceSettings(self.config.text(), self, output_root=self.root.text())
             if dialog.exec() == QDialog.Accepted:
                 self.config.setText(str(dialog.path))
+                self.root.setText(str(Path(dialog.output_root.text()).expanduser().resolve()))
                 self.remember_preferences()
-                self.status.setText('连接设置已保存。')
+                self.status.setText('设置已保存。'+('可以继续与 Agent 讨论。' if self.sources else '下一步：批量导入照片，填写角色。'))
                 self.refresh_creative_preparation()
+            elif self.pages.currentIndex()==self.welcome_index:
+                self.defer_setup()
         except Exception as error:
             self.status.setText('无法打开连接设置：' + str(error))
 
     def refresh_creative_preparation(self):
         self.update_setup_hint()
-        if self.pages.currentIndex()==1:
+        if self.pages.currentIndex()==self.welcome_index:
+            self.navigate(0)
+        elif self.pages.currentIndex()==1:
             self.navigate(1)
         else:
             self.update_actions()
@@ -1689,6 +1474,7 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('读取本次结果失败：' + str(error))
         self.pages.setCurrentIndex(index)
+        self.update_setup_hint()
         for number, button in enumerate(self.nav_buttons):
             button.setChecked(number == index)
         self.update_actions()

@@ -24,7 +24,7 @@ def make_server(root, config, host='127.0.0.1', port=8765):
         try:
             if mode=='beautify':
                 result = beautify_completed(body['run'],config,skin=body.get('skin',0.0),slim=body.get('slim',0.0),
-                    session=body.get('session'),progress=progress)
+                    protect_features=body.get('protect_features',True),session=body.get('session'),progress=progress)
                 with lock:
                     jobs[job_id].update(status='complete',stage='美化版已保存',result=result)
                 return

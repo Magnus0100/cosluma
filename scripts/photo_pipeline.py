@@ -135,10 +135,10 @@ def _failed_photo(source, error):
     return result
 
 
-def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, session=None, progress=None):
+def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features=True, session=None, progress=None):
     """Explicit post-production edit; the completed production chain is untouched."""
     from face_beauty import BeautyParameters, BeautySession, prepare_face, prepare_skin, save_beauty
-    parameters = BeautyParameters(skin=skin,slim=slim)
+    parameters = BeautyParameters(skin=skin,slim=slim,protect_features=protect_features)
     if not (skin or slim):
         raise ValueError('美肤与瘦脸均为零，原成片无需另存')
     path = Path(run_path).expanduser().resolve()
@@ -157,7 +157,7 @@ def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, session=None, pr
         prepared = prepare_skin(prepared,config['beauty'],progress)
     result = save_beauty(pixels,prepared,parameters)
     save_json(path.parent/'beauty-session.json',{'session':prepared.directory.name,
-        'parameters':{'skin':skin,'slim':slim}})
+        'parameters':{'skin':skin,'slim':slim,'protect_features':protect_features}})
     return result
 
 

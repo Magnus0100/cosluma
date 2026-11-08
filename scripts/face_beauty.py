@@ -33,12 +33,15 @@ BROWS = ([70,63,105,66,107,55,65,52,53,46], [300,293,334,296,336,285,295,282,283
 LIPS = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185]
 INNER_LIPS = [78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191]
 NOSE = [168,6,197,195,5,4,1,2,98,97,327,326]
+FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,
+    152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109]
 
 
 @dataclass(frozen=True)
 class BeautyParameters:
     skin: float = 0.0
     slim: float = 0.0
+    protect_features: bool = True
 
     def __post_init__(self):
         if not 0 <= self.skin <= 1 or not 0 <= self.slim <= 1:
@@ -175,6 +178,13 @@ def _feature_mask(points, size, *, protect_nose=False):
     return cv2.GaussianBlur(mask.astype(np.float32),(0,0),max(1,min(size)*.003))*mask
 
 
+def _face_mask(points, size):
+    mask = np.zeros(size[::-1],np.uint8)
+    polygon = np.rint(points[FACE_OVAL]*np.array(size)).astype(np.int32)
+    cv2.fillPoly(mask,[polygon],1)
+    return cv2.GaussianBlur(mask.astype(np.float32),(0,0),max(1,min(size)*.01))*mask
+
+
 def _slim_map(points, strength, size):
     """Inverse thin-plate spline; fixed features and a stationary outer border."""
     indices = list(dict.fromkeys(JAW+sum(EYES,[])+sum(BROWS,[])+LIPS+INNER_LIPS+NOSE+list(range(468,478))))
@@ -216,10 +226,13 @@ def render_beauty(pixels, session, parameters):
     if parameters.skin:
         if session.delta is None:
             raise ValueError('请先生成美肤基础')
-        mask = cv2.resize(session.mask,size,interpolation=cv2.INTER_LINEAR)
-        # Explicitly protect eyes, brows and lips when applying the learned
-        # skin adjustment. The original float pixels remain the RGB carrier.
-        mask *= _feature_mask(session.points,size)
+        if parameters.protect_features:
+            mask = cv2.resize(session.mask,size,interpolation=cv2.INTER_LINEAR)
+            mask *= _feature_mask(session.points,size)
+        else:
+            # The user's explicit choice allows the learned adjustment on
+            # eyes, brows and lips, while keeping it within the face contour.
+            mask = _face_mask(session.points,size)
         delta = cv2.resize(session.delta,size,interpolation=cv2.INTER_CUBIC)
         crop = np.clip(crop+delta*(mask*parameters.skin)[...,None],0,1)
     if parameters.slim:
@@ -234,7 +247,8 @@ def save_beauty(pixels, session, parameters):
     directory = session.directory/('edit-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
     final = render_beauty(pixels,session,parameters)
-    result = {'parameters':{'skin':parameters.skin,'slim':parameters.slim},
+    result = {'parameters':{'skin':parameters.skin,'slim':parameters.slim,
+            'protect_features':parameters.protect_features},
         'source':str(session.base_path),'source_dimensions':session.state['source_dimensions'],
         'session':os.path.relpath(session.directory,session.directory.parent), 'box':list(session.box),
         'analysis':session.state['analysis'],'skin':session.state.get('skin') if parameters.skin else None,
