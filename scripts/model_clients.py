@@ -245,6 +245,7 @@ def _discussion_messages(conversation):
                 'view_mode','next_sample_source','selected_sample')}
             if 'viewed_samples' in context:
                 anchors['viewed_samples'] = context['viewed_samples']
+            anchors['comparison_sample'] = context.get('comparison_sample')
             anchors['edits'] = normalise_edits(context.get('edits'))
             anchors['samples'] = [{key:sample[key] for key in ('id','label','source','status')} for sample in context['samples']]
             content = '本条消息发送时的讨论对象（之后切换画面不改变此指代）：\n'+json.dumps(anchors,ensure_ascii=False)+'\n用户原文：\n'+content
@@ -252,12 +253,25 @@ def _discussion_messages(conversation):
     return messages
 
 
+def _visible_sample_ids(context):
+    mode = context['view_mode']
+    ids = set(context.get('viewed_samples',[])) if mode=='samples' else set()
+    if mode in ('output','compare') and context['viewed_sample'] is not None:
+        ids.add(context['viewed_sample'])
+    if mode in ('source','compare') and context.get('comparison_sample') is not None:
+        ids.add(context['comparison_sample'])
+    return ids
+
+
 def _discussion_image_ids(context, conversation):
-    ids = {sample['id'] for sample in context['samples']}
-    for row in conversation:
+    ids = {sample['id'] for sample in context['samples'] if sample['id']!=context.get('comparison_sample')}
+    ids.update(_visible_sample_ids(context))
+    if context['selected_sample'] is not None:
+        ids.add(context['selected_sample'])
+    for row in reversed(conversation):
         if row['role']=='user' and row.get('status')!='failed' and 'context' in row:
-            ids.update((row['context']['viewed_sample'],row['context']['selected_sample']))
-            ids.update(row['context'].get('viewed_samples',[]))
+            ids.update(_visible_sample_ids(row['context']))
+            break
     return ids
 
 
@@ -280,7 +294,7 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
     for source in selected:
         images.append(('原片：'+Path(source).name+'；素材 ID：'+str(source),discussion_preview(source)))
     samples = [] if context is None else _discussion_samples(context,conversation)
-    image_ids = set() if context is None else _discussion_image_ids(context,conversation)
+    image_ids = set() if context is None else _discussion_image_ids(context,conversation[:-1])
     images.extend(_sample_images(samples,image_ids))
     instruction = (
         '你是与用户共同创作 COS 摄影后期的摄影 Agent，现在处于讨论与试样阶段。'
@@ -289,6 +303,9 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '已定稿样片可能来自先前轮次，与本轮候选分开理解；用户查看或比较其他候选不代表更换定稿。'
         '每条用户消息附有发送当时的画面对象、轮次、样片 ID 与实际预览模式；“这张”“第二张”按那条消息的上下文理解，'
         '不能把历史轮次的方案编号套到当前轮次。原片、成片、原片与成片并排、三个样片并排要分清；本次附图均有素材或样片 ID。'
+        'comparison_sample 是左侧改稿前样片的稳定 ID；它不是原片。viewed_source 始终是实际原片，'
+        'viewed_sample 是右侧当前稿，view_mode 说明实际查看左侧、右侧还是并排。'
+        '本轮只附当前与最近讨论所需样片的实图，较早轮次保留文字和稳定 ID；未附图时不要声称刚检查过其细节。'
         'view_mode 为 samples 时，用户同时查看该轮三个位置的样片；viewed_samples 列出已完成的可见样片 ID，'
         'viewed_sample 为空，不把其中一个默认为用户当前选中或采纳的方案。'
         'has_image 表示本次是否提供该样片实图；未附图的历史候选只有已有方向资料，不声称观察过未提供的画面细节。'
@@ -301,7 +318,8 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '未开启的功能可以讨论建议，但须说明实际试样前需要用户开启对应选项，不声称已经生效。'
         '明度和色温可以调整，但不能用曲线冒充空间重打光。特效按单张动作、视线和留白决定，不设整组开关。'
         '本次调用只讨论，不运行生图、超分、分割或批量。'
-        '需要试样时请用户点击“按当前讨论生成三个样片”；修改后仍由用户主动生成，不声称已经完成未执行的动作。'
+        '需要探索时请用户点击“探索三个方向”或“重新探索三个方向”；'
+        '已有接近预期的完整样片时，可单独查看后点击“沿这张改一张”。仍由用户主动生成，不声称已经完成未执行的动作。'
         '最终方向只能由用户明确点击样片的定稿按钮决定；不要自行宣布定稿或开始批量。'
         '返回 JSON，必须包含且只有 reply 和 direction_update。reply 是直接显示给用户的自然对话，不包含 JSON 或算法术语。'
         'direction_update 为 null 表示不修改当前创作要求；为字符串表示替换为完整的新要求，空字符串表示用户明确清空要求。'
@@ -355,6 +373,8 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             '这张图随后会作为生图第二张风格参考，第一张始终是本次试样原片，身份和构图只来自第一张。'
             '单纯浏览、比较或 Agent 尚未被采纳的建议不代表采用参考，未明确沿用时填写 null。'
             '引用时依据原消息的轮次和 ID，不把旧轮的“第二张”换成当前轮第二张。'
+            'comparison_sample 是左侧改稿前样片，viewed_sample 是右侧当前稿；'
+            'viewed_source 始终是真实原片，view_mode 记录当时实际看哪侧或并排，不能把父样片当原片。'
             'has_image 为 false 的历史候选本次只有方向资料，不能声称观察过未附图的细节；完整样片 ID 仍可解析为实际生图参考。'
             '用户要求保留某样片的场景时，三个方向在该场景与要求范围内探索有区别的摄影表达，不另起矛盾场景。'
             '本次讨论上下文：\n'+_discussion_details(discussion['context'],samples,image_ids)+

@@ -295,6 +295,10 @@ class DeliveryView(QWidget):
         self.compare_revision = QPushButton('比较新稿')
         self.compare_revision.clicked.connect(self.compare_new_revision)
         revision_row.addWidget(self.compare_revision,1)
+        self.adopt_revision = QPushButton('采用左侧为交付')
+        self.adopt_revision.setProperty('kind','primary')
+        self.adopt_revision.clicked.connect(self.adopt_comparison)
+        revision_row.addWidget(self.adopt_revision,1)
         column.addLayout(revision_row)
         splitter.addWidget(right)
         splitter.setSizes([530,650])
@@ -549,6 +553,7 @@ class DeliveryView(QWidget):
             self.preview_photo = photo['key']
         self.comparison_note.setText('左侧：'+label+'\n右侧交付版本：'+version['label'])
         self.comparison_note.setToolTip('比较对象只用于查看；导出始终使用右侧交付版本。')
+        self.update_revision_controls()
 
     def change_reference(self, _index):
         photo = self.current_photo()
@@ -607,6 +612,28 @@ class DeliveryView(QWidget):
             and any(version['kind']=='base' for version in photo['versions']))
         self.revise.setToolTip('选择这张的基础成片并填写单张要求，只制作一张新稿；交付选择保持原样')
         self.compare_revision.setVisible(photo is not None and photo['key'] in self.state['latest_revisions'])
+        reference = self.state['comparisons'].get(photo['key']) if photo is not None else None
+        chosen = self.state['choices'][photo['key']]['version'] if photo is not None else None
+        self.adopt_revision.setVisible(reference is not None and reference!=chosen)
+        self.adopt_revision.setEnabled(not self.is_busy() and not self.production_busy)
+        self.adopt_revision.setToolTip('明确将左侧已保存版本设为交付版本；保留当前交付勾选，不发起制作')
+
+    def adopt_comparison(self):
+        if self.is_busy() or self.production_busy:
+            return
+        photo = self.current_photo()
+        if photo is None:
+            return
+        try:
+            reference = selected_version(photo,{'version':self.state['comparisons'][photo['key']]})
+            for path in reference['files'].values():
+                if not Path(path).is_file():
+                    raise FileNotFoundError('所选版本文件不存在：'+path)
+            previous = self.state['choices'][photo['key']]['version']
+            self.state['comparisons'][photo['key']] = previous
+            self.version.setCurrentIndex(self.version.findData(reference['id']))
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('无法采用比较版本：'+str(error))
 
     def remember_revision_draft(self, version, draft):
         self.state['revision_drafts'][version] = draft

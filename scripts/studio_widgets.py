@@ -485,6 +485,8 @@ class PhotoPreview(QWidget):
         for label, value in ((output_label, 'output'), (source_label, 'source'), (source_label+' / '+output_label, 'compare')):
             self.mode.addItem(label, value)
         self.mode.currentIndexChanged.connect(self.change_mode)
+        self.source_caption = None
+        self.output_caption = None
         toolbar.addWidget(self.mode)
         layout.addLayout(toolbar)
         self.pages = QStackedWidget()
@@ -499,6 +501,10 @@ class PhotoPreview(QWidget):
             column = QVBoxLayout()
             caption = QLabel(label)
             caption.setAlignment(Qt.AlignCenter)
+            if image is self.before:
+                self.source_caption = caption
+            else:
+                self.output_caption = caption
             column.addWidget(caption)
             column.addWidget(image, 1)
             row.addLayout(column, 1)
@@ -533,6 +539,13 @@ class PhotoPreview(QWidget):
             view.zoom_changed.connect(lambda view=view:self.synchronize(view,zoom=True))
             view.pan_changed.connect(lambda view=view:self.synchronize(view,zoom=False))
         self.set_photo()
+
+    def set_labels(self, source_label='原片', output_label='成片'):
+        self.source_caption.setText(source_label)
+        self.output_caption.setText(output_label)
+        self.mode.setItemText(0,output_label)
+        self.mode.setItemText(1,source_label)
+        self.mode.setItemText(2,source_label+' / '+output_label)
 
     @staticmethod
     def image_label():
