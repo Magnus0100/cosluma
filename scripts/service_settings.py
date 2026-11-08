@@ -36,7 +36,7 @@ class ServiceSettings(QDialog):
     service_names = {'llm':'摄影 Agent', 'image':'整图生图', 'head':'整头分割', 'sr':'超分'}
     service_pages = {'llm':0, 'image':1, 'head':2, 'sr':2}
 
-    def __init__(self, path, parent=None, *, output_root=None):
+    def __init__(self, path, parent=None, *, output_root=None, project_output=True):
         super().__init__(parent)
         self.path = Path(path).expanduser().resolve()
         self.existing = self.path.is_file()
@@ -139,12 +139,17 @@ class ServiceSettings(QDialog):
             builtin.clicked.connect(use_builtin)
             form.addRow(builtin)
         self.output_root = QLineEdit(str(output_root or Path.home()/'CosLuma/output'))
-        row = QHBoxLayout()
-        row.addWidget(self.output_root, 1)
-        browse = QPushButton('选择文件夹')
-        browse.clicked.connect(self.choose_output)
-        row.addWidget(browse)
-        form.addRow('照片结果保存到', row)
+        if not project_output:
+            note = ui_label('新建项目时选择保存位置，默认在项目文件夹的 work 中保存制作结果。')
+            note.setWordWrap(True)
+            form.addRow('项目保存位置', note)
+        else:
+            row = QHBoxLayout()
+            row.addWidget(self.output_root, 1)
+            browse = QPushButton('选择文件夹')
+            browse.clicked.connect(self.choose_output)
+            row.addWidget(browse)
+            form.addRow('本项目制作结果保存到', row)
         location = ui_label(str(self.path))
         location.setWordWrap(True)
         location.setTextInteractionFlags(Qt.TextSelectableByMouse)

@@ -341,7 +341,7 @@ class BeautyEditor(QWidget):
 
     def save_draft(self):
         if self.session is None:
-            return
+            return True
         try:
             parameters = self.parameters()
             save_json(Path(self.context['directory'])/'beauty-session.json',
@@ -349,6 +349,8 @@ class BeautyEditor(QWidget):
                     'protect_features':parameters.protect_features}})
         except OSError as error:
             self.message.setText('保存美化草稿失败：'+str(error))
+            return False
+        return True
 
     def update_controls(self):
         busy = self.worker is not None

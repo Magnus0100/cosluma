@@ -564,6 +564,9 @@ class PhotoPreview(QWidget):
     def load_pending(self):
         if self.direct_images or self.loader is not None:
             return
+        # Another photo view may have filled the shared cache before this timer runs.
+        self.images.update({kind:self.cache[key] for kind,key in self.keys.items() if key in self.cache})
+        self.update_preview()
         missing = list(dict.fromkeys(key for key in self.keys.values() if key is not None and key not in self.cache))
         if missing:
             self.loader = PreviewLoader(missing)

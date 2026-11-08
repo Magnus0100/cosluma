@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from datetime import datetime
 import json
 import os
@@ -12,7 +13,7 @@ import uuid
 from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QMainWindow, QMenu, QPushButton, QPlainTextEdit, QProgressBar,
     QScrollArea, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget)
@@ -27,6 +28,8 @@ from model_clients import select_photos
 from photo_pipeline import finish_batch, load_style
 from settings import default_settings_path, load_settings
 from service_settings import ServiceSettings, endpoint_url
+from project_store import Project, recent_projects, remember_project
+from project_browser import NewProject, ProjectBrowser
 
 
 class ImportWorker(QThread):
@@ -129,6 +132,9 @@ class Workbench(QMainWindow):
     def __init__(self, root=None, config=None):
         super().__init__()
         self.preferences = QSettings(str(Path.home() / 'CosplayWorkbench/config/desktop.ini'), QSettings.IniFormat)
+        self.project = None
+        self.project_batches = []
+        self.legacy_workspace = None
         self.workspace_restoring = True
         self.workspace_timer = QTimer(self)
         self.workspace_timer.setSingleShot(True)
@@ -155,6 +161,7 @@ class Workbench(QMainWindow):
         self.close_after_finish = False
         self.tray = None
         self.selected_style = None
+        self.style_selection_file = None
         self.style_context = None
         self.style_samples_directory = None
         self.style_samples_context = None
@@ -163,7 +170,7 @@ class Workbench(QMainWindow):
         self.current_output = None
         self.current_png = None
         self.batch_directory = None
-        self.last_batch_directory = self.preferences.value('last_batch_directory', '', type=str)
+        self.last_batch_directory = ''
         self.batch_error = ''
         self.photo_errors = {}
         self.stages = {}
@@ -186,6 +193,16 @@ class Workbench(QMainWindow):
         header = QHBoxLayout()
         header.setSpacing(10)
         header.addWidget(ui_label('CosLuma', 'title'))
+        self.projects_button = QPushButton('项目')
+        self.projects_button.setProperty('role', 'workspaceTab')
+        self.projects_button.setCheckable(True)
+        self.projects_button.clicked.connect(self.show_projects)
+        header.addWidget(self.projects_button)
+        self.project_title = QPushButton('新建项目')
+        self.project_title.setProperty('kind', 'quiet')
+        self.project_title.clicked.connect(self.rename_active_project)
+        self.project_title.setMaximumWidth(230)
+        header.addWidget(self.project_title)
         self.nav_buttons = []
         for index, text in enumerate(('照片', '创作', '成片')):
             button = QPushButton(text)
@@ -298,13 +315,10 @@ class Workbench(QMainWindow):
         form = QFormLayout(form_host)
         form.setContentsMargins(0, 0, 0, 0)
         form.setVerticalSpacing(10)
-        self.character = QLineEdit(self.preferences.value('character', '', type=str))
+        self.character = QLineEdit()
         self.character.setPlaceholderText('例如：鸣潮 · 守岸人')
         form.addRow('角色', self.character)
         self.brief = QPlainTextEdit()
-        self.brief_character = self.character.text().strip()
-        if self.brief_character:
-            self.brief.setPlainText(self.preferences.value('briefs/' + self.brief_character, '', type=str))
         self.brief.setPlaceholderText('可留空；补充想保留的细节或场景想法')
         self.brief.setFixedHeight(64)
         form.addRow('补充要求', self.brief)
@@ -427,6 +441,7 @@ class Workbench(QMainWindow):
         self.last_batch_button.setText('查看已有结果')
         self.last_batch_button.setPopupMode(QToolButton.MenuButtonPopup)
         saved_menu = QMenu(self)
+        self.project_batches_menu = saved_menu.addMenu('本项目的制作批次')
         self.last_batch_action = saved_menu.addAction('查看上次制作', self.open_last_batch)
         saved_menu.addAction('选择其他批次文件夹', self.choose_saved_batch)
         self.last_batch_button.setMenu(saved_menu)
@@ -550,31 +565,34 @@ class Workbench(QMainWindow):
         welcome_layout.addStretch(1)
         self.welcome_index = self.pages.addWidget(self.welcome_page)
 
+        self.project_browser = ProjectBrowser(self)
+        self.projects_index = self.pages.addWidget(self.project_browser)
+        self.project_browser.create_requested.connect(self.new_project)
+        self.project_browser.browse_requested.connect(self.browse_project)
+        self.project_browser.legacy_requested.connect(lambda:self.new_project(from_legacy=True))
+        self.project_browser.open_requested.connect(self.open_project)
+        self.project_browser.rename_requested.connect(self.rename_project)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('等待开始')
         layout.addWidget(self.progress_bar)
-        self.status = ui_label('添加照片与角色，从一张代表原片开始讨论和试样。')
+        self.status = ui_label('新建或打开项目，继续照片创作。')
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status.setMaximumHeight(42)
         layout.addWidget(self.status)
         self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button,
             self.import_button, self.setup_guide_button])
-        self.character.editingFinished.connect(self.switch_character)
         for edit in (self.character, self.brief, self.root, self.config, self.edge):
             edit.textChanged.connect(self.update_actions)
             edit.textChanged.connect(self.schedule_workspace_save)
         self.config.textChanged.connect(self.update_setup_hint)
         self.update_setup_hint()
-        self.restore_workspace()
-        self.restore_style_selection()
         self.workspace_restoring = False
-        self.navigate(self.restored_page)
-        if (not Path(self.config.text()).expanduser().is_file() and not self.sources and not self.last_batch_directory
-                and not self.preferences.value('setup_deferred', False, type=bool)):
-            self.navigate(self.welcome_index)
+        self.show_projects()
+        self.load_initial_project()
         self.update_actions()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
@@ -588,13 +606,189 @@ class Workbench(QMainWindow):
     def source_key(source):
         return os.path.normcase(str(source))
 
+    def refresh_projects(self):
+        self.project_browser.refresh(recent_projects(self.preferences), self.project)
+
+    def show_projects(self):
+        if self.project is not None and not self.persist_project():
+            return
+        try:
+            self.refresh_projects()
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.status.setText('读取项目列表失败：'+str(error))
+        self.navigate(self.projects_index)
+
+    def load_initial_project(self):
+        try:
+            saved = self.preferences.value('workspace', '', type=str)
+            if saved and not self.preferences.value('projects/migrated', '', type=str):
+                state = json.loads(saved)
+                creative = {name:self.preferences.value('style/'+name, '', type=str)
+                    for name in ('discussion', 'samples', 'selected')}
+                if state.get('sources') or state.get('character') or state.get('brief') or state.get('batch_directory') or any(creative.values()):
+                    state.setdefault('output_root', self.preferences.value('output_root', self.root.text(), type=str))
+                    state.setdefault('output_edge', self.preferences.value('output_edge', '', type=str))
+                    self.legacy_workspace = (state, creative)
+                    self.project_browser.set_legacy_available(True)
+        except (ValueError, KeyError, TypeError) as error:
+            self.status.setText('读取上次工作区失败：'+str(error))
+
+    def new_project(self, *, from_legacy=False):
+        if self.work_in_progress():
+            return
+        parent = self.preferences.value('projects/directory', str(Path.home()/'CosLuma/projects'), type=str)
+        dialog = NewProject(parent, self)
+        if from_legacy:
+            dialog.setWindowTitle('将上次工作区收为项目')
+            dialog.name.setText((self.legacy_workspace[0].get('character') or '上次创作')+' · 原工作区')
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            if not self.persist_project():
+                return
+            legacy = self.legacy_workspace if from_legacy else None
+            if legacy is not None:
+                workspace, creative = deepcopy(legacy)
+                last = self.preferences.value('last_batch_directory', '', type=str)
+                recorded = [result.get('batch_directory') for result in workspace['results']]
+                batches = list(dict.fromkeys(path for path in [*recorded, workspace.get('batch_directory'), last] if path))
+            else:
+                workspace, creative, batches = None, None, None
+            project = Project.create(dialog.directory, dialog.name.text(), workspace=workspace,
+                creative=creative, batches=batches)
+            self.preferences.setValue('projects/directory', str(dialog.directory.parent))
+            self.activate_project(project)
+            if legacy is not None:
+                self.preferences.setValue('projects/migrated', str(project.path))
+                self.legacy_workspace = None
+                self.project_browser.set_legacy_available(False)
+                self.preferences.sync()
+            self.status.setText('项目已创建：'+project.data['name']+'。'+
+                ('已收纳上次的照片、讨论、样片与定稿，已有文件保持原位置。' if legacy else '可以导入照片，开始这组创作。'))
+            return project
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.status.setText('创建项目失败：'+str(error))
+
+    def browse_project(self):
+        if self.work_in_progress():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, '打开 CosLuma 项目',
+            self.preferences.value('projects/directory', str(Path.home()/'CosLuma/projects'), type=str),
+            'CosLuma 项目 (project.json)')
+        if path:
+            self.open_project(path)
+
+    def open_project(self, path):
+        if self.work_in_progress():
+            self.status.setText('当前项目仍在处理中，结束后可切换项目。')
+            return
+        try:
+            project = Project.open(path)
+            if self.project is not None and project.path == self.project.path:
+                self.navigate(self.restored_page if self.pages.currentIndex() == self.projects_index else 0)
+                return
+            if self.persist_project():
+                self.activate_project(project)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.status.setText('打开项目失败：'+str(error))
+
+    def persist_project(self):
+        if self.project is None:
+            return True
+        if self.creative_workspace is not None and not self.creative_workspace.flush_draft():
+            self.status.setText(self.creative_workspace.message.toPlainText())
+            return False
+        if self.beauty_editor is not None:
+            self.beauty_editor.draft_timer.stop()
+            if not self.beauty_editor.save_draft():
+                self.status.setText(self.beauty_editor.message.text())
+                return False
+        return self.save_workspace()
+
+    def activate_project(self, project):
+        self.workspace_restoring = True
+        self.workspace_timer.stop()
+        if self.creative_workspace is not None:
+            self.creative_workspace.draft_timer.stop()
+            self.creative_layout.removeWidget(self.creative_workspace)
+            self.creative_workspace.deleteLater()
+            self.creative_workspace = None
+        for view in (self.current_batch_view, self.archive_view, self.beauty_editor):
+            if view is not None:
+                self.result_views.removeWidget(view)
+                view.deleteLater()
+        self.current_batch_view = self.archive_view = self.beauty_editor = None
+        self.result_views.setCurrentWidget(self.results_empty)
+        self.creative_context = self.style_context = None
+        self.style_samples_context = self.style_discussion_context = None
+        self.selected_style = None
+        self.style_selection_file = project.data['creative'].get('selected') or None
+        self.style_samples_directory = self.style_discussion_directory = None
+        self.creative_direction = ''
+        self.creative_draft = False
+        self.sources, self.results, self.stages, self.photo_errors = [], {}, {}, {}
+        self.excluded_sources = set()
+        self.representative_source = self.photo_selection = self.photo_selection_directory = None
+        self.photo_selection_error = self.batch_error = ''
+        self.preview_key = self.chosen_preview_key = self.current_output = self.current_png = None
+        self.photo_preview.set_photo()
+        self.batch_directory = None
+        self.project = project
+        self.status.setText('已打开项目：'+project.data['name'])
+        self.project_batches = list(project.data['batches'])
+        self.last_batch_directory = self.project_batches[-1] if self.project_batches else ''
+        self.root.setText(project.data['workspace']['output_root'])
+        self.edge.setText(project.data['workspace'].get('output_edge', ''))
+        self.restore_workspace()
+        self.restore_style_selection()
+        self.workspace_restoring = False
+        self.refresh_batch_menu()
+        remember_project(self.preferences, project)
+        self.refresh_projects()
+        self.navigate(self.restored_page)
+        if (not Path(self.config.text()).expanduser().is_file() and not self.sources and not self.last_batch_directory
+                and not self.preferences.value('setup_deferred', False, type=bool)):
+            self.navigate(self.welcome_index)
+        self.update_actions()
+        if not self.save_workspace():
+            self.status.setText('项目已打开，保存失败。请检查项目文件夹的写入权限。')
+
+    def rename_active_project(self):
+        if self.project is None:
+            self.new_project()
+        else:
+            self.rename_project(str(self.project.path))
+
+    def rename_project(self, path):
+        if self.work_in_progress():
+            return
+        try:
+            project = self.project if self.project is not None and self.project.path == Path(path).resolve() else Project.open(path)
+            name, accepted = QInputDialog.getText(self, '重命名项目', '项目名称', text=project.data['name'])
+            if not accepted:
+                return
+            if project is self.project and not self.persist_project():
+                return
+            project.rename(name)
+            self.refresh_projects()
+            self.update_actions()
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.status.setText('重命名项目失败：'+str(error))
+
+    def refresh_batch_menu(self):
+        self.project_batches_menu.clear()
+        for directory in reversed(self.project_batches):
+            self.project_batches_menu.addAction(Path(directory).name,
+                lambda _checked=False, directory=directory:self.show_saved_batch(directory))
+        self.project_batches_menu.setEnabled(bool(self.project_batches))
+
     def schedule_workspace_save(self):
-        if not self.workspace_restoring:
+        if not self.workspace_restoring and self.project is not None:
             self.workspace_timer.start()
 
     def save_workspace(self):
-        if self.workspace_restoring:
-            return
+        if self.workspace_restoring or self.project is None:
+            return True
         self.workspace_timer.stop()
         fields = ('source','status','directory','batch_directory','files','exports',
             'output_dimensions','output_adjustment','stage','error')
@@ -604,25 +798,25 @@ class Workbench(QMainWindow):
             'import_recursive':self.import_recursive.isChecked(),
             'selection_brief':self.selection_brief.text(),'photo_selection':self.photo_selection,
             'photo_selection_directory':self.photo_selection_directory,'photo_selection_error':self.photo_selection_error,
-            'page':0 if self.pages.currentIndex()==self.welcome_index else self.pages.currentIndex(),
+            'page':self.pages.currentIndex() if self.pages.currentIndex() in (0, 1, 2) else self.restored_page,
             'selected_source':self.sources[row] if 0<=row<len(self.sources) else None,
             'results':[{name:result[name] for name in fields if name in result} for result in self.results.values()],
             'stages':self.stages,'photo_errors':self.photo_errors,
-            'batch_directory':self.batch_directory,'batch_error':self.batch_error}
-        self.preferences.setValue('workspace',json.dumps(state,ensure_ascii=False))
-        for key,value in (('output_root',self.root.text()),('config_path',self.config.text()),('output_edge',self.edge.text())):
-            if value.strip() or key=='output_edge':
-                self.preferences.setValue(key,value.strip())
-        self.preferences.sync()
-        if self.preferences.status() != QSettings.NoError:
-            self.status.setText('工作区未能保存到本机，请检查配置目录的写入权限。已有照片结果仍保留在保存目录。')
+            'batch_directory':self.batch_directory,'batch_error':self.batch_error,
+            'output_root':self.root.text(), 'output_edge':self.edge.text()}
+        creative = {'discussion':self.style_discussion_directory or '',
+            'samples':self.style_samples_directory or '',
+            'selected':self.style_selection_file or ''}
+        try:
+            self.project.save(state, creative, self.project_batches)
+        except OSError as error:
+            self.status.setText('项目保存失败：'+str(error)+'。当前窗口内容与已有成片保留。')
+            return False
+        return True
 
     def restore_workspace(self):
-        saved = self.preferences.value('workspace','',type=str)
-        if not saved:
-            return
         try:
-            state = json.loads(saved)
+            state = deepcopy(self.project.data['workspace'])
             self.restored_page = state.get('page', 0)
             self.sources = state['sources']
             known = {self.source_key(source) for source in self.sources}
@@ -634,7 +828,6 @@ class Workbench(QMainWindow):
             self.photo_selection_directory = state.get('photo_selection_directory')
             self.photo_selection_error = state.get('photo_selection_error','')
             self.character.setText(state.get('character',self.character.text()))
-            self.brief_character = self.character.text().strip()
             self.brief.setPlainText(state.get('brief',self.brief.toPlainText()))
             self.batch_directory = state.get('batch_directory')
             self.batch_error = state.get('batch_error','')
@@ -683,8 +876,11 @@ class Workbench(QMainWindow):
             self.creative_direction == self.selected_style['art_direction'].get('creative_direction', ''))
 
     def restore_style_selection(self):
+        creative = self.project.data['creative']
+        self.style_discussion_directory = creative.get('discussion') or None
+        self.style_samples_directory = creative.get('samples') or None
         try:
-            discussion = self.preferences.value('style/discussion', '', type=str)
+            discussion = creative.get('discussion')
             if discussion:
                 state = json.loads((Path(discussion) / 'conversation.json').read_text(encoding='utf-8'))
                 self.style_discussion_directory = discussion
@@ -692,12 +888,12 @@ class Workbench(QMainWindow):
                 self.creative_context = self.style_discussion_context
                 self.creative_direction = state.get('direction', '')
                 self.creative_draft = bool(state.get('draft', '').strip())
-            directory = self.preferences.value('style/samples', '', type=str)
+            directory = creative.get('samples')
             if directory:
                 state = json.loads((Path(directory) / 'styles.json').read_text(encoding='utf-8'))
                 self.style_samples_directory = directory
                 self.style_samples_context = (state['character'], state['brief'])
-            chosen = self.preferences.value('style/selected', '', type=str)
+            chosen = creative.get('selected')
             if chosen:
                 self.selected_style = load_style(chosen)
                 self.style_context = (self.selected_style['result']['character'], self.selected_style['result']['brief'])
@@ -771,12 +967,15 @@ class Workbench(QMainWindow):
 
     def configure_services(self):
         try:
-            dialog = ServiceSettings(self.config.text(), self, output_root=self.root.text())
+            dialog = ServiceSettings(self.config.text(), self, output_root=self.root.text(),
+                project_output=self.project is not None)
             if dialog.exec() == QDialog.Accepted:
                 self.config.setText(str(dialog.path))
-                self.root.setText(str(Path(dialog.output_root.text()).expanduser().resolve()))
+                if self.project is not None:
+                    self.root.setText(str(Path(dialog.output_root.text()).expanduser().resolve()))
                 self.remember_preferences()
-                self.status.setText('设置已保存。'+('可以继续与 Agent 讨论。' if self.sources else '下一步：批量导入照片，填写角色。'))
+                self.status.setText('设置已保存。'+('可以继续与 Agent 讨论。' if self.sources else
+                    '下一步：批量导入照片，填写角色。' if self.project is not None else '新建或打开项目后开始创作。'))
                 self.refresh_creative_preparation()
             elif self.pages.currentIndex()==self.welcome_index:
                 self.defer_setup()
@@ -807,23 +1006,8 @@ class Workbench(QMainWindow):
         else:
             self.configure_services()
 
-    def switch_character(self):
-        character = self.character.text().strip()
-        if character == self.brief_character:
-            return
-        if self.brief_character:
-            self.preferences.setValue('briefs/' + self.brief_character, self.brief.toPlainText())
-        self.brief_character = character
-        self.brief.setPlainText(self.preferences.value('briefs/' + character, '', type=str) if character else '')
-
     def remember_preferences(self):
-        self.switch_character()
-        self.preferences.setValue('character', self.brief_character)
-        if self.brief_character:
-            self.preferences.setValue('briefs/' + self.brief_character, self.brief.toPlainText())
-        for key, value in (('output_root', self.root.text()), ('config_path', self.config.text()), ('output_edge', self.edge.text())):
-            if value.strip() or key == 'output_edge':
-                self.preferences.setValue(key, value.strip())
+        self.preferences.setValue('config_path', self.config.text().strip())
         self.preferences.sync()
 
     def path_row(self, edit, directory=False):
@@ -844,6 +1028,10 @@ class Workbench(QMainWindow):
     def add_sources(self, paths):
         if self.work_in_progress() or not paths:
             return
+        if self.project is None or self.pages.currentIndex() == self.projects_index:
+            if self.new_project() is None:
+                return
+        self.navigate(0)
         self.import_worker = ImportWorker(paths,self.import_recursive.isChecked())
         self.import_worker.ready.connect(self.import_ready)
         self.import_worker.progress.connect(self.status.setText)
@@ -1083,7 +1271,18 @@ class Workbench(QMainWindow):
         self.schedule_workspace_save()
 
     def update_actions(self):
+        if self.workspace_restoring:
+            return
         running = self.work_in_progress()
+        has_project = self.project is not None
+        for button in self.nav_buttons:
+            button.setEnabled(has_project)
+        self.project_title.setEnabled(not running)
+        self.project_title.setVisible(has_project)
+        self.project_title.setText(self.project.data['name'] if has_project else '新建项目')
+        self.project_title.setToolTip(str(self.project.path) if has_project else '开始一组新的创作')
+        self.setWindowTitle('CosLuma '+VERSION+(' · '+self.project.data['name'] if has_project else ''))
+        self.project_browser.set_busy(running)
         choosing = self.import_worker is not None or self.selection_worker is not None
         self.progress_bar.setVisible(self.worker is not None or choosing)
         if choosing:
@@ -1329,7 +1528,9 @@ class Workbench(QMainWindow):
     def batch_started(self, directory):
         self.batch_directory = directory
         self.last_batch_directory = directory
-        self.preferences.setValue('last_batch_directory', directory)
+        if directory not in self.project_batches:
+            self.project_batches.append(directory)
+        self.refresh_batch_menu()
         self.open_folder_button.setEnabled(True)
         self.current_batch_view = self.make_results_view(directory)
         if self.result_views.currentWidget() is self.results_empty:
@@ -1431,12 +1632,10 @@ class Workbench(QMainWindow):
             self.restore_window()
 
     def closeEvent(self, event):
-        if self.creative_workspace is not None and not self.creative_workspace.flush_draft():
-            self.status.setText(self.creative_workspace.message.toPlainText())
+        if not self.persist_project():
             event.ignore()
             return
         self.remember_preferences()
-        self.save_workspace()
         if self.work_in_progress():
             if self.tray is not None:
                 self.close_after_finish = True
@@ -1455,6 +1654,8 @@ class Workbench(QMainWindow):
 
 
     def navigate(self, index):
+        if index in (0, 1, 2) and self.project is None:
+            index = self.projects_index
         if self.pages.currentIndex() == 1 and self.creative_workspace is not None:
             if not self.creative_workspace.flush_draft():
                 return
@@ -1474,7 +1675,10 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('读取本次结果失败：' + str(error))
         self.pages.setCurrentIndex(index)
+        if index in (0, 1, 2):
+            self.restored_page = index
         self.update_setup_hint()
+        self.projects_button.setChecked(index == self.projects_index)
         for number, button in enumerate(self.nav_buttons):
             button.setChecked(number == index)
         self.update_actions()
@@ -1535,8 +1739,7 @@ class Workbench(QMainWindow):
         changed = (self.style_discussion_directory, self.style_discussion_context) != (directory, context)
         self.style_discussion_directory, self.style_discussion_context = directory, context
         if changed:
-            self.preferences.setValue('style/discussion', directory)
-            self.preferences.sync()
+            self.save_workspace()
 
 
     def creative_state_changed(self):
@@ -1550,17 +1753,17 @@ class Workbench(QMainWindow):
         if workspace.directory is not None and workspace.options:
             self.style_samples_directory = workspace.directory
             self.style_samples_context = self.creative_context
-            self.preferences.setValue('style/samples', workspace.directory)
+        self.schedule_workspace_save()
         self.update_actions()
         self.finish_background_work()
 
 
     def select_style(self, option):
         self.selected_style = option
+        self.style_selection_file = option['selection_file']
         workspace = self.creative_workspace
         self.style_context = (workspace.character, workspace.brief)
-        self.preferences.setValue('style/selected', option['selection_file'])
-        self.preferences.sync()
+        self.save_workspace()
         self.status.setText('已定稿“' + option['title'] + '”。确认这张真实样片后，单独点击批量制作。')
         self.show_current_batch()
 
