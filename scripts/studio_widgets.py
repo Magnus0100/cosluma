@@ -251,6 +251,11 @@ class ConversationView(QScrollArea):
             bubble.body.setTextFormat(Qt.RichText)
             bubble.body.setText(document.toHtml())
         column.addWidget(bubble.body)
+        if entry.get('direction_changed'):
+            evidence = ui_label('本次要求更新依据：'+entry['direction_evidence'])
+            evidence.setWordWrap(True)
+            evidence.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            column.addWidget(evidence)
         bubble.error_label = None
         if failed:
             bubble.error_label = ui_label(entry['error'])

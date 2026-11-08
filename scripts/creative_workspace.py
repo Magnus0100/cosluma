@@ -776,7 +776,8 @@ class CreativeWorkspace(QWidget):
     def receive_reply(self, reply):
         update = reply['direction_update']
         changed = update is not None and update!=self.creative_direction
-        self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply'],'direction_update':update}])
+        self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply'],
+            'direction_update':update,'direction_evidence':reply['direction_evidence'],'direction_changed':changed}])
         self.pending_message = None
         if update is not None:
             self.creative_direction = update

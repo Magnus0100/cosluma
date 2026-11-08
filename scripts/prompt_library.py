@@ -141,8 +141,15 @@ class ReferenceLibrary:
 
     def call(self, name, arguments):
         if name == 'search_photography_references':
+            if (not isinstance(arguments,dict) or set(arguments)!={'queries'} or not isinstance(arguments['queries'],list)
+                    or any(not isinstance(query,dict) or set(query)!={'category','query'}
+                        or not all(isinstance(query[key],str) for key in ('category','query')) for query in arguments['queries'])):
+                raise ValueError('参考搜索只接受分类与检索词，不接受路径、网址或操作参数')
             result = self.search(arguments['queries'])
         elif name == 'read_photography_references':
+            if (not isinstance(arguments,dict) or set(arguments)!={'ids'} or not isinstance(arguments['ids'],list)
+                    or any(not isinstance(identifier,str) for identifier in arguments['ids'])):
+                raise ValueError('参考读取只接受本次检索得到的条目 ID')
             result = self.read(arguments['ids'])
         else:
             raise ValueError('未知参考查阅工具：'+str(name))
