@@ -131,6 +131,8 @@ class BeautyEditor(QWidget):
         self.pending = None
         self.rendered = BeautyParameters()
         self.failed = False
+        self.failure_message = ''
+        self.needs_restore = True
         self.restored = BeautyParameters()
         self.draft_timer = QTimer(self)
         self.draft_timer.setSingleShot(True)
@@ -224,7 +226,6 @@ class BeautyEditor(QWidget):
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.message)
-        QTimer.singleShot(0,self.restore_or_prepare)
 
     def is_busy(self):
         return self.worker is not None
@@ -234,6 +235,9 @@ class BeautyEditor(QWidget):
             slim=self.sliders['slim'].value()/100,protect_features=self.protect_features.isChecked())
 
     def restore_or_prepare(self):
+        if not self.isVisible() or self.worker is not None or not self.needs_restore:
+            return
+        self.needs_restore = False
         path = Path(self.context['directory'])/'beauty-session.json'
         try:
             if path.is_file():
@@ -250,7 +254,10 @@ class BeautyEditor(QWidget):
         if self.worker is not None:
             return
         self.draft_timer.stop()
+        self.needs_restore = False
         self.failed = False
+        if phase!='resume':
+            self.failure_message = ''
         worker = BeautyWorker(phase, context=self.context,config=self.config,
             session=self.session,pixels=self.pixels,parameters=self.parameters())
         worker.ready.connect(self.action_ready)
@@ -270,8 +277,12 @@ class BeautyEditor(QWidget):
             parameters = self.restored if phase == 'resume' else BeautyParameters()
             self.set_parameters(parameters)
             self.rendered = BeautyParameters()
-            self.pending = parameters if parameters != self.rendered else None
-            self.message.setText('人脸已准备。调整瘦脸，或主动生成美肤基础。')
+            self.pending = parameters if parameters != self.rendered and not self.failure_message else None
+            if self.failure_message:
+                self.failed = True
+                self.message.setText(self.failure_message+'\n已载入基础成片；调整参数后更新预览。')
+            else:
+                self.message.setText('人脸已准备。调整瘦脸，或主动生成美肤基础。')
             self.save_draft()
         elif phase == 'skin':
             self.session = result
@@ -293,15 +304,23 @@ class BeautyEditor(QWidget):
     def action_failed(self, error):
         self.failed = True
         self.pending = None
-        self.message.setText('人脸美化失败：'+error+'。当前画面保留上次成功预览。')
+        self.failure_message = '人脸美化失败：'+error
+        self.message.setText(self.failure_message+'。当前画面保留上次成功预览。')
 
     def action_finished(self):
         worker,self.worker = self.worker,None
+        worker.pixels = worker.session = None
         worker.deleteLater()
-        if self.pending is not None and not self.failed:
+        if not self.isVisible():
+            self.release_pixels()
+            self.update_controls()
+            self.busy_changed.emit()
+            return
+        if self.pending is not None and self.pending!=self.rendered and not self.failed:
             self.pending = None
             self.start('render')
             return
+        self.pending = None
         self.update_controls()
         self.busy_changed.emit()
 
@@ -332,7 +351,7 @@ class BeautyEditor(QWidget):
 
     def request_preview(self):
         self.save_draft()
-        if self.session is None:
+        if self.session is None or not self.isVisible():
             return
         if self.worker is not None:
             self.pending = self.parameters()
@@ -351,6 +370,33 @@ class BeautyEditor(QWidget):
             self.message.setText('保存美化草稿失败：'+str(error))
             return False
         return True
+
+    def release_pixels(self):
+        self.draft_timer.stop()
+        self.pending = None
+        if self.pixels is None:
+            return
+        if not self.save_draft():
+            return
+        if self.worker is not None:
+            return
+        self.session = self.pixels = self.before = None
+        self.needs_restore = True
+        self.preview.release_images()
+        self.update_controls()
+
+    def hideEvent(self, event):
+        self.release_pixels()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.pixels is not None:
+            self.preview.set_image_pair(self.before,self.before)
+            self.rendered = BeautyParameters()
+            if not self.failed:
+                self.request_preview()
+        QTimer.singleShot(0,self.restore_or_prepare)
 
     def update_controls(self):
         busy = self.worker is not None
@@ -371,4 +417,5 @@ class BeautyEditor(QWidget):
         self.connection_button.setEnabled(not busy)
         self.reset_button.setEnabled(self.session is not None and (not busy or rendering))
         parameters = self.parameters()
-        self.save_button.setEnabled(not busy and parameters == self.rendered and bool(parameters.skin or parameters.slim))
+        self.save_button.setEnabled(self.pixels is not None and not busy and
+            parameters == self.rendered and bool(parameters.skin or parameters.slim))

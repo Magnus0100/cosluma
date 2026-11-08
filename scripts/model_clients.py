@@ -596,12 +596,20 @@ def edit_image(source, prompt, config, directory, *, name='generated', style_ref
     response_bytes = request(config['url'], data=body, headers=headers,
         response_path=directory / (name + '-response.json'))
     response = json.loads(response_bytes)
+    del response_bytes, body, image_bytes
     result = response['data'][0]
-    pixels = base64.b64decode(result['b64_json']) if result.get('b64_json') else request(result['url'])
+    encoded = result.pop('b64_json',None)
+    inline = bool(encoded)
+    pixels = base64.b64decode(encoded) if inline else request(result['url'])
+    del encoded
     path = directory / (name + '-native.png')
     path.write_bytes(pixels)
     with open_rgb(path) as image:
         image.load()
+    if inline:
+        response['cosluma_saved_image'] = {'file':path.name,'bytes':len(pixels),
+            'extracted_from':'data[0].b64_json'}
+        save_json(directory/(name+'-response.json'),response)
     return path
 
 

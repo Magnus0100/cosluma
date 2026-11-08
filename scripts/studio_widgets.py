@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import OrderedDict
 import os
 import sys
+from threading import Event
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QTextDocument
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QPixmapCache, QTextDocument
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
     QSizePolicy, QVBoxLayout, QWidget)
@@ -442,6 +444,7 @@ class PhotoCanvas(QGraphicsView):
 
 class PreviewSignals(QObject):
     loaded = Signal(object)
+    finished = Signal()
 
 
 
@@ -451,25 +454,49 @@ class PreviewLoader(QRunnable):
         super().__init__()
         self.keys = keys
         self.signals = PreviewSignals()
+        self.cancelled = Event()
 
     def run(self):
-        images = {}
         for key in self.keys:
+            if self.cancelled.is_set():
+                break
             try:
-                images[key] = (open_display(key[0]), '')
-            except Exception as error:
-                images[key] = (None, str(error))
-        self.signals.loaded.emit(images)
+                image, error = open_display(key[0]), ''
+            except Exception as exception:
+                image, error = None, str(exception)
+            if not self.cancelled.is_set():
+                self.signals.loaded.emit({key:(image,error)})
+            del image
+        self.signals.finished.emit()
 
 
 
 class PhotoPreview(QWidget):
     """Read display previews independently of the untouched production images."""
-    cache = {}
-    errors = {}
+    errors = OrderedDict()
+
+    @staticmethod
+    def cached_preview(key):
+        return QPixmapCache.find('CosLuma:'+repr(key))
+
+    @staticmethod
+    def store_preview(key, pixels, error=''):
+        if pixels is not None:
+            QPixmapCache.insert('CosLuma:'+repr(key),pixels)
+            PhotoPreview.errors.pop(key,None)
+        elif error:
+            PhotoPreview.errors[key] = error
+            while len(PhotoPreview.errors)>32:
+                PhotoPreview.errors.popitem(last=False)
+
+    @staticmethod
+    def clear_cache():
+        QPixmapCache.clear()
+        PhotoPreview.errors.clear()
 
     def __init__(self, parent=None, *, source_label='原片', output_label='成片'):
         super().__init__(parent)
+        QPixmapCache.setCacheLimit(64*1024)
         self.source = None
         self.output = None
         self.direct_images = False
@@ -565,17 +592,14 @@ class PhotoPreview(QWidget):
             key = (str(path), Path(path).stat().st_mtime_ns,full)
         except OSError:
             return None
-        if key not in self.cache:
+        pixels = self.cached_preview(key)
+        if pixels is None and key not in self.errors:
             try:
-                self.cache[key] = QPixmap.fromImage(open_display(path, max_edge=None if full else 1600))
+                pixels = QPixmap.fromImage(open_display(path, max_edge=None if full else 360))
+                self.store_preview(key,pixels)
             except Exception as error:
-                self.cache[key] = None
-                self.errors[key] = str(error)
-            if len(self.cache) > 6:
-                removed = next(iter(self.cache))
-                self.cache.pop(removed)
-                self.errors.pop(removed, None)
-        return self.cache[key]
+                self.store_preview(key,None,str(error))
+        return pixels
 
     def set_photo(self, source=None, output=None, *, preserve_view=False):
         self.direct_images = False
@@ -586,6 +610,7 @@ class PhotoPreview(QWidget):
                 if not view.fitting and not view.photo.pixmap().isNull():
                     self.saved_views[view] = (view.photo.pixmap().size(),view.transform().m11(),
                         view.mapToScene(view.viewport().rect().center()))
+        previous_keys, previous_images = self.keys,self.images
         self.source, self.output = source, output
         self.keys = {}
         for kind,path in (('source',source),('output',output)):
@@ -594,20 +619,23 @@ class PhotoPreview(QWidget):
                     self.keys[kind] = (str(path),Path(path).stat().st_mtime_ns,True)
                 except OSError:
                     self.keys[kind] = None
-        self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
+        self.images = {kind:previous_images[kind] for kind,key in self.keys.items()
+            if self.isVisible() and previous_keys.get(kind)==key and kind in previous_images}
+        if self.loader is not None and previous_keys!=self.keys:
+            self.loader.cancelled.set()
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice if output else 'source'))
         self.mode.setEnabled(bool(output))
         self.mode.blockSignals(False)
         self.update_preview()
-        self.load_timer.start()
+        if self.isVisible():
+            self.load_timer.start()
 
     def set_image_pair(self, before, after):
         """Show the beauty editor's in-memory images with the same native canvas."""
         self.load_timer.stop()
         self.direct_images = True
-        self.saved_views = {}
-        self.images = {'source':QPixmap.fromImage(before), 'output':QPixmap.fromImage(after)}
+        self.images = {'source':QPixmap.fromImage(before), 'output':QPixmap.fromImage(after)} if self.isVisible() else {}
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice))
         self.mode.setEnabled(True)
@@ -615,41 +643,48 @@ class PhotoPreview(QWidget):
         self.update_preview()
 
     def load_pending(self):
-        if self.direct_images or self.loader is not None:
+        if not self.isVisible() or self.direct_images or self.loader is not None:
             return
-        # Another photo view may have filled the shared cache before this timer runs.
-        self.images.update({kind:self.cache[key] for kind,key in self.keys.items() if key in self.cache})
-        self.update_preview()
         visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
+        for kind in visible:
+            if kind not in self.images and self.keys.get(kind) is not None:
+                pixels = self.cached_preview(self.keys[kind])
+                if pixels is not None:
+                    self.images[kind] = pixels
+        self.update_preview()
         missing = list(dict.fromkeys(self.keys[kind] for kind in visible
-            if self.keys.get(kind) is not None and self.keys[kind] not in self.cache))
+            if self.keys.get(kind) is not None and kind not in self.images and self.keys[kind] not in self.errors))
         if missing:
-            self.loader = PreviewLoader(missing)
+            self.loader = PreviewLoader(missing[:1])
             self.loader.signals.loaded.connect(self.previews_loaded)
+            self.loader.signals.finished.connect(self.previews_finished)
             QThreadPool.globalInstance().start(self.loader)
 
     @Slot(object)
     def previews_loaded(self, images):
-        self.loader = None
-        for key,(image,error) in images.items():
-            self.cache[key] = QPixmap.fromImage(image) if image is not None else None
-            if error:
-                self.errors[key] = error
-        while len(self.cache) > 6:
-            removed = next(iter(self.cache))
-            self.cache.pop(removed)
-            self.errors.pop(removed, None)
-        if self.direct_images:
+        if not self.isVisible() or self.direct_images:
             return
-        self.images = {kind:self.cache.get(key) for kind,key in self.keys.items()}
+        visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
+        for key,(image,error) in images.items():
+            matching = [kind for kind in visible if self.keys.get(kind)==key]
+            if matching:
+                pixels = QPixmap.fromImage(image) if image is not None else None
+                self.store_preview(key,pixels,error)
+                if pixels is not None:
+                    self.images.update({kind:pixels for kind in matching})
         self.update_preview()
+
+    @Slot()
+    def previews_finished(self):
+        self.loader = None
         self.load_pending()
 
     def change_mode(self):
         if self.output or self.direct_images:
             self.choice = self.mode.currentData()
         self.update_preview()
-        self.load_timer.start()
+        if self.isVisible():
+            self.load_timer.start()
 
     def update_preview(self):
         mode = self.mode.currentData()
@@ -658,9 +693,18 @@ class PhotoPreview(QWidget):
         if self.pages.currentIndex() != page:
             self.pages.setCurrentIndex(page)
             QTimer.singleShot(0, self.update_preview)
+        if not self.isVisible():
+            return
         targets = ((self.before, 'source'), (self.after, 'output')) if self.pages.currentIndex() else (
             (self.preview, mode if has_output else 'source'),)
         self.syncing = True
+        active = {label for label,kind in targets}
+        for view in (self.preview,self.before,self.after):
+            if view not in active:
+                view.setText('')
+        if not self.direct_images:
+            visible = {kind for label,kind in targets}
+            self.images = {kind:pixels for kind,pixels in self.images.items() if kind in visible}
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
@@ -671,10 +715,10 @@ class PhotoPreview(QWidget):
                     label.centerOn(previous[2])
             elif not self.source:
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
-            elif self.keys.get(kind) is not None and self.keys[kind] not in self.cache:
-                label.setText('正在读取照片…')
             elif self.keys.get(kind) in self.errors:
                 label.setText(('读取成片失败\n' if kind == 'output' else '读取原片失败\n')+self.errors[self.keys[kind]])
+            elif self.keys.get(kind) is not None:
+                label.setText('正在读取照片…')
             elif kind == 'output':
                 label.setText('成片暂时无法预览\n可打开成片或批次文件夹查看文件')
             elif not Path(self.source).is_file():
@@ -684,6 +728,28 @@ class PhotoPreview(QWidget):
         self.syncing = False
         self.linked.setEnabled(bool(page))
         self.update_zoom_label()
+
+    def release_images(self):
+        self.load_timer.stop()
+        if self.loader is not None:
+            self.loader.cancelled.set()
+        self.syncing = True
+        for view in (self.preview,self.before,self.after):
+            if not view.fitting and not view.photo.pixmap().isNull():
+                self.saved_views[view] = (view.photo.pixmap().size(),view.transform().m11(),
+                    view.mapToScene(view.viewport().rect().center()))
+            view.setText('正在读取照片…')
+        self.images.clear()
+        self.syncing = False
+
+    def hideEvent(self, event):
+        self.release_images()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_preview()
+        self.load_timer.start()
 
     def synchronize(self, source, *, zoom):
         if self.syncing or not self.pages.currentIndex() or not self.linked.isChecked() or source.photo.pixmap().isNull():
@@ -736,6 +802,7 @@ class SampleComparison(QWidget):
         super().__init__(parent)
         self.keys = {}
         self.images = {}
+        self.saved_views = {}
         self.loader = None
         self.syncing = False
         self.views, self.titles, self.stages, self.inspect_buttons = [], [], [], []
@@ -819,7 +886,7 @@ class SampleComparison(QWidget):
                 view.setText('读取样片失败\n'+str(error))
                 continue
             keys[index] = key
-            pixels = self.images.get(index) if self.keys.get(index)==key else PhotoPreview.cache.get(key)
+            pixels = (self.images.get(index) if self.keys.get(index)==key else PhotoPreview.cached_preview(key)) if self.isVisible() else None
             if pixels is not None:
                 images[index] = pixels
                 view.setPixmap(pixels)
@@ -828,43 +895,80 @@ class SampleComparison(QWidget):
             else:
                 view.setText('正在读取样片…')
         self.keys, self.images = keys, images
+        if self.loader is not None and any(key not in keys.values() for key in self.loader.keys):
+            self.loader.cancelled.set()
         self.syncing = False
         self.update_zoom_label()
-        self.load_timer.start()
+        if self.isVisible():
+            self.load_timer.start()
 
     def load_pending(self):
-        if self.loader is not None:
+        if not self.isVisible() or self.loader is not None:
             return
+        for index,key in self.keys.items():
+            if index not in self.images:
+                pixels = PhotoPreview.cached_preview(key)
+                if pixels is not None:
+                    self.show_image(index,pixels)
         missing = list(dict.fromkeys(key for index,key in self.keys.items()
             if index not in self.images and key not in PhotoPreview.errors))
         if missing:
-            self.loader = PreviewLoader(missing)
+            self.loader = PreviewLoader(missing[:1])
             self.loader.signals.loaded.connect(self.previews_loaded)
+            self.loader.signals.finished.connect(self.previews_finished)
             QThreadPool.globalInstance().start(self.loader)
 
     @Slot(object)
     def previews_loaded(self, images):
-        self.loader = None
+        if not self.isVisible():
+            return
         self.syncing = True
         for key,(image,error) in images.items():
+            if key not in self.keys.values():
+                continue
             pixels = QPixmap.fromImage(image) if image is not None else None
-            PhotoPreview.cache[key] = pixels
-            if error:
-                PhotoPreview.errors[key] = error
+            PhotoPreview.store_preview(key,pixels,error)
             for index,current in self.keys.items():
                 if current==key:
                     if pixels is not None:
-                        self.images[index] = pixels
-                        self.views[index].setPixmap(pixels)
+                        self.show_image(index,pixels)
                     else:
                         self.views[index].setText('读取样片失败\n'+error)
-        while len(PhotoPreview.cache)>6:
-            removed = next(iter(PhotoPreview.cache))
-            PhotoPreview.cache.pop(removed)
-            PhotoPreview.errors.pop(removed,None)
         self.syncing = False
         self.update_zoom_label()
+
+    @Slot()
+    def previews_finished(self):
+        self.loader = None
         self.load_pending()
+
+    def show_image(self, index, pixels):
+        self.images[index] = pixels
+        view = self.views[index]
+        self.syncing = True
+        view.setPixmap(pixels)
+        previous = self.saved_views.pop(index,None)
+        if previous is not None and previous[0]==self.keys[index]:
+            view.set_zoom(previous[1])
+            view.centerOn(previous[2])
+        self.syncing = False
+        self.update_zoom_label()
+
+    def hideEvent(self, event):
+        self.load_timer.stop()
+        if self.loader is not None:
+            self.loader.cancelled.set()
+        for index,view in enumerate(self.views):
+            if not view.fitting and not view.photo.pixmap().isNull():
+                self.saved_views[index] = (self.keys[index],view.transform().m11(),
+                    view.mapToScene(view.viewport().rect().center()))
+            view.setText('正在读取样片…' if index in self.keys else view.empty_message)
+        self.images.clear()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.load_timer.start()
 
     def synchronize(self, source, *, zoom):
         if self.syncing:

@@ -25,7 +25,7 @@ from batch_results import BatchResults
 from delivery_view import DeliveryView
 from beauty_editor import BeautyConnection, BeautyEditor
 from image_io import IMAGE_EXTENSIONS
-from model_clients import select_photos
+from model_clients import select_photos, _discussion_preview
 from photo_pipeline import finish_batch, load_style
 from creative_edits import normalise_edits, edits_match
 from settings import default_settings_path, load_settings
@@ -718,6 +718,8 @@ class Workbench(QMainWindow):
         return self.save_workspace()
 
     def activate_project(self, project):
+        PhotoPreview.clear_cache()
+        _discussion_preview.cache_clear()
         self.workspace_restoring = True
         self.workspace_timer.stop()
         if self.creative_workspace is not None:

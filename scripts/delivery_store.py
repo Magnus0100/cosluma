@@ -154,8 +154,11 @@ def export_delivery(photos, choices, parent, name, formats, *, progress=None):
             for kind in formats:
                 target = directory/kind/(candidate+('.jpg' if kind=='JPEG' else '.png'))
                 temporary = target.with_name(target.name+'.tmp')
-                shutil.copy2(version['files'][kind],temporary)
-                os.replace(temporary,target)
+                try:
+                    shutil.copy2(version['files'][kind],temporary)
+                    os.replace(temporary,target)
+                finally:
+                    temporary.unlink(missing_ok=True)
                 item['files'][kind] = str(target)
         except (OSError,ValueError,KeyError) as error:
             item.update(status='failed',error=str(error))

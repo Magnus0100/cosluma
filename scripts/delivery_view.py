@@ -4,8 +4,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+from threading import Event
 
-from PySide6.QtCore import QObject, QRunnable, QSize, QThread, QThreadPool, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, QThread, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
@@ -28,15 +29,20 @@ class ThumbnailLoader(QRunnable):
         super().__init__()
         self.keys = keys
         self.signals = ThumbnailSignals()
+        self.cancelled = Event()
 
     def run(self):
         for key in self.keys:
+            if self.cancelled.is_set():
+                break
             try:
                 image = open_display(key[0],max_edge=360)
                 error = ''
             except Exception as exception:
                 image,error = None,str(exception)
-            self.signals.ready.emit(key,image,error)
+            if not self.cancelled.is_set():
+                self.signals.ready.emit(key,image,error)
+            del image
         self.signals.finished.emit()
 
 
@@ -195,6 +201,11 @@ class DeliveryView(QWidget):
         self.thumbnail_keys = {}
         self.thumbnail_cache = {}
         self.thumbnail_errors = {}
+        self.thumbnail_rows = set()
+        self.thumbnail_timer = QTimer(self)
+        self.thumbnail_timer.setSingleShot(True)
+        self.thumbnail_timer.setInterval(80)
+        self.thumbnail_timer.timeout.connect(self.load_thumbnails)
         self.loaded = False
         self.preview_key = None
         self.preview_photo = None
@@ -244,6 +255,8 @@ class DeliveryView(QWidget):
         self.listing.setTextElideMode(Qt.ElideRight)
         self.listing.currentRowChanged.connect(self.browse_photo)
         self.listing.itemChanged.connect(self.change_inclusion)
+        self.listing.verticalScrollBar().valueChanged.connect(lambda _value:self.thumbnail_timer.start(80))
+        self.listing.viewport().installEventFilter(self)
         column.addWidget(self.listing,1)
         self.empty = ui_label('本项目还没有完整成片。完成制作后，可以在这里挑选并导出。')
         self.empty.setWordWrap(True)
@@ -370,6 +383,7 @@ class DeliveryView(QWidget):
         self.state['choices'] = photo_choices(photos,self.state['choices'])
         self.rows = {photo['key']:row for row,photo in enumerate(photos)}
         self.thumbnail_keys = {}
+        self.thumbnail_rows.clear()
         self.listing.blockSignals(True)
         self.listing.clear()
         for photo in photos:
@@ -401,38 +415,86 @@ class DeliveryView(QWidget):
             self.thumbnail_keys.pop(photo['key'],None)
             return
         self.thumbnail_keys[photo['key']] = key
-        item.setIcon(self.thumbnail_cache.get(key,QIcon()))
+        item.setIcon(self.thumbnail_cache.get(key,QIcon()) if self.rows[photo['key']] in self.thumbnail_rows else QIcon())
         item.setToolTip(photo['source']+'\n'+version['label']+(
             '\n读取缩略图失败：'+self.thumbnail_errors[key] if key in self.thumbnail_errors else '')+
             '\n'+version['description'])
 
     def load_thumbnails(self):
-        if self.thumbnail_loader is not None:
+        if not self.isVisible():
             return
-        keys = list(dict.fromkeys(key for key in self.thumbnail_keys.values()
-            if key not in self.thumbnail_cache and key not in self.thumbnail_errors))
+        viewport = self.listing.viewport().rect()
+        area = viewport.adjusted(0,-216,0,216)
+        rows = {row for row in range(self.listing.count())
+            if not self.listing.item(row).isHidden() and
+                self.listing.visualItemRect(self.listing.item(row)).intersects(area)}
+        self.listing.blockSignals(True)
+        for row in self.thumbnail_rows-rows:
+            if row<self.listing.count():
+                self.listing.item(row).setIcon(QIcon())
+        self.thumbnail_rows = rows
+        retained = {self.thumbnail_keys.get(self.photos[row]['key']) for row in rows}
+        self.thumbnail_cache = {key:icon for key,icon in self.thumbnail_cache.items() if key in retained}
+        self.thumbnail_errors = {key:error for key,error in self.thumbnail_errors.items() if key in retained}
+        for row in rows:
+            self.update_tile(self.photos[row])
+        self.listing.blockSignals(False)
+        self.load_next_thumbnail()
+
+    def load_next_thumbnail(self):
+        if not self.isVisible() or self.thumbnail_loader is not None:
+            return
+        keys = list(dict.fromkeys(self.thumbnail_keys[self.photos[row]['key']] for row in sorted(self.thumbnail_rows)
+            if self.photos[row]['key'] in self.thumbnail_keys))
+        keys = [key for key in keys
+            if key not in self.thumbnail_cache and key not in self.thumbnail_errors]
         if keys:
-            self.thumbnail_loader = ThumbnailLoader(keys)
+            self.thumbnail_loader = ThumbnailLoader(keys[:1])
             self.thumbnail_loader.signals.ready.connect(self.thumbnail_ready)
             self.thumbnail_loader.signals.finished.connect(self.thumbnails_finished)
             QThreadPool.globalInstance().start(self.thumbnail_loader)
 
     @Slot(object,object,str)
     def thumbnail_ready(self, key, image, error):
+        matching = [row for row in self.thumbnail_rows if
+            self.thumbnail_keys.get(self.photos[row]['key'])==key]
+        if not self.isVisible() or not matching:
+            return
         if image is not None:
             self.thumbnail_cache[key] = QIcon(QPixmap.fromImage(image))
         else:
             self.thumbnail_errors[key] = error
         self.listing.blockSignals(True)
-        for photo in self.photos:
-            if self.thumbnail_keys.get(photo['key'])==key:
-                self.update_tile(photo)
+        for row in matching:
+            self.update_tile(self.photos[row])
         self.listing.blockSignals(False)
 
     @Slot()
     def thumbnails_finished(self):
         self.thumbnail_loader = None
-        self.load_thumbnails()
+        self.load_next_thumbnail()
+
+    def eventFilter(self, watched, event):
+        if watched is self.listing.viewport() and event.type()==QEvent.Resize:
+            self.thumbnail_timer.start(80)
+        return super().eventFilter(watched,event)
+
+    def hideEvent(self, event):
+        self.thumbnail_timer.stop()
+        if self.thumbnail_loader is not None:
+            self.thumbnail_loader.cancelled.set()
+        self.listing.blockSignals(True)
+        for row in self.thumbnail_rows:
+            self.listing.item(row).setIcon(QIcon())
+        self.listing.blockSignals(False)
+        self.thumbnail_rows.clear()
+        self.thumbnail_cache.clear()
+        self.thumbnail_errors.clear()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.thumbnail_timer.start(80)
 
     def apply_filters(self):
         query = self.search.text().strip().casefold()
@@ -453,6 +515,8 @@ class DeliveryView(QWidget):
         self.empty.setVisible(not visible)
         self.show_photo(self.listing.currentRow())
         self.update_controls()
+        if self.isVisible():
+            self.thumbnail_timer.start(80)
 
     def mark_visible(self, included):
         self.listing.blockSignals(True)

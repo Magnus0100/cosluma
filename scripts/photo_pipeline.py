@@ -14,6 +14,7 @@ from image_io import apply_tone_curve, fit_generated, open_photo, open_rgb, save
 from model_clients import edit_image, plan_photos, superresolve, write_prompt
 from head_composite import restore_head
 from creative_edits import normalise_edits, edits_match
+from delivery_store import result_path
 
 
 def _requested_size(source_size, config, explicit):
@@ -111,7 +112,7 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         stage('准备原片整头')
         final,record['head'] = restore_head(source_image,frame,record['head_box'],config,directory,stage,
             edits=edits,headwear=record.get('headwear',()))
-        del source_image
+        del source_image, frame
         record['head_blending'] = record['head']['method']
         if config.get('finish_curve'):
             stage('调整整图明度层次')
@@ -161,7 +162,8 @@ def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features
     run = json.loads(path.read_text(encoding='utf-8'))
     if run['status']!='complete':
         raise ValueError('请提供已完成成片的 run.json')
-    base = path.parent/Path(run['files']['final']).name
+    base = Path(result_path(path.parent.parent,run,run['files']['final'])) if run.get('batch_directory') else (
+        path.parent/Path(run['files']['final']).name)
     if session is None:
         prepared,pixels = prepare_face(base,run['head']['region'],path.parent,config['beauty'],progress)
     else:
@@ -312,6 +314,18 @@ def load_style(path):
     return option
 
 
+def _organise_outputs(result, directory, name):
+    """Keep one completed file per format; both records point at the organised image."""
+    result['exports'] = {}
+    for kind,key,suffix in (('PNG','final','.png'),('JPEG','jpeg','.jpg')):
+        target = directory/kind/(name+suffix)
+        target.parent.mkdir(exist_ok=True)
+        Path(result['files'][key]).rename(target)
+        result['files'][key] = str(target)
+        result['exports'][kind] = str(target)
+        save_json(Path(result['directory'])/'run.json',result)
+
+
 def revise_photo(source, character, root, config, *, art_direction, reference, revision_brief,
         revision_of, brief='', size=None, progress=None, batch_started=None):
     """Explicitly make one new version without changing a finalized group direction."""
@@ -339,23 +353,11 @@ def revise_photo(source, character, root, config, *, art_direction, reference, r
     result.update(batch_directory=str(directory),revision_of=revision_of,revision_brief=revision_brief,
         revision_requirements=requirements)
     if result['status']=='complete':
-        result['exports'] = {}
         try:
-            for kind,key,suffix in (('PNG','final','.png'),('JPEG','jpeg','.jpg')):
-                target = directory/kind/(source.stem+suffix)
-                target.parent.mkdir(exist_ok=True)
-                temporary = target.with_name(target.name+'.tmp')
-                output = temporary.open('xb')
-                try:
-                    with output, Path(result['files'][key]).open('rb') as pixels:
-                        shutil.copyfileobj(pixels,output)
-                    temporary.rename(target)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                result['exports'][kind] = str(target)
+            _organise_outputs(result,directory,source.stem)
         except OSError as error:
             result.update(status='failed',stage='整理成片',
-                error=f'整理成片：{error}。已合成文件保留在 {result["directory"]}')
+                error=f'整理成片：{error}。已合成文件与整理记录保留在 {directory}')
     state['items'][str(source)] = result
     complete = result['status']=='complete'
     state.update(status='complete' if complete else 'unfinished',stage='完成' if complete else result.get('stage','制作单张改稿'))
@@ -454,23 +456,11 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
                 name = source.stem
                 if names[name.casefold()]>1:
                     name = Path(result['directory']).name
-                result['exports'] = {}
                 try:
-                    for kind,key,suffix in (('PNG','final','.png'),('JPEG','jpeg','.jpg')):
-                        target = directory/kind/(name+suffix)
-                        target.parent.mkdir(exist_ok=True)
-                        temporary = target.with_name(target.name+'.tmp')
-                        output = temporary.open('xb')
-                        try:
-                            with output, Path(result['files'][key]).open('rb') as pixels:
-                                shutil.copyfileobj(pixels,output)
-                            temporary.rename(target)
-                        finally:
-                            temporary.unlink(missing_ok=True)
-                        result['exports'][kind] = str(target)
+                    _organise_outputs(result,directory,name)
                 except OSError as error:
                     result.update(status='failed',stage='整理成片',
-                        error=f'整理成片：{error}。已合成文件保留在 {result["directory"]}')
+                        error=f'整理成片：{error}。已合成文件与整理记录保留在 {directory}')
             state['items'][str(source)] = result
             save_json(directory/'batch.json',state)
             yield result
