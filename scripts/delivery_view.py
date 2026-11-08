@@ -5,14 +5,15 @@ from copy import deepcopy
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, QThread, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QSize, QThread, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
-    QSplitter, QVBoxLayout, QWidget)
+    QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
 
-from delivery_store import export_delivery, photo_choices, project_photos, selected_version
+from delivery_store import export_delivery, photo_choices, project_photos, revision_context, selected_version, source_key
+from creative_edits import normalise_edits
 from image_io import open_display
 from studio_widgets import PhotoPreview, StatusText, ui_label
 
@@ -55,8 +56,119 @@ class ExportWorker(QThread):
             self.failed.emit('导出失败：'+str(error))
 
 
+class RevisionWorker(QThread):
+    progress = Signal(str)
+    ready = Signal(dict)
+    failed = Signal(str)
+    directory_created = Signal(str)
+
+    def __init__(self, context, root, config):
+        super().__init__()
+        self.arguments = (context['source'],context['character'],root,deepcopy(config))
+        self.options = {key:deepcopy(context[key]) for key in
+            ('art_direction','reference','revision_brief','revision_of','brief','size')}
+
+    def run(self):
+        from photo_pipeline import revise_photo
+        try:
+            result = revise_photo(*self.arguments,**self.options,progress=self.progress.emit,
+                batch_started=self.directory_created.emit)
+            self.ready.emit(result)
+        except Exception as error:
+            self.failed.emit('改稿未完成：'+str(error))
+
+
+class RevisionDialog(QDialog):
+    draft_changed = Signal(str,dict)
+
+    def __init__(self, photo, current, drafts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('给这张改稿 · '+photo['name'])
+        self.resize(560,440)
+        self.versions = [version for version in reversed(photo['versions']) if version['kind']=='base']
+        self.drafts = deepcopy(drafts)
+        self.previous = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(ui_label(photo['name'],'heading'))
+        layout.addWidget(ui_label('改稿依据 · 基础成片'))
+        self.basis = QComboBox()
+        self.basis.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
+        initial = (current['id'] if current['kind']=='base' else
+            next(version['id'] for version in self.versions if version['work']==current['work']))
+        for version in self.versions:
+            self.basis.addItem(version['label'],version['id'])
+            self.basis.setItemData(self.basis.count()-1,version['description'],Qt.ToolTipRole)
+        self.basis.setCurrentIndex(self.basis.findData(initial))
+        layout.addWidget(self.basis)
+        note = ui_label('沿用所选基础版的摄影方向。下方选项只影响这张新稿，美化可在新稿完成后另做。')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        options = QHBoxLayout()
+        self.hair = QCheckBox('修发与头发生成')
+        self.relight = QCheckBox('人物重打光')
+        options.addWidget(self.hair)
+        options.addWidget(self.relight)
+        options.addStretch(1)
+        layout.addLayout(options)
+        option_note = ui_label('补发请主动开启修发；改变人物光向请开启重打光。两项初始沿用基础版的实际设置。')
+        option_note.setWordWrap(True)
+        layout.addWidget(option_note)
+        self.requirements = QPlainTextEdit()
+        self.requirements.setPlaceholderText('说明这张要改什么、保留什么，例如：补右侧假发缺口，保留刘海、头饰与衣服纹样。')
+        self.requirements.setMinimumHeight(110)
+        layout.addWidget(self.requirements,1)
+        boundary = ui_label('改稿会重新生成整幅画面，未指定的其他细节也可能变化。新稿另存，交付选择由你决定。')
+        boundary.setWordWrap(True)
+        layout.addWidget(boundary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Cancel).setText('返回')
+        buttons.rejected.connect(self.reject)
+        self.generate = buttons.addButton('生成一张新稿',QDialogButtonBox.AcceptRole)
+        self.generate.setProperty('kind','primary')
+        self.generate.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+        self.basis.currentIndexChanged.connect(self.change_basis)
+        self.requirements.textChanged.connect(self.change_draft)
+        self.hair.toggled.connect(self.change_draft)
+        self.relight.toggled.connect(self.change_draft)
+        self.change_basis()
+
+    def change_basis(self, _index=None):
+        self.previous = self.basis.currentData()
+        saved = self.drafts.get(self.previous)
+        self.loaded_edits = normalise_edits(saved['edits'] if saved is not None else self.selected()['edits'])
+        self.requirements.blockSignals(True)
+        self.requirements.setPlainText(saved['brief'] if saved is not None else '')
+        self.requirements.blockSignals(False)
+        for control,key in ((self.hair,'hair'),(self.relight,'relight')):
+            control.blockSignals(True)
+            control.setChecked(self.loaded_edits[key])
+            control.blockSignals(False)
+        self.generate.setEnabled(bool(self.requirements.toPlainText().strip()))
+
+    def change_draft(self, _checked=None):
+        text = self.requirements.toPlainText()
+        draft = {'brief':text,'edits':self.edits()}
+        self.drafts[self.previous] = draft
+        self.draft_changed.emit(self.previous,draft)
+        self.generate.setEnabled(bool(text.strip()))
+
+    def edits(self):
+        edits = dict(self.loaded_edits)
+        for control,key,brief in ((self.hair,'hair','hair_brief'),(self.relight,'relight','lighting_brief')):
+            if control.isChecked() and not edits[key]:
+                edits[brief] = ''
+            edits[key] = control.isChecked()
+        return edits
+
+    def selected(self):
+        return next(version for version in self.versions if version['id']==self.basis.currentData())
+
+
 class DeliveryView(QWidget):
     beauty_requested = Signal(dict)
+    revision_requested = Signal(dict)
+    batch_created = Signal(str)
     busy_changed = Signal()
     state_changed = Signal()
 
@@ -68,9 +180,16 @@ class DeliveryView(QWidget):
         self.state.setdefault('exports',[])
         self.state.setdefault('formats',['JPEG'])
         self.state.setdefault('comparisons',{})
+        self.state.setdefault('revision_drafts',{})
+        self.state.setdefault('latest_revisions',{})
         self.photos = []
         self.rows = {}
         self.worker = None
+        self.operation = ''
+        self.draft_timer = QTimer(self)
+        self.draft_timer.setSingleShot(True)
+        self.draft_timer.setInterval(400)
+        self.draft_timer.timeout.connect(self.save_state)
         self.production_busy = False
         self.thumbnail_loader = None
         self.thumbnail_keys = {}
@@ -169,6 +288,14 @@ class DeliveryView(QWidget):
         self.beauty.setEnabled(False)
         details.addWidget(self.beauty)
         column.addLayout(details)
+        revision_row = QHBoxLayout()
+        self.revise = QPushButton('给这张改稿')
+        self.revise.clicked.connect(self.open_revision)
+        revision_row.addWidget(self.revise,1)
+        self.compare_revision = QPushButton('比较新稿')
+        self.compare_revision.clicked.connect(self.compare_new_revision)
+        revision_row.addWidget(self.compare_revision,1)
+        column.addLayout(revision_row)
         splitter.addWidget(right)
         splitter.setSizes([530,650])
         layout.addWidget(splitter,1)
@@ -210,6 +337,7 @@ class DeliveryView(QWidget):
         self.update_controls()
 
     def save_state(self):
+        self.draft_timer.stop()
         try:
             self.project.save_delivery(self.state)
         except OSError as error:
@@ -345,6 +473,7 @@ class DeliveryView(QWidget):
             self.save_state()
 
     def show_photo(self, row):
+        self.update_revision_controls()
         self.version.blockSignals(True)
         self.reference.blockSignals(True)
         self.version.clear()
@@ -457,7 +586,7 @@ class DeliveryView(QWidget):
         visible = sum(not self.listing.item(row).isHidden() for row in range(self.listing.count()))
         self.summary.setText(f'已选交付 {count} 张 · 显示 {visible}/{len(self.photos)} 张')
         busy = self.is_busy()
-        self.listing.setEnabled(not busy)
+        self.listing.setEnabled(not busy or self.operation=='revision')
         self.version.setEnabled(not busy and self.current_photo() is not None)
         self.reference.setEnabled(self.current_photo() is not None)
         self.select_all.setEnabled(not busy and bool(visible))
@@ -470,6 +599,84 @@ class DeliveryView(QWidget):
         self.open_export.setEnabled(bool(self.state['exports']))
         self.history.setEnabled(not busy and bool(self.state['exports']))
         self.beauty.setEnabled(not busy and not self.production_busy and self.base_path is not None and Path(self.base_path).is_file())
+        self.update_revision_controls()
+
+    def update_revision_controls(self):
+        photo = self.current_photo()
+        self.revise.setEnabled(not self.is_busy() and not self.production_busy and photo is not None
+            and any(version['kind']=='base' for version in photo['versions']))
+        self.revise.setToolTip('选择这张的基础成片并填写单张要求，只制作一张新稿；交付选择保持原样')
+        self.compare_revision.setVisible(photo is not None and photo['key'] in self.state['latest_revisions'])
+
+    def remember_revision_draft(self, version, draft):
+        self.state['revision_drafts'][version] = draft
+        self.draft_timer.start()
+
+    def open_revision(self):
+        if self.is_busy() or self.production_busy:
+            return
+        try:
+            photo = self.current_photo()
+            if photo is None:
+                return
+            current = selected_version(photo,self.state['choices'][photo['key']])
+            dialog = RevisionDialog(photo,current,self.state['revision_drafts'],self)
+            dialog.draft_changed.connect(self.remember_revision_draft)
+            accepted = dialog.exec()==QDialog.Accepted
+            if not self.save_state() or not accepted:
+                return
+            context = revision_context(photo,dialog.selected())
+            context['art_direction']['edits'] = dialog.edits()
+            context['revision_brief'] = dialog.requirements.toPlainText().strip()
+            self.revision_requested.emit(context)
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('无法开始这张的改稿：'+str(error))
+
+    def start_revision(self, context, root, config):
+        self.operation = 'revision'
+        self.worker = RevisionWorker(context,root,config)
+        self.worker.progress.connect(self.message.setPlainText)
+        self.worker.directory_created.connect(self.batch_created.emit)
+        self.worker.ready.connect(self.revision_ready)
+        self.worker.failed.connect(self.message.setPlainText)
+        self.worker.finished.connect(self.revision_finished)
+        self.message.setPlainText('正在沿所选基础版制作这张的新稿。旧版、整组定稿与交付选择保留。')
+        self.update_controls()
+        self.busy_changed.emit()
+        self.worker.start()
+
+    def revision_ready(self, result):
+        if result['status']=='complete':
+            self.state['latest_revisions'][source_key(result['source'])] = result['exports']['PNG']
+            self.save_state()
+            self.message.setPlainText(Path(result['source']).name+' 的新稿已另存。点击“比较新稿”查看；采用时在“交付版本”中选择新稿。')
+        else:
+            self.message.setPlainText('这张改稿未完成：'+str(result['error']))
+
+    def revision_finished(self):
+        worker,self.worker = self.worker,None
+        self.operation = ''
+        self.refresh()
+        self.update_controls()
+        self.busy_changed.emit()
+        worker.deleteLater()
+
+    def compare_new_revision(self):
+        photo = self.current_photo()
+        if photo is None:
+            return
+        reference = self.state['latest_revisions'].get(photo['key'])
+        if reference is None:
+            return
+        try:
+            selected_version(photo,{'version':reference})
+            self.state['comparisons'][photo['key']] = reference
+            self.preview.choice = 'compare'
+            self.preview_key = None
+            self.show_photo(self.listing.currentRow())
+            self.save_state()
+        except ValueError as error:
+            self.message.setPlainText('新稿无法读取：'+str(error))
 
     def open_beauty(self):
         try:
@@ -494,6 +701,7 @@ class DeliveryView(QWidget):
         self.state['parent'] = str(parent)
         if not self.save_state():
             return
+        self.operation = 'export'
         self.worker = ExportWorker(self.photos,self.state['choices'],str(parent),
             self.project.data['name'],self.state['formats'])
         self.worker.progress.connect(self.message.setPlainText)
@@ -543,6 +751,7 @@ class DeliveryView(QWidget):
 
     def export_finished(self):
         worker,self.worker = self.worker,None
+        self.operation = ''
         self.update_controls()
         self.busy_changed.emit()
         worker.deleteLater()

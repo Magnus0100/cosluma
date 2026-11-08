@@ -1,6 +1,7 @@
 """Saved project photographs, explicit versions and unchanged delivery copies."""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 import json
 import os
@@ -52,11 +53,20 @@ def project_photos(batches):
                     for kind,field in (('PNG','final'),('JPEG','jpeg'))}
                 edits = normalise_edits(result.get('edits'))
                 treatment = edits_label(edits)
+                revision_brief = result.get('revision_brief','')
+                description = edits_description(edits)
+                if result.get('revision_of'):
+                    requirements = result.get('revision_requirements',[])
+                    description += ('\n本张已采纳要求（后者覆盖冲突）：\n'+'\n'.join(requirements)
+                        if requirements else '\n本次改稿要求：'+revision_brief)
+                revision_label = ' · 改稿' if result.get('revision_of') else ''
                 common = {'batch':str(directory),'work':work,'dimensions':result['output_dimensions'],
                     'base':result_path(directory,result,result['files']['final']),'edits':edits,
-                    'description':edits_description(edits),'direction':result.get('direction','')}
-                base = {'id':files['PNG'],'kind':'base','label':f'制作 {number} · {treatment} · 基础成片',
-                    'short_label':f'制作 {number} · {treatment}','files':files,**common}
+                    'description':description,'direction':result.get('direction',''),
+                    'revision_of':result.get('revision_of'),'revision_brief':revision_brief,
+                    'revision_requirements':result.get('revision_requirements',[])}
+                base = {'id':files['PNG'],'kind':'base','label':f'制作 {number}{revision_label} · {treatment} · 基础成片',
+                    'short_label':f'制作 {number}{revision_label} · {treatment}','files':files,**common}
                 if not any(version['id']==base['id'] for version in photo['versions']):
                     photo['versions'].append(base)
                 for edit_number,path in enumerate(sorted(Path(work).glob('beauty-*/edit-*/beauty.json')),1):
@@ -66,17 +76,30 @@ def project_photos(batches):
                     if saved['status']!='complete':
                         continue
                     parameters = saved['parameters']
-                    label = f'制作 {number} · {treatment} · 美化 {edit_number}（美肤 {round(parameters["skin"]*100)} / 瘦脸 {round(parameters["slim"]*100)}）'
+                    label = f'制作 {number}{revision_label} · {treatment} · 美化 {edit_number}（美肤 {round(parameters["skin"]*100)} / 瘦脸 {round(parameters["slim"]*100)}）'
                     beauty_files = {}
                     for kind,field in (('PNG','final'),('JPEG','jpeg')):
                         recorded = Path(saved['files'][field])
                         beauty_files[kind] = str(path.parent/(recorded.name if recorded.is_absolute() else recorded))
                     photo['versions'].append({'id':str(path),'kind':'beauty','label':label,
-                        'short_label':f'制作 {number} · {treatment} · 美化 {edit_number}','parameters':parameters,
+                        'short_label':f'制作 {number}{revision_label} · {treatment} · 美化 {edit_number}','parameters':parameters,
                         'files':beauty_files,**common})
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise ValueError(f'读取项目成片失败：{directory}\n{error}') from error
     return list(photos.values())
+
+
+def revision_context(photo, version):
+    """Read the explicitly selected base version's own production direction."""
+    if version['kind']!='base':
+        raise ValueError('请选择基础成片作为改稿依据；美化在新稿完成后另做')
+    work = Path(version['work'])
+    run = json.loads((work/'run.json').read_text(encoding='utf-8'))
+    direction = json.loads((Path(version['batch'])/'art-direction.json').read_text(encoding='utf-8'))
+    direction['edits'] = deepcopy(version['edits'])
+    return {'source':photo['source'],'character':run['character'],'brief':run['brief'],
+        'art_direction':direction,'reference':version['files']['JPEG'],
+        'revision_of':version['id'],'size':tuple(version['dimensions'])}
 
 
 def selected_version(photo, choice):

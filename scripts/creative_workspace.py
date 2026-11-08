@@ -27,7 +27,7 @@ class StyleWorker(QThread):
     directory_created = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction='', discussion=None, edits=None):
+    def __init__(self, sources, sample_source, character, brief, root, config, *, creative_direction='', discussion=None, edits=None, base_style=None):
         super().__init__()
         self.sources, self.sample_source = sources, sample_source
         self.character, self.brief = character, brief
@@ -35,13 +35,15 @@ class StyleWorker(QThread):
         self.creative_direction = creative_direction
         self.discussion = discussion
         self.edits = normalise_edits(edits)
+        self.base_style = deepcopy(base_style)
 
     def run(self):
         try:
             for option in make_style_samples(self.sources,self.sample_source,self.character,self.root,self.config,
                     brief=self.brief,progress=self.progress.emit,planned=self.plans_ready.emit,
                     sample_progress=self.sample_stage.emit,started=self.directory_created.emit,
-                    creative_direction=self.creative_direction,discussion=self.discussion,edits=self.edits):
+                    creative_direction=self.creative_direction,discussion=self.discussion,edits=self.edits,
+                    base_style=self.base_style):
                 self.sample_ready.emit(option)
         except Exception as error:
             self.failed.emit(str(error))
@@ -85,6 +87,8 @@ class CreativeWorkspace(QWidget):
         self.discussion_directory = None
         self.sample_directories = []
         self.round_sources = {}
+        self.round_kinds = {}
+        self.viewed_count = 3
         self.viewed_directory = None
         self.viewed_source = sample_source
         self.viewed_plans = []
@@ -139,7 +143,7 @@ class CreativeWorkspace(QWidget):
         self.focus_button.setCheckable(True)
         self.focus_button.toggled.connect(self.focus_photo)
         row.addWidget(self.focus_button)
-        self.generate = QPushButton('按当前讨论生成三个样片')
+        self.generate = QPushButton('探索三个方向')
         self.generate.setProperty('kind','primary')
         self.generate.setMinimumHeight(32)
         self.generate.clicked.connect(self.generate_samples)
@@ -167,21 +171,35 @@ class CreativeWorkspace(QWidget):
         self.sample_settings.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
         sample_layout.addWidget(self.sample_settings)
         self.sample_actions = QWidget()
-        sample_actions = QHBoxLayout(self.sample_actions)
+        sample_actions = QVBoxLayout(self.sample_actions)
         sample_actions.setContentsMargins(0,0,0,0)
+        sample_actions.setSpacing(5)
+        round_row = QHBoxLayout()
         self.sample_round = QComboBox()
         self.sample_round.setPlaceholderText('样片轮次 · 生成后可回看')
         self.sample_round.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
         self.sample_round.setToolTip('切换仅查看已有样片；再试样使用上方的下次试样原片')
         self.sample_round.currentIndexChanged.connect(self.view_round)
-        sample_actions.addWidget(self.sample_round,1)
+        round_row.addWidget(self.sample_round,1)
         self.compare_button = QToolButton()
         self.compare_button.setText('三个样片并排')
         self.compare_button.setCheckable(True)
         self.compare_button.setEnabled(False)
         self.compare_button.toggled.connect(self.compare_samples)
-        sample_actions.addWidget(self.compare_button)
-        sample_actions.addWidget(self.generate)
+        round_row.addWidget(self.compare_button)
+        sample_actions.addLayout(round_row)
+        generation_row = QHBoxLayout()
+        generation_row.addWidget(self.generate,1)
+        self.revise = QPushButton('沿这张改一张')
+        self.revise.setMinimumHeight(32)
+        self.revise.clicked.connect(self.revise_sample)
+        generation_row.addWidget(self.revise,1)
+        sample_actions.addLayout(generation_row)
+        self.revision_note = ui_label('单独查看一张完整样片后，可沿它改稿。')
+        self.revision_note.setWordWrap(True)
+        self.revision_note.setMaximumHeight(44)
+        self.revision_note.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred)
+        sample_actions.addWidget(self.revision_note)
         sample_layout.addWidget(self.sample_actions)
         self.sample_strip = QWidget()
         self.sample_strip.setFixedHeight(132)
@@ -447,6 +465,8 @@ class CreativeWorkspace(QWidget):
         self.refresh_sample_view()
 
     def refresh_sample_view(self):
+        if self.viewed_count<2 and self.compare_button.isChecked():
+            self.leave_comparison()
         has_samples = self.viewed_directory is not None or bool(self.options)
         focused = self.focus_button.isChecked()
         comparing = self.compare_button.isChecked()
@@ -546,6 +566,7 @@ class CreativeWorkspace(QWidget):
         for sample_directory in self.sample_directories:
             sample_state = json.loads((Path(sample_directory)/'styles.json').read_text(encoding='utf-8'))
             self.round_sources[sample_directory] = sample_state['sample_source']
+            self.round_kinds[sample_directory] = sample_state.get('kind','exploration')
         self.chosen_file = state.get('selected_file','')
         self.frozen_direction = state.get('frozen_direction','')
         if self.chosen_file:
@@ -566,7 +587,7 @@ class CreativeWorkspace(QWidget):
             self.show_original()
         if state.get('viewing_selected') and self.selected_style is not None:
             self.show_selected_style(self.selected_style)
-        elif state.get('comparing_samples') and self.viewed_directory is not None:
+        elif state.get('comparing_samples') and self.viewed_directory is not None and self.viewed_count>1:
             self.compare_button.blockSignals(True)
             self.compare_button.setChecked(True)
             self.compare_button.setText('返回单张查看')
@@ -656,6 +677,15 @@ class CreativeWorkspace(QWidget):
         draft_note = '这段输入尚未发送。请先发给 Agent，或清空输入，再按已经讨论的要求试样或定稿。'
         source = self.sample_source.currentData()
         self.generate.setToolTip(draft_note if draft else '按当前创作要求，用上方所选原片制作新一轮三个真实样片')
+        revision = self.revision_source()
+        self.revise.setEnabled(not busy and not draft and revision is not None)
+        self.revise.setToolTip(draft_note if draft else
+            '沿眼前完整样片的方向和原片，按当前讨论制作一张新稿；不会自动定稿')
+        note = ('改稿依据：'+revision['title']+' · '+Path(revision['sample_source']).name+
+            '\n沿用方向制作一张；整幅重新生成，其他细节也可能变化。' if revision is not None else
+            '单独查看一张完整样片后，可沿它改稿。')
+        self.revision_note.setText(note)
+        self.revision_note.setToolTip(note)
         self.finalize.setToolTip(draft_note if draft else
             '这一轮使用此前的创作要求或可选设置，可回看；按当前设置试样后再定稿' if not self.samples_are_current() else
             '将当前完整样片保存为这组照片的最终方向')
@@ -663,7 +693,7 @@ class CreativeWorkspace(QWidget):
         self.sample_source.setEnabled(not busy)
         self.sample_round.setEnabled(bool(self.sample_directories))
         self.compare_button.setEnabled(self.viewed_directory is not None and not self.viewing_original
-            and not self.viewing_selected and bool(self.viewed_plans or self.options))
+            and not self.viewing_selected and self.viewed_count>1 and bool(self.viewed_plans or self.options))
         for index,card in self.cards.items():
             card[2].setEnabled(index in self.options)
         option = self.options.get(self.current_option,{})
@@ -801,7 +831,7 @@ class CreativeWorkspace(QWidget):
         self.sample_round.blockSignals(False)
         self.refresh_sample_view()
         self.open_folder.setEnabled(False)
-        self.generate.setText('按当前讨论生成三个样片')
+        self.generate.setText('探索三个方向')
         self.canvas.set_photo(self.viewed_source)
         self.active_caption.setText('下次试样原片'+(' · '+Path(self.viewed_source).name if self.viewed_source else ' · 请在照片页添加原片'))
         self.active_caption.setToolTip(self.active_caption.text())
@@ -817,7 +847,7 @@ class CreativeWorkspace(QWidget):
         self.sample_round.clear()
         for number,directory in enumerate(self.sample_directories,1):
             source = self.round_sources[directory]
-            label = f'第 {number} 轮 · '+Path(source).name
+            label = f'第 {number} 轮'+(' · 改稿' if self.round_kinds.get(directory)=='revision' else '')+' · '+Path(source).name
             if self.worker is not None and directory==self.active_directory:
                 label += ' · 制作中'
             self.sample_round.addItem(label,directory)
@@ -836,8 +866,10 @@ class CreativeWorkspace(QWidget):
         except (OSError,ValueError,KeyError,TypeError) as error:
             self.message.setPlainText('无法读取这一轮样片：'+str(error))
 
-    def reset_cards(self, stage_text):
+    def reset_cards(self, stage_text, count=3):
+        self.viewed_count = count
         for index,(summary,stage,button,thumbnail,panel) in self.cards.items():
+            panel.setVisible(index<count)
             panel.setTitle(f'方案 {index+1}')
             summary.setText('分析当前角色与照片后，再确定此方向')
             summary.setToolTip('')
@@ -850,6 +882,10 @@ class CreativeWorkspace(QWidget):
 
     def display_plans(self, plans):
         self.viewed_plans = plans
+        if plans:
+            self.viewed_count = len(plans)
+            for index,card in self.cards.items():
+                card[4].setVisible(index<len(plans))
         for index,plan in enumerate(plans):
             self.cards[index][4].setTitle(f'方案 {index+1} · '+plan['title'])
             self.cards[index][0].setText(plan['summary'])
@@ -880,6 +916,8 @@ class CreativeWorkspace(QWidget):
             options = self.active_options
             plans = self.active_plans
             error = self.failure_message
+            count = 1 if self.worker.base_style is not None else 3
+            kind = 'revision' if self.worker.base_style is not None else 'exploration'
         else:
             path = Path(directory)
             state = json.loads((path/'styles.json').read_text(encoding='utf-8'))
@@ -888,6 +926,8 @@ class CreativeWorkspace(QWidget):
             edits = normalise_edits(state.get('edits'))
             error = state.get('error','')
             status = state['status']
+            count = state.get('option_count',3)
+            kind = state.get('kind','exploration')
             plans = (json.loads((path/'style-options.json').read_text(encoding='utf-8'))
                 if status in ('rendering','complete','unfinished') else [])
             options = {}
@@ -901,6 +941,7 @@ class CreativeWorkspace(QWidget):
         if directory not in self.sample_directories:
             self.sample_directories.append(directory)
         self.round_sources[directory] = source
+        self.round_kinds[directory] = kind
         self.viewed_directory = directory
         self.viewed_source = source
         self.viewing_original = False
@@ -908,8 +949,10 @@ class CreativeWorkspace(QWidget):
         self.samples_direction = direction
         self.samples_edits = dict(edits)
         self.options = options
-        self.reset_cards('设计方向中' if active and not plans else '未完成')
+        self.reset_cards('准备改稿' if kind=='revision' and not plans else '设计方向中' if active and not plans else '未完成',count)
         self.display_plans(plans)
+        if self.current_option>=self.viewed_count:
+            self.current_option = 0
         for option in options.values():
             self.display_sample(option)
         if active:
@@ -919,7 +962,7 @@ class CreativeWorkspace(QWidget):
                     self.cards[index][1].setToolTip(stage)
         self.refresh_round_choices()
         self.open_folder.setEnabled(True)
-        self.generate.setText('按当前讨论再做三个样片')
+        self.generate.setText('重新探索三个方向')
         if self.compare_button.isChecked():
             self.refresh_sample_view()
             self.update_creative_actions()
@@ -939,7 +982,21 @@ class CreativeWorkspace(QWidget):
         else:
             self.message.setPlainText('正在回看已有真实样片，可选择完整样片明确定稿；再试样使用上方所选原片与当前讨论。')
 
+    def revision_source(self):
+        if self.viewing_original or self.compare_button.isChecked():
+            return None
+        option = self.selected_style if self.viewing_selected else self.options.get(self.current_option)
+        return option if option is not None and option.get('status')=='complete' else None
+
     def generate_samples(self):
+        self.start_samples()
+
+    def revise_sample(self):
+        option = self.revision_source()
+        if option is not None:
+            self.start_samples(base_style=deepcopy(option))
+
+    def start_samples(self, *, base_style=None):
         if self.is_busy() or self.production_busy:
             return
         if self.chat_input.toPlainText().strip():
@@ -953,6 +1010,9 @@ class CreativeWorkspace(QWidget):
             return
         discussion = deepcopy({'messages':[row for row in self.messages if row.get('status')!='failed'],
             'context':self.discussion_context()})
+        source = base_style['sample_source'] if base_style is not None else self.sample_source.currentData()
+        if not source:
+            return
         self.leave_comparison()
         self.active_directory = None
         self.active_plans = []
@@ -961,25 +1021,28 @@ class CreativeWorkspace(QWidget):
         self.options = self.active_options
         self.viewed_plans = []
         self.viewed_directory = None
-        self.viewed_source = self.sample_source.currentData()
+        self.viewed_source = source
+        self.current_option = 0
         self.viewing_original = False
         self.viewing_selected = False
         self.failure_message = ''
         self.samples_direction = self.creative_direction
         self.samples_edits = self.current_edits()
         self.open_folder.setEnabled(False)
-        self.reset_cards('设计方向中')
+        self.reset_cards('准备改稿' if base_style is not None else '设计方向中',1 if base_style is not None else 3)
         self.sample_round.blockSignals(True)
         self.sample_round.setCurrentIndex(-1)
         self.sample_round.blockSignals(False)
-        self.canvas.set_photo(self.sample_source.currentData())
-        self.active_caption.setText('原片 · 正在设计三个方向')
+        self.canvas.set_photo(source,base_style['result']['files']['jpeg'] if base_style is not None else None)
+        self.active_caption.setText('沿“'+base_style['title']+'”制作一张修改稿 · 原片 '+Path(source).name if base_style is not None else
+            '原片 · 正在设计三个方向')
         self.generate.setEnabled(False)
         self.change_source.setEnabled(False)
         self.sample_source.setEnabled(False)
-        represented = list(dict.fromkeys([self.sample_source.currentData(),*self.sources]))
-        self.worker = StyleWorker(represented,self.sample_source.currentData(),self.character,
-            self.brief,self.root,self.config,creative_direction=self.creative_direction,discussion=discussion,edits=self.samples_edits)
+        represented = list(dict.fromkeys([source,*self.sources]))
+        self.worker = StyleWorker(represented,source,self.character,
+            self.brief,self.root,self.config,creative_direction=self.creative_direction,discussion=discussion,
+            edits=self.samples_edits,base_style=base_style)
         self.worker.progress.connect(self.sample_progress)
         self.worker.plans_ready.connect(self.show_plans)
         self.worker.sample_stage.connect(self.show_stage)
@@ -987,7 +1050,8 @@ class CreativeWorkspace(QWidget):
         self.worker.directory_created.connect(self.directory_ready)
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.samples_finished)
-        self.message.setPlainText('正在结合角色“'+self.character+'”、代表原片与补充要求设计三个方向。其余照片尚未提交。')
+        self.message.setPlainText('沿“'+base_style['title']+'”的摄影方向，按当前讨论制作一张新稿。旧样片与定稿保留。' if base_style is not None else
+            '正在结合角色“'+self.character+'”、代表原片与补充要求设计三个方向。其余照片尚未提交。')
         self.refresh_sample_view()
         self.update_creative_actions()
         self.state_changed.emit()
@@ -999,6 +1063,7 @@ class CreativeWorkspace(QWidget):
         if directory not in self.sample_directories:
             self.sample_directories.append(directory)
         self.round_sources[directory] = self.worker.sample_source
+        self.round_kinds[directory] = 'revision' if self.worker.base_style is not None else 'exploration'
         if self.viewed_directory is None and not self.viewing_original and not self.viewing_selected:
             self.viewed_directory = directory
             self.open_folder.setEnabled(True)
@@ -1074,16 +1139,17 @@ class CreativeWorkspace(QWidget):
 
     def samples_finished(self):
         worker,self.worker = self.worker,None
-        self.generate.setText('按当前讨论再做三个样片')
+        self.generate.setText('重新探索三个方向')
         if self.viewed_directory==self.active_directory and not self.viewing_original:
             complete = sum(option['status']=='complete' for option in self.active_options.values())
-            for index in self.cards:
+            for index in range(1 if worker.base_style is not None else 3):
                 if index not in self.active_options:
                     self.cards[index][1].setText('未完成')
                     self.cards[index][1].setToolTip('未完成')
             if not self.viewing_selected:
                 if self.active_options:
-                    self.message.setPlainText(f'已完成 {complete} 个真实样片。可比较、继续讨论或明确定稿；再次试样将保留这一轮。' if complete else
+                    self.message.setPlainText(('修改稿已完成。可与原片比较、继续讨论或明确定稿；此前版本保留。' if worker.base_style is not None else
+                        f'已完成 {complete} 个真实样片。可比较、继续讨论或明确定稿；再次试样将保留这一轮。') if complete else
                         '本轮样片未完成，点击方案查看真实错误；已有文件保留，由你决定是否再试样。')
                 if self.failure_message:
                     self.message.setPlainText('样片未全部完成：'+self.failure_message)

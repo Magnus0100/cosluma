@@ -1884,6 +1884,8 @@ class Workbench(QMainWindow):
         if self.delivery_view is None:
             self.delivery_view = DeliveryView(self.project,self.result_views)
             self.delivery_view.beauty_requested.connect(self.open_beauty)
+            self.delivery_view.revision_requested.connect(self.start_photo_revision)
+            self.delivery_view.batch_created.connect(self.remember_revision_batch)
             self.delivery_view.state_changed.connect(self.update_actions)
             self.delivery_view.busy_changed.connect(self.delivery_busy_changed)
             self.result_views.addWidget(self.delivery_view)
@@ -1902,6 +1904,22 @@ class Workbench(QMainWindow):
     def delivery_busy_changed(self):
         self.update_actions()
         self.finish_background_work()
+
+    def start_photo_revision(self, context):
+        if self.work_in_progress():
+            return
+        try:
+            config = load_settings(self.config.text())
+            self.delivery_view.start_revision(context,self.root.text(),config)
+        except (OSError,ValueError,KeyError) as error:
+            self.delivery_view.message.setPlainText('无法开始改稿：'+str(error))
+
+    def remember_revision_batch(self, directory):
+        if directory not in self.project_batches:
+            self.project_batches.append(directory)
+        self.last_batch_directory = directory
+        self.refresh_batch_menu()
+        self.save_workspace()
 
 
     def work_in_progress(self):

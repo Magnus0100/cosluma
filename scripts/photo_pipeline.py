@@ -45,6 +45,9 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
     directory.mkdir(parents=True,exist_ok=False)
     record = {'source':str(source),'character':character,'brief':brief,'directory':str(directory),
         'status':'running','stage':'decode','files':{},'sr':[],'edits':edits}
+    if art_direction is not None and 'revision_of' in art_direction:
+        record.update(revision_of=art_direction['revision_of'],revision_brief=art_direction.get('revision_brief',''),
+            revision_requirements=deepcopy(art_direction.get('revision_requirements',[])))
     def stage(name):
         record['stage'] = name
         save_json(directory/'run.json',record)
@@ -67,7 +70,9 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         description = write_prompt(source_image,character,brief,library,config['llm'],directory,
             direction=art_direction['direction'] if art_direction is not None else '',
             style_reference=art_direction.get('style_reference') if art_direction is not None else None,
-            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',edits=edits)
+            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',
+            revision_brief=art_direction.get('revision_brief','') if art_direction is not None else '',
+            revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],edits=edits)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         if edits['hair']:
@@ -198,8 +203,9 @@ def _reuse_style_sample(selected, directory):
 
 
 def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
-        progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None, edits=None):
-    """Render three real styles through finish_photo, once per option."""
+        progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None, edits=None,
+        base_style=None):
+    """Render three directions, or explicitly revise one complete sample, through finish_photo."""
     report = progress or (lambda message: None)
     edits = normalise_edits(edits)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -211,21 +217,39 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     state = {'status':'planning','sample_source':str(sample_source),'sources':[str(source) for source in sources],
         'character':character,'brief':brief,'creative_direction':creative_direction,'edits':edits,'options':{},
         'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
+    if base_style is not None:
+        state.update(kind='revision',revision_of=base_style['selection_file'],option_count=1,
+            revision_brief=creative_direction)
     if discussion is not None:
         state['discussion'] = discussion
     save_json(directory/'styles.json',state)
     if started is not None:
         started(str(directory))
-    report('设计三个不同的摄影方向')
+    report('沿用完整样片，准备单张改稿' if base_style is not None else '设计三个不同的摄影方向')
     try:
-        represented = [sample_source] + [source for source in sources if source != sample_source]
-        plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,
-            option_count=3,creative_direction=creative_direction,discussion=discussion,edits=edits)
+        if base_style is not None:
+            if base_style['status']!='complete' or base_style['result']['status']!='complete':
+                raise ValueError('请从已完成的真实样片开始改稿')
+            plan = deepcopy(base_style['art_direction'])
+            plan.pop('revision_requirements',None)
+            plan.update(title=base_style['title'].removesuffix(' · 改稿')+' · 改稿',
+                summary='沿用这张样片的摄影方向，按本轮讨论与设置修改。',
+                creative_direction=creative_direction,edits=dict(edits),
+                style_reference=base_style['result']['files']['jpeg'],
+                sample_reference_id=base_style['selection_file'],revision_of=base_style['selection_file'],
+                revision_brief=creative_direction)
+            plans = [plan]
+            save_json(directory/'style-options.json',plans)
+        else:
+            represented = [sample_source] + [source for source in sources if source != sample_source]
+            plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,
+                option_count=3,creative_direction=creative_direction,discussion=discussion,edits=edits)
     except Exception as error:
         message = getattr(error,'provider_message','') or str(error)
         state.update(status='failed',error=message)
         save_json(directory/'styles.json',state)
-        raise RuntimeError(f'设计风格样片：{message}。目录：{directory}') from None
+        action = '准备样片改稿' if base_style is not None else '设计风格样片'
+        raise RuntimeError(f'{action}：{message}。目录：{directory}') from None
     state.update(status='rendering')
     save_json(directory/'styles.json',state)
     if planned is not None:
@@ -238,6 +262,8 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
             'sample_source':str(sample_source),'styles_directory':str(directory),
             'selection_file':str(directory/f'style-{index+1}.json'),
             'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
+        if base_style is not None:
+            option.update(kind='revision',revision_of=plan['revision_of'],revision_brief=plan['revision_brief'])
         try:
             result = finish_photo(sample_source,character,directory,config,brief=brief,size=size,
                 art_direction=plan,progress=stage)
@@ -248,7 +274,7 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
             option['error'] = result['error']
         save_json(option['selection_file'],option)
         return option
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=len(plans)) as pool:
         pending = {pool.submit(produce,index,plan) for index,plan in enumerate(plans)}
         for future in as_completed(pending):
             pending.remove(future)
@@ -284,6 +310,57 @@ def load_style(path):
             raise FileNotFoundError(f'所选样片的成片文件不存在：{result["files"][key]}')
     option.update(styles_directory=str(path.parent),selection_file=str(path))
     return option
+
+
+def revise_photo(source, character, root, config, *, art_direction, reference, revision_brief,
+        revision_of, brief='', size=None, progress=None, batch_started=None):
+    """Explicitly make one new version without changing a finalized group direction."""
+    report = progress or (lambda message:None)
+    source = Path(source).expanduser().resolve()
+    plan = deepcopy(art_direction)
+    requirements = deepcopy(plan.get('revision_requirements',[]))
+    requirements.append(revision_brief)
+    plan.update(style_reference=str(Path(reference).expanduser().resolve()),
+        revision_brief=revision_brief,revision_of=revision_of,revision_requirements=requirements)
+    directory = Path(root).expanduser().resolve()/('batch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+    directory.mkdir(parents=True,exist_ok=False)
+    state = {'status':'running','stage':'制作单张改稿','kind':'revision','total':1,'sources':[str(source)],
+        'character':character,'brief':brief,'direction':plan['direction'],'edits':normalise_edits(plan.get('edits')),
+        'revision_of':revision_of,'revision_brief':revision_brief,'revision_requirements':requirements,'items':{}}
+    save_json(directory/'art-direction.json',plan)
+    save_json(directory/'batch.json',state)
+    if batch_started is not None:
+        batch_started(str(directory))
+    try:
+        result = finish_photo(source,character,directory,config,brief=brief,size=size,
+            art_direction=plan,progress=report)
+    except Exception as error:
+        result = _failed_photo(source,error)
+    result.update(batch_directory=str(directory),revision_of=revision_of,revision_brief=revision_brief,
+        revision_requirements=requirements)
+    if result['status']=='complete':
+        result['exports'] = {}
+        try:
+            for kind,key,suffix in (('PNG','final','.png'),('JPEG','jpeg','.jpg')):
+                target = directory/kind/(source.stem+suffix)
+                target.parent.mkdir(exist_ok=True)
+                temporary = target.with_name(target.name+'.tmp')
+                output = temporary.open('xb')
+                try:
+                    with output, Path(result['files'][key]).open('rb') as pixels:
+                        shutil.copyfileobj(pixels,output)
+                    temporary.rename(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                result['exports'][kind] = str(target)
+        except OSError as error:
+            result.update(status='failed',stage='整理成片',
+                error=f'整理成片：{error}。已合成文件保留在 {result["directory"]}')
+    state['items'][str(source)] = result
+    complete = result['status']=='complete'
+    state.update(status='complete' if complete else 'unfinished',stage='完成' if complete else result.get('stage','制作单张改稿'))
+    save_json(directory/'batch.json',state)
+    return result
 
 
 def finish_batch(sources, character, root, config, *, brief='', size=None, workers=None,
@@ -327,6 +404,9 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
             shutil.copyfile(selected['result']['files']['jpeg'],reference)
             art_direction = deepcopy(selected['art_direction'])
             art_direction['style_reference'] = str(reference)
+            art_direction.pop('revision_of',None)
+            art_direction.pop('revision_brief',None)
+            art_direction.pop('revision_requirements',None)
             save_json(directory/'art-direction.json',art_direction)
         except Exception as error:
             state.update(status='failed',stage='准备选中风格',error=str(error))
