@@ -231,7 +231,7 @@ def _representatives(sources, *, required=()):
 @lru_cache(maxsize=16)
 def _discussion_preview(path, modified_ns):
     """Reuse display data for unchanged files; the modification time is part of the key."""
-    with open_rgb(path) as image:
+    with open_rgb(path,max_edge=1280) as image:
         return preview_data_url(image,1280)
 
 

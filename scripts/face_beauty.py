@@ -143,12 +143,13 @@ def prepare_face(base, region, root, config, progress=None):
     return BeautySession(directory), pixels
 
 
-def prepare_skin(session, config, progress=None):
+def prepare_skin(session, config, progress=None, *, pixels=None):
     report = progress or (lambda message:None)
     directory = session.directory/('skin-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
     report('从完整成片准备官方 1024 像素输入')
-    pixels = open_photo(session.base_path)
+    if pixels is None:
+        pixels = open_photo(session.base_path)
     left,top,right,bottom = session.box
     image = to_preview(pixels[top:bottom,left:right]).resize((1024,1024),Image.Resampling.BILINEAR)
     del pixels

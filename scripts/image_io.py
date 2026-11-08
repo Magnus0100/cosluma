@@ -124,7 +124,10 @@ def to_preview(pixels, max_edge=None):
         if factor < 1:
             size = (max(1, round(width * factor)), max(1, round(height * factor)))
             pixels = fit_photo(pixels, size)
-    return Image.fromarray(np.uint8(np.clip(pixels, 0, 1) * 255.0 + .5))
+    encoded = np.empty(pixels.shape,np.uint8)
+    for start in range(0,pixels.shape[0],256):
+        encoded[start:start+256] = np.clip(pixels[start:start+256],0,1)*255.0+.5
+    return Image.fromarray(encoded)
 
 
 def display_image(pixels, *, max_edge=None):
@@ -157,28 +160,36 @@ def save_image(image, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + '.tmp')
-    if isinstance(image, np.ndarray):
-        pixels = np.uint16(np.clip(image, 0, 1) * 65535.0 + .5)
-        if pixels.shape[2] == 3:
-            pixels = np.dstack((pixels, np.full(pixels.shape[:2], 65535, np.uint16)))
-            image_format = QImage.Format_RGBX64
+    try:
+        if isinstance(image, np.ndarray):
+            pixels = np.empty((*image.shape[:2],4),np.uint16)
+            for start in range(0,image.shape[0],256):
+                pixels[start:start+256,:,:image.shape[2]] = np.clip(image[start:start+256],0,1)*65535.0+.5
+            if image.shape[2] == 3:
+                pixels[...,3] = 65535
+                image_format = QImage.Format_RGBX64
+            else:
+                image_format = QImage.Format_RGBA64
+            encoded = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], image_format)
+            encoded.setColorSpace(QColorSpace(QColorSpace.SRgb))
+            if not encoded.save(str(temporary), 'PNG'):
+                raise OSError(f'Cannot save {path}')
         else:
-            image_format = QImage.Format_RGBA64
-        encoded = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], image_format)
-        encoded.setColorSpace(QColorSpace(QColorSpace.SRgb))
-        if not encoded.save(str(temporary), 'PNG'):
-            raise OSError(f'Cannot save {path}')
-    else:
-        image.save(temporary, format='PNG', icc_profile=SRGB if image.mode in ('RGB', 'RGBA') else None)
-    os.replace(temporary, path)
+            image.save(temporary, format='PNG', icc_profile=SRGB if image.mode in ('RGB', 'RGBA') else None)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return str(path.resolve())
 
 
 def save_json(path, value):
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_jpeg(pixels, path):
@@ -186,8 +197,11 @@ def save_jpeg(pixels, path):
     path = Path(path)
     path.parent.mkdir(parents=True,exist_ok=True)
     temporary = path.with_name(path.name+'.tmp')
-    to_preview(pixels).save(temporary,format='JPEG',quality=95,subsampling=0,icc_profile=SRGB)
-    os.replace(temporary,path)
+    try:
+        to_preview(pixels).save(temporary,format='JPEG',quality=95,subsampling=0,icc_profile=SRGB)
+        os.replace(temporary,path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return str(path.resolve())
 
 

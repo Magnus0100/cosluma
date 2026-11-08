@@ -1,7 +1,9 @@
 """BeautyGRPO's published BF16 FluxKontext inference, inside the model service."""
 from importlib.metadata import version
 from pathlib import Path
+import gc
 import hashlib
+import traceback
 
 from diffusers import FluxKontextPipeline
 from PIL import Image
@@ -35,36 +37,41 @@ class CosLumaBeautyGRPO:
 
     def __init__(self):
         self.pipeline = None
-        self.loaded = None
         self.parameters = None
 
     @torch.inference_mode(False)
     @torch.no_grad()
     def retouch(self,image,model,lora,device,memory,filename_prefix):
+        try:
+            return self._retouch(image,model,lora,device,memory,filename_prefix)
+        except Exception as error:
+            traceback.clear_frames(error.__traceback__)
+            raise
+        finally:
+            self.pipeline = self.parameters = None
+            gc.collect()
+            comfy.model_management.soft_empty_cache()
+
+    def _retouch(self,image,model,lora,device,memory,filename_prefix):
         # Paths select one explicit installation. No downloads, precision
         # substitutions or exception paths that continue without the LoRA.
         model_path = Path(folder_paths.models_dir)/'diffusers'/model
         lora_path = Path(folder_paths.get_full_path_or_raise('loras',lora))
-        selected = (str(model_path),str(lora_path),device,memory)
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
-        if self.loaded!=selected:
-            self.pipeline = None
-            self.loaded = None
-            self.parameters = None
-            pipe = FluxKontextPipeline.from_pretrained(str(model_path),torch_dtype=torch.bfloat16,
-                local_files_only=True)
-            pipe.load_lora_weights(str(lora_path.parent),weight_name=lora_path.name)
-            self.parameters = {name:{'count':sum(parameter.numel() for parameter in component.parameters()),
-                'dtypes':sorted({str(parameter.dtype) for parameter in component.parameters()})}
-                for name,component in pipe.components.items() if isinstance(component,torch.nn.Module)}
-            if memory=='group_offload':
-                pipe.enable_group_offload(onload_device=torch.device(device),
-                    offload_device=torch.device('cpu'),offload_type='block_level',
-                    num_blocks_per_group=1,use_stream=False)
-            else:
-                pipe.to(device)
-            self.pipeline,self.loaded = pipe,selected
+        pipe = FluxKontextPipeline.from_pretrained(str(model_path),torch_dtype=torch.bfloat16,
+            local_files_only=True)
+        self.pipeline = pipe
+        pipe.load_lora_weights(str(lora_path.parent),weight_name=lora_path.name)
+        self.parameters = {name:{'count':sum(parameter.numel() for parameter in component.parameters()),
+            'dtypes':sorted({str(parameter.dtype) for parameter in component.parameters()})}
+            for name,component in pipe.components.items() if isinstance(component,torch.nn.Module)}
+        if memory=='group_offload':
+            pipe.enable_group_offload(onload_device=torch.device(device),
+                offload_device=torch.device('cpu'),offload_type='block_level',
+                num_blocks_per_group=1,use_stream=False)
+        else:
+            pipe.to(device)
         pixels = np.uint8(np.clip(image[0].cpu().numpy(),0,1)*255+.5)
         input_image = Image.fromarray(pixels).convert('RGB')
         if input_image.size!=(1024,1024):

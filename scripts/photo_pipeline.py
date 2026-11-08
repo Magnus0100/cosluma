@@ -172,7 +172,7 @@ def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features
             raise ValueError('美化会话对应另一张成片，请使用该成片的会话')
         pixels = open_photo(base)
     if skin and prepared.delta is None:
-        prepared = prepare_skin(prepared,config['beauty'],progress)
+        prepared = prepare_skin(prepared,config['beauty'],progress,pixels=pixels)
     result = save_beauty(pixels,prepared,parameters)
     save_json(path.parent/'beauty-session.json',{'session':prepared.directory.name,
         'parameters':{'skin':skin,'slim':slim,'protect_features':protect_features}})

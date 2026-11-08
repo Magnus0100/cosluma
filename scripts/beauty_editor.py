@@ -103,7 +103,7 @@ class BeautyWorker(QThread):
                 pixels = open_photo(self.context['base'])
                 result = (session,pixels,display_image(pixels))
             elif self.phase == 'skin':
-                result = prepare_skin(self.session,self.config,self.progress.emit)
+                result = prepare_skin(self.session,self.config,self.progress.emit,pixels=self.pixels)
             elif self.phase == 'render':
                 result = display_image(render_beauty(self.pixels,self.session,self.parameters))
             elif self.phase == 'save':

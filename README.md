@@ -1,6 +1,6 @@
 # CosLuma
 
-**0.25.0 · Windows x64 · 源码使用 Python 3.12**
+**0.25.1 · Windows x64 · 源码使用 Python 3.12**
 
 按项目整理一组照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；保留本人五官、脸型和相机细节。创作时可独立开启修发与人物重打光，两项默认关闭。
 
@@ -32,9 +32,9 @@ flowchart TD
 
 ## 下载与首次使用
 
-[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.25.0/CosLuma-0.25.0-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.25.0)
+[下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.25.1/CosLuma-0.25.1-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.25.1)
 
-Windows 用户下载 Release 中的 `CosLuma-0.25.0-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
+Windows 用户下载 Release 中的 `CosLuma-0.25.1-windows-x64.zip`，完整解压，打开 `CosLuma/CosLuma.exe`。
 包内已有 Python、桌面和图像处理依赖，源码 ZIP 用于开发，不是可直接双击运行的 Windows 包。
 
 **软件是模型服务的桌面客户端。首次出片需要你自己的图文提示词服务、图像编辑服务，以及已部署分割和超分模型的 ComfyUI。**
@@ -257,11 +257,12 @@ PNG 是带 sRGB 配置的 16 位结果，JPEG 是同一结果的 8 位查看副�
 可复用的显示图片使用最多 64 MiB 的共享缓存，按最近使用淘汰；当前正在查看的图片和制作中的工作内存另计，大图可直接显示而不进入缓存。
 三个样片依次解码并显示，隐藏后停止后续读取；交付缩略图只保留可见范围和相邻一行，滚动、筛选与换版时移除离开范围的图标，离开交付页清空缩略图。
 离开美化页先保存草稿，当前处理结束后释放原尺寸 float32 成片与显示像素；回来读取已有美化会话并恢复预览，不重新调用分析或生图服务。切换项目清空共享显示缓存与对话附图缓存。
+保存 16 位 PNG 和制作 8 位查看副本时，按行分块转换像素，避免同时保留整张浮点转换副本；制作合成仍使用原尺寸 float32。生成美肤基础复用当前已读取的完整成片，不额外解码一份。讨论附图请求 1280 像素长边预览，支持缩小解码的格式直接读取小图；RAW 与 HEIC/HEIF 仍需先完成原格式解码再缩小。
 
 生图接口返回 Base64 图片时，先保存并成功读取原始模型图片，再将响应记录中的该图片编码改为文件名与字节数，保留其余响应字段；读取失败保留原响应。
 软件不另外建立磁盘预览缓存。原片、模型文件、历轮样片、基础成片、美化原始模型输出和已另存版本均保留，交付导出仍是用户主动创建的独立副本；这些属于项目内容，会随制作次数增长，可在不再需要时由用户整理归档。
-交付复制失败时清理该次未完成的临时副本，原成片与已成功导出的文件保留，错误照常显示。
-已部署的 ComfyUI 服务独立管理自己的输入、输出和模型内存，桌面不删除服务端文件；旧版本已产生的重复文件也不自动迁移或删除。
+PNG、JPEG 与 JSON 保存，以及交付复制在结束或失败时清理各自本次写入的临时文件；原成片与已成功保存的文件保留，错误照常显示。
+已部署的 ComfyUI 服务独立管理自己的输入、输出；随包美肤节点在每次完整推理后释放自身的 Pipeline 和模型内存，详见下方部署说明。桌面不删除服务端文件，旧版本已产生的重复文件也不自动迁移或删除。
 
 角色、补充要求、照片队列、请求尺寸、结果路径与创作、交付状态保存在当前项目的 `project.json`。
 本机配置路径、最近项目列表和界面偏好保存在 `~/CosplayWorkbench/config/desktop.ini`；服务连接与凭据独立于项目。
@@ -381,6 +382,7 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 使用已有 ComfyUI 的 Python 环境与模型目录，将随包 `providers/comfyui_cosluma_beauty` 整个文件夹复制到
 `ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors、MediaPipe、Diffusers、Transformers、Accelerate 与 PEFT；桌面端不安装或加载这些模型运行库。
 在已有 ComfyUI 的 Python 中执行 `python -m pip install -r <CosLuma目录>/providers/comfyui_cosluma_beauty/requirements.txt` 后重启服务。
+升级已有美化服务时也需用当前包中的该文件夹更新节点并重启 ComfyUI，桌面更新不会改写其他机器上的服务代码。
 
 美肤使用 [BeautyGRPO（CVPR 2026）](https://github.com/vivoCameraResearch/BeautyGRPO) 的官方 FLUX Kontext LoRA。
 其[论文](https://arxiv.org/abs/2603.01163)报告了 1,000 张自然人像上的 FID 2.23、LPIPS 0.049 与身份相似度 0.952；
@@ -391,6 +393,7 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 不使用 FP8/INT8/GGUF 权重，不以 ComfyUI KSampler 近似官方流程，不跳过 LoRA 加载错误。
 推理时使用独立 PyTorch 运行的默认计算精度，关闭宿主额外启用的 TF32 矩阵乘法和半精度 math SDP 累加。
 节点直接保存官方 Pipeline 返回的 PIL 图，完整原始输出可独立查看；皮肤差值、五官保护与强度调节在模型输出之后进行。
+每次生成结束或失败后，节点释放本次 Pipeline、分组卸载的 CPU 权重及未使用的 CUDA 缓存，不让完整模型长期驻留。用户明确重新生成时重新加载同一套完整权重，因此包含加载耗时；滑杆和五官保护开关继续复用已经保存的美肤基础，不加载模型或重新生图。
 这复现的是官方公开推理方法；论文的训练、奖励模型与整套测试集指标不因单张推理而被重新复现。
 瘦脸使用 [MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) 的 478 点定位，包含眼睑与虹膜；
 下颌轮廓收缩由 SciPy 薄板样条计算，眼鼻唇等五官范围的形变场为零。皮肤范围使用 [FaceXFormer](https://github.com/Kartik-3004/facexformer) 的面部解析，不使用其 68 点定位。
