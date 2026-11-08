@@ -251,11 +251,13 @@ class ConversationView(QScrollArea):
             bubble.body.setTextFormat(Qt.RichText)
             bubble.body.setText(document.toHtml())
         column.addWidget(bubble.body)
-        if entry.get('direction_changed'):
+        if not user and entry.get('direction_changed'):
             evidence = ui_label('本次要求更新依据：'+entry['direction_evidence'])
             evidence.setWordWrap(True)
             evidence.setTextInteractionFlags(Qt.TextSelectableByMouse)
             column.addWidget(evidence)
+        if entry.get('direction_reverted'):
+            column.addWidget(ui_label('此要求更新已撤回，保留原讨论记录。'))
         bubble.error_label = None
         if failed:
             bubble.error_label = ui_label(entry['error'])

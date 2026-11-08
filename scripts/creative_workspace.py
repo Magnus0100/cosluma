@@ -9,7 +9,7 @@ import uuid
 
 from PySide6.QtCore import QThread, Signal, Qt, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from image_io import save_json
@@ -279,7 +279,21 @@ class CreativeWorkspace(QWidget):
         chat_layout.addWidget(self.discussion_target)
         self.chat_history = ConversationView()
         chat_layout.addWidget(self.chat_history,1)
-        chat_layout.addWidget(ui_label('当前创作要求'))
+        direction_tools = QHBoxLayout()
+        direction_tools.addWidget(ui_label('当前创作要求'),1)
+        self.edit_direction = QToolButton()
+        self.edit_direction.setProperty('kind','quiet')
+        self.edit_direction.setText('编辑要求')
+        self.edit_direction.setToolTip('直接编辑完整创作要求，不发送给 Agent；已有对话、样片和草稿保留')
+        self.edit_direction.clicked.connect(self.edit_creative_direction)
+        direction_tools.addWidget(self.edit_direction)
+        self.undo_direction = QToolButton()
+        self.undo_direction.setProperty('kind','quiet')
+        self.undo_direction.setText('撤回更新')
+        self.undo_direction.setToolTip('恢复最近一次要求更新之前的完整内容；不删除对话、样片或草稿')
+        self.undo_direction.clicked.connect(self.undo_creative_direction)
+        direction_tools.addWidget(self.undo_direction)
+        chat_layout.addLayout(direction_tools)
         self.discussion_summary = QPlainTextEdit()
         self.discussion_summary.setProperty('role','summary')
         self.discussion_summary.setReadOnly(True)
@@ -618,6 +632,71 @@ class CreativeWorkspace(QWidget):
         self.chat_history.show_messages(self.messages)
         self.discussion_summary.setPlainText(self.creative_direction)
 
+    def direction_change_to_undo(self):
+        for index in range(len(self.messages)-1,-1,-1):
+            row = self.messages[index]
+            if row.get('direction_changed') and not row.get('direction_reverted') and row.get('direction_action')!='undo':
+                return index if 'direction_before' in row and row['direction_update']==self.creative_direction else None
+        return None
+
+    def edit_creative_direction(self):
+        if self.is_busy() or self.production_busy:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('编辑当前创作要求')
+        dialog.resize(620,420)
+        layout = QVBoxLayout(dialog)
+        note = ui_label('直接保存完整要求，也可清空。已有对话、样片与输入草稿保留；修改后按当前要求试样再定稿。')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        text = QPlainTextEdit(self.creative_direction)
+        text.setAccessibleName('完整创作要求')
+        layout.addWidget(text,1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText('保存要求')
+        buttons.button(QDialogButtonBox.Cancel).setText('取消')
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec()==QDialog.Accepted:
+            direction = text.toPlainText().strip()
+            content = '我已直接编辑当前创作要求，完整内容如下：\n'+direction if direction else '我已直接清空当前创作要求。'
+            self.save_direction_action(direction,content,'edit')
+
+    def undo_creative_direction(self):
+        if self.is_busy() or self.production_busy:
+            return
+        index = self.direction_change_to_undo()
+        if index is not None:
+            direction = self.messages[index]['direction_before']
+            content = ('撤回最近一次创作要求更新，恢复为：\n'+direction if direction else
+                '撤回最近一次创作要求更新，恢复为尚无创作要求。')
+            self.save_direction_action(direction,content,'undo',reverted=index)
+
+    def save_direction_action(self, direction, content, action, *, reverted=None):
+        if direction==self.creative_direction:
+            return
+        try:
+            self.ensure_discussion()
+        except OSError as error:
+            self.message.setPlainText('无法保存创作要求：'+str(error))
+            return
+        row = {'role':'user','content':content,'context':deepcopy(self.discussion_context()),
+            'direction_before':self.creative_direction,'direction_update':direction,
+            'direction_action':action,'direction_changed':True}
+        if reverted is not None:
+            self.messages[reverted]['direction_reverted'] = True
+            row['reverted_message'] = reverted
+        self.messages.append(row)
+        self.creative_direction = direction
+        self.render_conversation()
+        self.chat_history.scroll_to_latest()
+        self.update_creative_actions()
+        self.state_changed.emit()
+        if self.flush_draft():
+            self.message.setPlainText('已恢复更新前的创作要求，已有对话与样片保留。' if action=='undo' else
+                '已直接保存创作要求。按当前要求试样后再定稿；已有对话、样片与草稿保留。')
+
     def discussion_sample(self, option):
         directory = option['styles_directory']
         round_label = (f'第 {self.sample_directories.index(directory)+1} 轮'
@@ -683,6 +762,8 @@ class CreativeWorkspace(QWidget):
         draft = bool(self.chat_input.toPlainText().strip())
         self.send.setEnabled(not busy and draft)
         self.chat_input.setEnabled(not busy)
+        self.edit_direction.setEnabled(not busy)
+        self.undo_direction.setEnabled(not busy and self.direction_change_to_undo() is not None)
         self.hair.setEnabled(not busy)
         self.relight.setEnabled(not busy)
         self.hair_brief.setEnabled(not busy and self.hair.isChecked())
@@ -777,7 +858,8 @@ class CreativeWorkspace(QWidget):
         update = reply['direction_update']
         changed = update is not None and update!=self.creative_direction
         self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply'],
-            'direction_update':update,'direction_evidence':reply['direction_evidence'],'direction_changed':changed}])
+            'direction_update':update,'direction_evidence':reply['direction_evidence'],'direction_changed':changed,
+            'direction_before':self.creative_direction}])
         self.pending_message = None
         if update is not None:
             self.creative_direction = update

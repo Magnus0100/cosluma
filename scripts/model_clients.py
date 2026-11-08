@@ -260,6 +260,8 @@ def _discussion_messages(conversation):
         if row.get('status')=='failed':
             continue
         content = row['content']
+        if row.get('direction_reverted'):
+            content = '此条创作要求更新已由用户撤回，仅保留作讨论记录，不沿用其新增要求：\n'+content
         if row['role']=='user' and 'context' in row:
             context = row['context']
             anchors = {key:context[key] for key in ('label','viewed_source','viewed_sample',
