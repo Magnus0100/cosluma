@@ -21,6 +21,20 @@ def edits_match(first, second):
         for enabled,brief in (('hair','hair_brief'),('relight','lighting_brief')))
 
 
+def edits_label(value=None):
+    edits = normalise_edits(value)
+    enabled = [label for key,label in (('hair','修发'),('relight','重打光')) if edits[key]]
+    return ' + '.join(enabled) if enabled else '保留原发与光向'
+
+
+def edits_description(value=None):
+    edits = normalise_edits(value)
+    hair = edits['hair_brief'] or '修整瑕疵，保留原有发型'
+    lighting = edits['lighting_brief'] or '按摄影方向统一人物与环境受光'
+    return '\n'.join(('修发：'+hair if edits['hair'] else '修发：关闭，保留原片发型',
+        '重打光：'+lighting if edits['relight'] else '重打光：关闭，沿用原片光向'))
+
+
 def edit_instructions(value=None):
     edits = normalise_edits(value)
     hair = (

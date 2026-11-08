@@ -67,6 +67,7 @@ def apply_theme(app):
         QPushButton[kind="primary"]:disabled { background: #dce5ec; color: #8b9ba9; border-color: #d1dce5; }
         QPushButton[kind="quiet"], QToolButton[kind="quiet"] { background: transparent; border-color: transparent; color: #586e83; }
         QPushButton[kind="quiet"]:hover, QToolButton[kind="quiet"]:hover { color: #234c70; background: #e5edf4; }
+        QToolButton[kind="quiet"]:checked { color: #234c70; background: #e5edf4; border-color: #b7c9d8; }
         QLineEdit, QPlainTextEdit, QComboBox { background: #ffffff; border: 1px solid #d2dce6; border-radius: 8px; padding: 8px; selection-background-color: #315f87; }
         QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-color: #426f98; }
         QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled { color: #8596a5; border-color: #ffffff; }
@@ -465,10 +466,13 @@ class PhotoPreview(QWidget):
         self.source = None
         self.output = None
         self.direct_images = False
+        self.preserve_view = False
+        self.saved_views = {}
         self.choice = 'compare'
         self.images = {}
         self.keys = {}
         self.loader = None
+        self.syncing = False
         self.load_timer = QTimer(self)
         self.load_timer.setSingleShot(True)
         self.load_timer.setInterval(80)
@@ -503,6 +507,14 @@ class PhotoPreview(QWidget):
         tools = QHBoxLayout()
         self.zoom_label = ui_label('滚轮缩放，拖动查看')
         tools.addWidget(self.zoom_label,1)
+        self.linked = QToolButton()
+        self.linked.setProperty('kind','quiet')
+        self.linked.setText('联动查看')
+        self.linked.setCheckable(True)
+        self.linked.setChecked(True)
+        self.linked.setToolTip('按画面比例同步两侧缩放与查看位置；关闭后可分别检查')
+        self.linked.toggled.connect(self.link_views)
+        tools.addWidget(self.linked)
         fit = QToolButton()
         fit.setProperty('kind','quiet')
         fit.setText('适应窗口')
@@ -517,6 +529,9 @@ class PhotoPreview(QWidget):
         layout.addLayout(tools)
         for view in (self.preview,self.before,self.after):
             view.zoom_changed.connect(self.update_zoom_label)
+        for view in (self.before,self.after):
+            view.zoom_changed.connect(lambda view=view:self.synchronize(view,zoom=True))
+            view.pan_changed.connect(lambda view=view:self.synchronize(view,zoom=False))
         self.set_photo()
 
     @staticmethod
@@ -542,8 +557,15 @@ class PhotoPreview(QWidget):
                 self.errors.pop(removed, None)
         return self.cache[key]
 
-    def set_photo(self, source=None, output=None):
+    def set_photo(self, source=None, output=None, *, preserve_view=False):
         self.direct_images = False
+        self.preserve_view = preserve_view
+        self.saved_views = {}
+        if preserve_view:
+            for view in (self.preview,self.before,self.after):
+                if not view.fitting and not view.photo.pixmap().isNull():
+                    self.saved_views[view] = (view.photo.pixmap().size(),view.transform().m11(),
+                        view.mapToScene(view.viewport().rect().center()))
         self.source, self.output = source, output
         self.keys = {}
         for kind,path in (('source',source),('output',output)):
@@ -564,6 +586,7 @@ class PhotoPreview(QWidget):
         """Show the beauty editor's in-memory images with the same native canvas."""
         self.load_timer.stop()
         self.direct_images = True
+        self.saved_views = {}
         self.images = {'source':QPixmap.fromImage(before), 'output':QPixmap.fromImage(after)}
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice))
@@ -577,7 +600,9 @@ class PhotoPreview(QWidget):
         # Another photo view may have filled the shared cache before this timer runs.
         self.images.update({kind:self.cache[key] for kind,key in self.keys.items() if key in self.cache})
         self.update_preview()
-        missing = list(dict.fromkeys(key for key in self.keys.values() if key is not None and key not in self.cache))
+        visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
+        missing = list(dict.fromkeys(self.keys[kind] for kind in visible
+            if self.keys.get(kind) is not None and self.keys[kind] not in self.cache))
         if missing:
             self.loader = PreviewLoader(missing)
             self.loader.signals.loaded.connect(self.previews_loaded)
@@ -604,6 +629,7 @@ class PhotoPreview(QWidget):
         if self.output or self.direct_images:
             self.choice = self.mode.currentData()
         self.update_preview()
+        self.load_timer.start()
 
     def update_preview(self):
         mode = self.mode.currentData()
@@ -614,10 +640,15 @@ class PhotoPreview(QWidget):
             QTimer.singleShot(0, self.update_preview)
         targets = ((self.before, 'source'), (self.after, 'output')) if self.pages.currentIndex() else (
             (self.preview, mode if has_output else 'source'),)
+        self.syncing = True
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
-                label.setPixmap(pixels, preserve_view=self.direct_images)
+                label.setPixmap(pixels, preserve_view=self.direct_images or self.preserve_view)
+                previous = self.saved_views.pop(label,None)
+                if previous is not None and previous[0]==pixels.size():
+                    label.set_zoom(previous[1])
+                    label.centerOn(previous[2])
             elif not self.source:
                 label.setText('选择照片查看预览\n完成后可对比原片与成片')
             elif self.keys.get(kind) is not None and self.keys[kind] not in self.cache:
@@ -630,12 +661,39 @@ class PhotoPreview(QWidget):
                 label.setText('原片不在原来的位置\n已保存的成片仍可查看')
             else:
                 label.setText('原片暂时无法预览\n可使用“打开原片”查看文件')
+        self.syncing = False
+        self.linked.setEnabled(bool(page))
         self.update_zoom_label()
+
+    def synchronize(self, source, *, zoom):
+        if self.syncing or not self.pages.currentIndex() or not self.linked.isChecked() or source.photo.pixmap().isNull():
+            return
+        target = self.after if source is self.before else self.before
+        pixels,other = source.photo.pixmap(),target.photo.pixmap()
+        if other.isNull():
+            return
+        center = source.mapToScene(source.viewport().rect().center())
+        self.syncing = True
+        if zoom and source.fitting:
+            target.fit_photo()
+        else:
+            if zoom:
+                target.set_zoom(source.transform().m11()*pixels.width()/other.width())
+            target.centerOn(center.x()/pixels.width()*other.width(),center.y()/pixels.height()*other.height())
+        self.syncing = False
+        self.update_zoom_label()
+
+    def link_views(self, linked):
+        if linked:
+            self.synchronize(self.after,zoom=True)
 
     def zoom_views(self, action):
         views = (self.before,self.after) if self.pages.currentIndex() else (self.preview,)
+        self.syncing = True
         for view in views:
             getattr(view,action)()
+        self.syncing = False
+        self.update_zoom_label()
 
     def update_zoom_label(self):
         if not hasattr(self,'zoom_label'):

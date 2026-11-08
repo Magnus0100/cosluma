@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel
 from image_io import save_json
 from model_clients import _representatives, discuss_style
 from photo_pipeline import load_style, make_style_samples
-from creative_edits import normalise_edits, edits_match
+from creative_edits import normalise_edits, edits_match, edits_label, edits_description
 from studio_widgets import ui_label, StatusText, SampleCard, ConversationView, PhotoPreview, SampleComparison
 
 
@@ -163,6 +163,9 @@ class CreativeWorkspace(QWidget):
         self.active_caption.setWordWrap(True)
         self.active_caption.setMaximumHeight(42)
         sample_layout.addWidget(self.active_caption)
+        self.sample_settings = ui_label('')
+        self.sample_settings.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
+        sample_layout.addWidget(self.sample_settings)
         self.sample_actions = QWidget()
         sample_actions = QHBoxLayout(self.sample_actions)
         sample_actions.setContentsMargins(0,0,0,0)
@@ -260,7 +263,7 @@ class CreativeWorkspace(QWidget):
         self.edits_button = QToolButton()
         self.edits_button.setProperty('kind','quiet')
         self.edits_button.setCheckable(True)
-        self.edits_button.setText('可选修发与光照 · 均未开启')
+        self.edits_button.setText('下次试样设置 · 均未开启')
         self.edits_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.edits_button.setArrowType(Qt.RightArrow)
         chat_layout.addWidget(self.edits_button)
@@ -282,9 +285,9 @@ class CreativeWorkspace(QWidget):
         self.lighting_brief.setPlaceholderText('如：左侧暖主光，右侧承接蓝色环境反光')
         self.lighting_brief.setAccessibleName('人物光照要求')
         edits_layout.addWidget(self.lighting_brief)
-        edits_note = ui_label('两项独立。要求可留空或继续与 Agent 讨论；改变后试样再定稿。')
-        edits_note.setWordWrap(True)
-        edits_layout.addWidget(edits_note)
+        self.edits_note = ui_label('两项独立。要求可留空或继续与 Agent 讨论；改变后试样再定稿。')
+        self.edits_note.setWordWrap(True)
+        edits_layout.addWidget(self.edits_note)
         self.edits_panel.hide()
         chat_layout.addWidget(self.edits_panel)
         self.edits_button.toggled.connect(self.toggle_edits_panel)
@@ -360,6 +363,7 @@ class CreativeWorkspace(QWidget):
         self.update_creative_actions()
         self.sample_source.currentIndexChanged.connect(self.change_representative)
         self.canvas.mode.currentIndexChanged.connect(self.refresh_discussion_target)
+        self.canvas.linked.toggled.connect(lambda:self.draft_timer.start())
 
     def sync_sources(self, sources):
         if list(sources)==self.sources:
@@ -451,12 +455,24 @@ class CreativeWorkspace(QWidget):
         self.empty_hint.setVisible(not has_samples and not focused and not self.viewing_selected)
         self.empty_hint.setText('正在查看下次试样原片。可从“样片轮次”回看已有样片。' if self.sample_directories else
             '还没有样片。先聊想法，或让 Agent 根据角色和原片探索三个方向。')
+        self.update_sample_settings()
         if comparing:
             self.comparison.set_samples(self.options,self.viewed_plans,
                 {index:card[1].text() for index,card in self.cards.items()})
             label = self.sample_round.currentText()+' · 三个真实样片并排'
             self.active_caption.setText(label+'\n单独查看满意的样片后，可将它定稿；也可以继续和 Agent 讨论。')
             self.active_caption.setToolTip(self.active_caption.text())
+
+    def update_sample_settings(self):
+        visible = not self.viewing_original and (self.viewing_selected or self.viewed_directory is not None or bool(self.options))
+        self.sample_settings.setVisible(visible)
+        if not visible:
+            return
+        option = self.selected_style if self.viewing_selected else self.options.get(self.current_option)
+        edits = option['art_direction'].get('edits') if option is not None else self.samples_edits
+        label = '本轮样片：' if self.compare_button.isChecked() else '眼前样片：'
+        self.sample_settings.setText(label+edits_label(edits))
+        self.sample_settings.setToolTip(edits_description(edits))
 
     def compare_samples(self, comparing):
         self.compare_button.setText('返回单张查看' if comparing else '三个样片并排')
@@ -509,6 +525,7 @@ class CreativeWorkspace(QWidget):
                 'comparing_samples':self.compare_button.isChecked(),
                 'viewed_option':self.current_option,'canvas_mode':self.canvas.choice,
                 'linked_comparison':self.comparison.linked.isChecked(),
+                'linked_photo_comparison':self.canvas.linked.isChecked(),
                 'selected_file':self.chosen_file,'frozen_direction':self.frozen_direction,
                 'draft':self.pending_message['content'] if self.pending_message else self.chat_input.toPlainText()})
             self.discussion_saved.emit(self.discussion_directory)
@@ -537,6 +554,7 @@ class CreativeWorkspace(QWidget):
         self.current_option = state.get('viewed_option',0)
         self.canvas.choice = state.get('canvas_mode','output')
         self.comparison.linked.setChecked(state.get('linked_comparison',True))
+        self.canvas.linked.setChecked(state.get('linked_photo_comparison',True))
         if state.get('sample_source') in self.sources:
             self.sample_source.setCurrentIndex(self.sample_source.findData(state['sample_source']))
             self.canvas.set_photo(self.sample_source.currentData())
@@ -624,7 +642,15 @@ class CreativeWorkspace(QWidget):
         self.hair_brief.setEnabled(not busy and self.hair.isChecked())
         self.lighting_brief.setEnabled(not busy and self.relight.isChecked())
         enabled = [label for control,label in ((self.hair,'修发'),(self.relight,'重打光')) if control.isChecked()]
-        self.edits_button.setText('可选修发与光照 · '+('、'.join(enabled)+'已开启' if enabled else '均未开启'))
+        self.edits_button.setText('下次试样设置 · '+('、'.join(enabled)+'已开启' if enabled else '均未开启'))
+        self.edits_button.setToolTip(edits_description(self.current_edits()))
+        if self.relight.isChecked():
+            self.edits_note.setText('两项独立。重打光保留原片脸部细节，原有锐利硬阴影可能残留；改变设置后试样再定稿。')
+        elif self.hair.isChecked():
+            self.edits_note.setText('修发会采用生成的头发，未指定修改的发束也可能变化；改变设置后试样再定稿。')
+        else:
+            self.edits_note.setText('两项默认关闭；展开后分别开启，要求可留空或继续与 Agent 讨论。')
+        self.update_sample_settings()
         self.generate.setEnabled(not busy and not draft and bool(self.sample_source.currentData()))
         self.input_hint.setText('尚未发送 · Ctrl + Enter 发送' if draft and not busy else 'Ctrl + Enter 发送')
         draft_note = '这段输入尚未发送。请先发给 Agent，或清空输入，再按已经讨论的要求试样或定稿。'

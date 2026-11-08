@@ -9,6 +9,8 @@ import re
 import shutil
 import uuid
 
+from creative_edits import edits_description, edits_label, normalise_edits
+
 
 def source_key(source):
     return os.path.normcase(str(Path(source).expanduser().resolve()))
@@ -48,10 +50,13 @@ def project_photos(batches):
                 exports = result.get('exports',{})
                 files = {kind:result_path(directory,result,exports[kind] if kind in exports else result['files'][field])
                     for kind,field in (('PNG','final'),('JPEG','jpeg'))}
+                edits = normalise_edits(result.get('edits'))
+                treatment = edits_label(edits)
                 common = {'batch':str(directory),'work':work,'dimensions':result['output_dimensions'],
-                    'base':result_path(directory,result,result['files']['final'])}
-                base = {'id':files['PNG'],'kind':'base','label':f'制作 {number} · 基础成片',
-                    'short_label':f'基础成片 · 制作 {number}','files':files,**common}
+                    'base':result_path(directory,result,result['files']['final']),'edits':edits,
+                    'description':edits_description(edits),'direction':result.get('direction','')}
+                base = {'id':files['PNG'],'kind':'base','label':f'制作 {number} · {treatment} · 基础成片',
+                    'short_label':f'制作 {number} · {treatment}','files':files,**common}
                 if not any(version['id']==base['id'] for version in photo['versions']):
                     photo['versions'].append(base)
                 for edit_number,path in enumerate(sorted(Path(work).glob('beauty-*/edit-*/beauty.json')),1):
@@ -61,13 +66,13 @@ def project_photos(batches):
                     if saved['status']!='complete':
                         continue
                     parameters = saved['parameters']
-                    label = f'制作 {number} · 美化 {edit_number}（美肤 {round(parameters["skin"]*100)} / 瘦脸 {round(parameters["slim"]*100)}）'
+                    label = f'制作 {number} · {treatment} · 美化 {edit_number}（美肤 {round(parameters["skin"]*100)} / 瘦脸 {round(parameters["slim"]*100)}）'
                     beauty_files = {}
                     for kind,field in (('PNG','final'),('JPEG','jpeg')):
                         recorded = Path(saved['files'][field])
                         beauty_files[kind] = str(path.parent/(recorded.name if recorded.is_absolute() else recorded))
                     photo['versions'].append({'id':str(path),'kind':'beauty','label':label,
-                        'short_label':f'美化 {edit_number} · 制作 {number}','parameters':parameters,
+                        'short_label':f'制作 {number} · {treatment} · 美化 {edit_number}','parameters':parameters,
                         'files':beauty_files,**common})
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise ValueError(f'读取项目成片失败：{directory}\n{error}') from error
