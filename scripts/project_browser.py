@@ -14,6 +14,23 @@ from project_store import Project
 from studio_widgets import PhotoPreview, ui_label
 
 
+def _project_record(project, *, active=False):
+    state = project.data['workspace']
+    title = project.data['name']
+    edited = datetime.fromisoformat(project.data['updated_at']).astimezone().strftime('%Y-%m-%d %H:%M')
+    label = title+('  · 当前项目' if active else '')
+    label += '\n'+(state.get('character') or '尚未填写角色')+f'  · {len(state["sources"])} 张照片  · {edited}'
+    complete = sum(item['status']=='complete' for item in state['results'])
+    delivery = project.data.get('delivery',{})
+    included = sum(choice['included'] for choice in delivery.get('choices',{}).values())
+    delivery_info = f'\n已选交付 {included} 张 · 已导出 {len(delivery.get("exports",[]))} 次' if delivery else ''
+    info = (state.get('character') or '角色待填写')+f' · {len(state["sources"])} 张原片 · {complete} 张已有成片 · {len(project.data["batches"])} 个批次'+delivery_info+'\n'+str(project.path.parent)
+    source = state.get('representative_source') or next(iter(state['sources']),None)
+    result = next((item for item in state['results'] if item['source']==source and item['status']=='complete'),None)
+    output = (result.get('exports',{}).get('JPEG') or result.get('files',{}).get('jpeg')) if result else None
+    return {'path':str(project.path),'label':label,'title':title,'info':info,'preview':(source,output)}
+
+
 class NewProject(QDialog):
     def __init__(self, parent_directory, parent=None):
         super().__init__(parent)
@@ -99,6 +116,7 @@ class ProjectBrowser(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.records = []
+        self.active_project = None
         self.preview_key = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 4)
@@ -183,20 +201,17 @@ class ProjectBrowser(QWidget):
         selected = self.selected()
         selected_path = selected['path'] if selected else None
         self.records = []
+        self.active_project = active
         self.listing.blockSignals(True)
         self.listing.clear()
         for path in paths:
             try:
                 project = active if active is not None and Path(path).resolve() == active.path else Project.open(path)
-                state = project.data['workspace']
-                edited = datetime.fromisoformat(project.data['updated_at']).astimezone().strftime('%Y-%m-%d %H:%M')
-                label = project.data['name']+('  · 当前项目' if active and project.path == active.path else '')
-                label += '\n'+(state.get('character') or '尚未填写角色')+f'  · {len(state["sources"])} 张照片  · {edited}'
-                record = {'path':str(project.path), 'project':project}
+                record = _project_record(project,active=active is not None and project.path==active.path)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 label = Path(path).parent.name+'\n无法打开：'+str(error)
-                record = {'path':path, 'error':str(error)}
-            item = QListWidgetItem(label)
+                record = {'path':path,'error':str(error),'label':label}
+            item = QListWidgetItem(record['label'])
             item.setToolTip(record['path'])
             self.listing.addItem(item)
             self.records.append(record)
@@ -231,32 +246,25 @@ class ProjectBrowser(QWidget):
 
     def show_project(self, _row=None):
         record = self.selected()
-        project = record.get('project') if record else None
-        enabled = project is not None and self.switching_enabled
+        valid = record is not None and 'error' not in record
+        if valid and self.active_project is not None and record['path']==str(self.active_project.path):
+            record = _project_record(self.active_project,active=True)
+        enabled = valid and self.switching_enabled
         self.continue_button.setEnabled(enabled)
         self.rename.setEnabled(enabled)
         self.folder.setEnabled(record is not None)
-        if project is None:
+        if not valid:
             self.title.setText('选择一个项目')
             if self.preview_key is not None:
                 self.preview.set_photo()
                 self.preview_key = None
             self.info.setText(record['error'] if record else '')
             return
-        state = project.data['workspace']
-        complete = sum(item['status'] == 'complete' for item in state['results'])
-        self.title.setText(project.data['name'])
-        delivery = project.data.get('delivery',{})
-        included = sum(choice['included'] for choice in delivery.get('choices',{}).values())
-        delivery_info = f'\n已选交付 {included} 张 · 已导出 {len(delivery.get("exports",[]))} 次' if delivery else ''
-        self.info.setText((state.get('character') or '角色待填写')+f' · {len(state["sources"])} 张原片 · {complete} 张已有成片 · {len(project.data["batches"])} 个批次'+delivery_info+'\n'+str(project.path.parent))
-        representative = state.get('representative_source')
-        source = representative or next(iter(state['sources']), None)
-        result = next((item for item in state['results'] if item['source'] == source and item['status'] == 'complete'), None)
-        output = (result.get('exports', {}).get('JPEG') or result.get('files', {}).get('jpeg')) if result else None
-        key = (source, output)
+        self.title.setText(record['title'])
+        self.info.setText(record['info'])
+        key = record['preview']
         if key != self.preview_key:
-            self.preview.set_photo(source, output)
+            self.preview.set_photo(*key)
             self.preview_key = key
 
     def set_busy(self, busy):
@@ -270,12 +278,12 @@ class ProjectBrowser(QWidget):
 
     def open_selected(self):
         record = self.selected()
-        if self.switching_enabled and record and 'project' in record:
+        if self.switching_enabled and record and 'error' not in record:
             self.open_requested.emit(record['path'])
 
     def rename_selected(self):
         record = self.selected()
-        if self.switching_enabled and record and 'project' in record:
+        if self.switching_enabled and record and 'error' not in record:
             self.rename_requested.emit(record['path'])
 
     def open_folder(self):

@@ -1143,13 +1143,13 @@ class Workbench(QMainWindow):
         if included==(key not in self.excluded_sources):
             return
         self.excluded_sources.discard(key) if included else self.excluded_sources.add(key)
-        self.refresh_queue()
+        self.refresh_queue_selection((key,))
 
     def set_all_included(self, included):
         if self.work_in_progress():
             return
         self.excluded_sources = set() if included else {self.source_key(source) for source in self.sources}
-        self.refresh_queue()
+        self.refresh_queue_selection(self.rows)
 
     def set_representative(self):
         if self.work_in_progress():
@@ -1160,10 +1160,35 @@ class Workbench(QMainWindow):
         source = self.sources[row]
         if self.source_key(source) in self.excluded_sources:
             return
+        previous = self.representative_source
         self.representative_source = source
-        self.sync_creative_sources()
-        self.refresh_queue()
+        changed = {self.source_key(source)}
+        if previous is not None:
+            changed.add(self.source_key(previous))
+        self.refresh_queue_selection(changed)
         self.status.setText('试样原片已设为 '+Path(source).name+'，查看其他照片不会改变它。')
+
+    def refresh_queue_selection(self, changed):
+        included = self.included_sources()
+        previous = self.representative_source
+        if previous not in included:
+            self.representative_source = included[0] if included else None
+        changed = set(changed)
+        for source in (previous,self.representative_source):
+            if source is not None:
+                changed.add(self.source_key(source))
+        self.listing.blockSignals(True)
+        for key in changed:
+            row = self.rows[key]
+            source = self.sources[row]
+            name = self.listing.item(row,0)
+            name.setText(('★ ' if source==self.representative_source else '')+Path(source).name)
+            name.setCheckState(Qt.Unchecked if key in self.excluded_sources else Qt.Checked)
+            if key not in self.results:
+                self.listing.item(row,1).setText(self.stages.get(key,
+                    '未勾选' if key in self.excluded_sources else '等待制作'))
+        self.listing.blockSignals(False)
+        self.update_queue_state(included)
 
     def request_photo_selection(self):
         if self.work_in_progress() or not self.sources:
@@ -1236,6 +1261,7 @@ class Workbench(QMainWindow):
             {item.row() for item in self.listing.selectedItems()}) if self.listing.item(row, 0)]
         current = self.listing.item(self.listing.currentRow(), 0)
         current = current.data(Qt.UserRole) if current else None
+        self.listing.setUpdatesEnabled(False)
         self.listing.blockSignals(True)
         self.rows.clear()
         keys = {self.source_key(source) for source in self.sources}
@@ -1270,12 +1296,6 @@ class Workbench(QMainWindow):
             if result and result.get('error'):
                 cell.setToolTip(str(result['error']))
             self.listing.setItem(row, 1, cell)
-        self.queue_pages.setCurrentIndex(1 if self.sources else 0)
-        self.count.setText(f'已勾选 {len(included)} / 导入 {len(self.sources)} 张' if self.sources else '尚未添加照片')
-        if self.worker is None:
-            self.progress_bar.setRange(0, max(1, len(included)))
-            self.progress_bar.setValue(sum(self.source_key(source) in self.results for source in included))
-            self.progress_bar.setFormat('已处理 %v / %m 张' if self.results else '等待开始')
         self.preview_key = None
         selected_keys = {self.source_key(source) for source in selected}
         if self.sources:
@@ -1289,6 +1309,16 @@ class Workbench(QMainWindow):
             if not self.listing.selectedItems():
                 self.listing.selectRow(row)
         self.listing.blockSignals(False)
+        self.listing.setUpdatesEnabled(True)
+        self.update_queue_state(included)
+
+    def update_queue_state(self, included):
+        self.queue_pages.setCurrentIndex(1 if self.sources else 0)
+        self.count.setText(f'已勾选 {len(included)} / 导入 {len(self.sources)} 张' if self.sources else '尚未添加照片')
+        if self.worker is None:
+            self.progress_bar.setRange(0, max(1, len(included)))
+            self.progress_bar.setValue(sum(self.source_key(source) in self.results for source in included))
+            self.progress_bar.setFormat('已处理 %v / %m 张' if self.results else '等待开始')
         self.show_selected()
         self.sync_creative_sources()
         self.update_actions()
@@ -1316,7 +1346,9 @@ class Workbench(QMainWindow):
         for row in range(self.listing.rowCount()):
             item = self.listing.item(row,0)
             flags = item.flags()
-            item.setFlags(flags & ~Qt.ItemIsUserCheckable if running else flags | Qt.ItemIsUserCheckable)
+            updated = flags & ~Qt.ItemIsUserCheckable if running else flags | Qt.ItemIsUserCheckable
+            if flags != updated:
+                item.setFlags(updated)
         self.selection_button.setEnabled(not running and bool(self.sources))
         row = self.listing.currentRow()
         source = self.sources[row] if 0<=row<len(self.sources) else None
