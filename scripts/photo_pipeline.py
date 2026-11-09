@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import uuid
 
-from image_io import apply_tone_curve, fit_generated, open_photo, open_rgb, save_image, save_jpeg, save_json
+from image_io import apply_tone_curve, fit_generated, image_size, open_photo, open_rgb, save_image, save_jpeg, save_json
 from model_clients import edit_image, plan_photos, superresolve, write_prompt
 from head_composite import restore_head
 from creative_edits import normalise_edits, edits_match
@@ -89,8 +89,7 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             generated = Path(generated).expanduser().resolve()
             record['existing_generated'] = str(generated)
         record['files']['generated_native'] = str(generated)
-        with open_rgb(generated) as native:
-            record['native_dimensions'] = list(native.size)
+        record['native_dimensions'] = list(image_size(generated))
         stage('匹配生成画面尺寸')
         if superresolved is None:
             returned,record['sr'] = superresolve(generated,requested,config.get('sr'),directory,stage)

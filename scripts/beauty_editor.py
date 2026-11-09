@@ -6,13 +6,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QPainter
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
     QScrollArea, QVBoxLayout, QWidget)
 
 from face_beauty import (BEAUTY_DEFAULTS, BeautyParameters, BeautySession,
-    prepare_face, prepare_skin, render_beauty, save_beauty)
+    prepare_face, prepare_skin, render_beauty_crop, save_beauty)
 from image_io import display_image, open_photo, save_json
 from settings import load_settings
 from model_downloads import ModelDownloads
@@ -87,10 +87,11 @@ class BeautyWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, phase, *, context, config, session=None, pixels=None, parameters=None):
+    def __init__(self, phase, *, context, config, session=None, pixels=None, parameters=None, before=None):
         super().__init__()
         self.phase, self.context, self.config = phase,context,config
         self.session,self.pixels,self.parameters = session,pixels,parameters
+        self.before = before
 
     def run(self):
         try:
@@ -105,7 +106,13 @@ class BeautyWorker(QThread):
             elif self.phase == 'skin':
                 result = prepare_skin(self.session,self.config,self.progress.emit,pixels=self.pixels)
             elif self.phase == 'render':
-                result = display_image(render_beauty(self.pixels,self.session,self.parameters))
+                result = self.before
+                if self.parameters.skin or self.parameters.slim:
+                    crop = render_beauty_crop(self.pixels,self.session,self.parameters)
+                    result = self.before.copy()
+                    painter = QPainter(result)
+                    painter.drawImage(self.session.box[0],self.session.box[1],display_image(crop))
+                    painter.end()
             elif self.phase == 'save':
                 self.progress.emit('保存 16 位 PNG 和 JPEG 美化版')
                 result = save_beauty(self.pixels,self.session,self.parameters)
@@ -259,7 +266,7 @@ class BeautyEditor(QWidget):
         if phase!='resume':
             self.failure_message = ''
         worker = BeautyWorker(phase, context=self.context,config=self.config,
-            session=self.session,pixels=self.pixels,parameters=self.parameters())
+            session=self.session,pixels=self.pixels,parameters=self.parameters(),before=self.before)
         worker.ready.connect(self.action_ready)
         worker.failed.connect(self.action_failed)
         worker.progress.connect(self.message.setText)
@@ -309,7 +316,7 @@ class BeautyEditor(QWidget):
 
     def action_finished(self):
         worker,self.worker = self.worker,None
-        worker.pixels = worker.session = None
+        worker.pixels = worker.session = worker.before = None
         worker.deleteLater()
         if not self.isVisible():
             self.release_pixels()

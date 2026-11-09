@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColorSpace, QImage, QImageReader
+from PySide6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader
 
 Image.MAX_IMAGE_PIXELS = None
 QImageReader.setAllocationLimit(0)
@@ -73,6 +73,17 @@ def _read_image(path, max_edge=None):
             image = image.convertToFormat(QImage.Format_RGB888)
         image.setColorSpace(QColorSpace(QColorSpace.SRgb))
     return image
+
+
+def image_size(path):
+    """Read a model image's oriented dimensions without decoding its RGB."""
+    reader = QImageReader(str(path))
+    size = reader.size()
+    if not size.isValid():
+        raise OSError(f'Cannot read {path}: {reader.errorString()}')
+    if reader.transformation() & QImageIOHandler.TransformationRotate90:
+        size.transpose()
+    return size.width(),size.height()
 
 
 def open_photo(path):

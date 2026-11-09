@@ -14,7 +14,7 @@ import uuid
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from image_io import SRGB, open_rgb, preview_data_url, save_json, to_preview
+from image_io import SRGB, image_size, open_rgb, preview_data_url, save_json, to_preview
 from prompt_library import ReferenceLibrary
 from settings import credential
 from creative_edits import normalise_edits, edit_instructions
@@ -653,15 +653,13 @@ def comfy_upscale(source, config, directory):
 
 def superresolve(source, target, config, directory, progress):
     """Run the configured model once, then let the caller crop or downsample."""
-    with open_rgb(source) as image:
-        ratio = max(target[0] / image.width, target[1] / image.height)
-        if ratio <= 1:
-            return Path(source), []
+    width,height = image_size(source)
+    if max(target[0]/width,target[1]/height) <= 1:
+        return Path(source), []
     progress('模型超分 1/1')
     result = comfy_upscale(source, config, directory)
-    with open_rgb(result) as image:
-        records = [{'input': str(source), 'model_return': str(result),
-            'dimensions': list(image.size)}]
+    records = [{'input': str(source), 'model_return': str(result),
+        'dimensions': list(image_size(result))}]
     return result, records
 
 

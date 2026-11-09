@@ -218,9 +218,8 @@ def _slim_map(points, strength, size):
     return xx+delta[...,0]*(size[0]-1), yy+delta[...,1]*(size[1]-1)
 
 
-def render_beauty(pixels, session, parameters):
-    if parameters.skin == 0 and parameters.slim == 0:
-        return pixels
+def render_beauty_crop(pixels, session, parameters):
+    """Render only the native face region, shared by preview and final saving."""
     x0,y0,x1,y1 = session.box
     size = (x1-x0,y1-y0)
     crop = pixels[y0:y1,x0:x1].copy()
@@ -239,8 +238,16 @@ def render_beauty(pixels, session, parameters):
     if parameters.slim:
         map_x,map_y = _slim_map(session.points,parameters.slim,size)
         crop = cv2.remap(crop,map_x,map_y,cv2.INTER_LANCZOS4,borderMode=cv2.BORDER_REFLECT_101)
+    return np.clip(crop,0,1)
+
+
+def render_beauty(pixels, session, parameters):
+    if parameters.skin == 0 and parameters.slim == 0:
+        return pixels
+    x0,y0,x1,y1 = session.box
+    crop = render_beauty_crop(pixels,session,parameters)
     output = pixels.copy()
-    output[y0:y1,x0:x1] = np.clip(crop,0,1)
+    output[y0:y1,x0:x1] = crop
     return output
 
 

@@ -143,7 +143,8 @@ def restore_head(original, generated, head_box, config, directory, progress, *, 
         where=warped_alpha[...,None]>1e-6)
     np.clip(restored,0,1,out=restored)
     coverage = np.clip(warped_alpha,0,1)
-    output = np.asarray(generated,np.float32)/255
+    output = np.asarray(generated,np.float32)
+    output /= 255
     target = output[low[1]:high[1],low[0]:high[0]].copy()
     lighting = None
     if edits['relight']:
