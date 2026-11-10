@@ -38,8 +38,13 @@ jobs:
           sys.path.insert(0, "scripts")
           from head_composite import _colour_match
           from image_io import open_photo, save_image
-          for path in Path("scripts").glob("*.py"):
+          from face_beauty import BeautySession
+          from local_editor import LocalRetouchEditor
+          from local_retouch import TASKS
+          from relighting import RELIGHT_DEFAULTS
+          for path in [*Path("scripts").glob("*.py"), *Path("providers").rglob("*.py")]:
               ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          assert set(TASKS) == {"hair_repair", "hair_shape", "neck"}
           cv2.SIFT_create()
           source = np.random.default_rng(0).uniform(.1, .8, (16, 16, 3)).astype(np.float32)
           matched = _colour_match(source, source * .8 + .1, np.ones((16, 16), np.float32))
@@ -70,6 +75,12 @@ jobs:
           prompts = json.loads((providers / "prompts.json").read_text(encoding="utf-8"))
           assert settings["prompt_library"] is None
           assert prompts and all({"title", "text", "source"} <= item.keys() for item in prompts)
+          for relative in ("comfyui_cosluma_beauty/landmarks.py", "comfyui_cosluma_beauty/fgtbt_network.py",
+                  "comfyui_cosluma_beauty/FGTBT-LICENSE", "comfyui_cosluma_beauty/SegFormer-LICENSE",
+                  "convert_fgtbt.py", "comfyui_cosluma_local/infer_edit.py",
+                  "comfyui_cosluma_relight/infer_fields.py"):
+              assert (providers / relative).is_file(), relative
+          assert not list(providers.rglob("__pycache__"))
           from PySide6.QtWidgets import QApplication, QDialog
           from qt_workbench import ServiceSettings, endpoint_url
           from settings import load_settings

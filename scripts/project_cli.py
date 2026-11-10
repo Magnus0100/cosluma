@@ -44,6 +44,8 @@ def main(argv=None):
     beauty.add_argument('--protect-features',action=argparse.BooleanOptionalAction,default=True,
         help='preserve eyes, brows and lips during skin retouching; enabled by default')
     beauty.add_argument('--session',type=Path,help='reuse this photograph\'s saved beauty session')
+    beauty.add_argument('--face-region',type=int,nargs=4,metavar=('LEFT','TOP','RIGHT','BOTTOM'),
+        help='explicit face rectangle in completed photograph pixels; required for new analysis')
     for child in (finish, compose, samples):
         child.add_argument('--brief', default='')
         child.add_argument('--size', type=int, nargs=2, metavar=('WIDTH', 'HEIGHT'))
@@ -58,7 +60,7 @@ def main(argv=None):
     progress = lambda message: print(message, file=sys.stderr, flush=True)
     if args.command=='beautify':
         result = beautify_completed(args.run,config,skin=args.skin,slim=args.slim,
-            protect_features=args.protect_features,session=args.session,progress=progress)
+            protect_features=args.protect_features,session=args.session,face_region=args.face_region,progress=progress)
         print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0
     edits = None

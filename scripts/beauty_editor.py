@@ -5,18 +5,102 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QPainter
+from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
+    QFrame, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
     QScrollArea, QVBoxLayout, QWidget)
 
 from face_beauty import (BEAUTY_DEFAULTS, BeautyParameters, BeautySession,
     prepare_face, prepare_skin, render_beauty_crop, save_beauty)
-from image_io import display_image, open_photo, save_json
+from image_io import display_image, image_size, open_display, open_photo, save_json
 from settings import load_settings
 from model_downloads import ModelDownloads
-from studio_widgets import PhotoPreview, ui_label
+from studio_widgets import PhotoCanvas, PhotoPreview, ui_label
+
+
+class FaceRangeCanvas(PhotoCanvas):
+    selected = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setCursor(Qt.CrossCursor)
+        self.anchor = None
+        self.selection = self.scene().addRect(QRectF(),QPen(QColor('#50d9c9'),2))
+        self.selection.setZValue(1)
+        self.setToolTip('拖动框选人脸；滚轮缩放，双击适应窗口。')
+
+    def image_point(self, event):
+        point = self.mapToScene(event.position().toPoint())
+        bounds = self.photo.boundingRect()
+        return QPointF(max(0,min(bounds.width(),point.x())),max(0,min(bounds.height(),point.y())))
+
+    def mousePressEvent(self, event):
+        if event.button()==Qt.LeftButton:
+            self.anchor = self.image_point(event)
+            self.selection.setRect(QRectF(self.anchor,self.anchor))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.anchor is not None and event.buttons()&Qt.LeftButton:
+            self.selection.setRect(QRectF(self.anchor,self.image_point(event)).normalized())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button()==Qt.LeftButton and self.anchor is not None:
+            self.selection.setRect(QRectF(self.anchor,self.image_point(event)).normalized())
+            self.anchor = None
+            self.selected.emit()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class FaceRangeDialog(QDialog):
+    def __init__(self, context, parent=None, *, initial=None):
+        super().__init__(parent)
+        self.setWindowTitle('选择本张人脸范围')
+        self.resize(850,740)
+        layout = QVBoxLayout(self)
+        note = ui_label('在整张成片上框住眉毛到下巴及左右脸颊，留少量边缘；可先滚轮放大再拖动。头饰和大面积头发不必框入。')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        native = image_size(context['base'])
+        display = open_display(context['base'],max_edge=2000)
+        self.scale = (native[0]/display.width(),native[1]/display.height())
+        # The canvas is the whole completed photograph, shown only shrunk. The
+        # range is therefore not limited by the head box of an earlier run.
+        self.offset = (0,0)
+        self.canvas = FaceRangeCanvas()
+        self.canvas.setPixmap(QPixmap.fromImage(display))
+        layout.addWidget(self.canvas,1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        self.analyze = buttons.button(QDialogButtonBox.Ok)
+        self.analyze.setText('分析选定范围')
+        self.analyze.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.canvas.selected.connect(self.selection_changed)
+        if initial is not None:
+            left,top,right,bottom = initial
+            self.canvas.selection.setRect(QRectF(
+                left/self.scale[0]-self.offset[0],top/self.scale[1]-self.offset[1],
+                (right-left)/self.scale[0],(bottom-top)/self.scale[1]))
+            self.selection_changed()
+        layout.addWidget(buttons)
+
+    def selection_changed(self):
+        self.analyze.setEnabled(not self.canvas.selection.rect().isEmpty())
+
+    def region(self):
+        rect = self.canvas.selection.rect()
+        return [round((value+offset)*scale) for value,offset,scale in zip(
+            (rect.left(),rect.top(),rect.right(),rect.bottom()),self.offset*2,self.scale*2)]
 
 
 class BeautyConnection(QDialog):
@@ -37,7 +121,8 @@ class BeautyConnection(QDialog):
         form = QFormLayout()
         self.fields = {}
         for key,label in (('url','ComfyUI 地址'),('analysis_model','FaceXFormer 模型'),
-                ('landmark_model','面部定位模型'),('model','完整 Kontext 模型目录'),('lora','BeautyGRPO LoRA')):
+                ('landmark_model','FGTBT 关键点模型'),
+                ('model','完整 Kontext 模型目录'),('lora','BeautyGRPO LoRA')):
             field = QLineEdit(str(values[key]))
             form.addRow(label,field)
             self.fields[key] = field
@@ -45,9 +130,9 @@ class BeautyConnection(QDialog):
         for device in ('cuda:0','cpu'):
             self.device.addItem(device)
         self.device.setCurrentText(values['analysis_device'])
-        form.addRow('皮肤分析设备',self.device)
+        form.addRow('皮肤与关键点分析设备',self.device)
         self.memory = QComboBox()
-        self.memory.addItem('完整 BF16 · 分组卸载到内存','group_offload')
+        self.memory.addItem('NF4 底座 · 完整 LoRA / BF16 文本与 VAE','bnb_nf4')
         self.memory.addItem('完整 BF16 · 全部放入显存','cuda')
         self.memory.setCurrentIndex(self.memory.findData(values['memory']))
         form.addRow('美肤内存布局',self.memory)
@@ -96,7 +181,7 @@ class BeautyWorker(QThread):
     def run(self):
         try:
             if self.phase == 'analysis':
-                session,pixels = prepare_face(self.context['base'],self.context['region'],
+                session,pixels = prepare_face(self.context['base'],self.context['analysis_region'],
                     self.context['directory'],self.config,self.progress.emit)
                 result = (session,pixels,display_image(pixels))
             elif self.phase == 'resume':
@@ -212,9 +297,9 @@ class BeautyEditor(QWidget):
         self.reset_button.clicked.connect(self.reset_parameters)
         controls.addWidget(self.reset_button)
         controls.addStretch(1)
-        self.analyze_button = QPushButton('重新分析人脸')
+        self.analyze_button = QPushButton('选择人脸并分析')
         self.analyze_button.setProperty('kind','quiet')
-        self.analyze_button.clicked.connect(lambda:self.start('analysis'))
+        self.analyze_button.clicked.connect(self.choose_face)
         controls.addWidget(self.analyze_button)
         self.save_button = QPushButton('另存美化版')
         self.save_button.setProperty('kind','primary')
@@ -229,7 +314,7 @@ class BeautyEditor(QWidget):
         splitter.addWidget(scroll)
         splitter.setSizes([900,280])
         layout.addWidget(splitter,1)
-        self.message = ui_label('正在准备主体人脸，原成片保持可查看。')
+        self.message = ui_label('选择本张人脸范围后开始分析；已有美化草稿会直接恢复。')
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.message)
@@ -253,9 +338,21 @@ class BeautyEditor(QWidget):
                 self.restored = BeautyParameters(**state['parameters'])
                 self.start('resume')
             else:
-                self.start('analysis')
+                self.message.setText('点击“选择人脸并分析”，框住本张脸部后开始。')
         except (OSError,ValueError,KeyError) as error:
             self.message.setText('读取美化草稿失败：'+str(error))
+
+    def choose_face(self):
+        if self.worker is not None:
+            return
+        try:
+            initial = self.session.analysis_region if self.session is not None else None
+            dialog = FaceRangeDialog(self.context,self,initial=initial)
+            if dialog.exec()==QDialog.Accepted:
+                self.context['analysis_region'] = dialog.region()
+                self.start('analysis')
+        except (OSError,ValueError) as error:
+            self.message.setText('选择人脸范围失败：'+str(error))
 
     def start(self, phase):
         if self.worker is not None:
@@ -415,9 +512,7 @@ class BeautyEditor(QWidget):
         self.skin_button.setText('重新生成美肤基础' if self.session is not None and self.session.delta is not None else '生成美肤基础')
         self.raw_button.setEnabled(self.session is not None and self.session.delta is not None)
         if self.session is not None and self.session.delta is not None:
-            official = self.session.state.get('skin',{}).get('engine')=='diffusers.FluxKontextPipeline'
-            self.source_note.setText('当前基础：官方 BF16 推理。滑杆调整应用强度；模型原始输出单独保留。' if official else
-                '当前基础来自此前的推理配置。主动重新生成后使用官方 BF16 方法，旧文件保留。')
+            self.source_note.setText('当前基础：官方 BF16 推理。滑杆调整应用强度；模型原始输出单独保留。')
         else:
             self.source_note.setText('生成完整 BF16 模型输出后，再调整应用强度。模型原始输出单独保留，可直接查看。')
         self.analyze_button.setEnabled(not busy)

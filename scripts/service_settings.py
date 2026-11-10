@@ -7,7 +7,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
+from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QLineEdit, QListWidget, QPushButton, QScrollArea,
     QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
@@ -15,6 +15,7 @@ from settings import editable_settings, resource_path, save_settings
 from model_downloads import ModelDownloads
 from prompt_library import load_library
 from studio_widgets import ui_label
+from relighting import RELIGHT_DEFAULTS
 
 
 def endpoint_url(value, service):
@@ -110,6 +111,28 @@ class ServiceSettings(QDialog):
         info = ui_label('ComfyUI 地址可指向本机或远端。软件包不包含模型服务和权重，请按部署说明准备。')
         info.setWordWrap(True)
         form.addRow(info)
+        self.relight_group = QGroupBox('可选人物重打光 · PIXLRelight')
+        self.relight_group.setCheckable(True)
+        self.relight_group.setChecked(bool(self.values.get('relight')))
+        lighting_form = QFormLayout(self.relight_group)
+        self.relight_fields = {}
+        lighting = {**RELIGHT_DEFAULTS, **self.values.get('relight',{})}
+        for key,label in (('url','ComfyUI 地址'),('model_directory','PIXLRelight 目录'),
+                ('intrinsics_directory','Marigold 目录')):
+            field = QLineEdit(lighting.get(key,self.values.get('head',{}).get('url','')))
+            self.relight_fields[key] = field
+            lighting_form.addRow(label,field)
+        self.relight_device = QComboBox()
+        self.relight_device.addItems(['cuda:0','cpu'])
+        self.relight_device.setCurrentText(lighting['device'])
+        lighting_form.addRow('推理设备',self.relight_device)
+        download = QPushButton('下载重打光模型与查看安装方法')
+        download.clicked.connect(lambda: ModelDownloads(self,model='relight').exec())
+        lighting_form.addRow(download)
+        note = ui_label('仅主动开启人物重打光时调用；保存连接不改变创作开关。模型目录位于服务机器。')
+        note.setWordWrap(True)
+        lighting_form.addRow(note)
+        form.addRow(self.relight_group)
         form = self.add_page('核对设置，开始第一组照片',
             '确认服务用途和保存位置。保存不测试连接，也不生成图片；实际服务错误会在调用步骤显示。')
         self.summary = {}
@@ -392,6 +415,19 @@ class ServiceSettings(QDialog):
                     parameters[key] = edit.text().strip()
                 else:
                     parameters.pop(key, None)
+            if self.relight_group.isChecked():
+                lighting = {**RELIGHT_DEFAULTS, **values.get('relight',{})}
+                for key,field in self.relight_fields.items():
+                    value = field.text().strip()
+                    if not value:
+                        self.tabs.setCurrentIndex(2)
+                        field.setFocus()
+                        raise ValueError('请填写 PIXLRelight 服务地址和实际模型目录')
+                    lighting[key] = endpoint_url(value,'relight') if key=='url' else value
+                lighting['device'] = self.relight_device.currentText()
+                values['relight'] = lighting
+            else:
+                values.pop('relight',None)
             self.tabs.setCurrentIndex(3)
             if not self.output_root.text().strip():
                 self.output_root.setFocus()

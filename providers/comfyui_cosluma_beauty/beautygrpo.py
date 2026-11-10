@@ -1,11 +1,12 @@
-"""BeautyGRPO's published BF16 FluxKontext inference, inside the model service."""
+"""BeautyGRPO official inference with explicitly selected weight precision."""
 from importlib.metadata import version
 from pathlib import Path
 import gc
 import hashlib
 import traceback
 
-from diffusers import FluxKontextPipeline
+from accelerate import cpu_offload
+from diffusers import BitsAndBytesConfig, FluxKontextPipeline, FluxTransformer2DModel
 from PIL import Image
 import numpy as np
 import torch
@@ -15,9 +16,9 @@ import comfy.utils
 import folder_paths
 
 
-PROMPT = "Beautify this person's face while maintaining a natural and realistic appearance."
+PROMPT = "Beautify this person's face while maintaining a natural and realistic appearance"
 UPSTREAM = 'vivoCameraResearch/BeautyGRPO'
-UPSTREAM_REVISION = '80fcf466d6bfc3b3a05e1cbedd11e3a3ced2bcb9'
+UPSTREAM_REVISION = 'main (retrieved 2026-11-11)'
 
 
 class CosLumaBeautyGRPO:
@@ -27,7 +28,7 @@ class CosLumaBeautyGRPO:
             'model':('STRING',{'default':'FLUX.1-Kontext-dev'}),
             'lora':('STRING',{'default':'beautygrpo.safetensors'}),
             'device':(['cuda:0'],),
-            'memory':(['group_offload','cuda'],),
+            'memory':(['bnb_nf4','cuda'],),
             'filename_prefix':('STRING',{'default':'CosLuma/BeautyGRPO'})}}
 
     RETURN_TYPES = ()
@@ -52,26 +53,41 @@ class CosLumaBeautyGRPO:
             gc.collect()
             comfy.model_management.soft_empty_cache()
 
+    def _load_pipeline(self,model_path,lora_path,device,memory):
+        if memory == 'bnb_nf4':
+            quantization = BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_quant_type='nf4',
+                bnb_4bit_compute_dtype=torch.bfloat16,bnb_4bit_use_double_quant=True)
+            transformer = FluxTransformer2DModel.from_pretrained(str(model_path),subfolder='transformer',
+                torch_dtype=torch.bfloat16,quantization_config=quantization,
+                device_map={'':device},low_cpu_mem_usage=True,local_files_only=True)
+            pipe = FluxKontextPipeline.from_pretrained(str(model_path),transformer=transformer,
+                torch_dtype=torch.bfloat16,low_cpu_mem_usage=True,local_files_only=True)
+        else:
+            pipe = FluxKontextPipeline.from_pretrained(str(model_path),torch_dtype=torch.bfloat16,
+                local_files_only=True)
+        pipe.load_lora_weights(str(lora_path.parent),weight_name=lora_path.name)
+        if memory == 'bnb_nf4':
+            # Keep the complete BF16 text encoder on CPU; Accelerate stages its
+            # called layers, while the NF4 transformer remains on the GPU.
+            cpu_offload(pipe.text_encoder_2,execution_device=torch.device(device),offload_buffers=True)
+            pipe.text_encoder.to(device)
+            pipe.vae.to(device)
+        else:
+            pipe.to(device)
+        return pipe
+
     def _retouch(self,image,model,lora,device,memory,filename_prefix):
-        # Paths select one explicit installation. No downloads, precision
-        # substitutions or exception paths that continue without the LoRA.
+        # Paths and precision are explicit. No downloads, automatic layout
+        # changes or exception paths that continue without the LoRA.
         model_path = Path(folder_paths.models_dir)/'diffusers'/model
         lora_path = Path(folder_paths.get_full_path_or_raise('loras',lora))
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
-        pipe = FluxKontextPipeline.from_pretrained(str(model_path),torch_dtype=torch.bfloat16,
-            local_files_only=True)
+        pipe = self._load_pipeline(model_path,lora_path,device,memory)
         self.pipeline = pipe
-        pipe.load_lora_weights(str(lora_path.parent),weight_name=lora_path.name)
         self.parameters = {name:{'count':sum(parameter.numel() for parameter in component.parameters()),
             'dtypes':sorted({str(parameter.dtype) for parameter in component.parameters()})}
             for name,component in pipe.components.items() if isinstance(component,torch.nn.Module)}
-        if memory=='group_offload':
-            pipe.enable_group_offload(onload_device=torch.device(device),
-                offload_device=torch.device('cpu'),offload_type='block_level',
-                num_blocks_per_group=1,use_stream=False)
-        else:
-            pipe.to(device)
         pixels = np.uint8(np.clip(image[0].cpu().numpy(),0,1)*255+.5)
         input_image = Image.fromarray(pixels).convert('RGB')
         if input_image.size!=(1024,1024):
@@ -101,7 +117,12 @@ class CosLumaBeautyGRPO:
         output.save(Path(directory)/filename)
         record = {'engine':'diffusers.FluxKontextPipeline','upstream':UPSTREAM,
             'upstream_revision':UPSTREAM_REVISION,'model':str(model_path),'lora':str(lora_path),
-            'dtype':'bfloat16','device':device,'memory':memory,'prompt':PROMPT,
+            'dtype':'nf4/bfloat16' if memory=='bnb_nf4' else 'bfloat16',
+            'device':device,'memory':memory,'prompt':PROMPT,
+            'quantization':({'backend':'bitsandbytes','version':version('bitsandbytes'),
+                'component':'transformer','bits':4,'type':'nf4','double_quant':True,
+                'compute_dtype':'bfloat16'} if memory=='bnb_nf4' else None),
+            'placement':'nf4 CUDA transformer / CPU-offloaded BF16 T5' if memory=='bnb_nf4' else 'cuda',
             'tf32_matmul':False,'reduced_precision_math_sdp':False,
             'input_size':list(input_image.size),'output_size':list(output.size),
             'steps':28,'guidance':2.5,'seed':42,'scheduler':dict(self.pipeline.scheduler.config),

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
     QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
 
-from delivery_store import export_delivery, photo_choices, project_photos, revision_context, selected_version, source_key
+from delivery_store import export_delivery, photo_choices, project_photos, retouch_parent, revision_context, selected_version, source_key
 from creative_edits import normalise_edits
 from image_io import open_display
 from studio_widgets import PhotoPreview, StatusText, ui_label
@@ -173,6 +173,7 @@ class RevisionDialog(QDialog):
 
 class DeliveryView(QWidget):
     beauty_requested = Signal(dict)
+    retouch_requested = Signal(dict)
     revision_requested = Signal(dict)
     batch_created = Signal(str)
     busy_changed = Signal()
@@ -300,6 +301,10 @@ class DeliveryView(QWidget):
         self.beauty.clicked.connect(self.open_beauty)
         self.beauty.setEnabled(False)
         details.addWidget(self.beauty)
+        self.retouch = QPushButton('局部修发／发束／双下巴')
+        self.retouch.clicked.connect(self.open_retouch)
+        self.retouch.setEnabled(False)
+        details.addWidget(self.retouch)
         column.addLayout(details)
         revision_row = QHBoxLayout()
         self.revise = QPushButton('给这张改稿')
@@ -558,6 +563,7 @@ class DeliveryView(QWidget):
             self.details.setToolTip('')
             self.comparison_note.setText('')
             self.beauty.setEnabled(False)
+            self.retouch.setEnabled(False)
             return
         photo = self.photos[row]
         self.photo_title.setText(photo['name'])
@@ -588,6 +594,7 @@ class DeliveryView(QWidget):
             self.details.setToolTip('')
             self.comparison_note.setText('')
             self.beauty.setEnabled(False)
+            self.retouch.setEnabled(False)
             return
         width,height = version['dimensions']
         self.base_path = version['base']
@@ -595,6 +602,7 @@ class DeliveryView(QWidget):
         self.details.setToolTip(version['description']+('\n摄影方向：'+version['direction'] if version['direction'] else ''))
         self.update_comparison(photo,version)
         self.beauty.setEnabled(not self.is_busy() and not self.production_busy and Path(version['base']).is_file())
+        self.retouch.setEnabled(not self.is_busy() and not self.production_busy and Path(version['files']['PNG']).is_file())
 
     def update_comparison(self, photo, version):
         reference = self.reference.currentData()
@@ -668,6 +676,15 @@ class DeliveryView(QWidget):
         self.open_export.setEnabled(bool(self.state['exports']))
         self.history.setEnabled(not busy and bool(self.state['exports']))
         self.beauty.setEnabled(not busy and not self.production_busy and self.base_path is not None and Path(self.base_path).is_file())
+        photo = self.current_photo()
+        if photo is not None:
+            try:
+                version = selected_version(photo,self.state['choices'][photo['key']])
+                self.retouch.setEnabled(not busy and not self.production_busy and Path(version['files']['PNG']).is_file())
+            except ValueError:
+                self.retouch.setEnabled(False)
+        else:
+            self.retouch.setEnabled(False)
         self.update_revision_controls()
 
     def update_revision_controls(self):
@@ -779,6 +796,16 @@ class DeliveryView(QWidget):
                 'return_to_delivery':True})
         except (OSError,ValueError,KeyError) as error:
             self.message.setPlainText('无法打开人脸美化：'+str(error))
+
+    def open_retouch(self):
+        try:
+            photo = self.current_photo()
+            version = selected_version(photo,self.state['choices'][photo['key']])
+            self.retouch_requested.emit({'name':photo['name'],'base':version['files']['PNG'],
+                'directory':version['work'],'batch_directory':version['batch'],'return_to_delivery':True,
+                'parent_version':retouch_parent(version)})
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('无法打开局部修饰：'+str(error))
 
     def choose_export(self):
         parent = QFileDialog.getExistingDirectory(self,'选择交付文件夹的保存位置',

@@ -9,6 +9,7 @@ from scipy.ndimage import binary_fill_holes
 from image_io import save_image, to_preview
 from model_clients import extract_head_mask
 from creative_edits import normalise_edits
+from relighting import transfer_lighting
 
 
 def _colour_match(source, target, alpha):
@@ -22,44 +23,6 @@ def _colour_match(source, target, alpha):
     return np.clip(cv2.transform(source,np.column_stack((matrix,offset)).astype(np.float32)),0,1)
 
 
-def _transfer_lighting(source, target, alpha):
-    """Transfer a spatial illumination ratio in linear RGB, preserving source detail.
-
-    Normalised frequency separation excludes the surrounding background from
-    both illumination estimates. Only light and colour change; no RGB warping,
-    generated facial texture, or additional global colour match is applied.
-    """
-    height,width = alpha.shape
-    scale = min(1.0,768/max(width,height))
-    field_size = (max(1,round(width*scale)),max(1,round(height*scale)))
-    # This resized data estimates low-frequency light, never identity pixels.
-    source_light = cv2.resize(source,field_size,interpolation=cv2.INTER_AREA)
-    target_light = cv2.resize(target,field_size,interpolation=cv2.INTER_AREA)
-    source_linear = np.where(source_light<=.04045,source_light/12.92,((source_light+.055)/1.055)**2.4)
-    target_linear = np.where(target_light<=.04045,target_light/12.92,((target_light+.055)/1.055)**2.4)
-    support = cv2.resize((alpha>.95).astype(np.float32),field_size,interpolation=cv2.INTER_AREA)
-    radius = max(1.0,float(np.sqrt(support.sum()))*.025)
-    weight = cv2.GaussianBlur(support,(0,0),radius)
-    log_source = np.log(np.maximum(source_linear,1/65535))
-    log_target = np.log(np.maximum(target_linear,1/65535))
-    difference = cv2.GaussianBlur((log_target-log_source)*support[...,None],(0,0),radius)
-    np.divide(difference,weight[...,None],out=difference,where=weight[...,None]>1e-6)
-    difference[weight<=1e-6] = 0
-    difference = cv2.resize(difference,(width,height),interpolation=cv2.INTER_LINEAR)
-    result = np.empty_like(source,dtype=np.float32)
-    for channel in range(3):
-        values = source[...,channel]
-        linear = np.where(values<=.04045,values/12.92,((values+.055)/1.055)**2.4)
-        linear *= np.exp(difference[...,channel])
-        np.clip(linear,0,1,out=linear)
-        result[...,channel] = np.where(linear<=.0031308,linear*12.92,1.055*linear**(1/2.4)-.055)
-    return result,{
-        'method':'masked linear-RGB log illumination ratio; frequency separation',
-        'field_dimensions':list(field_size),'radius_in_field_pixels':radius,
-        'guide':'generated full-frame face and body lighting',
-        'source_detail':'camera RGB sampled once with the SIFT similarity transform'}
-
-
 def _align_head(source, target, alpha, source_box, original_size):
     """SIFT correspondences across the whole head; OpenCV's four-DOF fit."""
     source_preview = to_preview(source,1536)
@@ -70,6 +33,10 @@ def _align_head(source, target, alpha, source_box, original_size):
     padding = (expected[1]-expected[0])*.2
     low = np.maximum(0,np.floor(expected[0]-padding)).astype(int)
     high = np.minimum(target.size,np.ceil(expected[1]+padding)).astype(int)
+    if np.any(high<=low):
+        raise ValueError('头部保留区换算到成片画幅后为空或落在画面之外，无法进行整头对齐；'
+            f'成片 {target.width}×{target.height}，期望范围 {[int(value) for value in (*low,*high)]}。'
+            '请重新制作该张，或按实际画面调整提示词阶段的头部范围')
     target_box = [int(low[0]),int(low[1]),int(high[0]),int(high[1])]
     target_preview = target.crop(target_box)
     target_preview.thumbnail((1536,1536),Image.Resampling.LANCZOS)
@@ -78,18 +45,18 @@ def _align_head(source, target, alpha, source_box, original_size):
     a,da = sift.detectAndCompute(cv2.cvtColor(np.asarray(source_preview),cv2.COLOR_RGB2GRAY),source_mask)
     b,db = sift.detectAndCompute(cv2.cvtColor(np.asarray(target_preview),cv2.COLOR_RGB2GRAY),None)
     if da is None or db is None or len(db)<2:
-        raise ValueError('No head texture descriptors are available for whole-head alignment')
+        raise ValueError('整头对齐未在头部保留区找到可用的纹理特征：可能是保留区过小或该区域纹理不足；原片与已生成画面均已保留')
     pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(da,db,k=2)
     good = [m for m,n in pairs if m.distance < .75*n.distance]
     if len(good)<3:
-        raise ValueError('Not enough corresponding head texture points for a similarity transform')
+        raise ValueError('整头对齐的原片与成片特征对应点不足：可能是保留区过小、纹理不足，或生成画面与头部差异过大；原片与已生成画面均已保留')
     source_scale = np.array([source.shape[1]/source_preview.width,source.shape[0]/source_preview.height])
     target_scale = (high-low)/np.array(target_preview.size)
     source_points = np.array([a[m.queryIdx].pt for m in good],np.float32)*source_scale
     target_points = np.array([b[m.trainIdx].pt for m in good],np.float32)*target_scale+low
     transform,inliers = cv2.estimateAffinePartial2D(source_points,target_points,method=cv2.RANSAC)
     if transform is None:
-        raise ValueError('A whole-head similarity transform could not be estimated')
+        raise ValueError('无法用现有特征对应估计整头等比相似变换：可能是特征点错误或保留区纹理不足；原片与已生成画面均已保留')
     return transform.astype(np.float32),len(good),int(inliers.sum())
 
 
@@ -149,8 +116,8 @@ def restore_head(original, generated, head_box, config, directory, progress, *, 
     lighting = None
     if edits['relight']:
         progress('迁移面部空间光照，与身体和环境统一')
-        matched,lighting = _transfer_lighting(restored,target,coverage)
-        method = 'SIFT similarity; linear-RGB spatial illumination transfer; float alpha composite'
+        matched,lighting = transfer_lighting(restored,target,coverage,config.get('relight'),directory)
+        method = 'SIFT similarity; PIXLRelight affine modulation; float alpha composite'
     else:
         progress('匹配头部光色与融合')
         matched = _colour_match(restored,target,coverage)

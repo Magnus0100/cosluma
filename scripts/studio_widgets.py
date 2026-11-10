@@ -8,7 +8,7 @@ import sys
 from threading import Event
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QPixmapCache, QTextDocument
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPixmap, QPixmapCache, QTextDocument, QTransform
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
     QSizePolicy, QVBoxLayout, QWidget)
@@ -352,6 +352,11 @@ class PhotoCanvas(QGraphicsView):
         self.setToolTip('滚轮缩放，按住鼠标拖动；双击或按 0 适应窗口，按 1 查看 100%')
         self.setScene(QGraphicsScene(self))
         self.photo = self.scene().addPixmap(QPixmap())
+        self.photo.setTransformationMode(Qt.SmoothTransformation)
+        self.display = self.scene().addPixmap(QPixmap())
+        self.display.setTransformationMode(Qt.SmoothTransformation)
+        self.display.hide()
+        self.display_key = None
         self.fitting = True
         self.empty_message = ''
 
@@ -364,11 +369,13 @@ class PhotoCanvas(QGraphicsView):
         self.setSceneRect(self.photo.boundingRect())
         if not keep_view:
             self.fit_photo()
+        self.update_display_copy()
 
     def setText(self, text):
         self.photo.setPixmap(QPixmap())
         self.setSceneRect(0,0,0,0)
         self.empty_message = text
+        self.update_display_copy()
         self.viewport().update()
 
     def fit_photo(self):
@@ -377,6 +384,12 @@ class PhotoCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         if not self.photo.pixmap().isNull():
             self.fitInView(self.photo,Qt.KeepAspectRatio)
+            native = 1.0/self.devicePixelRatioF()
+            if self.transform().m11()>native:
+                self.resetTransform()
+                self.scale(native,native)
+                self.centerOn(self.photo)
+        self.update_display_copy()
         self.zoom_changed.emit()
 
     def set_zoom(self, scale):
@@ -387,10 +400,38 @@ class PhotoCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         factor = max(.01,min(8.0/self.devicePixelRatioF(),scale))/self.transform().m11()
         self.scale(factor,factor)
+        self.update_display_copy()
         self.zoom_changed.emit()
 
     def actual_size(self):
         self.set_zoom(1.0/self.devicePixelRatioF())
+
+    def update_display_copy(self):
+        """Draw a smoothly reduced copy while the whole photo fits; native pixels stay untouched."""
+        pixels = self.photo.pixmap()
+        key = placement = None
+        dpr = self.devicePixelRatioF()
+        scale = self.transform().m11()*dpr
+        if self.isVisible() and not pixels.isNull() and 0<scale<1:
+            ratio = pixels.devicePixelRatio()
+            width, height = pixels.width()/ratio,pixels.height()/ratio
+            target = max(1,round(width*scale)),max(1,round(height*scale))
+            viewport = self.viewport().size()
+            if target[0]<=viewport.width()*dpr and target[1]<=viewport.height()*dpr and target[0]<pixels.width():
+                key = (pixels.cacheKey(),*target)
+                placement = width/target[0],height/target[1]
+        if key == self.display_key:
+            return
+        self.display_key = key
+        if key is None:
+            self.display.setPixmap(QPixmap())
+            self.display.hide()
+            return
+        copy = pixels.scaled(key[1],key[2],Qt.IgnoreAspectRatio,Qt.SmoothTransformation)
+        copy.setDevicePixelRatio(1)
+        self.display.setPixmap(copy)
+        self.display.setTransform(QTransform.fromScale(*placement))
+        self.display.show()
 
     def wheelEvent(self, event):
         if not self.photo.pixmap().isNull() and event.angleDelta().y():
@@ -429,6 +470,18 @@ class PhotoCanvas(QGraphicsView):
         super().resizeEvent(event)
         if hasattr(self,'photo') and self.fitting:
             self.fit_photo()
+        elif hasattr(self,'display'):
+            self.update_display_copy()
+
+    def hideEvent(self, event):
+        self.display_key = None
+        self.display.setPixmap(QPixmap())
+        self.display.hide()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_display_copy()
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter,rect)

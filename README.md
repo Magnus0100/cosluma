@@ -1,6 +1,8 @@
 # CosLuma
 
-**0.25.3 · Windows x64 · 源码使用 Python 3.12**
+**本地稳定版 0.26.0 · Windows x64 · 源码使用 Python 3.12**
+
+0.26.0 包含 PIXLRelight 人物重打光、FGTBT 98 点人脸定位，以及补发与露网修补、发束造型、双下巴修饰三个成片后编辑入口；收齐了真实制作流程中的内存释放、头饰保留、局部肤色融合和版本恢复修复。以下说明对应本版源码与本地构建，旧候选包不对应最终修复。0.26.0 尚未公开发布，公开下载仍为 0.25.3；模型节点需按对应章节更新并重启服务。
 
 按项目整理一组照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；保留本人五官、脸型和相机细节。创作时可独立开启修发与人物重打光，两项默认关闭。
 
@@ -31,6 +33,8 @@ flowchart TD
 **原片与摄影方向、可选设置 → 按单张构图写提示词 → 整图生图 → 必要时一次模型超分 → SAM3.1 提取原片身份保留区 → SIFT 整体等比对齐 → MKL 仿色或已开启的空间光照迁移 → 一次浮点蒙版融合 → 可选明度曲线 → 保存。**
 
 ## 下载与首次使用
+
+本地稳定版 Windows 包名为 `CosLuma-0.26.0-windows-x64.zip`，完整解压后打开 `CosLuma/CosLuma.exe`；同提交源码包名为 `CosLuma-0.26.0-source.zip`，使用同目录 `SHA256SUMS.txt` 核对文件。旧的 0.26.0 候选包不包含最终修复，请勿混用。公开下载仍是 0.25.3，其中没有本版新增的重打光、FGTBT 与局部修饰。
 
 [下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.25.3/CosLuma-0.25.3-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.25.3)
 
@@ -82,7 +86,7 @@ Windows 用户下载 Release 中的 `CosLuma-0.25.3-windows-x64.zip`，完整解
 服务配置与凭据仍在本机配置目录，项目文件不包含密钥，也不复制服务配置；不同项目复用当前服务连接。
 
 返回项目页或切换项目时保存当前创作、美化草稿与交付选择；保存失败保留当前项目并显示错误。导入、选片、讨论、试样、改稿、批量、美化或交付导出仍在运行时，可查看项目列表与当前项目各页，处理结束后再切换项目。
-从旧版升级后，项目页提供“将上次工作区收为项目”，明确点击并命名后收纳上次的照片、讨论、样片、定稿与已记录批次，原文件保留原位置；“新建项目”始终从空白创作开始。
+“新建项目”始终从空白创作开始，不导入弃用方案的工作区状态。
 
 项目内的“照片”“创作”“成片”位于同一个工作室，可随时切换。照片页整理原片与角色，创作页讨论和试样，成片页浏览当前或已有批次。
 切换页面保留当前照片、对话、草稿与已有样片，不发起模型调用，也不会自动开始制作。
@@ -207,23 +211,23 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 
 ### 创作时的可选修发与人物重打光
 
-在创作页展开“下次试样设置”，分别勾选修发与人物重打光。两项默认关闭，属于本项目当前创作要求，服务连接仍复用已有整图生图与 SAM3.1，不需要另填一套接口。
+在创作页展开“下次试样设置”，分别勾选修发与人物重打光。两项默认关闭，属于本项目当前创作要求。修发使用已有整图生图与 SAM3.1；重打光另需在连接设置的“分割与超分”页配置 PIXLRelight 服务和模型目录。
 画布下方单独显示眼前样片实际使用的设置，悬停可看该轮要求；右侧设置控制下一次试样，回看旧样片时两者分别显示。
 
-- **修发与头发生成**：填写希望修补、保留或调整的位置，例如“补齐右侧缺发，刘海和头饰保留，长发向身后扬”。也可在对话中说明。留空时按原有发型修整露网、缺口、断层与干扰杂发，不自行增加飘发。开启后头发采用生成结果；Agent 按这张原片识别花冠、发卡等具体实体头饰，SAM3.1 分别提取脸部与这些头饰，再保留原片脸部、耳朵与实体头饰。脸部蒙版内封闭的眼睛、眉毛孔洞会补齐；新增头发不跨过保留区。宽大的透光头纱随生成场景受光，明确要求保留原片头纱时才列入保留物体。未修改发束的像素也可能随生成变化，不承诺只改一根发丝。
-- **人物重打光**：填写目标光感，例如“左侧暖主光，右侧承接蓝色环境反光”。留空时 Agent 根据当前摄影方向设计。整图生图共同处理面部、身体、服装、道具与背景的光向、反光和阴影；融合时在线性 RGB 中估计带蒙版的低频对数光照比，将空间光照迁移到已对齐的原片头部，保留原片几何与高频细节。该步骤替换普通 MKL 仿色，不再叠加一次 MKL。
+- **修发与头发生成**：填写希望修补、保留或调整的位置，例如“补齐右侧缺发，刘海和头饰保留，长发向身后扬”。也可在对话中说明。留空时按原有发型修整露网、缺口、断层与干扰杂发，不自行增加飘发。开启后头发采用生成结果；Agent 按这张原片识别花冠、发卡等具体实体头饰，SAM3.1 分别提取脸部与这些头饰，再保留原片脸部、耳朵与实体头饰。脸部蒙版内封闭的眼睛、眉毛孔洞会补齐；新增头发不跨过保留区。宽大的透光头纱随生成场景受光，明确要求保留原片头纱时才列入保留物体。头纱的外观、存在与结构默认作为衣装由生成画面保留，这不是把原片头纱当作固定身份像素回贴；是否列入保留物体只依据用户填写的补充要求、修发或光照要求、对话中已采纳的原话与本张改稿要求，Agent 归纳的摄影方向描述不算用户明确要求；该判定按名称整词匹配执行，记录保存在该张目录的 `headwear-audit.json`。未修改发束的像素也可能随生成变化，不承诺只改一根发丝。
+- **人物重打光**：填写目标光感，例如“左侧暖主光，右侧承接蓝色环境反光”。留空时 Agent 根据当前摄影方向设计。整图生图共同处理面部、身体、服装、道具与背景的光向、反光和阴影；融合端使用 PIXLRelight，以同画布生成结果为 RGB 参考预测增益和偏置，再作用于整体等比对齐后的原片 float32 RGB。原片几何与细节继续参与最终合成；该步骤替换普通 MKL，不叠加旧频率分离或额外 MKL。
 
 与 Agent 讨论后，首次探索主动生成三个真实样片；已有接近预期的样片时，可单独查看后“沿这张改一张”。比较实际修发和光照效果，再定稿用于批量。对话不会替用户打开这两个开关。
-开关与具体要求保存于对话、本轮样片、定稿和逐张制作记录；改变有效设置后需要按新设置试样再定稿。回看旧轮不会修改当前设置。
+开关与具体要求保存于对话、本轮样片、定稿和逐张制作记录；改变有效设置后需要按新设置试样再定稿，与当前设置一致的完整旧样片仍可明确定稿。仅修改已关闭选项的文字不改变有效设置；旧记录缺少选项字段时表示关闭。回看旧轮不会修改当前设置。
 两个选项关闭时沿用原有整头回贴与一次 MKL 仿色。批量沿用所选样片的设置，样片原片仍直接复用；整批重新制作可明确“勾选照片另做一批”，已有基础成片的单张修改可在交付页“给这张改稿”，后者初始沿用该版设置，可在窗口中明确为本张调整。旧版均保留。
 
-重打光使用当前图像编辑模型生成的整图作为光照依据，融合端使用频率分离，不是额外部署的 DreamLight 或 IC-Light 推理。它不能保证去除原片中锐利的硬阴影或恢复已过曝、纯黑处的细节；强烈条纹光、复杂遮挡和较大的生成几何偏差可能残留原阴影或产生局部光色偏差。SAM3.1 是分割蒙版，不是逐根发丝的透明度估计，头发与头饰相贴处可能有边缘误差。
-模型返回的图像与分割蒙版仍为 8 位；光照估计与最终合成使用 float32，另存 16 位 PNG 不补回模型环节丢失的精度。
+PIXLRelight 在 512 方形分析画布中读取原片保留区和生成上下文，官方 Marigold-IID-Lighting 单步分解 RGB 参考。完整网络使用明确的 BF16 autocast，返回 float32 光照场；客户端仅上采样光照场，直接调制已经采样一次的原片 RGB。分析图和模型重建 RGB 均不作为身份回贴素材。原片锐利硬阴影、过曝和纯黑处仍可能残留局限；大幅生成几何偏差也会影响匹配。SAM3.1 是分割蒙版，不是逐根发丝的透明度估计，头发与头饰相贴处可能有边缘误差。
+模型分析输入、生成图与分割蒙版为 8 位；光照场和最终合成为 float32，另存 16 位 PNG 不补回模型环节丢失的精度。
 
 ### 成片后的可选人脸美化
 
-基础成片保存后，在“成片”页选中照片，点击“人脸美化”。首次填写美化服务连接，保存后准备主体人脸；
-后续默认恢复这张成片的美化草稿。美化从基础成片开始，默认美肤、瘦脸均为 0，不自动用于样片或整批照片。
+基础成片保存后，在“成片”页选中照片，点击“人脸美化”。首次填写美化服务连接，再点击“选择人脸并分析”，在整张成片上主动框选要处理的人脸范围（不受此前自动头部范围限制）；
+FGTBT 直接读取选定裁片。后续恢复这张成片的当前美化草稿；打开页面和保存连接不调用模型。美化从基础成片开始，默认美肤、瘦脸均为 0，不自动用于样片或整批照片。
 
 1. “瘦脸”可直接在 0–100 间调整，收窄下颌两侧，固定眼、鼻、嘴和外侧边界。
 2. 点击“生成美肤基础”后，BeautyGRPO 生成本张人脸的调整基础；成功时从 30 的强度开始预览，可继续调到 0–100。
@@ -243,6 +247,18 @@ RAW 的预览、选片与制作均由 rawpy/LibRaw 解码；其他格式共用�
 模型输入直接从完整尺寸的成片裁取人脸，按官方方式用双线性缩放到 1024 像素、8 位 RGB；不从分析缩略图放大获得。
 推理为完整 BF16，官方 PIL 输出仍为 8 位 PNG；FaceXFormer 的分析输入为 224 像素，蒙版经 8 位 PNG 传输。
 16 位另存不会补回模型环节没有的色阶；生成模型也可能调整皮肤纹理，效果由你对比并选择强度。
+
+### 成片后的局部修发、发束造型与双下巴
+
+成片或“项目作品 / 交付”页点击“局部修发／发束／双下巴”，从当前已保存版本开始。三项任务分别保留草稿，初始没有修改范围，不自动调用模型。
+
+1. 选择“补发与露网修补”“发束造型”或“双下巴修饰”。补发延续相邻发色与发束，不自行增加飘动；发束造型可写明方向、轮廓和幅度；双下巴仅用于下颌下方和颈部的局部修饰。
+2. 用“涂选修改范围”画出允许写回的区域，粉色覆盖显示范围；“保护／擦除范围”可擦掉不应修改的位置。脸部、头饰、衣领和配饰请留在范围外。造型可另画青色形状标记，或选择发色、发束参考图；形状标记不替代修改范围。
+3. 填写本次具体要求，也可留空。明确点击“生成本次修饰”后，Qwen-Image-2.1 接收源局部、单独黑白蒙版及可选标记图、参考图。它们通过多图编辑输入，蒙版属于图像条件。
+4. 在“比较本次结果”中查看所选版本与本次修饰，可并排、联动或查看 100% 原尺寸。界面列出模型原生、一次超分和原尺寸写回区域的实际尺寸，可直接打开模型原始输出。模型原生结果按目标局部等比居中裁切，再下采样到该局部，不拉伸、不插值放大；原生输出覆盖不足时，复用“分割与超分”中已配置的模型超分一次，同样等比居中裁切并下采样到局部，不插值放大生成像素。软件只将涂选范围内的生成像素写回，羽化按涂选区域厚度向内收，范围外保持所选版本像素。模型原始结果另外保留。
+5. 点击“另存这个修饰版本”，得到同尺寸 16 位 PNG 与 JPEG。基础和历史版本保留，交付页会列出具体任务、要求，以及所选版本已有的美化和局部修饰；新增版本不改变已有交付选择。再次修改文字或涂画后需主动生成新结果，旧文件仍保留。
+
+涂画预览最长边 1600；模型输入、输出和蒙版为 8 位。原尺寸合成使用 float32，另存 16 位 PNG 不会增加生成区域原本没有的色阶，超分纹理也不等于相机原生细节。未配置所需超分、或一次超分仍不足以覆盖所选区域时，显示该步骤的真实错误并保留输出，可缩小范围后主动生成。草稿保存在照片工作目录的 `retouch-drafts`，每次生成位于独立 `retouch-*`，另存版本位于其中的 `edit-*`。离页释放原尺寸缓冲，回来只恢复当前流程的草稿与结果；失败显示实际错误，不自动重试或更换模型。
 
 “打开当前批次文件夹”定位正在查看的批次。`PNG` 与 `JPEG` 子目录按原片名保存成片：
 PNG 是带 sRGB 配置的 16 位结果，JPEG 是同一结果的 8 位查看副本。
@@ -301,7 +317,7 @@ Agent 根据原片可见内容和本轮要求，按分类与摄影关键词搜�
 批量沿用已定稿的方向、参考和真实样片，不重新检索整库。讨论与重新探索时使用当次词库；沿样片改稿或给交付基础成片改稿时，沿用所依据版本已保存的具体参考。旧定稿及文件保留。
 查阅响应与所读内容保存在对应讨论或试样的工作目录，不把检索正文追加到后续成功聊天历史。
 
-本轮词库来源已于 2026-11-08 在 GitHub 核对。COS 专用条目来自 `Couer869/cos-effect-prompt` 的特效、
+内置库的 COS 专用条目来自 `Couer869/cos-effect-prompt` 的特效、
 光影、服装材质和电影光色参考；补充了 `nuyoah-xiezhen-prompt`、`nuyoah-image-reverse-prompt` 的可迁移摄影描述与参考分析内容。
 通用库只保留适用的场景、布光、影调和短摄影节选；完整换装、换脸、商品、海报与多格版式模板不进入内置库。
 每条保留来源、版本、分类、标签与摘要；改编条目标明适用范围，外部工作流、默认风格、审批和模型参数不作为执行规则。
@@ -327,6 +343,8 @@ Agent 根据原片可见内容和本轮要求，按分类与摄影关键词搜�
 | `output_long_edge` | 请求长边，默认 6000；`null` 请求原片尺寸 |
 | `finish_curve` | 可选的归一化 `[输入明度, 输出明度]` 数组，默认不调整 |
 | `beauty` | 可选人脸美化的 ComfyUI 地址、模型名与明确的人脸分析设备；在美化页单独保存，未配置不影响基础制作 |
+| `relight` | 可选人物重打光的 ComfyUI 地址、PIXLRelight 与 Marigold 目录、设备和种子；在连接设置中保存，创作开关独立 |
+| `local_edit` | 成片后局部修饰的 ComfyUI 地址和 Qwen 生成模型、文本编码器、VAE 文件名；在局部修饰页单独保存 |
 | `python` | 源码启动器使用的已有 Python 路径；Windows 包不使用 |
 
 ### 接口约定
@@ -351,7 +369,7 @@ Agent 根据原片可见内容和本轮要求，按分类与摄影关键词搜�
 | 超分 | LoadImage → UpscaleModelLoader → ImageUpscaleWithModel → SaveImage |
 
 将服务加载器支持的 SAM3.1 图像权重放入 `models/checkpoints`，超分权重放入 `models/upscale_models`。
-配置中的模型名须与服务文件名一致；示例名不会触发下载。分割节点实现见[上游源码](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_sam3.py)。
+配置中的模型名须与服务文件名一致；示例名不会触发下载。接入或排错时以实际配置、已安装文件及服务加载器返回的可选名称为准，不将示例名称当作本机已安装文件。分割节点实现见[上游源码](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_sam3.py)。
 原始权重与转换格式的许可均随权重保留，不能只改后缀冒充转换。
 
 连接设置的“模型下载”可用浏览器打开上游文件，或修改 ComfyUI 目录后复制下载命令，在服务机器的 PowerShell 执行。
@@ -381,25 +399,39 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 客户端使用 `/upload/image`、`/prompt`、`/history/<id>` 和 `/view`；这些端点需从运行 CosLuma 的机器可达。
 这里是服务提供方的安装约定，不是每张照片的评分或放行步骤。
 
-### 可选美化服务
+### 可选重打光服务与局部编辑模型
+
+人物重打光需把 `providers/comfyui_cosluma_relight` 复制到服务的 `custom_nodes`，在现有 Python 中只补齐缺少的 `addict==2.4.0` 和 OmegaConf，然后重启 ComfyUI。不要运行上游环境安装脚本或替换已有 Torch、Diffusers。
+“模型下载”中的 PIXLRelight 命令取得固定版本上游源码、完整 `model.safetensors` 和 `config.yaml`，以及对应 Marigold 的 FP16 推理组件。默认放在 `models/cosluma_relight/pixlrelight` 和 `models/cosluma_relight/marigold-iid-lighting-v1-1`；连接中可明确填写服务机器的绝对目录。
+`relight.url` 指向该 ComfyUI，`model_directory`、`intrinsics_directory`、`device` 和 `seed` 对应实际目录、设备与种子。参考分解固定单步；模型在独立进程加载，成功或失败均释放 CPU/CUDA 权重，不自动下载或换模型。原始光照场保存为 `relight-fields.npz`，模型配置和工作流随该张制作记录保留。
+
+成片后的三个局部修饰使用支持 `TextEncodeQwenImage21`、`QwenImage21Cache` 的 ComfyUI。将 `providers/comfyui_cosluma_local` 复制到服务的 `custom_nodes` 后重启。`CosLumaQwenLocalEdit` 在现有服务 Python 的独立进程中调用这些接口，编码完成后释放文本编码器再加载生成模型。“局部修饰连接”明确指定每次使用的权重文件，“模型下载”提供固定版本文件：
+
+| 字段 | 服务目录 / 文件 |
+| --- | --- |
+| `local_edit.model` | `models/diffusion_models/qwen_image_2.1_int8_convrot.safetensors`，约 7.26 GB |
+| `local_edit.clip` | `models/text_encoders/qwen3vl_8b_bf16.safetensors`，约 17.53 GB |
+| `local_edit.vae` | `models/vae/qwen_image_2.1_vae_bf16.safetensors`，约 676 MB |
+
+局部编辑默认使用 INT8 ConvRot 生成权重，Qwen3-VL 编码器与 VAE 保持 BF16；连接中可明确指定其他受该服务支持的文件，不在运行时切换。固定 1024 面积分辨率（按原局部宽高比取 32 的倍数）、40 步、guidance/cfg 1、Euler/simple、seed 42。文本编码器保持完整 BF16，明确使用 CUDA 计算与 ComfyUI 原生低显存 CPU 卸载，避免在 CPU 上同时保留大幅参考图的注意力工作区；编码完成后释放文本编码器，再加载生成模型。无损 KV 缓存使用 CPU 内存，生成模型使用 CUDA；VAE 编码与解码预先配置为 512 像素分块、64 像素重叠，不在出错后改变布局。每次生成的独立进程退出时释放全部模型与执行缓存；生成区域需要超分时另外调用已有 `sr.url`、`sr.model`，输出和工作流随会话保存，查看或另存已有结果不加载模型。实际权重存储类型与计算精度分别记录。下载与安装仅由用户主动执行；不会升级 BeautyGRPO 的 Diffusers 或改变其官方推理。
+颈部修饰回写前，从涂选范围外的邻近未编辑上下文估计生成图的 RGB 偏移，只校正生成局部的附带肤色漂移，再做向内羽化；上下文和全部范围外原图像素不写入改动。原始模型图保留不变，已有结果可重新比较并另存，无需重新生图。
+
+### 可选美化节点与权重
 
 使用已有 ComfyUI 的 Python 环境与模型目录，将随包 `providers/comfyui_cosluma_beauty` 整个文件夹复制到
-`ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors、MediaPipe、Diffusers、Transformers、Accelerate 与 PEFT；桌面端不安装或加载这些模型运行库。
+`ComfyUI/custom_nodes/comfyui_cosluma_beauty`。节点使用 PyTorch、Torchvision、OpenCV、Pillow、safetensors、timm、Diffusers、Transformers、Accelerate 与 PEFT；桌面端不安装或加载这些模型运行库。
 在已有 ComfyUI 的 Python 中执行 `python -m pip install -r <CosLuma目录>/providers/comfyui_cosluma_beauty/requirements.txt` 后重启服务。
 升级已有美化服务时也需用当前包中的该文件夹更新节点并重启 ComfyUI，桌面更新不会改写其他机器上的服务代码。
 
-美肤使用 [BeautyGRPO（CVPR 2026）](https://github.com/vivoCameraResearch/BeautyGRPO) 的官方 FLUX Kontext LoRA。
-其[论文](https://arxiv.org/abs/2603.01163)报告了 1,000 张自然人像上的 FID 2.23、LPIPS 0.049 与身份相似度 0.952；
-这是面部修饰任务的选型依据，不表示它在所有身份指标领先，也不是 COS 妆造效果的保证。
-美肤节点按[官方推理源码](https://github.com/vivoCameraResearch/BeautyGRPO/blob/80fcf466d6bfc3b3a05e1cbedd11e3a3ced2bcb9/src/inference/infer.py)
+美肤使用 [BeautyGRPO](https://github.com/vivoCameraResearch/BeautyGRPO) 的官方 FLUX Kontext LoRA。
+美肤节点按[官方推理源码](https://github.com/vivoCameraResearch/BeautyGRPO/blob/main/src/inference/infer.py)
 调用 `FluxKontextPipeline.from_pretrained(..., torch_dtype=torch.bfloat16)`，加载完整 BeautyGRPO LoRA，沿用模型目录中的官方调度器、tokenizer、文本编码器与 VAE。
-固定 1024 输入、28 步、guidance 2.5、seed 42；提示词为官方脚本的 `Beautify this person's face while maintaining a natural and realistic appearance.`，不追加提示词。
-不使用 FP8/INT8/GGUF 权重，不以 ComfyUI KSampler 近似官方流程，不跳过 LoRA 加载错误。
+固定 1024 输入、28 步、guidance 2.5、seed 42；提示词为官方脚本的 `Beautify this person's face while maintaining a natural and realistic appearance`，不追加提示词。
+用户已允许量化底座：默认使用 Diffusers/BitsAndBytes 上游 `load_in_4bit=True`、NF4、double quant、BF16 计算，直接从官方底座检查点量化加载 Transformer，并非宣称作者另行发布了 NF4 权重。完整 LoRA、文本编码器和 VAE 不做该量化。不以 ComfyUI KSampler 近似官方流程，不跳过 LoRA 加载错误。
 推理时使用独立 PyTorch 运行的默认计算精度，关闭宿主额外启用的 TF32 矩阵乘法和半精度 math SDP 累加。
 节点直接保存官方 Pipeline 返回的 PIL 图，完整原始输出可独立查看；皮肤差值、五官保护与强度调节在模型输出之后进行。
-每次生成结束或失败后，节点释放本次 Pipeline、分组卸载的 CPU 权重及未使用的 CUDA 缓存，不让完整模型长期驻留。用户明确重新生成时重新加载同一套完整权重，因此包含加载耗时；滑杆和五官保护开关继续复用已经保存的美肤基础，不加载模型或重新生图。
-这复现的是官方公开推理方法；论文的训练、奖励模型与整套测试集指标不因单张推理而被重新复现。
-瘦脸使用 [MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) 的 478 点定位，包含眼睑与虹膜；
+每次生成结束或失败后，节点释放本次 Pipeline、CPU 权重及未使用的 CUDA 缓存，不让完整模型长期驻留。用户明确重新生成时重新加载同一套完整权重，因此包含加载耗时；滑杆和五官保护开关继续复用已经保存的美肤基础，不加载模型或重新生图。
+瘦脸使用 [FGTBT](https://github.com/Xi0ngxinyu/FGTBT) 完整权重的 480 输入与官方翻转热图平均，从统一 124 点取 WFLW 98 点，包含眼睑和瞳孔；
 下颌轮廓收缩由 SciPy 薄板样条计算，眼鼻唇等五官范围的形变场为零。皮肤范围使用 [FaceXFormer](https://github.com/Kartik-3004/facexformer) 的面部解析，不使用其 68 点定位。
 
 按上游许可下载以下推理权重，放在服务机器上；不需要 BeautyGRPO 的训练奖励模型：
@@ -407,7 +439,7 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 | 配置字段 | 服务目录 / 文件名 | 上游 |
 | --- | --- | --- |
 | `beauty.analysis_model` | `models/cosluma_face/facexformer.safetensors` | [FaceXFormer 的 ckpts/model.pt](https://huggingface.co/kartiknarayan/facexformer)，按下方命令无损提取 |
-| `beauty.landmark_model` | `models/cosluma_face/face_landmarker.task` | [Google 官方 float16/1 模型](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task) |
+| `beauty.landmark_model` | `models/cosluma_face/fgtbt.safetensors` | [FGTBT 作者检查点](https://huggingface.co/xxxxxxxxy/FGTBT/tree/ee401e339008f11ce8b26620d704524a62360262) 的 `FGTBT.pth`，按下方命令无损提取 |
 | `beauty.model` | 完整目录 `models/diffusers/FLUX.1-Kontext-dev`，也可填写服务机器上的绝对目录 | [BFL 官方 FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev/tree/24e9dedc4ef646698dc8eb4e18ae2cec3c9fea0d) 的完整 Diffusers 组件 |
 | `beauty.lora` | `models/loras/beautygrpo.safetensors` | [BeautyGRPO 官方权重](https://huggingface.co/Sehnsucht24/BeautyGRPO/tree/241d57903834ba55cb544b665686eb5d494b3dcf) 的 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放入 |
 
@@ -415,8 +447,8 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 这些组件均取自同一官方版本，不用其它发布包中同名文件替代；重复的单文件整合版不是 Diffusers 目录的一部分。
 BFL 权重需要有权限的 Hugging Face 账号下载，服务运行时只读取本机完整目录，不联网下载、不读取 Hugging Face 凭据。
 
-美化连接设置的“下载美化模型与查看安装方法”直接提供四项模型的上游文件、目标路径与命令。
-完整 Kontext 组件约 33.75 GB，BeautyGRPO LoRA 约 179 MB，FaceXFormer 原始权重约 1.01 GB，FaceLandmarker 约 3.8 MB；只做基础制作时不需要它们。
+美化连接设置的“下载美化模型与查看安装方法”提供这些模型的上游文件、目标路径与命令。
+完整 Kontext 组件约 33.75 GB，BeautyGRPO LoRA 约 179 MB，FaceXFormer 原始权重约 1.01 GB；FGTBT 作者训练检查点约 645 MB，无损提取的推理文件约 215 MB。只做基础制作时不需要美化模型。
 先在 BFL 模型页接受访问条款，再在已有服务环境中登录并下载完整 BF16 组件；下列目录按实际位置修改：
 
 ```powershell
@@ -426,25 +458,28 @@ hf download black-forest-labs/FLUX.1-Kontext-dev --revision 24e9dedc4ef646698dc8
 ```
 
 LoRA 从上表官方版本下载 `fluxkontext/checkpoint/pytorch_lora_weights.safetensors`，重命名放为 `models/loras/beautygrpo.safetensors`；界面复制的命令会直接按此名称安装。
-FaceLandmarker 可直接下载后放入表中目录；FaceXFormer 下载 `ckpts/model.pt` 后执行转换。
+FaceXFormer 下载 `ckpts/model.pt`，FGTBT 下载 `FGTBT.pth` 后分别转换。
 
 在已有 ComfyUI Python 中执行：
 
 ```powershell
 python <CosLuma目录>/providers/convert_facexformer.py <下载目录>/ckpts/model.pt <ComfyUI目录>/models/cosluma_face/facexformer.safetensors
+python <CosLuma目录>/providers/convert_fgtbt.py <下载目录>/FGTBT.pth <ComfyUI目录>/models/cosluma_face/fgtbt.safetensors
 ```
 
-转换只提取 `state_dict_backbone`，不量化或改动张量；节点严格加载完整权重，不另外下载 ImageNet 初始化参数。
-美化页首次连接的地址默认沿用整头服务，可改为单独服务；`beauty.analysis_device` 为 FaceXFormer 皮肤解析明确选择 `cuda:0` 或 `cpu`。
-MediaPipe 定位在当前 Windows 服务使用 CPU/XNNPACK；两个分析模块均不自动切换设备。
-`beauty.inference_device` 为明确的 `cuda:0`。`beauty.memory` 可选择 `group_offload` 或 `cuda`；16 GB 显存使用前者，
-由 Diffusers 按一个 block 分组在 CPU 内存与 GPU 间搬运完整 BF16 参数，不量化、不改变采样和步数。
+FaceXFormer 提取 `state_dict_backbone`，FGTBT 提取全部 929 个 `model.sd` 推理张量，均不量化或改动张量；节点严格加载完整权重，不另外下载 ImageNet 初始化参数。FGTBT 转换器只接受与作者发布文件 SHA-256 `36ea4f7575622f258df884e9296c47da9a0a8e03742035e4f4730162d3314266` 一致的检查点；下载入口中的作者 Hugging Face 文件与该原始文件相同。
+FGTBT 会话明确保存 `wflw-98` 拓扑和选定的人脸范围，轮廓与五官保护使用对应索引。只恢复包含这些信息的当前分析会话；已保存成片的浏览和交付直接读取文件，不依赖分析会话。
+FGTBT 和 FaceXFormer 按本次分析加载，结束或失败后释放权重与未使用的 CUDA 缓存；服务节点不保留 CPU 模型供下一张常驻。
+分析使用独立节点 `CosLumaFGTBTAnalysis`，客户端和服务端均移除以前的分析节点名。更新节点文件后需重启 ComfyUI 服务，才能加载此节点。
+美化页首次连接的地址默认沿用整头服务，可改为单独服务；`beauty.analysis_device` 为 FGTBT 关键点和 FaceXFormer 皮肤解析明确选择 `cuda:0` 或 `cpu`。FGTBT 直接分析用户选定的人脸裁片，不依赖额外找脸模型；这些模块不在失败时切换设备或定位器。
+`beauty.inference_device` 为明确的 `cuda:0`。`beauty.memory` 可选择 `bnb_nf4` 或 `cuda`；16 GB 显存默认明确配置为 `bnb_nf4`。
+NF4 Transformer 与完整 LoRA 在 GPU 上推理，完整 BF16 T5 由上游 Accelerate `cpu_offload` 按被调用层调入 GPU，CLIP 与 VAE 保持 BF16。不自行拆分文本编码与生图步骤，仍只调用一次官方 Pipeline，不改变提示词、采样和步数。原始底座文件保持不变，量化与计算精度随每次原始模型输出记录。
 `cuda` 将整套模型放入显存，需要足够显存；两种布局均事先明确配置，失败不会自动切换。
-本机 Windows 服务使用原生 PyTorch allocator，并关闭 ComfyUI DynamicVRAM 的 CUDA hooks，由 Diffusers 管理美肤参数卸载。
+本机 Windows 服务使用原生 PyTorch allocator，并关闭 ComfyUI DynamicVRAM 的 CUDA hooks，由上游 Accelerate 管理低显存布局的参数卸载。
 启动服务时明确设置 `PYTORCH_ALLOC_CONF=backend:native` 和 `PYTORCH_CUDA_ALLOC_CONF=backend:native`，并加上 `--disable-dynamic-vram --disable-cuda-malloc`；
 不在推理失败后更换内存管理方式。
-完整底座与 LoRA 共约 34 GB 权重，运行还需要足够系统内存；权重保存在服务机器，未随桌面包分发。
-已有美肤基础保留其实际推理配置；界面会说明此前的配置，主动重新生成才使用当前官方 BF16 方法，旧图片不会改写。
+完整底座与 LoRA 原始文件共约 34 GB，NF4 通过上游加载器现场量化，不修改原始文件，不要求整套 BF16 权重同时常驻内存。全流程桌面端与参与的模型服务合计运行内存峰值要求不超过 30 GB；以真实 E2E 的实际占用为准。权重保存在服务机器，未随桌面包分发。
+只恢复当前 FGTBT 分析会话和官方 BF16 美肤基础；已保存成片可直接浏览与交付，无需恢复已弃用分析数据。
 FLUX.1-dev 模型受其非商业许可约束，BeautyGRPO 权重与其他组件分别遵循上游条款，见 [第三方许可](LICENSES/README.md)。
 
 ### 自定义提示词库
@@ -465,6 +500,8 @@ FLUX.1-dev 模型受其非商业许可约束，BeautyGRPO 权重与其他组件�
 ```powershell
 python -m pip install -r scripts/requirements-desktop.txt
 python -B scripts/qt_workbench.py
+# 直接打开已有项目文件或项目文件夹；只恢复记录，不自动调用模型
+python -B scripts/qt_workbench.py --project D:/CosLuma/projects/example/project.json
 ```
 
 源码桌面提供相同的连接设置。首次保存新配置时记录当前 Python 路径；
@@ -494,7 +531,7 @@ python -B scripts/project_cli.py --root D:/CosLuma-output compose --source D:/ph
 python -B scripts/project_cli.py --root D:/CosLuma-output compose --source D:/photos/a.jpg --generated D:/renders/a.png --superresolved D:/renders/a-sr.png
 
 # 对已完成的成片另存美化版；强度为 0–1，默认均为 0
-python -B scripts/project_cli.py --root D:/CosLuma-output beautify --run D:/CosLuma-output/批次/照片/run.json --skin 0.3 --slim 0.2
+python -B scripts/project_cli.py --root D:/CosLuma-output beautify --run D:/CosLuma-output/批次/照片/run.json --face-region 1800 800 3000 2100 --skin 0.3 --slim 0.2
 
 # 本地 HTTP，默认仅监听 127.0.0.1:8765
 python -B scripts/backend_server.py --root D:/CosLuma-output
@@ -510,9 +547,9 @@ HTTP 提供 `POST /api/styles`、`POST /api/stylize`、`POST /api/compose`、`PO
 `styles`、`stylize` 与 `compose` 可传 `edits`，格式为 `{"hair":true,"hair_brief":"修发要求","relight":true,"lighting_brief":"人物光照要求"}`，两项默认关闭。
 CLI 对应 `--hair`、`--hair-brief`、`--relight`、`--lighting-brief`；单独提供某项要求也开启该项，显式 `--no-hair` 或 `--no-relight` 则关闭。
 传入 `style` 时不传 `edits` 即完整沿用样片设置；显式设置与定稿不一致会显示错误，须先按新要求试样定稿，不能批量时暗中改变。`compose` 只复用已有生成图，不会按新要求重新修发或重画身体光照。
-`beautify` 接受已完成照片的 `run` 路径、0–1 的 `skin`、`slim`，可选已有美化目录 `session`；CLI 对应 `--session`。
+`beautify` 接受已完成照片的 `run` 路径、0–1 的 `skin`、`slim`，新分析需明确提供成片像素坐标 `face_region=[left,top,right,bottom]`；CLI 对应 `--face-region LEFT TOP RIGHT BOTTOM`。也可传入当前流程的美化目录 `session`，CLI 对应 `--session`。独立成片按记录中的绝对路径或相对于 `run.json` 的路径读取，批次成片沿用当前批次位置解析。
 `protect_features` 默认为 `true`，设为 `false` 允许美肤调整五官；CLI 使用 `--no-protect-features` 关闭，瘦脸位置约束保持。
-没有传会话时按该成片分析一次；传入该照片的会话可复用已有美肤基础。结果保存在原成片的工作目录，`--root` 不改变此位置。
+没有传会话时按明确的人脸范围分析一次；传入该照片当前流程的会话可复用已有美肤基础。结果保存在原成片的工作目录，`--root` 不改变此位置。
 
 ```powershell
 $job = Invoke-RestMethod http://127.0.0.1:8765/api/stylize -Method Post -ContentType 'application/json' -Body (@{
@@ -550,8 +587,8 @@ HTTP 单张调用前者，批量调用后者；没有并列的贴脸、全身覆
 | 超分与尺寸 | 仅一次配置模型，之后只裁切或下采样；覆盖不足使用实际范围并记录，不循环超分或插值扩大交付尺寸 |
 | 头部定位与分割 | LLM 选择一个主体头部，修发时另列这张原片的具体头饰英文名；SAM3.1 同次请求分别识别整头、脸/耳与列出的头饰；分析默认长边最多 2048，节点内部 1008×1008；不是精细透明度抠图 |
 | 几何 | SIFT 纹理匹配后只拟合一个等比缩放、旋转和平移，不局部变形或非均匀塑脸；纹理不足、头部姿态改变时可能失败或偏移 |
-| 采样与融合 | 原片 RGB 与蒙版预乘后使用同一 Lanczos 变换采样一次；默认一次 MKL，重打光开启时替换为线性 RGB 空间光照迁移，float32 合成；不对原片脸部几何做局部变形 |
-| 光与边界 | MKL 只能做整体光色匹配；可选光照迁移使用最多 768 像素长边的 float32 光照估计，不作为回贴素材，原片高频纹理保留；不能保证消除硬阴影，头发和半透明头纱仍可能留下接缝 |
+| 采样与融合 | 原片 RGB 与蒙版预乘后使用同一 Lanczos 变换采样一次；默认一次 MKL，重打光开启时替换为 PIXLRelight 光照场调制，float32 合成；不对原片脸部几何做局部变形 |
+| 光与边界 | MKL 只能做整体光色匹配；可选 PIXLRelight 在 512 分析画布预测光照场，再调制原尺寸 float32 原片 RGB；硬阴影、过曝和纯黑处仍可能残留局限，头发和半透明头纱可能留下接缝 |
 | 明度曲线 | 单调三次插值调整整图明度，默认关闭；纯黑按黑点映射中性灰，其余保持 RGB 比例；不提供空间重打光 |
 | 精度 | 原片与 MKL 保持浮点，保存带 sRGB 配置的 16 位 PNG；服务图片和分割蒙版传输为 8 位，16 位保存不能恢复丢失精度，超分纹理不等于相机原生细节 |
 
@@ -562,13 +599,18 @@ LLM 不保证每张都定位正确或符合审美；镜中清晰正脸是主体�
 
 ## 开发与发布
 
-先读当前 README 和 [AGENTS.md](AGENTS.md)，再按问题修改对应模块：
+先读当前 README 和 [AGENTS.md](AGENTS.md)，查看 `git status` 与相关差异，保留无关改动，再按问题修改对应模块。
+README 中的模型与参数描述当前源码行为；开发时可按任务改进对应实现，明确的用户要求继续遵守。开发约定统一维护在 AGENTS，不把部署示例或旧核对记录当作新的操作要求。
 
 | 职责 | 文件 |
 | --- | --- |
 | 唯一制作顺序、批量与保存目录 | `scripts/photo_pipeline.py` |
 | 提示词、生图、ComfyUI 请求 | `scripts/model_clients.py` |
 | 原片身份提取、几何与局部融合 | `scripts/head_composite.py` |
+| PIXLRelight 光照场请求与原尺寸调制 | `scripts/relighting.py`、`providers/comfyui_cosluma_relight/` |
+| 人脸美化会话、局部调整与界面 | `scripts/face_beauty.py`、`scripts/beauty_editor.py` |
+| FGTBT 分析与官方 BeautyGRPO 推理服务 | `providers/comfyui_cosluma_beauty/` |
+| 成片后局部修饰、蒙版合成与界面 | `scripts/local_retouch.py`、`scripts/local_editor.py`、`providers/comfyui_cosluma_local/` |
 | 图片解码、浮点数据、位深与色彩保存 | `scripts/image_io.py` |
 | 提示词目录、配置与凭据引用 | `scripts/prompt_library.py`、`scripts/settings.py` |
 | 桌面主窗、导航与首次欢迎 | `scripts/qt_workbench.py` |
@@ -592,10 +634,9 @@ python -m PyInstaller --noconfirm --distpath "$env:TEMP/CosLuma/dist" --workpath
 
 版本在 `scripts/app_version.py` 定义，README 同步更新。GitHub Actions 为新提交检查源码、浮点保存、
 Windows 构建、桌面/CLI/HTTP 启动，并提供 Windows ZIP、同提交源码 ZIP 和 `SHA256SUMS.txt`。
-这些检查不调用模型，不证明所有照片都成功；已经通过的同一提交不重复运行。
+这些是提交与发布构建检查，不调用模型；日常修改只做相关基本验证，已通过且没有新问题时不重复运行。
 发布时用该提交产物，核对三个文件与 SHA256、tag 指向后公开草稿。
-Python 在 GitHub Windows runner 中指定 `3.12`，不假设其提供任意补丁版本；
-Actions 旧运行的失败状态不会因新提交成功而改变，失败邮件应按所链接的提交与运行查看。
+GitHub Windows runner 使用 Python `3.12`。
 
 欢迎通过 Issues 报告问题、Pull Requests 提交修改，说明具体问题、修改行为和必要验证。
 安全漏洞使用仓库 Security 页的私密报告入口，勿公开照片、凭据或私有配置。

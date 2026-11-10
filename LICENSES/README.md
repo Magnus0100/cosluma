@@ -35,12 +35,14 @@ Qt/PySide、LibRaw 等组件保留各自许可。Windows 包使用独立的动�
 
 [BeautyGRPO](https://github.com/vivoCameraResearch/BeautyGRPO) 的公开推理调用用于独立编写服务适配，直接调用官方 Diffusers FluxKontextPipeline，未复制其推理实现。
 上游代码声明 MIT，同时明确预训练权重与 FLUX.1-Kontext-dev 底座有各自许可；
-不据代码许可推定 BeautyGRPO 权重已重新授权。BeautyGRPO、FLUX、文本编码器、VAE 与 MediaPipe FaceLandmarker 权重
+不据代码许可推定 BeautyGRPO 权重已重新授权。BeautyGRPO、FLUX、文本编码器与 VAE 权重
 由服务部署者从上游取得，未随桌面或源码包分发。FLUX.1-dev 底座适用其非商业许可；
 其他权重按各自模型页与随权重条款使用，不受本项目 GPL 许可替代。
-MediaPipe 运行库在服务环境安装，其代码适用 [Apache-2.0](https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE)；
-FaceLandmarker 使用 Google 发布的模型包，未将运行库或模型包随桌面分发。
-Diffusers、Transformers、Accelerate 与 PEFT 仅在模型服务环境安装，各自的 Apache-2.0 许可随安装保留。
+当前美化定位随附 [FGTBT](https://github.com/Xi0ngxinyu/FGTBT/tree/32627a248c66b5a5defec347fa197860347d080d) 的推理网络适配，取消训练注册器和旧 MMCV 依赖，保留完整推理层和严格权重加载。FGTBT 新增代码为 MIT，声明见节点目录 `FGTBT-LICENSE`；其中 SegFormer 原有部分保留 NVIDIA Source Code License，原文见节点目录 `SegFormer-LICENSE`。该部分仅供非商业研究或评估，不由主项目 GPL 重新授权。作者检查点放在服务端，不随桌面分发。
+
+[PIXLRelight](https://github.com/mlfarinha/pixlrelight/tree/f8cb2dba4d08b3dfcd392cf9b2946a11f1f48c23) 上游源码、DINOv3 层及相关声明由部署者原样保留在仓库外模型目录；本仓库提供独立编写的节点与光照场适配，不打包这些源码和权重。上游代码声明 MIT，模型为 CC-BY-NC-4.0；其第三方 DINOv3 部分遵循随文件提供的 DINOv3 条款。[Marigold-IID-Lighting](https://huggingface.co/prs-eth/marigold-iid-lighting-v1-1) 按模型页及随权重的 OpenRAIL++ 条款使用。
+[Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) 的权重和 ComfyUI 格式文件只在服务端读取，不随软件分发，按模型页的 Qwen Research License Agreement 与各组件随附声明使用，格式转换或量化不改变模型许可。局部修饰的独立进程调用已有 ComfyUI 编辑接口，明确指定检查点、BF16 文本编码的 CUDA/CPU 卸载与 VAE 分块布局，不复制 Qwen 推理源码。
+Diffusers、Transformers、Accelerate 与 PEFT 仅在模型服务环境安装，各自的 Apache-2.0 许可随安装保留。[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 用于用户明确选择的 NF4 底座加载，其 MIT 许可随服务环境安装保留；量化不改变底座或 LoRA 的许可。
 内置 `providers/prompts.json` 含 260 条分类摄影参考，每条保留来源；项目原创 4 条使用 GPL-3.0-or-later。
 其余条目来自以下明确授权的上游版本，随附许可证原文，不包含原始图片：
 
@@ -53,5 +55,5 @@ Diffusers、Transformers、Accelerate 与 PEFT 仅在模型服务环境安装，
 | [nuyoah-xiezhen-prompt](https://github.com/nuyoah-ai-works/nuyoah-xiezhen-prompt) | 12 | `7482a14074bcffb9fed8eb8fe2ddcdc4ac2e980b` | MIT；`nuyoah-xiezhen-prompt/LICENSE` |
 | [nuyoah-image-reverse-prompt](https://github.com/nuyoah-ai-works/nuyoah-image-reverse-prompt) | 2 | `f56616e2e0db10f5344645d8f6c09f3915ce0d25` | MIT；`nuyoah-image-reverse-prompt/LICENSE` |
 
-条目按摄影任务选取短文本或改编，改编条目标注 section、适用范围、来源文件散列和核对日期（2026-11-08）。
+条目按摄影任务选取短文本或改编，改编条目标注 section、适用范围和来源文件散列；具体来源版本见上表及条目元数据。
 库中条目用于摄影参考，不作为执行规则或预设风格菜单。自定义库位于仓库外，由其提供者保留来源、作者与许可。

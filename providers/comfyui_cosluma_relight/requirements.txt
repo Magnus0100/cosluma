@@ -1,0 +1,3 @@
+# Install only missing support packages in the existing service runtime.
+addict==2.4.0
+omegaconf>=2.3

@@ -5,7 +5,9 @@ import base64
 from functools import lru_cache
 from io import BytesIO
 import json
+import math
 from pathlib import Path
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -119,7 +121,11 @@ def _describe(instruction, images, config, response_path, *, task, conversation=
         save_json(Path(response_path).with_name(Path(response_path).stem+f'-lookup-{phase+1}.json'), response)
         messages.append({'role':'assistant', 'content':message.get('content'), 'tool_calls':calls})
         call = calls[0]
-        result = references.call(call['function']['name'], json.loads(call['function']['arguments']))
+        try:
+            arguments = json.loads(call['function']['arguments'])
+        except (TypeError, ValueError):
+            raise ValueError('摄影 Agent 的参考工具参数不是有效的 JSON；原始响应已保存，未执行该调用') from None
+        result = references.call(call['function']['name'], arguments)
         messages.append({'role':'tool', 'tool_call_id':call['id'], 'content':json.dumps(result,ensure_ascii=False)})
         save_json(Path(response_path).with_name(Path(response_path).stem+'-references.json'), references.lookups)
     content = message['content']
@@ -310,6 +316,116 @@ def _discussion_details(context, samples, image_ids):
     return details
 
 
+def user_requirement_text(*sources):
+    """Merge the user's own wording only; agent prose never enters this list."""
+    text = []
+    for source in sources:
+        if source is None:
+            continue
+        values = [source] if isinstance(source, str) else list(source)
+        for value in values:
+            if isinstance(value, str) and value.strip() and value.strip() not in text:
+                text.append(value.strip())
+    return text
+
+
+def _typed_briefs(edits):
+    """The two briefs the user typed, used only while the user switched them on."""
+    edits = normalise_edits(edits)
+    return [edits[key] for enabled, key in (('hair', 'hair_brief'), ('relight', 'lighting_brief')) if edits[enabled]]
+
+
+def discussion_user_requirements(discussion, edits):
+    """Only adopted user wording: quoted evidence and requirements the user saved directly."""
+    quotes = []
+    previous = None
+    for row in ([] if discussion is None else discussion['messages']):
+        if row.get('role') == 'user':
+            previous = row
+            if row.get('status') != 'failed' and row.get('direction_action') == 'edit':
+                quotes.append(row.get('direction_update'))
+            continue
+        evidence = row.get('direction_evidence')
+        content = (previous or {}).get('content')
+        if (row.get('status') == 'failed' or row.get('direction_action') is not None
+                or not row.get('direction_changed') or row.get('direction_reverted')
+                or not isinstance(evidence, str) or not isinstance(content, str) or evidence not in content):
+            continue
+        quotes.append(evidence)
+    return user_requirement_text(quotes, _typed_briefs(edits))
+
+
+_GauzeNameWords = frozenset({'veil','veils','tulle','gauze','chiffon','organza','voile','mantilla'})
+_VeilRequestTerms = ('头纱','面纱','纱巾','轻纱','白纱','透明纱','网纱')
+_VeilCancelCjk = ('不保留','不要保留','不需要','不用保留','取消','去掉','移除','去除','别保留','无需','不列入','不要','别','不')
+_VeilCancelWords = ('not','no','never','without','remove','removing','drop','exclude','omit')
+_VeilContext = 16
+
+
+def _veil_terms(text):
+    """Veil-like words in one headwear name or one sentence, matched as whole tokens."""
+    if not isinstance(text,str):
+        return []
+    words = {value for value in re.findall(r'[a-z]+',text.casefold()) if value in _GauzeNameWords}
+    words.update(term for term in _VeilRequestTerms if term in text)
+    return sorted(words)
+
+
+def _veil_cancel_marker(window):
+    """The cancellation wording right before one veil word, if any."""
+    for marker in _VeilCancelCjk:
+        if marker in window:
+            return marker
+    for marker in _VeilCancelWords:
+        if re.search(r'(?<![a-z])'+re.escape(marker)+r'(?![a-z])',window):
+            return marker
+    return ''
+
+
+def _veil_requests(requirements):
+    """Explicit veil request versus explicit cancellation, judged on the wording beside the veil word."""
+    requested,cancelled = [],[]
+    for item in requirements:
+        for sentence in re.split(r'[。；;！!？?、，,\n]',item if isinstance(item,str) else ''):
+            folded = sentence.casefold()
+            for term in _veil_terms(sentence):
+                start = 0
+                while True:
+                    index = folded.find(term.casefold(),start)
+                    if index < 0:
+                        break
+                    window = folded[max(0,index-_VeilContext):index]
+                    if _veil_cancel_marker(window):
+                        cancelled.append(term)
+                    else:
+                        requested.append(term)
+                    start = index + len(term)
+    return sorted(set(requested)),sorted(set(cancelled))
+    return sorted(set(requested)),sorted(set(cancelled))
+
+
+def review_headwear(names, requirements):
+    """Drop gauze-like headwear unless the user asked in their own words to keep it."""
+    requested,cancelled = _veil_requests(requirements)
+    gauze = [name for name in names if _veil_terms(name)]
+    keep = list(names) if requested else [name for name in names if name not in gauze]
+    if not gauze:
+        reason = '本次没有返回纱质头饰条目'
+    elif requested:
+        reason = '用户明确要求保留原片头纱，纱质条目保留'
+    elif cancelled:
+        reason = '用户明确取消保留原片头纱，纱质条目剔除'
+    else:
+        reason = '用户原话未明确要求保留原片头纱，纱质条目按衣装随生成场景受光，从原片身份保留区剔除'
+    audit = {'raw_headwear':list(names),'headwear':keep,
+        'removed':[name for name in names if name not in keep],'gauze_headwear':gauze,
+        'explicit_user_request':bool(requested),'explicit_user_cancellation':bool(cancelled),
+        'requested_terms':requested,'cancelled_terms':cancelled,'user_requirements':list(requirements),
+        'reason':reason,
+        'rule':'veil/tulle/gauze/chiffon/organza/voile/mantilla 纱质名称按整词匹配；仅当用户原话明确要求保留原片头纱或面纱时保留'}
+    return keep,audit
+
+
 def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None, edits=None):
     """Discuss the current photographs and samples without submitting production."""
     images = []
@@ -351,6 +467,9 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         '没有明确依据时 direction_update 和 direction_evidence 均为 null；询问、比较和引用资料本身不能作为采纳。'
         '询问建议、比较画面、询问原因、浏览或选择已有样片时返回 null，不重写、润色或补全旧要求。'
         '你提出但用户尚未采纳的建议只写进 reply，不写进 direction_update；不能替用户作出创作决定。'
+        '更新时只能收拢用户已经表达的意图：可以沿用用户对服装、花冠、头纱等实物外观与结构的描述，'
+        '但不替用户新增“保留”或“移除”具体物件的决定，也不把外观描述写成保留原片该物件的像素。'
+        '用户没有点名的实物保持通用表述，不顺带替用户作出取舍。'
         '更新时保留未取消的要求，未知内容保持未定；写清被沿用样片的轮次、名称和实际画面，不只写“第二张”。'
         '用户后续明确要求覆盖最初补充要求中的冲突，不得恢复已取消的要求。'
         '新要求只写实际创作意图，不写对话过程、打招呼、试样操作或用户尚未作出的选择。'
@@ -463,6 +582,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
     descriptions = description['options'] if option_count is not None else [description]
     if not isinstance(descriptions, list) or (option_count is not None and len(descriptions) != option_count):
         raise ValueError('提示词服务没有返回请求数量的摄影方向；原始响应已保存')
+    user_requirements = None if discussion is None else discussion_user_requirements(discussion, edits)
     plans = []
     for item in descriptions:
         if set(item)!=fields:
@@ -474,6 +594,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             'representative_sources':[str(source) for source in selected],'creative_direction':creative_direction,
             'edits':dict(edits)}
         if discussion is not None:
+            plan['user_requirements'] = user_requirements
             reference_id = item['sample_reference_id']
             plan['sample_reference_id'] = reference_id
             if reference_id is not None:
@@ -493,8 +614,11 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
 
 
 def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None,
-        creative_direction='', revision_brief='', revision_requirements=None, edits=None):
+        creative_direction='', revision_brief='', revision_requirements=None, edits=None, user_requirements=None,
+        revision_user_text=''):
     edits = normalise_edits(edits)
+    verbatim = user_requirement_text(brief, _typed_briefs(edits), user_requirements,
+        [value for value in (revision_requirements or []) if isinstance(value, str)], revision_user_text)
     schema = ('返回一个 JSON 对象，只有 prompt、head_box 和 headwear 三个字段。' if edits['hair'] else
         '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。')
     instruction = (
@@ -547,7 +671,14 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
             '\nheadwear 是本张原片中实际可见、须保留的实体头饰的简短英文名数组，例如具体的花冠、发卡、角或帽子；'
             '按实际照片命名，不预设角色配件，不写 head、hair、person、clothes 或笼统 headdress。'
             '每项是一个明确物体名称，不含逗号、冒号或参数，没有实体头饰时为空数组。'
-            '宽大的透光头纱按服装材质随生成场景受光处理；只有用户明确要求保留原片头纱时才单独列入。')
+            '判断“用户明确要求”只看任务资料里的 user_requirements：用户填写的补充要求、用户亲自打开并填写的修发与光照要求、'
+            '讨论中已采纳的用户原话，以及本张已采纳的改稿要求；它为空表示用户没有逐字要求。'
+            'group_direction 与 current_creative_direction 是 Agent 归纳的摄影方向，属于创作描述，不是用户逐字要求，'
+            '不能据此替用户新增“保留”或“移除”某个物件的决定。'
+            '头纱的外观、存在与结构默认作为衣装由生成画面保留，prompt 可正常描写其形态、褶皱与半透明层次；'
+            '这不等于把原片头纱并入原片身份保留区，也不必在 headwear 里列出。'
+            '宽大的透光头纱默认随生成场景受光，不列入 headwear；只有 user_requirements 明确要求保留原片头纱或面纱时才列入，'
+            '用户明确取消保留时同样不列入。')
     save_json(directory / 'prompt-sources.json', library)
     images = [('本张原片，头部定位只依据此图',preview_data_url(source))]
     if style_reference is not None:
@@ -556,18 +687,32 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
     description = _describe(instruction,images,config,directory/'llm-response.json',
         task={'character':character,'initial_brief':brief,'current_creative_direction':creative_direction,
             'group_direction':direction,'revision_requirements':revision_requirements or [],
-            'latest_revision_brief':revision_brief,
+            'latest_revision_brief':revision_brief,'user_requirements':verbatim,
             'selected_references':[{key:item[key] for key in ('title','text')} for item in library],'edits':edits})
     fields = {'prompt','head_box','headwear'} if edits['hair'] else {'prompt','head_box'}
     if set(description)!=fields:
         raise ValueError('单张提示词响应包含当前阶段以外的字段；原始响应已保存')
-    if not isinstance(description['prompt'],str) or len(description['head_box'])!=4:
+    if not isinstance(description['prompt'],str):
         raise ValueError('The LLM did not return an edit prompt and one head box')
+    box = description['head_box']
+    if not isinstance(box,(list,tuple)) or isinstance(box,str) or len(box)!=4:
+        raise ValueError('单张提示词响应须返回原片主体头部的四个坐标 [左,上,右,下]；原始响应已保存')
+    for value in box:
+        if isinstance(value,bool) or not isinstance(value,(int,float)):
+            raise ValueError('头部范围须为四个数值坐标 [左,上,右,下]，不接受文本或布尔值；原始响应已保存')
+    if any(isinstance(value,float) and not math.isfinite(value) for value in box):
+        raise ValueError('头部范围须为有限数值，不接受 NaN 或无穷；原始响应已保存')
+    left,top,right,bottom = box
+    if not (0<=left<right<=1000 and 0<=top<bottom<=1000):
+        raise ValueError('头部范围须满足 0<=左<右<=1000 与 0<=上<下<=1000（按原片归一化坐标）；原始响应已保存')
     if edits['hair']:
         names = description['headwear']
         if not isinstance(names,list) or any(not isinstance(name,str) or not name.strip() or ',' in name or ':' in name for name in names):
             raise ValueError('修发定位须返回原片具体头饰的英文名称数组；原始响应已保存')
-        description['headwear'] = list(dict.fromkeys(name.strip() for name in names))
+        names = list(dict.fromkeys(name.strip() for name in names))
+        description['headwear'],audit = review_headwear(names,verbatim)
+        audit['prompt_response'] = str(directory/'llm-response.json')
+        save_json(directory/'headwear-audit.json',audit)
     return description
 
 

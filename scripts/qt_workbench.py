@@ -24,6 +24,7 @@ from creative_workspace import CreativeWorkspace
 from batch_results import BatchResults
 from delivery_view import DeliveryView
 from beauty_editor import BeautyConnection, BeautyEditor
+from local_editor import LocalConnection, LocalRetouchEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos, _discussion_preview
 from photo_pipeline import finish_batch, load_style
@@ -136,7 +137,6 @@ class Workbench(QMainWindow):
         self.preferences = QSettings(str(Path.home() / 'CosplayWorkbench/config/desktop.ini'), QSettings.IniFormat)
         self.project = None
         self.project_batches = []
-        self.legacy_workspace = None
         self.workspace_restoring = True
         self.workspace_timer = QTimer(self)
         self.workspace_timer.setSingleShot(True)
@@ -578,7 +578,6 @@ class Workbench(QMainWindow):
         self.projects_index = self.pages.addWidget(self.project_browser)
         self.project_browser.create_requested.connect(self.new_project)
         self.project_browser.browse_requested.connect(self.browse_project)
-        self.project_browser.legacy_requested.connect(lambda:self.new_project(from_legacy=True))
         self.project_browser.open_requested.connect(self.open_project)
         self.project_browser.rename_requested.connect(self.rename_project)
 
@@ -601,7 +600,6 @@ class Workbench(QMainWindow):
         self.update_setup_hint()
         self.workspace_restoring = False
         self.show_projects()
-        self.load_initial_project()
         self.update_actions()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
@@ -627,53 +625,20 @@ class Workbench(QMainWindow):
             self.status.setText('读取项目列表失败：'+str(error))
         self.navigate(self.projects_index)
 
-    def load_initial_project(self):
-        try:
-            saved = self.preferences.value('workspace', '', type=str)
-            if saved and not self.preferences.value('projects/migrated', '', type=str):
-                state = json.loads(saved)
-                creative = {name:self.preferences.value('style/'+name, '', type=str)
-                    for name in ('discussion', 'samples', 'selected')}
-                if state.get('sources') or state.get('character') or state.get('brief') or state.get('batch_directory') or any(creative.values()):
-                    state.setdefault('output_root', self.preferences.value('output_root', self.root.text(), type=str))
-                    state.setdefault('output_edge', self.preferences.value('output_edge', '', type=str))
-                    self.legacy_workspace = (state, creative)
-                    self.project_browser.set_legacy_available(True)
-        except (ValueError, KeyError, TypeError) as error:
-            self.status.setText('读取上次工作区失败：'+str(error))
-
-    def new_project(self, *, from_legacy=False):
+    def new_project(self):
         if self.work_in_progress():
             return
         parent = self.preferences.value('projects/directory', str(Path.home()/'CosLuma/projects'), type=str)
         dialog = NewProject(parent, self)
-        if from_legacy:
-            dialog.setWindowTitle('将上次工作区收为项目')
-            dialog.name.setText((self.legacy_workspace[0].get('character') or '上次创作')+' · 原工作区')
         if dialog.exec() != QDialog.Accepted:
             return
         try:
             if not self.persist_project():
                 return
-            legacy = self.legacy_workspace if from_legacy else None
-            if legacy is not None:
-                workspace, creative = deepcopy(legacy)
-                last = self.preferences.value('last_batch_directory', '', type=str)
-                recorded = [result.get('batch_directory') for result in workspace['results']]
-                batches = list(dict.fromkeys(path for path in [*recorded, workspace.get('batch_directory'), last] if path))
-            else:
-                workspace, creative, batches = None, None, None
-            project = Project.create(dialog.directory, dialog.name.text(), workspace=workspace,
-                creative=creative, batches=batches)
+            project = Project.create(dialog.directory, dialog.name.text())
             self.preferences.setValue('projects/directory', str(dialog.directory.parent))
             self.activate_project(project)
-            if legacy is not None:
-                self.preferences.setValue('projects/migrated', str(project.path))
-                self.legacy_workspace = None
-                self.project_browser.set_legacy_available(False)
-                self.preferences.sync()
-            self.status.setText('项目已创建：'+project.data['name']+'。'+
-                ('已收纳上次的照片、讨论、样片与定稿，已有文件保持原位置。' if legacy else '可以导入照片，开始这组创作。'))
+            self.status.setText('项目已创建：'+project.data['name']+'。可以导入照片，开始这组创作。')
             return project
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.status.setText('创建项目失败：'+str(error))
@@ -1389,7 +1354,8 @@ class Workbench(QMainWindow):
         elif self.selection_worker is not None:
             next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
         elif self.beauty_editor is not None and self.beauty_editor.is_busy():
-            next_step = '正在处理可选人脸美化，可切页查看已有照片。'
+            next_step = ('正在处理可选局部修饰，可切页查看已有照片。'
+                if isinstance(self.beauty_editor,LocalRetouchEditor) else '正在处理可选人脸美化，可切页查看已有照片。')
         elif self.delivery_view is not None and self.delivery_view.is_busy():
             next_step = '正在复制所选版本到交付文件夹，可切页查看已有照片。'
         elif not has_photos:
@@ -1448,7 +1414,8 @@ class Workbench(QMainWindow):
         self.delivery_button.setVisible(not delivering)
         self.open_folder_button.setVisible(not delivering)
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
-        self.results_caption.setText('项目作品 · 选择版本与交付' if delivering else '成片后的可选人脸美化' if beautifying else
+        self.results_caption.setText('项目作品 · 选择版本与交付' if delivering else
+            ('成片后的可选局部修饰' if isinstance(self.beauty_editor,LocalRetouchEditor) else '成片后的可选人脸美化') if beautifying else
             '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
     def dragEnterEvent(self, event):
@@ -1848,11 +1815,12 @@ class Workbench(QMainWindow):
         view = BatchResults(directory, self.result_views)
         view.back_requested.connect(lambda: self.navigate(0))
         view.beauty_requested.connect(self.open_beauty)
+        view.retouch_requested.connect(self.open_retouch)
         self.result_views.addWidget(view)
         return view
 
     def open_beauty(self, context):
-        same_editor = self.beauty_editor is not None and self.beauty_editor.context['directory']==context['directory']
+        same_editor = isinstance(self.beauty_editor,BeautyEditor) and self.beauty_editor.context['directory']==context['directory']
         if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
             self.status.setText('当前项目仍在处理中，结束后可打开另一张照片的人脸美化。')
             return
@@ -1868,6 +1836,9 @@ class Workbench(QMainWindow):
                 if dialog.exec()!=QDialog.Accepted:
                     return
                 config = load_settings(self.config.text())
+            if self.beauty_editor is not None and not self.beauty_editor.save_draft():
+                self.status.setText(self.beauty_editor.message.text())
+                return
             editor = BeautyEditor(context,config['beauty'],self.result_views)
             editor.back_requested.connect(self.return_from_beauty)
             editor.saved.connect(self.beauty_saved)
@@ -1894,6 +1865,51 @@ class Workbench(QMainWindow):
         except (OSError,ValueError,KeyError) as error:
             self.beauty_editor.message.setText('保存美化连接失败：'+str(error))
 
+    def open_retouch(self, context):
+        same_editor = isinstance(self.beauty_editor,LocalRetouchEditor) and self.beauty_editor.context['base']==context['base']
+        if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
+            self.status.setText('当前项目仍在处理中，结束后可打开局部修饰。')
+            return
+        if same_editor:
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
+            self.result_views.setCurrentWidget(self.beauty_editor)
+            self.navigate(2)
+            return
+        try:
+            config = load_settings(self.config.text())
+            if 'local_edit' not in config:
+                if LocalConnection(self.config.text(),self).exec()!=QDialog.Accepted:
+                    return
+                config = load_settings(self.config.text())
+            if self.beauty_editor is not None and not self.beauty_editor.save_draft():
+                self.status.setText(self.beauty_editor.message.text())
+                return
+            editor = LocalRetouchEditor(context,config['local_edit'],self.result_views,sr_config=config.get('sr'))
+            editor.back_requested.connect(self.return_from_beauty)
+            editor.saved.connect(self.beauty_saved)
+            editor.busy_changed.connect(self.beauty_busy_changed)
+            editor.connection_requested.connect(self.configure_local)
+            if self.beauty_editor is not None:
+                self.result_views.removeWidget(self.beauty_editor)
+                self.beauty_editor.deleteLater()
+            self.beauty_editor = editor
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
+            self.result_views.addWidget(editor)
+            self.result_views.setCurrentWidget(editor)
+            self.navigate(2)
+        except (OSError,ValueError,KeyError) as error:
+            self.status.setText('打开局部修饰失败：'+str(error))
+
+    def configure_local(self):
+        try:
+            if LocalConnection(self.config.text(),self).exec()==QDialog.Accepted:
+                config = load_settings(self.config.text())
+                self.beauty_editor.config = config['local_edit']
+                self.beauty_editor.sr_config = config.get('sr')
+                self.beauty_editor.message.setText('局部修饰连接已保存，下次主动生成时使用。')
+        except (OSError,ValueError,KeyError) as error:
+            self.beauty_editor.message.setText('保存局部修饰连接失败：'+str(error))
+
     def beauty_busy_changed(self):
         self.update_actions()
         self.finish_background_work()
@@ -1907,7 +1923,7 @@ class Workbench(QMainWindow):
 
     def beauty_saved(self, result):
         self.return_from_beauty()
-        self.status.setText('已另存美化版：'+result['files']['final'])
+        self.status.setText(('已另存局部修饰版：' if result.get('task') else '已另存美化版：')+result['files']['final'])
 
 
     def show_current_batch(self):
@@ -1918,6 +1934,7 @@ class Workbench(QMainWindow):
         if self.delivery_view is None:
             self.delivery_view = DeliveryView(self.project,self.result_views)
             self.delivery_view.beauty_requested.connect(self.open_beauty)
+            self.delivery_view.retouch_requested.connect(self.open_retouch)
             self.delivery_view.revision_requested.connect(self.start_photo_revision)
             self.delivery_view.batch_created.connect(self.remember_revision_batch)
             self.delivery_view.state_changed.connect(self.update_actions)
@@ -1985,11 +2002,14 @@ def main():
     parser.add_argument('--version', action='version', version='CosLuma ' + VERSION)
     parser.add_argument('--root', type=Path)
     parser.add_argument('--config', type=Path)
+    parser.add_argument('--project', type=Path, help='打开已有项目文件或项目文件夹')
     args = parser.parse_args()
     app = QApplication(sys.argv)
     apply_theme(app)
     window = Workbench(args.root, args.config)
     window.show()
+    if args.project is not None:
+        window.open_project(args.project)
     return app.exec()
 
 

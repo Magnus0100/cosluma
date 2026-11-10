@@ -11,7 +11,7 @@ import shutil
 import uuid
 
 from image_io import apply_tone_curve, fit_generated, image_size, open_photo, open_rgb, save_image, save_jpeg, save_json
-from model_clients import edit_image, plan_photos, superresolve, write_prompt
+from model_clients import discussion_user_requirements, edit_image, plan_photos, superresolve, write_prompt
 from head_composite import restore_head
 from creative_edits import normalise_edits, edits_match
 from delivery_store import result_path
@@ -48,7 +48,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         'status':'running','stage':'decode','files':{},'sr':[],'edits':edits}
     if art_direction is not None and 'revision_of' in art_direction:
         record.update(revision_of=art_direction['revision_of'],revision_brief=art_direction.get('revision_brief',''),
-            revision_requirements=deepcopy(art_direction.get('revision_requirements',[])))
+            revision_requirements=deepcopy(art_direction.get('revision_requirements',[])),
+            revision_user_text=art_direction.get('revision_user_text',''))
     def stage(name):
         record['stage'] = name
         save_json(directory/'run.json',record)
@@ -72,12 +73,15 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             direction=art_direction['direction'] if art_direction is not None else '',
             style_reference=art_direction.get('style_reference') if art_direction is not None else None,
             creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',
+            user_requirements=art_direction.get('user_requirements') if art_direction is not None else None,
             revision_brief=art_direction.get('revision_brief','') if art_direction is not None else '',
-            revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],edits=edits)
+            revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],
+            revision_user_text=art_direction.get('revision_user_text','') if art_direction is not None else '',edits=edits)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         if edits['hair']:
             record['headwear'] = description['headwear']
+            record['headwear_audit'] = str(directory/'headwear-audit.json')
         prompt_path = directory/'prompt.txt'
         prompt_path.write_text(prompt,encoding='utf-8')
         record['files']['prompt'] = str(prompt_path)
@@ -151,7 +155,8 @@ def _failed_photo(source, error):
     return result
 
 
-def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features=True, session=None, progress=None):
+def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features=True, session=None,
+        face_region=None, progress=None):
     """Explicit post-production edit; the completed production chain is untouched."""
     from face_beauty import BeautyParameters, BeautySession, prepare_face, prepare_skin, save_beauty
     parameters = BeautyParameters(skin=skin,slim=slim,protect_features=protect_features)
@@ -161,17 +166,25 @@ def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features
     run = json.loads(path.read_text(encoding='utf-8'))
     if run['status']!='complete':
         raise ValueError('请提供已完成成片的 run.json')
-    base = Path(result_path(path.parent.parent,run,run['files']['final'])) if run.get('batch_directory') else (
-        path.parent/Path(run['files']['final']).name)
+    directory = path.parent.parent if run.get('batch_directory') else path.parent
+    base = Path(result_path(directory,run,run['files']['final']))
+    def beauty_config():
+        # Only reached when this call must actually start a beauty service job.
+        if 'beauty' not in config:
+            raise ValueError('本次需要调用人脸美化服务，但配置文件中没有 beauty 连接：'
+                '请先在美化页的“美化连接”中保存服务地址与模型，或补全配置文件的 beauty 段后重试')
+        return config['beauty']
     if session is None:
-        prepared,pixels = prepare_face(base,run['head']['region'],path.parent,config['beauty'],progress)
+        if face_region is None:
+            raise ValueError('请明确提供成片中的人脸范围 face_region=[left,top,right,bottom]')
+        prepared,pixels = prepare_face(base,face_region,path.parent,beauty_config(),progress)
     else:
         prepared = BeautySession(session)
         if prepared.base_path!=base.resolve():
             raise ValueError('美化会话对应另一张成片，请使用该成片的会话')
         pixels = open_photo(base)
     if skin and prepared.delta is None:
-        prepared = prepare_skin(prepared,config['beauty'],progress,pixels=pixels)
+        prepared = prepare_skin(prepared,beauty_config(),progress,pixels=pixels)
     result = save_beauty(pixels,prepared,parameters)
     save_json(path.parent/'beauty-session.json',{'session':prepared.directory.name,
         'parameters':{'skin':skin,'slim':slim,'protect_features':protect_features}})
@@ -233,12 +246,15 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
                 raise ValueError('请从已完成的真实样片开始改稿')
             plan = deepcopy(base_style['art_direction'])
             plan.pop('revision_requirements',None)
+            plan.pop('revision_user_text',None)
             plan.update(title=base_style['title'].removesuffix(' · 改稿')+' · 改稿',
                 summary='沿用这张样片的摄影方向，按本轮讨论与设置修改。',
                 creative_direction=creative_direction,edits=dict(edits),
                 style_reference=base_style['result']['files']['jpeg'],
                 sample_reference_id=base_style['selection_file'],revision_of=base_style['selection_file'],
-                revision_brief=creative_direction)
+                revision_brief=creative_direction,
+                user_requirements=(discussion_user_requirements(discussion,edits) if discussion is not None
+                    else plan.get('user_requirements',[])))
             plans = [plan]
             save_json(directory/'style-options.json',plans)
         else:
@@ -334,12 +350,14 @@ def revise_photo(source, character, root, config, *, art_direction, reference, r
     requirements = deepcopy(plan.get('revision_requirements',[]))
     requirements.append(revision_brief)
     plan.update(style_reference=str(Path(reference).expanduser().resolve()),
-        revision_brief=revision_brief,revision_of=revision_of,revision_requirements=requirements)
+        revision_brief=revision_brief,revision_of=revision_of,revision_requirements=requirements,
+        revision_user_text=revision_brief)
     directory = Path(root).expanduser().resolve()/('batch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
     state = {'status':'running','stage':'制作单张改稿','kind':'revision','total':1,'sources':[str(source)],
         'character':character,'brief':brief,'direction':plan['direction'],'edits':normalise_edits(plan.get('edits')),
-        'revision_of':revision_of,'revision_brief':revision_brief,'revision_requirements':requirements,'items':{}}
+        'revision_of':revision_of,'revision_brief':revision_brief,'revision_requirements':requirements,
+        'revision_user_text':revision_brief,'items':{}}
     save_json(directory/'art-direction.json',plan)
     save_json(directory/'batch.json',state)
     if batch_started is not None:
@@ -350,7 +368,7 @@ def revise_photo(source, character, root, config, *, art_direction, reference, r
     except Exception as error:
         result = _failed_photo(source,error)
     result.update(batch_directory=str(directory),revision_of=revision_of,revision_brief=revision_brief,
-        revision_requirements=requirements)
+        revision_requirements=requirements,revision_user_text=revision_brief)
     if result['status']=='complete':
         try:
             _organise_outputs(result,directory,source.stem)
@@ -371,6 +389,9 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
     if not sources:
         raise ValueError('No photographs were selected')
+    workers = config.get('workers', 4) if workers is None else workers
+    if type(workers) is not int or workers < 1:
+        raise ValueError(f'并行数量须为正整数，当前为 {workers!r}；请在配置的 workers 或 --workers 指定 1 以上的整数')
     selected = load_style(style) if style is not None else None
     if selected is not None:
         chosen_edits = normalise_edits(selected['art_direction'].get('edits'))
@@ -408,6 +429,7 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
             art_direction.pop('revision_of',None)
             art_direction.pop('revision_brief',None)
             art_direction.pop('revision_requirements',None)
+            art_direction.pop('revision_user_text',None)
             save_json(directory/'art-direction.json',art_direction)
         except Exception as error:
             state.update(status='failed',stage='准备选中风格',error=str(error))
@@ -416,7 +438,6 @@ def finish_batch(sources, character, root, config, *, brief='', size=None, worke
         state['selected_style'] = {key:selected[key] for key in ('title','summary','selection_file','sample_source')}
     state.update(stage='制作照片',direction=art_direction['direction'])
     save_json(directory/'batch.json',state)
-    workers = config.get('workers', 4) if workers is None else workers
     def produce(source):
         try:
             def report_photo(message):

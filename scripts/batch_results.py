@@ -10,13 +10,14 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QLi
     QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from studio_widgets import PhotoPreview, ui_label
-from delivery_store import result_path
+from delivery_store import project_photos, result_path, retouch_parent
 
 
 class BatchResults(QWidget):
     """Keep the selected photograph visible as this batch receives its results."""
     back_requested = Signal()
     beauty_requested = Signal(dict)
+    retouch_requested = Signal(dict)
 
     def __init__(self, directory, parent=None):
         super().__init__(parent)
@@ -84,6 +85,9 @@ class BatchResults(QWidget):
         self.beauty.setToolTip('完成后可选：分别调整美肤与瘦脸，另存美化版')
         self.beauty.clicked.connect(self.open_beauty)
         controls.addWidget(self.beauty)
+        self.retouch = QPushButton('局部修发／发束／双下巴')
+        self.retouch.clicked.connect(self.open_retouch)
+        controls.addWidget(self.retouch)
         self.beauty_version = QCheckBox('美化版')
         self.beauty_version.toggled.connect(self.change_beauty_version)
         controls.addWidget(self.beauty_version)
@@ -207,6 +211,7 @@ class BatchResults(QWidget):
             self.work.setEnabled(False)
             self.work.hide()
             self.beauty.setEnabled(False)
+            self.retouch.setEnabled(False)
             self.beauty_version.hide()
             self.details.setPlainText(self.error if not self.sources else '')
             return
@@ -222,6 +227,7 @@ class BatchResults(QWidget):
         self.work_directory = self.saved_path(result,result.get('directory')) or str(self.directory)
         self.base_path = self.saved_path(result,result.get('files',{}).get('final')) if result.get('status')=='complete' else None
         self.beauty.setEnabled(bool(self.base_path) and Path(self.base_path).is_file())
+        self.retouch.setEnabled(self.beauty.isEnabled())
         latest = Path(self.work_directory)/'beauty-latest.json'
         beauty_error = ''
         beauty_files = None
@@ -282,3 +288,15 @@ class BatchResults(QWidget):
                 'region':run['head']['region'],'directory':self.work_directory,'batch_directory':str(self.directory)})
         except (OSError,ValueError,KeyError) as error:
             self.details.setPlainText('无法打开人脸美化：'+str(error))
+
+    def open_retouch(self):
+        row = self.listing.currentRow()
+        if row>=0 and self.base_path:
+            try:
+                photo = next(photo for photo in project_photos([self.directory]) if photo['source']==self.sources[row])
+                version = next(version for version in photo['versions'] if version['files']['PNG']==self.png_path)
+                self.retouch_requested.emit({'name':Path(self.sources[row]).name,'base':self.png_path,
+                    'directory':self.work_directory,'batch_directory':str(self.directory),
+                    'parent_version':retouch_parent(version)})
+            except (OSError,ValueError,KeyError,StopIteration) as error:
+                self.details.setPlainText('无法打开局部修饰：'+str(error))

@@ -109,7 +109,6 @@ class NewProject(QDialog):
 class ProjectBrowser(QWidget):
     create_requested = Signal()
     browse_requested = Signal()
-    legacy_requested = Signal()
     open_requested = Signal(str)
     rename_requested = Signal(str)
 
@@ -133,17 +132,6 @@ class ProjectBrowser(QWidget):
         self.create.clicked.connect(self.create_requested.emit)
         header.addWidget(self.create)
         layout.addLayout(header)
-        self.legacy = QWidget()
-        legacy_row = QHBoxLayout(self.legacy)
-        legacy_row.setContentsMargins(0, 8, 0, 0)
-        legacy_note = ui_label('上次工作区尚未收纳为项目，照片、讨论与已有结果可以继续保留。')
-        legacy_note.setWordWrap(True)
-        legacy_row.addWidget(legacy_note, 1)
-        self.import_legacy = QPushButton('将上次工作区收为项目')
-        self.import_legacy.clicked.connect(self.legacy_requested.emit)
-        legacy_row.addWidget(self.import_legacy)
-        self.legacy.hide()
-        layout.addWidget(self.legacy)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         sidebar = QWidget()
@@ -220,9 +208,6 @@ class ProjectBrowser(QWidget):
         self.listing.setCurrentRow(previous)
         self.filter_projects()
 
-    def set_legacy_available(self, available):
-        self.legacy.setVisible(available)
-
     def filter_projects(self):
         query = self.search.text().strip().casefold()
         visible = []
@@ -271,7 +256,6 @@ class ProjectBrowser(QWidget):
         self.switching_enabled = not busy
         self.create.setEnabled(not busy)
         self.browse.setEnabled(not busy)
-        self.import_legacy.setEnabled(not busy)
         self.message.setText('当前项目正在处理中，可查看项目列表；处理结束后可以切换。' if busy else
             '打开项目只恢复已有内容，制作由你主动开始。')
         self.show_project()

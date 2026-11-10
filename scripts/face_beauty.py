@@ -20,21 +20,18 @@ from image_io import open_photo, open_rgb, save_image, save_jpeg, save_json, to_
 from model_clients import multipart, post_json, request
 
 BEAUTY_DEFAULTS = {'url':'http://127.0.0.1:8188', 'analysis_model':'facexformer.safetensors',
-    'landmark_model':'face_landmarker.task', 'analysis_device':'cuda:0',
+    'landmark_model':'fgtbt.safetensors',
+    'analysis_device':'cuda:0',
     'model':'FLUX.1-Kontext-dev', 'lora':'beautygrpo.safetensors',
-    'inference_device':'cuda:0','memory':'group_offload'}
+    'inference_device':'cuda:0','memory':'bnb_nf4'}
 
-# MediaPipe's anatomical contours; eyelids and iris centres come from the
-# dedicated 478-point landmarker, independently of skin segmentation.
-JAW = [234,93,132,58,172,136,150,149,152,378,379,365,397,288,361,323,454]
-EYES = ([33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246],
-    [263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466])
-BROWS = ([70,63,105,66,107,55,65,52,53,46], [300,293,334,296,336,285,295,282,283,276])
-LIPS = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185]
-INNER_LIPS = [78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191]
-NOSE = [168,6,197,195,5,4,1,2,98,97,327,326]
-FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,
-    152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109]
+
+def _topology(name):
+    if name == 'wflw-98':
+        return {'count':98, 'jaw':list(range(33)), 'eyes':[list(range(60,68)),list(range(68,76))],
+            'brows':[list(range(33,42)),list(range(42,51))], 'lips':list(range(76,88)),
+            'inner_lips':list(range(88,96)), 'nose':list(range(51,60)), 'pupils':[96,97]}
+    raise ValueError('未知面部关键点拓扑：'+str(name))
 
 
 @dataclass(frozen=True)
@@ -89,14 +86,25 @@ class BeautySession:
         self.directory = Path(directory).resolve()
         self.state = json.loads((self.directory/'session.json').read_text(encoding='utf-8'))
         self.box = tuple(self.state['box'])
+        missing = [key for key in ('analysis_region','landmark_topology') if key not in self.state]
+        if missing:
+            # Historical mediapipe sessions are not migrated: only the current
+            # FGTBT analysis can be restored, and the user re-frames it explicitly.
+            raise ValueError('该美化会话不是当前 FGTBT 98 点分析结果（缺少 '
+                +'、'.join(missing)+'），仅当前分析会话可恢复；请在美化页重新框选人脸并分析，'
+                '已有成片与旧文件保持不变')
+        self.analysis_region = tuple(self.state['analysis_region'])
         self.points = np.asarray(self.state['landmarks'], np.float32)
+        self.topology = self.state['landmark_topology']
+        if self.points.shape != (_topology(self.topology)['count'],2) or not np.isfinite(self.points).all():
+            raise ValueError('美化会话的关键点与所记录拓扑不一致')
         with open_rgb(self.directory/'skin.png') as mask:
             self.mask = np.asarray(mask, np.float32)[..., 0]/255
         self.delta = None
         if self.state.get('skin_ready'):
             with open_rgb(self.directory/self.state['skin_file']) as image:
                 retouched = np.asarray(image, np.float32)/255
-            with open_rgb(self.directory/self.state.get('skin_input','face-input.png')) as image:
+            with open_rgb(self.directory/self.state['skin_input']) as image:
                 original = np.asarray(image, np.float32)/255
             self.delta = retouched-original
 
@@ -105,21 +113,52 @@ class BeautySession:
         return (self.directory/self.state['base']).resolve()
 
 
+FACE_REGION_ERROR = '人脸范围须为四个有效像素坐标 [left,top,right,bottom]'
+
+
+def face_region_values(region):
+    """Validate the explicit face rectangle before any service call."""
+    try:
+        if isinstance(region, np.ndarray):
+            values = region
+        elif isinstance(region, (list, tuple)):
+            # numpy promotes [False, 0, 20, 30] to an int array, hiding the bool;
+            # inspect the declared element types before any conversion.
+            if any(isinstance(item, (bool, np.bool_)) for item in region):
+                raise ValueError(FACE_REGION_ERROR)
+            if not all(isinstance(item, (int, float, np.integer, np.floating)) for item in region):
+                raise ValueError(FACE_REGION_ERROR)
+            values = np.asarray(region)
+        else:
+            raise ValueError(FACE_REGION_ERROR)
+        if values.dtype == np.bool_ or values.dtype.kind not in 'iuf':
+            raise ValueError(FACE_REGION_ERROR)
+        values = values.astype(np.float64)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(FACE_REGION_ERROR) from None
+    if values.shape != (4,) or not np.isfinite(values).all():
+        raise ValueError(FACE_REGION_ERROR)
+    return values
+
+
 def prepare_face(base, region, root, config, progress=None):
     report = progress or (lambda message:None)
-    directory = Path(root)/('beauty-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
-    directory.mkdir(parents=True, exist_ok=False)
-    report('读取原成片与主体头部')
+    report('读取原成片与选定人脸范围')
     pixels = open_photo(base)
     height, width = pixels.shape[:2]
+    region = face_region_values(region)
     x0, y0, x1, y1 = np.rint(region).astype(int)
+    if not (0<=x0<x1<=width and 0<=y0<y1<=height):
+        raise ValueError('人脸范围须位于当前成片内，并包含有效面积')
+    directory = Path(root)/('beauty-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+    directory.mkdir(parents=True, exist_ok=False)
     preview = to_preview(pixels[y0:y1, x0:x1], 1024)
     image = _upload(preview, config)
     report('定位眼睑与面部轮廓，分析皮肤范围')
     prefix = 'CosLuma/beauty-'+uuid.uuid4().hex
     graph = {
         '1':{'class_type':'LoadImage','inputs':{'image':image}},
-        '2':{'class_type':'CosLumaFaceAnalysis','inputs':{'image':['1',0],
+        '2':{'class_type':'CosLumaFGTBTAnalysis','inputs':{'image':['1',0],
             'analysis_model':config['analysis_model'], 'landmark_model':config['landmark_model'],
             'device':config.get('analysis_device','cuda:0')}},
         '3':{'class_type':'SaveImage','inputs':{'images':['2',0],'filename_prefix':prefix+'-face'}},
@@ -134,11 +173,19 @@ def prepare_face(base, region, root, config, progress=None):
     # the smaller analysis image. Match the official 1024 bilinear input.
     left,top,right,bottom = box
     to_preview(pixels[top:bottom,left:right]).resize((1024,1024),Image.Resampling.BILINEAR).save(directory/'face-input.png')
+    # Rounding the native crop may change its width and height independently.
+    # Carry points through preview pixels, then normalize to the actual crop.
+    preview_box = np.asarray(analysis['box'],np.float32)
+    preview_points = np.asarray(analysis['landmarks'],np.float32)*(preview_box[2:]-preview_box[:2])+preview_box[:2]
+    native_points = preview_points*scale+[x0,y0]
+    normalized_points = (native_points-box[:2])/(box[2:]-box[:2])
     state = {'base':os.path.relpath(Path(base).resolve(), directory), 'box':box.tolist(),
-        'landmarks':analysis['landmarks'], 'source_dimensions':[width,height], 'skin_ready':False,
+        'landmarks':normalized_points.tolist(),'landmark_topology':analysis['landmark_topology'],
+        'source_dimensions':[width,height], 'skin_ready':False,'analysis_region':[int(x0),int(y0),int(x1),int(y1)],
         'face_input':'native completed RGB; official 1024 bilinear resize',
         'analysis':{'model':analysis['analysis_model'],'landmark_model':analysis['landmark_model'],
-            'landmark_device':analysis['landmark_device'],'device':analysis['device']}}
+            'landmark_device':analysis['landmark_device'],'device':analysis['device'],
+            'face_region_source':analysis['face_region_source'],'method':analysis['landmark_method']}}
     save_json(directory/'session.json', state)
     return BeautySession(directory), pixels
 
@@ -155,7 +202,8 @@ def prepare_skin(session, config, progress=None, *, pixels=None):
     del pixels
     image.save(directory/'input.png')
     filename = _upload(image, config)
-    report('BeautyGRPO 官方 BF16 完整推理 · 28 步')
+    report('BeautyGRPO · NF4 底座 / 完整 LoRA · 28 步' if config['memory']=='bnb_nf4'
+        else 'BeautyGRPO 官方 BF16 完整推理 · 28 步')
     graph = {
         '1':{'class_type':'LoadImage','inputs':{'image':filename}},
         '2':{'class_type':'CosLumaBeautyGRPO','inputs':{'image':['1',0],
@@ -169,9 +217,10 @@ def prepare_skin(session, config, progress=None, *, pixels=None):
     return BeautySession(session.directory)
 
 
-def _feature_mask(points, size, *, protect_nose=False):
+def _feature_mask(points, size, *, protect_nose=False, topology):
     mask = np.ones(size[::-1],np.uint8)
-    contours = (*BROWS,*EYES,LIPS,*([NOSE] if protect_nose else []))
+    shape = _topology(topology)
+    contours = (*shape['brows'],*shape['eyes'],shape['lips'],*([shape['nose']] if protect_nose else []))
     for indices in contours:
         polygon = np.rint(points[indices]*np.array(size)).astype(np.int32)
         cv2.fillConvexPoly(mask,cv2.convexHull(polygon),0)
@@ -179,25 +228,38 @@ def _feature_mask(points, size, *, protect_nose=False):
     return cv2.GaussianBlur(mask.astype(np.float32),(0,0),max(1,min(size)*.003))*mask
 
 
-def _face_mask(points, size):
+def _face_mask(points, size, *, topology):
     mask = np.zeros(size[::-1],np.uint8)
-    polygon = np.rint(points[FACE_OVAL]*np.array(size)).astype(np.int32)
+    _topology(topology)
+    # WFLW has a jaw contour but no forehead points. Extend the upper brow
+    # hull only for the optional beauty-difference mask, never for warping.
+    brow = points[list(range(33,51))].copy()
+    brow[:,1] -= np.ptp(points[:33,1])*.22
+    contour = np.concatenate((points[:33],brow))
+    polygon = cv2.convexHull(np.rint(contour*np.array(size)).astype(np.int32))
     cv2.fillPoly(mask,[polygon],1)
     return cv2.GaussianBlur(mask.astype(np.float32),(0,0),max(1,min(size)*.01))*mask
 
 
-def _slim_map(points, strength, size):
+def _slim_map(points, strength, size, *, topology):
     """Inverse thin-plate spline; fixed features and a stationary outer border."""
-    indices = list(dict.fromkeys(JAW+sum(EYES,[])+sum(BROWS,[])+LIPS+INNER_LIPS+NOSE+list(range(468,478))))
+    shape = _topology(topology)
+    jaw = shape['jaw']
+    indices = list(dict.fromkeys(jaw+sum(map(list,shape['eyes']),[])+sum(map(list,shape['brows']),[])+
+        shape['lips']+shape['inner_lips']+shape['nose']+shape['pupils']))
     mesh = np.asarray(points, np.float64)
     original = mesh[indices]
     target = original.copy()
-    horizontal = mesh[473]-mesh[468]
+    horizontal = mesh[97]-mesh[96]
+    center = (mesh[51]+mesh[54])/2
+    # Zero at temples and central chin; strongest on the lower cheeks.
+    t = np.linspace(0,1,len(jaw))
+    weights = np.sin(2*np.pi*t)**2
+    if np.linalg.norm(horizontal)<1e-6:
+        raise ValueError('眼部关键点重合，无法确定瘦脸方向')
     horizontal /= np.linalg.norm(horizontal)
-    center = (mesh[6]+mesh[4])/2
-    weights = np.array([0,.25,.5,.75,.95,1,1,.6,0,.6,1,1,.95,.75,.5,.25,0])
-    displacement = ((original[:17]-center)@horizontal)*(.18*strength*weights)
-    target[:17] -= displacement[:,None]*horizontal
+    displacement = ((original[:len(jaw)]-center)@horizontal)*(.18*strength*weights)
+    target[:len(jaw)] -= displacement[:,None]*horizontal
     line = np.linspace(0,1,6)
     border = np.concatenate([np.column_stack((line,np.zeros(6))),np.column_stack((line,np.ones(6))),
         np.column_stack((np.zeros(4),line[1:-1])),np.column_stack((np.ones(4),line[1:-1]))])
@@ -213,7 +275,7 @@ def _slim_map(points, strength, size):
     edge = edge*edge*(3-2*edge)
     delta *= edge[...,None]
     delta = cv2.resize(delta,size,interpolation=cv2.INTER_LINEAR)
-    delta *= _feature_mask(mesh,size,protect_nose=True)[...,None]
+    delta *= _feature_mask(mesh,size,protect_nose=True,topology=topology)[...,None]
     yy,xx = np.mgrid[:size[1],:size[0]].astype(np.float32)
     return xx+delta[...,0]*(size[0]-1), yy+delta[...,1]*(size[1]-1)
 
@@ -228,15 +290,15 @@ def render_beauty_crop(pixels, session, parameters):
             raise ValueError('请先生成美肤基础')
         if parameters.protect_features:
             mask = cv2.resize(session.mask,size,interpolation=cv2.INTER_LINEAR)
-            mask *= _feature_mask(session.points,size)
+            mask *= _feature_mask(session.points,size,topology=session.topology)
         else:
             # The user's explicit choice allows the learned adjustment on
             # eyes, brows and lips, while keeping it within the face contour.
-            mask = _face_mask(session.points,size)
+            mask = _face_mask(session.points,size,topology=session.topology)
         delta = cv2.resize(session.delta,size,interpolation=cv2.INTER_CUBIC)
         crop = np.clip(crop+delta*(mask*parameters.skin)[...,None],0,1)
     if parameters.slim:
-        map_x,map_y = _slim_map(session.points,parameters.slim,size)
+        map_x,map_y = _slim_map(session.points,parameters.slim,size,topology=session.topology)
         crop = cv2.remap(crop,map_x,map_y,cv2.INTER_LANCZOS4,borderMode=cv2.BORDER_REFLECT_101)
     return np.clip(crop,0,1)
 
@@ -259,7 +321,8 @@ def save_beauty(pixels, session, parameters):
             'protect_features':parameters.protect_features},
         'source':str(session.base_path),'source_dimensions':session.state['source_dimensions'],
         'session':os.path.relpath(session.directory,session.directory.parent), 'box':list(session.box),
-        'analysis':session.state['analysis'],'skin':session.state.get('skin') if parameters.skin else None,
+        'analysis':session.state['analysis'],'landmark_topology':session.topology,
+        'skin':session.state.get('skin') if parameters.skin else None,
         'files':{'final':save_image(final,directory/'final.png'),'jpeg':save_jpeg(final,directory/'final.jpg')},
         'output_bit_depth':16, 'status':'complete'}
     save_json(directory/'beauty.json',result)

@@ -35,7 +35,7 @@ def result_path(directory, result, value):
 
 
 def project_photos(batches):
-    """Group completed results by original, retaining all saved base and beauty versions."""
+    """Group completed results by original, retaining every explicitly saved version."""
     photos = {}
     for number, directory in enumerate(batches,1):
         directory = Path(directory)
@@ -84,9 +84,37 @@ def project_photos(batches):
                     photo['versions'].append({'id':str(path),'kind':'beauty','label':label,
                         'short_label':f'制作 {number}{revision_label} · {treatment} · 美化 {edit_number}','parameters':parameters,
                         'files':beauty_files,**common})
+                from local_retouch import TASKS
+                for edit_number,path in enumerate(sorted(Path(work).glob('retouch-*/edit-*/retouch.json')),1):
+                    if any(version['id']==str(path) for version in photo['versions']):
+                        continue
+                    saved = json.loads(path.read_text(encoding='utf-8'))
+                    if saved['status']!='complete':
+                        continue
+                    treatment_name = TASKS[saved['task']][0]
+                    files = {kind:str(path.parent/Path(saved['files'][field]).name)
+                        for kind,field in (('PNG','final'),('JPEG','jpeg'))}
+                    parent = saved.get('parent_version') or {}
+                    retouches = parent.get('retouches',[])+[{'task':saved['task'],'brief':saved.get('brief','')}]
+                    local_common = {**common,'description':parent.get('description',common['description'])+'\n局部修饰：'+treatment_name+
+                        ('\n具体要求：'+saved['brief'] if saved.get('brief') else '')}
+                    if parent.get('parameters') is not None:
+                        local_common['parameters'] = parent['parameters']
+                    inherited = ' · 美化' if 'parameters' in local_common else ''
+                    previous = ' · '+ '、'.join(TASKS[item['task']][0] for item in parent.get('retouches',[])) if parent.get('retouches') else ''
+                    local_label = (f'制作 {number}{revision_label} · {treatment}{inherited}{previous} · '
+                        f'局部修饰 {edit_number} · {treatment_name}')
+                    photo['versions'].append({'id':str(path),'kind':'retouch',
+                        'label':local_label,'short_label':local_label,
+                        'task':saved['task'],'retouches':retouches,'parent_version':parent,'files':files,**local_common})
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise ValueError(f'读取项目成片失败：{directory}\n{error}') from error
     return list(photos.values())
+
+
+def retouch_parent(version):
+    return {key:deepcopy(version[key]) for key in ('id','kind','label','description','parameters','retouches')
+        if key in version}
 
 
 def revision_context(photo, version):

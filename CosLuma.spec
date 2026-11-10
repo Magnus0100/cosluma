@@ -46,7 +46,8 @@ destination = Path(DISTPATH)/'CosLuma'
 for name in ('README.md','AGENTS.md','LICENSE'):
     shutil.copyfile(root/name,destination/name)
 for name in ('LICENSES','providers'):
-    shutil.copytree(root/name,destination/name,dirs_exist_ok=True)
+    shutil.copytree(root/name,destination/name,dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo','*.tmp','*.log'))
 # Include notices from the versions actually present in the build, including
 # optional modules collected by upstream PyInstaller hooks.
 licensed = {'numpy','pillow','pillow-heif','opencv-python-headless','pyside6','pyside6-essentials',

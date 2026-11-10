@@ -94,13 +94,23 @@ def open_photo(path):
         with rawpy.imread(str(path)) as raw:
             pixels = raw.postprocess(use_camera_wb=True, no_auto_bright=True,
                 output_color=rawpy.ColorSpace.sRGB, output_bps=16, gamma=(2.4, 12.92))
-        return pixels.astype(np.float32) / 65535.0
+        pixels = pixels.astype(np.float32)
+        pixels /= 65535.0
+        return pixels
     image = _read_image(path)
-    image = image.convertedToColorSpace(QColorSpace(QColorSpace.SRgb), QImage.Format_RGBX32FPx4)
-    if image.isNull():
-        raise ValueError(f'Cannot convert the colour profile of {path} to sRGB')
-    pixels = np.frombuffer(image.constBits(), np.float32).reshape(image.height(), image.bytesPerLine() // 4)
-    return pixels[:, :image.width() * 4].reshape(image.height(), image.width(), 4)[..., :3].copy()
+    width,height = image.width(),image.height()
+    pixels = np.empty((height,width,3),np.float32)
+    # Colour conversion is pixel-local. Convert rows instead of keeping a full
+    # float32 RGBX image alongside the final float32 RGB photograph.
+    for start in range(0,height,256):
+        rows = min(256,height-start)
+        tile = image.copy(0,start,width,rows).convertedToColorSpace(
+            QColorSpace(QColorSpace.SRgb),QImage.Format_RGBX32FPx4)
+        if tile.isNull():
+            raise ValueError(f'Cannot convert the colour profile of {path} to sRGB')
+        values = np.frombuffer(tile.constBits(),np.float32).reshape(rows,tile.bytesPerLine()//4)
+        pixels[start:start+rows] = values[:,:width*4].reshape(rows,width,4)[...,:3]
+    return pixels
 
 
 def fit_photo(pixels, size):
@@ -110,10 +120,29 @@ def fit_photo(pixels, size):
     return np.clip(np.stack(channels, axis=-1), 0, 1)
 
 
+def _curve_points(points):
+    """Validate finish_curve input as [input, output] pairs without changing values."""
+    try:
+        values = np.asarray(points, np.float64)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('明度曲线须为 [输入, 输出] 数值点组成的数组，例如 [[0,0],[0.5,0.55],[1,1]]；'
+            '请修正配置中的 finish_curve') from None
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError('明度曲线须为 [输入, 输出] 数值点组成的数组，例如 [[0,0],[0.5,0.55],[1,1]]；'
+            '请修正配置中的 finish_curve')
+    if values.shape[0] < 2:
+        raise ValueError('明度曲线至少需要两个 [输入, 输出] 点；请修正配置中的 finish_curve')
+    if not np.isfinite(values).all():
+        raise ValueError('明度曲线的坐标须为有限数值，不能包含 NaN 或无穷；请修正配置中的 finish_curve')
+    if np.any(np.diff(values[:, 0]) <= 0):
+        raise ValueError('明度曲线的输入坐标须严格递增且不重复；请修正配置中的 finish_curve')
+    return values
+
+
 def apply_tone_curve(pixels, points):
     """A monotone display-luminance curve; preserve RGB ratios and geometry."""
     from scipy.interpolate import PchipInterpolator
-    points = np.asarray(points, np.float64)
+    points = _curve_points(points)
     curve = PchipInterpolator(points[:, 0], points[:, 1])
     result = np.empty_like(pixels)
     weights = np.array([.2126, .7152, .0722], np.float32)
@@ -142,8 +171,18 @@ def to_preview(pixels, max_edge=None):
 
 
 def display_image(pixels, *, max_edge=None):
-    pixels = np.asarray(to_preview(pixels, max_edge))
-    image = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
+    if max_edge is not None:
+        height,width = pixels.shape[:2]
+        factor = min(1.0,max_edge/max(width,height))
+        if factor < 1:
+            pixels = fit_photo(pixels,(max(1,round(width*factor)),max(1,round(height*factor))))
+    height,width = pixels.shape[:2]
+    image = QImage(width,height,QImage.Format_RGB888)
+    encoded = np.frombuffer(image.bits(),np.uint8).reshape(height,image.bytesPerLine())
+    # Write the display allocation directly: no full-image PIL/NumPy/QImage copies.
+    for start in range(0,height,256):
+        rows = min(256,height-start)
+        encoded[start:start+rows,:width*3] = (np.clip(pixels[start:start+rows],0,1)*255.0+.5).reshape(rows,width*3)
     image.setColorSpace(QColorSpace(QColorSpace.SRgb))
     return image
 

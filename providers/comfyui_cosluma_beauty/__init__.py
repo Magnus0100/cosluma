@@ -1,29 +1,29 @@
-"""FaceXFormer analysis for CosLuma's optional post-production beauty editor."""
+"""FGTBT landmarks and FaceXFormer skin masks for saved CosLuma photographs."""
 from pathlib import Path
+import gc
+import traceback
 
 import cv2
 import numpy as np
 from PIL import Image
 import torch
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 from safetensors.torch import load_file
 import folder_paths
 import comfy.model_management
 
 from .facexformer import FaceXFormer
 from .beautygrpo import CosLumaBeautyGRPO
+from .landmarks import locate
 
 folder_paths.add_model_folder_path('cosluma_face', str(Path(folder_paths.models_dir)/'cosluma_face'))
 
 
-class CosLumaFaceAnalysis:
+class CosLumaFGTBTAnalysis:
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {'image':('IMAGE',),
             'analysis_model':('STRING', {'default':'facexformer.safetensors'}),
-            'landmark_model':('STRING', {'default':'face_landmarker.task'}),
+            'landmark_model':('STRING', {'default':'fgtbt.safetensors'}),
             'device':(['cuda:0', 'cpu'],)}}
 
     RETURN_TYPES = ('IMAGE', 'MASK')
@@ -32,32 +32,26 @@ class CosLumaFaceAnalysis:
     CATEGORY = 'CosLuma'
     OUTPUT_NODE = True
 
-    def __init__(self):
-        self.model = None
-        self.model_path = None
-        self.landmarker = None
-        self.landmark_path = None
-
     @torch.inference_mode()
     def analyze(self, image, analysis_model, landmark_model, device):
+        try:
+            return self._analyze(image,analysis_model,landmark_model,device)
+        except Exception as error:
+            traceback.clear_frames(error.__traceback__)
+            raise
+        finally:
+            gc.collect()
+            comfy.model_management.soft_empty_cache()
+
+    def _analyze(self, image, analysis_model, landmark_model, device):
         pixels = np.uint8(np.clip(image[0].cpu().numpy(), 0, 1)*255+.5)
         height, width = pixels.shape[:2]
         landmark_path = folder_paths.get_full_path_or_raise('cosluma_face',landmark_model)
-        if self.landmark_path!=landmark_path:
-            if self.landmarker is not None:
-                self.landmarker.close()
-            options = vision.FaceLandmarkerOptions(base_options=python.BaseOptions(
-                model_asset_path=landmark_path,delegate=python.BaseOptions.Delegate.CPU),
-                running_mode=vision.RunningMode.IMAGE,num_faces=1)
-            self.landmarker = vision.FaceLandmarker.create_from_options(options)
-            self.landmark_path = landmark_path
-        result = self.landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
-            data=np.ascontiguousarray(pixels)))
-        if not result.face_landmarks:
-            raise ValueError('未检测到可美化的人脸；原成片保留。')
-        points = np.array([[point.x*width,point.y*height] for point in result.face_landmarks[0]],np.float32)
-        x,y = points[:468].min(0)
-        w,h = points[:468].max(0)-[x,y]
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        points = locate(pixels,landmark_path,device)
+        x,y = points.min(0)
+        w,h = points.max(0)-[x,y]
         x0, y0 = np.floor(np.maximum((0, 0), (x-w*.25, y-h*.25))).astype(int)
         x1, y1 = np.ceil(np.minimum((width, height), (x+w*1.25, y+h*1.25))).astype(int)
         face_input = Image.fromarray(pixels[y0:y1, x0:x1]).resize((224, 224), Image.Resampling.BICUBIC)
@@ -66,18 +60,16 @@ class CosLumaFaceAnalysis:
         std = torch.tensor([.229, .224, .225])[:, None, None]
         tensor = ((tensor-mean)/std)[None].to(device)
         model_path = folder_paths.get_full_path_or_raise('cosluma_face', analysis_model)
-        if self.model_path != model_path:
-            self.model = FaceXFormer().eval()
-            self.model.load_state_dict(load_file(model_path), strict=True)
-            self.model_path = model_path
+        model = FaceXFormer().eval()
+        model.load_state_dict(load_file(model_path), strict=True)
         comfy.model_management.free_memory(1024**3, torch.device(device))
-        self.model.to(device)
+        model.to(device)
         try:
-            _, _, _, _, _, _, _, segmentation = self.model(tensor, {}, torch.tensor([0], device=device))
+            _, _, _, _, _, _, _, segmentation = model(tensor, {}, torch.tensor([0], device=device))
             probabilities = segmentation.softmax(dim=1)
             skin = (probabilities[0, 1]+probabilities[0, 6]).cpu().numpy()
         finally:
-            self.model.to('cpu')
+            del model,tensor
         # The learned skin mask excludes brows, eyes, lips and hair. Only the
         # analysis image is resized; the client keeps the native float carrier.
         mask = np.zeros((height, width), np.float32)
@@ -89,11 +81,13 @@ class CosLumaFaceAnalysis:
         crop_mask = cv2.resize(mask[top:top+side, left:left+side], (1024, 1024), interpolation=cv2.INTER_LINEAR)
         metadata = {'box':[left, top, left+side, top+side], 'input_dimensions':[width, height],
             'landmarks':((points-[left, top])/side).tolist(), 'analysis_model':analysis_model,
-            'landmark_model':landmark_model,'landmark_device':'cpu', 'device':device}
+            'landmark_model':landmark_model,'landmark_device':device, 'device':device,
+            'landmark_topology':'wflw-98','face_region_source':'explicit saved-photo rectangle',
+            'landmark_method':'FGTBT full float32; 480 input; official flip heatmap averaging'}
         face = torch.from_numpy(np.array(crop)).float()[None]/255
         return {'ui': {'face':[metadata]}, 'result':(face, torch.from_numpy(crop_mask)[None])}
 
 
-NODE_CLASS_MAPPINGS = {'CosLumaFaceAnalysis':CosLumaFaceAnalysis,'CosLumaBeautyGRPO':CosLumaBeautyGRPO}
-NODE_DISPLAY_NAME_MAPPINGS = {'CosLumaFaceAnalysis':'CosLuma · 皮肤解析与面部定位',
+NODE_CLASS_MAPPINGS = {'CosLumaFGTBTAnalysis':CosLumaFGTBTAnalysis,'CosLumaBeautyGRPO':CosLumaBeautyGRPO}
+NODE_DISPLAY_NAME_MAPPINGS = {'CosLumaFGTBTAnalysis':'CosLuma · FGTBT 定位与皮肤解析',
     'CosLumaBeautyGRPO':'CosLuma · BeautyGRPO 官方 BF16 推理'}
