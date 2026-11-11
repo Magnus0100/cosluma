@@ -10,7 +10,7 @@ from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, QThread, QThreadPo
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
-    QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
+    QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
     QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
 
 from delivery_store import export_delivery, photo_choices, project_photos, retouch_parent, revision_context, selected_version, source_key
@@ -660,8 +660,12 @@ class DeliveryView(QWidget):
 
     def update_controls(self):
         count = sum(choice['included'] for choice in self.state['choices'].values())
+        retained = sum(1 for key,choice in self.state['choices'].items() if choice['included'] and key not in self.rows)
         visible = sum(not self.listing.item(row).isHidden() for row in range(self.listing.count()))
-        self.summary.setText(f'已选交付 {count} 张 · 显示 {visible}/{len(self.photos)} 张')
+        self.summary.setText(f'已选交付 {count} 张 · 显示 {visible}/{len(self.photos)} 张'+(
+            f' · 另有 {retained} 张选择的原片不在当前作品中' if retained else ''))
+        self.summary.setToolTip('这些交付选择没有对应的当前作品；选择仍保留，导出时会在交付记录中'
+            '列出失败并说明原因。' if retained else '')
         busy = self.is_busy()
         self.listing.setEnabled(not busy or self.operation=='revision')
         self.version.setEnabled(not busy and self.current_photo() is not None)

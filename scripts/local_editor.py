@@ -443,8 +443,6 @@ class LocalRetouchEditor(QWidget):
         finally:
             self.restoring = False
         self.update_controls()
-        if self.result_directory and self.worker is None and self.pages.currentIndex()==1:
-            self.start('compare')
 
     def save_draft(self):
         self.draft_timer.stop()

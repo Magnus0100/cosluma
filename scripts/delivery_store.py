@@ -176,7 +176,10 @@ def export_delivery(photos, choices, parent, name, formats, *, progress=None):
         report(f'正在导出 {number}/{len(selected)}：'+Path(choice['source']).name)
         item = {'source':choice['source'],'version':choice['version'],'files':{},'status':'complete'}
         try:
-            photo = records[choice['key']]
+            photo = records.get(choice['key'])
+            if photo is None:
+                raise ValueError('交付选择引用的原片不在当前项目成片记录中：'+choice.get('source',choice['key'])+
+                    '；请检查对应批次记录是否已被移动或删除')
             version = selected_version(photo,choice)
             item['label'] = version['label']
             for kind in formats:

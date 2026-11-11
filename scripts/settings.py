@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from copy import deepcopy
 import uuid
 
@@ -49,6 +50,35 @@ def editable_settings(path):
     return config
 
 
+def owned_key_file(path, service, value):
+    """The pasted-key file this configuration wrote for one service, if that is what the value names."""
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    candidate = (candidate if candidate.is_absolute() else path.parent / candidate).resolve()
+    prefix = f'.{path.stem}-{service}-'
+    if candidate.parent != path.parent or candidate.suffix != '.key' or not candidate.name.startswith(prefix):
+        return None
+    identifier = candidate.stem[len(prefix):]
+    return candidate if len(identifier) == 32 and all(
+        character in '0123456789abcdef' for character in identifier) else None
+
+
+def previous_key_files(path):
+    """Keys the persisted configuration referenced before this save; an unreadable file only skips this cleanup."""
+    try:
+        previous = load_settings(path)
+        values = [previous.get(service, {}).get('api_key_file') for service in ('llm', 'image')]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    files = []
+    for service, value in zip(('llm', 'image'), values):
+        owned = owned_key_file(path, service, value)
+        if owned is not None:
+            files.append(owned)
+    return files
+
+
 def save_settings(path, config, keys=None):
     path = Path(path).expanduser().resolve()
     config = deepcopy(config)
@@ -69,48 +99,44 @@ def save_settings(path, config, keys=None):
         raise ValueError('参考词库须为非空 JSON 数组，每条包含 title、text 文本与 source 来源。')
     path.parent.mkdir(parents=True, exist_ok=True)
     config['prompt_library'] = str(library) if library is not None else None
+    obsolete = previous_key_files(path)
     created = []
-    previous = []
-    temporary = path.with_name(path.name + '.tmp')
+    temporary = None
     try:
         for service, secret in (keys or {}).items():
             if service not in ('llm', 'image') or not secret.strip():
                 raise ValueError('请填写有效的服务密钥')
             provider = config[service]
-            old = provider.get('api_key_file')
-            if old:
-                old = Path(old).expanduser()
-                old = (old if old.is_absolute() else path.parent / old).resolve()
-                prefix = f'.{path.stem}-{service}-'
-                identifier = old.stem[len(prefix):] if old.name.startswith(prefix) else ''
-                if old.parent == path.parent and old.suffix == '.key' and len(identifier) == 32 and all(
-                        character in '0123456789abcdef' for character in identifier):
-                    previous.append(old)
             target = path.parent / f'.{path.stem}-{service}-{uuid.uuid4().hex}.key'
             with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w', encoding='utf-8') as stream:
                 created.append(target)
                 stream.write(secret.strip())
             provider.pop('api_key_env', None)
             provider['api_key_file'] = str(target)
-        temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.', suffix='.tmp')
+        temporary = Path(name)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            stream.write(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
         os.replace(temporary, path)
+        temporary = None
     except Exception:
         for target in created:
             target.unlink(missing_ok=True)
         raise
     finally:
-        temporary.unlink(missing_ok=True)
-    for old in previous:
-        referenced = []
-        for service in ('llm', 'image'):
-            value = config.get(service, {}).get('api_key_file')
-            if value:
-                value = Path(value).expanduser()
-                referenced.append((value if value.is_absolute() else path.parent / value).resolve())
-        if old in referenced:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    referenced = set()
+    for service in ('llm', 'image'):
+        value = config.get(service, {}).get('api_key_file')
+        if value:
+            value = Path(value).expanduser()
+            referenced.add((value if value.is_absolute() else path.parent / value).resolve())
+    for value in obsolete:
+        if value in referenced:
             continue
         try:
-            old.unlink(missing_ok=True)
+            value.unlink(missing_ok=True)
         except OSError:
             # The new configuration is already committed; a locked obsolete key
             # must not turn a successful save into a false failure.

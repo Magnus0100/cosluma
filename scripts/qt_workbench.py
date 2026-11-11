@@ -30,7 +30,7 @@ from model_clients import select_photos, _discussion_preview
 from photo_pipeline import finish_batch, load_style
 from creative_edits import normalise_edits, edits_match
 from settings import default_settings_path, load_settings
-from service_settings import ServiceSettings, endpoint_url
+from service_settings import ServiceSettings
 from project_store import Project, recent_projects, remember_project
 from project_browser import NewProject, ProjectBrowser
 

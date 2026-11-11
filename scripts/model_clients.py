@@ -442,7 +442,6 @@ def _veil_requests(requirements):
                         requested.append(term)
                     start = index + len(term)
     return sorted(set(requested)),sorted(set(cancelled))
-    return sorted(set(requested)),sorted(set(cancelled))
 
 
 def review_headwear(names, requirements):

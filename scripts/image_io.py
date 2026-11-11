@@ -144,12 +144,17 @@ def _curve_points(points):
     return values
 
 
-def apply_tone_curve(pixels, points):
-    """A monotone display-luminance curve; preserve RGB ratios and geometry."""
+def apply_tone_curve(pixels, points, *, out=None):
+    """A monotone display-luminance curve; preserve RGB ratios and geometry.
+
+    The default returns a new float array and leaves the caller's pixels untouched.
+    A caller that already owns the only reference to a float32 RGB frame can pass it
+    as out to avoid a second full-frame allocation; the rows written are the same.
+    """
     from scipy.interpolate import PchipInterpolator
     points = _curve_points(points)
     curve = PchipInterpolator(points[:, 0], points[:, 1])
-    result = np.empty_like(pixels)
+    result = np.empty_like(pixels) if out is None else out
     weights = np.array([.2126, .7152, .0722], np.float32)
     for start in range(0, pixels.shape[0], 256):
         tile = pixels[start:start+256]

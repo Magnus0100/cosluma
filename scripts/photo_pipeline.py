@@ -124,7 +124,7 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         record['head_blending'] = record['head']['method']
         if config.get('finish_curve'):
             stage('调整整图明度层次')
-            final = apply_tone_curve(final, config['finish_curve'])
+            final = apply_tone_curve(final, config['finish_curve'], out=final)
             record['finish_curve'] = config['finish_curve']
         stage('合成保存')
         record['files']['final'] = save_image(final,directory/'final.png')

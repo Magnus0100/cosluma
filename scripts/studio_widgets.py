@@ -12,6 +12,7 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPix
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
     QSizePolicy, QVBoxLayout, QWidget)
+from shiboken6 import isValid
 
 from image_io import open_display
 
@@ -478,8 +479,11 @@ class PhotoCanvas(QGraphicsView):
 
     def hideEvent(self, event):
         self.display_key = None
-        self.display.setPixmap(QPixmap())
-        self.display.hide()
+        # Interpreter teardown can delete the scene items before this view is
+        # hidden; only an overlay that still exists is cleared then.
+        if isValid(self.display):
+            self.display.setPixmap(QPixmap())
+            self.display.hide()
         super().hideEvent(event)
 
     def showEvent(self, event):
@@ -526,10 +530,13 @@ class PreviewLoader(QRunnable):
                 image, error = open_display(key[0], max_edge=self.max_edge), ''
             except Exception as exception:
                 image, error = None, str(exception)
-            if not self.cancelled.is_set():
+            if not self.cancelled.is_set() and isValid(self.signals):
                 self.signals.loaded.emit({key:(image,error)})
             del image
-        self.signals.finished.emit()
+        # Interpreter teardown can delete the signal owner while this pool
+        # thread still runs, so only a live signal source is notified.
+        if isValid(self.signals):
+            self.signals.finished.emit()
 
 
 
@@ -684,10 +691,20 @@ class PhotoPreview(QWidget):
                 except OSError:
                     self.keys[kind] = None
 
+    def image_ready(self, kind):
+        """True only while the canvas holds pixels for this key and read size."""
+        key = self.keys.get(kind)
+        return key is not None and kind in self.images and self.image_edges.get(kind)==key[2]
+
     def set_photo(self, source=None, output=None, *, preserve_view=False):
         self.direct_images = False
         self.direct_sources = {}
         self.preserve_view = preserve_view
+        if not preserve_view:
+            # The canvas is fitted to this picture, so the previous picture's
+            # 100% request must not make the bounded preview read native pixels.
+            self.native_requested = False
+            self.native_zoom = None
         self.saved_views = {}
         if preserve_view:
             for view in (self.preview,self.before,self.after):
@@ -751,14 +768,14 @@ class PhotoPreview(QWidget):
         visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
         for kind in visible:
             key = self.keys.get(kind)
-            if key is not None and self.image_edges.get(kind)!=key[2] and key not in self.errors:
+            if key is not None and not self.image_ready(kind) and key not in self.errors:
                 pixels = self.cached_preview(key)
                 if pixels is not None:
                     self.images[kind] = pixels
                     self.image_edges[kind] = key[2]
         self.update_preview()
         missing = list(dict.fromkeys(self.keys[kind] for kind in visible
-            if self.keys.get(kind) is not None and self.image_edges.get(kind)!=self.keys[kind][2]
+            if self.keys.get(kind) is not None and not self.image_ready(kind)
             and self.keys[kind] not in self.errors))
         if missing:
             self.loader = PreviewLoader(missing[:1], max_edge=self.request_edge())
@@ -819,13 +836,17 @@ class PhotoPreview(QWidget):
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
+                empty_canvas = label.photo.pixmap().isNull()
                 anchor = self.anchor_for(label,pixels)
                 label.setPixmap(pixels, preserve_view=self.direct_images or self.preserve_view)
+                if self.native_requested and self.native_zoom=='actual' and (empty_canvas or anchor is not None):
+                    # The explicit 100% applies once, when pixels for that read
+                    # size arrive; a later same-size update keeps the zoom the
+                    # user has set on the canvas since.
+                    label.actual_size()
+                elif anchor is not None:
+                    label.set_zoom(anchor[2])
                 if anchor is not None:
-                    if self.native_requested and self.native_zoom=='actual':
-                        label.actual_size()
-                    else:
-                        label.set_zoom(anchor[2])
                     label.centerOn(anchor[0]*pixels.width(),anchor[1]*pixels.height())
                 previous = self.saved_views.pop(label,None)
                 if previous is not None and previous[0]==pixels.size():
@@ -917,6 +938,10 @@ class PhotoPreview(QWidget):
         """Read the file's own pixels only for an explicit 100% view."""
         native = bool(native)
         if native == self.native_requested:
+            # Pixels for this size are already requested: an explicit 100% still
+            # replaces the pending "keep the apparent size" intent.
+            if native and exact_zoom:
+                self.native_zoom = 'actual'
             return
         self.native_requested = native
         self.native_zoom = ('actual' if exact_zoom else 'keep') if native else None

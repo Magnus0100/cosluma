@@ -90,4 +90,4 @@ class CosLumaFGTBTAnalysis:
 
 NODE_CLASS_MAPPINGS = {'CosLumaFGTBTAnalysis':CosLumaFGTBTAnalysis,'CosLumaBeautyGRPO':CosLumaBeautyGRPO}
 NODE_DISPLAY_NAME_MAPPINGS = {'CosLumaFGTBTAnalysis':'CosLuma · FGTBT 定位与皮肤解析',
-    'CosLumaBeautyGRPO':'CosLuma · BeautyGRPO 官方 BF16 推理'}
+    'CosLumaBeautyGRPO':'CosLuma · BeautyGRPO 官方流程 · BF16 计算'}

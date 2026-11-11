@@ -124,8 +124,23 @@ class ServiceSettings(QDialog):
             lighting_form.addRow(label,field)
         self.relight_device = QComboBox()
         self.relight_device.addItems(['cuda:0','cpu'])
-        self.relight_device.setCurrentText(lighting['device'])
+        device = str(lighting['device'])
+        hint = None
+        if self.relight_device.findText(device) < 0:
+            # The relight node only accepts cuda:0 and cpu; keep a persisted value visible and
+            # unselected instead of replacing it, and save it back until the user picks one.
+            message = '当前配置 '+device+' 不在节点支持项中；未改选时保留原值'
+            self.relight_device.setPlaceholderText(message)
+            self.relight_device.setCurrentIndex(-1)
+            hint = ui_label(message)
+            hint.setWordWrap(True)
+        else:
+            self.relight_device.setCurrentText(device)
         lighting_form.addRow('推理设备',self.relight_device)
+        if hint is not None:
+            lighting_form.addRow(hint)
+            self.relight_device.currentIndexChanged.connect(
+                lambda _index: hint.setVisible(self.relight_device.currentIndex() < 0))
         download = QPushButton('下载重打光模型与查看安装方法')
         download.clicked.connect(lambda: ModelDownloads(self,model='relight').exec())
         lighting_form.addRow(download)
@@ -424,7 +439,8 @@ class ServiceSettings(QDialog):
                         field.setFocus()
                         raise ValueError('请填写 PIXLRelight 服务地址和实际模型目录')
                     lighting[key] = endpoint_url(value,'relight') if key=='url' else value
-                lighting['device'] = self.relight_device.currentText()
+                if self.relight_device.currentIndex() >= 0:
+                    lighting['device'] = self.relight_device.currentText()
                 values['relight'] = lighting
             else:
                 values.pop('relight',None)

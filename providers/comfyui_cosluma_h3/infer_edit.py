@@ -77,15 +77,28 @@ def _pre_resize_canvas(pixels, width, height):
     return np.array(image.resize((width,height),Image.Resampling.LANCZOS),dtype=np.float32)/255
 
 
-def worker_memory():
-    """Peak and current working set of this process.
+WORKER_MEMORY_FIELDS = ('peak_working_set_bytes','rss_bytes','private_commit_bytes',
+    'pagefile_commit_bytes','peak_pagefile_commit_bytes')
 
-    Windows reports the real peak; other platforms leave the peak null instead of
-    substituting the current RSS.
+
+def worker_memory():
+    """Current and peak OS counters of this process, in bytes.
+
+    Windows exposes PROCESS_MEMORY_COUNTERS_EX through psutil, so each counter keeps
+    the name of the counter it comes from: peak_wset is the peak and rss the current
+    working set, pagefile is the commit charge and peak_pagefile its peak, and private
+    is PrivateUsage. The working set is the resident pages of this process, private,
+    shared and file-mapped ones included, so part of it can still be reclaimed; the
+    commit counters are the OS commit charge, which is neither RSS nor bytes that sit
+    in the pagefile. The peaks belong to one process each, so stage peaks are not
+    additive and these fields are measurements, not a memory budget.
     """
     import psutil
     info = psutil.Process().memory_info()
-    return {'peak_working_set_bytes':getattr(info,'peak_wset',None),'rss_bytes':int(info.rss)}
+    return {'peak_working_set_bytes':getattr(info,'peak_wset',None),'rss_bytes':int(info.rss),
+        'private_commit_bytes':getattr(info,'private',None),
+        'pagefile_commit_bytes':getattr(info,'pagefile',None),
+        'peak_pagefile_commit_bytes':getattr(info,'peak_pagefile',None)}
 
 
 def write_json(path,record):
@@ -297,7 +310,8 @@ def orchestrate(args):
             stages[stage] = {'seconds':round(time.perf_counter()-stage_started,1),
                 **record.pop('worker_memory',{}),**record}
             print('stage '+stage+': '+str(stages[stage]['seconds'])+' s, peak working set '
-                +str(stages[stage].get('peak_working_set_bytes'))+' bytes',flush=True)
+                +str(stages[stage].get('peak_working_set_bytes'))+' bytes, peak commit '
+                +str(stages[stage].get('peak_pagefile_commit_bytes'))+' bytes',flush=True)
             if result.returncode:
                 error_path = directory/('stage-'+stage+'-error.json')
                 detail = json.loads(error_path.read_text(encoding='utf-8'))['error'] if error_path.is_file() else (
@@ -327,10 +341,13 @@ def orchestrate(args):
             'model_input_bit_depth':8,'model_output_bit_depth':8,
             'output_width':decode['output_width'],'output_height':decode['output_height'],
             'stages':stages,
-            'worker_memory':{'stages':{name:{key:value for key,value in stage.items()
-                    if key in ('peak_working_set_bytes','rss_bytes')} for name,stage in stages.items()},
+            'worker_memory':{'stages':{name:{key:stage[key] for key in WORKER_MEMORY_FIELDS if key in stage}
+                    for name,stage in stages.items()},
                 'orchestrator':worker_memory(),
-                'note':'one short-lived process per stage; the stages never run at the same time, so their peaks are not summed'},
+                'note':'each stage entry holds the OS counters of that process; one short-lived process per stage, so '
+                    'the stages never run at the same time and their peaks are not summed; working set is that '
+                    'process resident pages (private, shared, file-mapped), commit counters are OS commit charge, '
+                    'so these are per-process measurements and not a memory budget'},
             'timings':{'conditioning_seconds':condition['seconds'],'sampling_seconds':sample['seconds'],
                 'decode_seconds':decode['seconds'],'total_seconds':time.perf_counter()-started},
             'memory':'each stage process ends with its own weights; no retired model is moved back to CPU'}
@@ -339,7 +356,7 @@ def orchestrate(args):
     except Exception as error:
         write_json(directory/'error.json',{'error':str(error),'stage':getattr(error,'stage',None),'stages':stages,
             'worker_memory':{'orchestrator':worker_memory(),
-                'note':'per-stage peaks are in stages; the stages never run at the same time'}})
+                'note':'per-stage OS counters are in stages; the stages never run at the same time'}})
         traceback.print_exc()
         return 1
 
