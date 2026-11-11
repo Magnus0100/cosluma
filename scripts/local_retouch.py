@@ -15,7 +15,7 @@ from PIL import Image
 
 from image_io import (fit_generated, image_size, open_photo, open_rgb, save_image, save_jpeg,
     save_json, to_preview)
-from model_clients import request, post_json, superresolve
+from model_clients import download, request, post_json, superresolve
 from face_beauty import _upload
 
 
@@ -294,7 +294,7 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
                     raise RuntimeError(engine['label']+' 局部修饰失败：'+error)
                 outputs = result.get('outputs',{}).get('8',{}).get('images')
                 if outputs:
-                    (directory/'model-output.png').write_bytes(request(endpoint+'/view?'+urllib.parse.urlencode(outputs[0])))
+                    download(endpoint+'/view?'+urllib.parse.urlencode(outputs[0]),directory/'model-output.png')
                     state['model'] = result['outputs']['8']['model'][0]
                     break
                 if status.get('completed'):

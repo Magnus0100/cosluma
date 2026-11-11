@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import base64
 from functools import lru_cache
+import http.client
 from io import BytesIO
 import json
 import math
+import os
 from pathlib import Path
 import re
+import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -35,6 +39,16 @@ _AGENT_RULES = (
     '只返回当前阶段要求的 JSON，不声称已完成未执行的操作。')
 
 
+def _provider_message(result):
+    try:
+        details = json.loads(result)
+        details = details.get('error', details) if isinstance(details, dict) else details
+        message = details.get('message', '') if isinstance(details, dict) else details
+        return message[:600] if isinstance(message, str) else ''
+    except (ValueError, UnicodeError):
+        return ''
+
+
 def request(url, *, data=None, headers=None, response_path=None):
     headers = headers or {}
     call = urllib.request.Request(url, data=data, headers=headers)
@@ -50,17 +64,44 @@ def request(url, *, data=None, headers=None, response_path=None):
                     result = result.replace(secret.encode('utf-8'), b'[redacted]')
         if response_path:
             Path(response_path).write_bytes(result)
-        try:
-            details = json.loads(result)
-            details = details.get('error', details) if isinstance(details, dict) else details
-            message = details.get('message', '') if isinstance(details, dict) else details
-            error.provider_message = message[:600] if isinstance(message, str) else ''
-        except (ValueError, UnicodeError):
-            error.provider_message = ''
+        error.provider_message = _provider_message(result)
         raise
     if response_path:
         Path(response_path).write_bytes(result)
     return result
+
+
+_DOWNLOAD_CHUNK = 1 << 20
+
+
+def download(url, path):
+    """Stream one URL into path without holding the body in memory.
+
+    The body goes to a unique temporary file next to the destination and only
+    replaces it once the whole body arrives: a failed request keeps the old
+    target, and a body shorter than its Content-Length is raised like the
+    unchunked read it replaces instead of being written. The body itself is
+    never retained, so that error carries no partial bytes.
+    """
+    path = Path(path)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent,prefix=path.name+'.',suffix='.part')
+    try:
+        with os.fdopen(descriptor,'wb') as target, urllib.request.urlopen(url,timeout=None) as response:
+            expected = getattr(response,'length',None)
+            shutil.copyfileobj(response,target,_DOWNLOAD_CHUNK)
+            written = target.tell()
+        if expected is not None and written != expected:
+            raise http.client.IncompleteRead(b'',expected)
+        os.replace(temporary,path)
+    except BaseException as failure:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        if isinstance(failure, urllib.error.HTTPError):
+            failure.provider_message = _provider_message(failure.read())
+        raise
+    return path
 
 
 def post_json(url, payload, *, key=None, response_path=None):
@@ -745,10 +786,14 @@ def edit_image(source, prompt, config, directory, *, name='generated', style_ref
     result = response['data'][0]
     encoded = result.pop('b64_json',None)
     inline = bool(encoded)
-    pixels = base64.b64decode(encoded) if inline else request(result['url'])
-    del encoded
+    pixels = None
     path = directory / (name + '-native.png')
-    path.write_bytes(pixels)
+    if inline:
+        pixels = base64.b64decode(encoded)
+        del encoded
+        path.write_bytes(pixels)
+    else:
+        download(result['url'],path)
     with open_rgb(path) as image:
         image.load()
     if inline:
@@ -789,7 +834,7 @@ def comfy_upscale(source, config, directory):
             output = result.get('outputs', {}).get('4', {}).get('images')
             if output:
                 path = directory / 'generated-sr.png'
-                path.write_bytes(request(base + '/view?' + urllib.parse.urlencode(output[0])))
+                download(base + '/view?' + urllib.parse.urlencode(output[0]),path)
                 return path
             if result.get('status', {}).get('completed'):
                 raise RuntimeError('ComfyUI finished without an SR image; see the saved history file')
@@ -867,7 +912,7 @@ def extract_head_mask(image, config, directory, *, edit_hair=False, headwear=())
                 returned = {}
                 for name,(node,filename) in masks.items():
                     path = directory/filename
-                    path.write_bytes(request(base+'/view?'+urllib.parse.urlencode(outputs[node]['images'][0])))
+                    download(base+'/view?'+urllib.parse.urlencode(outputs[node]['images'][0]),path)
                     returned[name] = open_rgb(path)
                 return returned
             if result.get('status',{}).get('completed'):

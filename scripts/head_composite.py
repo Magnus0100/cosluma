@@ -59,16 +59,26 @@ def _align_head(source, target, alpha, source_box, original_size):
     return transform.astype(np.float32),len(good),int(inliers.sum())
 
 
-def restore_head(original, generated, head_box, config, directory, progress, *, edits=None, headwear=()):
-    """Extract one primary head, retain its camera pixels, and blend it once."""
-    edits = normalise_edits(edits)
+def prepare_head(original, head_box):
+    """Detach the one original head crop so the full frame can be released early."""
     height,width = original.shape[:2]
     box = np.rint(np.array(head_box)*np.array([width,height,width,height])/1000).astype(int)
     box = np.maximum(0,np.minimum(box,[width,height,width,height]))
     x0,y0,x1,y1 = box
     if x1<=x0 or y1<=y0:
         raise ValueError('The prompt writer returned an empty head region')
-    source = original[y0:y1,x0:x1]
+    # A slice would keep the whole original frame alive as its base; a
+    # contiguous copy owns its own buffer and retains no full photograph.
+    return original[y0:y1,x0:x1].copy(),box.tolist(),(width,height)
+
+
+def restore_head(head, generated, box, original_size, config, directory, progress, *, edits=None, headwear=()):
+    """Blend one detached original head crop onto the generated frame once."""
+    edits = normalise_edits(edits)
+    box = np.asarray(box)
+    x0,y0,x1,y1 = box
+    width,height = original_size
+    source = head
     progress('提取原片脸部与具体头饰' if edits['hair'] else '提取原片整头')
     model_input = to_preview(source,config['head'].get('input_max_edge',2048))
     masks = extract_head_mask(model_input,config['head'],directory,edit_hair=edits['hair'],headwear=headwear)

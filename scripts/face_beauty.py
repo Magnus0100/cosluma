@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from image_io import open_photo, open_rgb, save_image, save_jpeg, save_json, to_preview
-from model_clients import multipart, post_json, request
+from model_clients import download, multipart, post_json, request
 
 BEAUTY_DEFAULTS = {'url':'http://127.0.0.1:8188', 'analysis_model':'facexformer.safetensors',
     'landmark_model':'fgtbt.safetensors',
@@ -73,7 +73,7 @@ def _run(graph, outputs, config, directory, name):
             if all(result.get('outputs', {}).get(node, {}).get('images') for node in outputs):
                 for node, filename in outputs.items():
                     image = result['outputs'][node]['images'][0]
-                    (directory/filename).write_bytes(request(base+'/view?'+urllib.parse.urlencode(image)))
+                    download(base+'/view?'+urllib.parse.urlencode(image),directory/filename)
                 return result
             if status.get('completed'):
                 raise RuntimeError('人脸美化服务未返回所需图片；已保留服务记录')

@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from image_io import save_json, to_preview
-from model_clients import multipart, post_json, request
+from model_clients import download, multipart, post_json, request
 
 
 RELIGHT_DEFAULTS = {'model_directory':'pixlrelight',
@@ -78,7 +78,7 @@ def transfer_lighting(source, target, alpha, config, directory):
         time.sleep(1)
     record = fields[0]
     path = directory/'relight-fields.npz'
-    path.write_bytes(request(base+'/view?'+urllib.parse.urlencode(record['file'])))
+    download(base+'/view?'+urllib.parse.urlencode(record['file']),path)
     with np.load(path,allow_pickle=False) as data:
         gain,bias = data['gain'],data['bias']
     if gain.shape!=(512,512,3) or bias.shape!=gain.shape or not (

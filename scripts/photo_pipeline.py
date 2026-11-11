@@ -12,7 +12,7 @@ import uuid
 
 from image_io import apply_tone_curve, fit_generated, image_size, open_photo, open_rgb, save_image, save_jpeg, save_json
 from model_clients import discussion_user_requirements, edit_image, plan_photos, superresolve, write_prompt
-from head_composite import restore_head
+from head_composite import prepare_head, restore_head
 from creative_edits import normalise_edits, edits_match
 from delivery_store import result_path
 
@@ -94,6 +94,11 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             record['existing_generated'] = str(generated)
         record['files']['generated_native'] = str(generated)
         record['native_dimensions'] = list(image_size(generated))
+        stage('准备原片整头')
+        head,head_box,original_size = prepare_head(source_image,record['head_box'])
+        # The detached crop owns its pixels, so the full-resolution original is
+        # released here instead of after the composite.
+        del source_image
         stage('匹配生成画面尺寸')
         if superresolved is None:
             returned,record['sr'] = superresolve(generated,requested,config.get('sr'),directory,stage)
@@ -112,10 +117,10 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         if output_size != requested:
             record['output_adjustment'] = 'single-pass SR coverage'
             report(f'请求 {requested[0]}×{requested[1]}，实际输出 {output_size[0]}×{output_size[1]}')
-        stage('准备原片整头')
-        final,record['head'] = restore_head(source_image,frame,record['head_box'],config,directory,stage,
+        stage('对齐并融合原片整头')
+        final,record['head'] = restore_head(head,frame,head_box,original_size,config,directory,stage,
             edits=edits,headwear=record.get('headwear',()))
-        del source_image, frame
+        del head, frame
         record['head_blending'] = record['head']['method']
         if config.get('finish_curve'):
             stage('调整整图明度层次')
