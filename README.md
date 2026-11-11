@@ -1,8 +1,8 @@
 # CosLuma
 
-**本地稳定版 0.26.0 · Windows x64 · 源码使用 Python 3.12**
+**本地稳定版 0.27.0 · Windows x64 · 源码使用 Python 3.12**
 
-0.26.0 包含 PIXLRelight 人物重打光、FGTBT 98 点人脸定位，以及补发与露网修补、发束造型、双下巴修饰三个成片后编辑入口；收齐了真实制作流程中的内存释放、头饰保留、局部肤色融合和版本恢复修复。以下说明对应本版源码与本地构建，旧候选包不对应最终修复。0.26.0 尚未公开发布，公开下载仍为 0.25.3；模型节点需按对应章节更新并重启服务。
+0.27.0 在 0.26.0 的 PIXLRelight 人物重打光、FGTBT 98 点人脸定位与三个成片后编辑入口之上，把可选的 MiniMax-H3-Image 局部修饰引擎并入新的 Windows 桌面版，不再只是实验分支上的代码。H3 仍是可选引擎：默认与未配置时都用 Qwen-Image-2.1，不会自动启用，也不会自动替换已有结果；它在细发丝区域可能显得偏密、偏硬，现有真实样片没有证明它普遍优于 Qwen，具体限制随局部修饰章节说明。0.27.0 尚未公开发布，公开下载仍为 0.25.3；模型节点需按对应章节更新并重启服务。以下说明对应本版源码与本地构建，构建与校验结果以实际产出为准。
 
 按项目整理一组照片和角色，与摄影 Agent 讨论创作方向，比较同一张原片的三个真实样片，由用户定稿后再制作整组 COS 摄影后期；保留本人五官、脸型和相机细节。创作时可独立开启修发与人物重打光，两项默认关闭。
 
@@ -34,7 +34,7 @@ flowchart TD
 
 ## 下载与首次使用
 
-本地稳定版 Windows 包名为 `CosLuma-0.26.0-windows-x64.zip`，完整解压后打开 `CosLuma/CosLuma.exe`；同提交源码包名为 `CosLuma-0.26.0-source.zip`，使用同目录 `SHA256SUMS.txt` 核对文件。旧的 0.26.0 候选包不包含最终修复，请勿混用。公开下载仍是 0.25.3，其中没有本版新增的重打光、FGTBT 与局部修饰。
+本地稳定版 Windows 包名为 `CosLuma-0.27.0-windows-x64.zip`，完整解压后打开 `CosLuma/CosLuma.exe`；同提交源码包名为 `CosLuma-0.27.0-source.zip`，使用同目录 `SHA256SUMS.txt` 核对文件。0.27.0 尚未公开发布，下面的下载链接仍指向 0.25.3，其中没有本版新增的重打光、FGTBT、可选 H3 引擎与局部修饰。
 
 [下载 Windows 包](https://github.com/Magnus0100/cosluma/releases/download/v0.25.3/CosLuma-0.25.3-windows-x64.zip) · [Release 与校验文件](https://github.com/Magnus0100/cosluma/releases/tag/v0.25.3)
 
@@ -344,7 +344,7 @@ Agent 根据原片可见内容和本轮要求，按分类与摄影关键词搜�
 | `finish_curve` | 可选的归一化 `[输入明度, 输出明度]` 数组，默认不调整 |
 | `beauty` | 可选人脸美化的 ComfyUI 地址、模型名与明确的人脸分析设备；在美化页单独保存，未配置不影响基础制作 |
 | `relight` | 可选人物重打光的 ComfyUI 地址、PIXLRelight 与 Marigold 目录、设备和种子；在连接设置中保存，创作开关独立 |
-| `local_edit` | 成片后局部修饰的 ComfyUI 地址和 Qwen 生成模型、文本编码器、VAE 文件名；在局部修饰页单独保存 |
+| `local_edit` | 成片后局部修饰的引擎选择 `engine`（`qwen` 或 `h3`）、Qwen 引擎的 ComfyUI 地址与三个权重文件名（顶层字段），以及可选 H3 引擎的独立配置 `local_edit.h3`；在局部修饰页单独保存 |
 | `python` | 源码启动器使用的已有 Python 路径；Windows 包不使用 |
 
 ### 接口约定
@@ -405,7 +405,9 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 “模型下载”中的 PIXLRelight 命令取得固定版本上游源码、完整 `model.safetensors` 和 `config.yaml`，以及对应 Marigold 的 FP16 推理组件。默认放在 `models/cosluma_relight/pixlrelight` 和 `models/cosluma_relight/marigold-iid-lighting-v1-1`；连接中可明确填写服务机器的绝对目录。
 `relight.url` 指向该 ComfyUI，`model_directory`、`intrinsics_directory`、`device` 和 `seed` 对应实际目录、设备与种子。参考分解固定单步；模型在独立进程加载，成功或失败均释放 CPU/CUDA 权重，不自动下载或换模型。原始光照场保存为 `relight-fields.npz`，模型配置和工作流随该张制作记录保留。
 
-成片后的三个局部修饰使用支持 `TextEncodeQwenImage21`、`QwenImage21Cache` 的 ComfyUI。将 `providers/comfyui_cosluma_local` 复制到服务的 `custom_nodes` 后重启。`CosLumaQwenLocalEdit` 在现有服务 Python 的独立进程中调用这些接口，编码完成后释放文本编码器再加载生成模型。“局部修饰连接”明确指定每次使用的权重文件，“模型下载”提供固定版本文件：
+成片后的三个局部修饰可选 Qwen-Image-2.1（默认）与 0.27.0 起随桌面版提供的可选 MiniMax-H3-Image 引擎，由“局部修饰连接”的引擎下拉框明确指定；缺少或未配置引擎时按 Qwen-Image-2.1 运行，运行中不切换也不 fallback。两个引擎分别保存地址与三个权重文件名，切换只改变下一次生成使用的引擎，不覆盖另一个引擎已保存的路径。H3 不是自动采纳的更好方案：它在细发丝区域可能比原片更密、更硬，会重新生成所提供的编辑视图（颈部用整图，发丝用细节图加完整照片上下文），现有真实样片没有证明它普遍优于 Qwen；是否使用由用户明确选择，默认始终是 Qwen。
+
+Qwen 引擎使用支持 `TextEncodeQwenImage21`、`QwenImage21Cache` 的 ComfyUI。将 `providers/comfyui_cosluma_local` 复制到服务的 `custom_nodes` 后重启。`CosLumaQwenLocalEdit` 在现有服务 Python 的独立进程中调用这些接口，编码完成后释放文本编码器再加载生成模型。“局部修饰连接”明确指定每次使用的权重文件，“模型下载”提供固定版本文件：
 
 | 字段 | 服务目录 / 文件 |
 | --- | --- |
@@ -413,8 +415,18 @@ GPU、驱动与内存由服务部署者明确配置，客户端不自动切换�
 | `local_edit.clip` | `models/text_encoders/qwen3vl_8b_bf16.safetensors`，约 17.53 GB |
 | `local_edit.vae` | `models/vae/qwen_image_2.1_vae_bf16.safetensors`，约 676 MB |
 
-局部编辑默认使用 INT8 ConvRot 生成权重，Qwen3-VL 编码器与 VAE 保持 BF16；连接中可明确指定其他受该服务支持的文件，不在运行时切换。固定 1024 面积分辨率（按原局部宽高比取 32 的倍数）、40 步、guidance/cfg 1、Euler/simple、seed 42。文本编码器保持完整 BF16，明确使用 CUDA 计算与 ComfyUI 原生低显存 CPU 卸载，避免在 CPU 上同时保留大幅参考图的注意力工作区；编码完成后释放文本编码器，再加载生成模型。无损 KV 缓存使用 CPU 内存，生成模型使用 CUDA；VAE 编码与解码预先配置为 512 像素分块、64 像素重叠，不在出错后改变布局。每次生成的独立进程退出时释放全部模型与执行缓存；生成区域需要超分时另外调用已有 `sr.url`、`sr.model`，输出和工作流随会话保存，查看或另存已有结果不加载模型。实际权重存储类型与计算精度分别记录。下载与安装仅由用户主动执行；不会升级 BeautyGRPO 的 Diffusers 或改变其官方推理。
-颈部修饰回写前，从涂选范围外的邻近未编辑上下文估计生成图的 RGB 偏移，只校正生成局部的附带肤色漂移，再做向内羽化；上下文和全部范围外原图像素不写入改动。原始模型图保留不变，已有结果可重新比较并另存，无需重新生图。
+Qwen 引擎默认使用 INT8 ConvRot 生成权重，Qwen3-VL 编码器与 VAE 保持 BF16；连接中可明确指定其他受该服务支持的文件，不在运行时切换。固定 1024 面积分辨率（按原局部宽高比取 32 的倍数）、40 步、guidance/cfg 1、Euler/simple、seed 42。文本编码器保持完整 BF16，明确使用 CUDA 计算与 ComfyUI 原生低显存 CPU 卸载，避免在 CPU 上同时保留大幅参考图的注意力工作区；编码完成后释放文本编码器，再加载生成模型。无损 KV 缓存使用 CPU 内存，生成模型使用 CUDA；VAE 编码与解码预先配置为 512 像素分块、64 像素重叠，不在出错后改变布局。每次生成的独立进程退出时释放全部模型与执行缓存；生成区域需要超分时另外调用已有 `sr.url`、`sr.model`，输出和工作流随会话保存，查看或另存已有结果不加载模型。实际权重存储类型与计算精度分别记录。下载与安装仅由用户主动执行；不会升级 BeautyGRPO 的 Diffusers 或改变其官方推理。
+
+可选 H3 引擎是官方 MiniMax-H3-Image 的图像编辑（以被编辑图为条件编辑）。H3 对提供的编辑视图生成完整输出，不是原生蒙版修复：颈部使用整张已保存照片；补发和发束以细节裁图为 Picture 1、完整照片为 Picture 2 上下文参考。该模型没有蒙版条件通道，涂选范围不送进文本编码器或参考条件，只决定软件最终写回哪些像素（按 float32 蒙版写回，因为 VAE 重建不等于原图像素）。节点只接受图片、提示词、分辨率、步数、seed 与权重文件名，既没有蒙版输入也没有步数窗口输入：每次生成都是从空潜变量出发、跑完整 6 段蒸馏网格的官方图像编辑，没有任何采样器蒙版或步数保护。节点类与提示词输入编号由所选引擎决定：将 `providers/comfyui_cosluma_h3` 复制到已包含 `MiniMaxH3ImageConditioning` 的 ComfyUI 的 `custom_nodes` 后重启。`CosLumaH3ImageEdit` 用同一套现有 Python 把一次生成拆成文本与参考图条件、DiT 采样、VAE 解码三个短进程并依次运行：任一时刻只有一个阶段驻留权重，两个大权重不会同时加载；每个阶段结束即退出进程，由系统回收该阶段权重，阶段内不把已用完的模型转存回 CPU。阶段之间的条件张量与采样潜变量保存为 `condition.pt`、`latent.pt`，各阶段日志与 `model.json` 一并保留；失败时保留已完成阶段的文件与记录，不自动重跑。连接中为该引擎单独填写地址与文件：
+
+| 字段 | 服务目录 / 文件 |
+| --- | --- |
+| `local_edit.h3.model` | `models/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors`，约 20.98 GB |
+| `local_edit.h3.clip` | `models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`，约 15.69 GB |
+| `local_edit.h3.vae` | `models/vae/minimax_h3_image_vae_fp16.safetensors`，约 1.17 GB |
+
+H3 引擎默认使用官方推荐的 INT8 ConvRot 生成权重、2048 面积分辨率（面积约 4 MP，与官方图像编辑工作流的画布一致；1:1 时 2048×2048，其他比例按同一像素面积与整张照片的宽高比换算并对齐 32 像素网格）、6 步、cfg 1、Euler/simple、seed 42。输入按任务不同：颈部把整张照片在取条件前按自身宽高比用 LANCZOS 缩放到该画布再交给原生节点，与官方工作流先缩放输入图、再从该图取条件宽高的做法一致；补发与发束造型改以 `image1` 为原像素的涂选细节裁切（服务端再按同一面积规则把它缩放到画布，细裁切因此保留更多发丝密度），`image2` 是整张照片按长边（max_edge）1536 缩小的上下文参考图，只作模型参考、不参与回贴——两者都走原生节点已有的通用多参考接口，这是桌面端的输入策略，不是官方训练过的局部重绘配方。这一步只重采样已有照片，不产生新细节；其余参考图（形状标记合成图、风格参考）仍按原生短边 1024–2048 的规则缩放，条件参考的像素尺寸因此可能与画布不同；实际文件名、画布尺寸、涂选裁切与上下文预览的像素尺寸、步数、权重存储类型与计算精度随本次会话记录；步数由权重文件的 PDD 输出头决定，与文件记录不一致时该次生成直接报错，不改成其他步数继续。提示词按该引擎约定以 `<Picture 1>` 指代整张照片，写成一条直接指令并原样附上用户填写的要求，不接提示词增强模型，也不替用户改写意图或否定句；界面提示只说明要描述希望得到的最终外观、尽量简短（例如“颈部皮肤自然平滑”），留空时使用该任务的简短正面默认句（颈部 Gently smooth the neck skin for a natural portrait finish.；补发把头发修成与相邻发色、质感一致的连续自然发丝；发束按用户给的方向梳理成自然流动的发丝），不自动追加毛孔、纹理、光照或保护清单。该图只有图片条件通道，提示词因此不描述蒙版、白色/黑色区域或写回范围。涂选为空时界面直接报错（“局部修饰失败：请先涂出需要修改的范围”），不改用其他引擎或参数。输出保留模型原生尺寸并记录，原始输出（完整 6 步结果）另行保留：原生输出覆盖不了整张照片时，使用“分割与超分”中已配置的模型超分一次再缩小到写回尺寸；未配置超分时保留原始输出并明确失败，不插值放大，也不自动回退到其他引擎或其他参数。写回是 float32 蒙版合成：H3 三个任务都只在涂选内部的相邻像素之间按模型渲染的梯度求解（跨蒙版边界的梯度引导为零，边界处固定为原片像素值），再做一次向内羽化的柔和覆盖——输入范围仍按任务区分（颈部整图，补发与发束造型是细节裁切＋整图参考）。Qwen 颈部沿用历史的中值邻域 RGB 校正，Qwen 的补发与发束造型仍是普通 float32 蒙版与向内羽化。羽化向内收，范围外像素逐值保持。这类处理只为降低局部贴回时的整体偏移，不保证所有接缝都完全无痕；涂选范围只决定软件写回哪些像素，不是模型端的空间保护。画布按 32 像素对齐后与照片的宽高比可能略有差别，写回前按共用规则等比例居中裁掉少量像素后下采样，不拉伸。两个引擎的原生输出、会话与工作流分别保存；切换引擎不使已有结果失效，查看、比较与另存已有结果都不重新生成。选择 H3 时“模型下载与部署方法”打开 [Comfy Org 的 MiniMax-H3-Image 模型卡](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/blob/892de7cb61df49753bf15145a711154803a355cb/README.md)（固定 revision，不放视频模型的 MiniMax-H3 仓库）；Qwen 引擎仍打开原有的下载与部署说明。
+Qwen 颈部修饰回写前，从涂选范围外的邻近未编辑上下文估计生成图的 RGB 偏移，只校正生成局部的附带肤色漂移，再做向内羽化；上下文和全部范围外原图像素不写入改动。原始模型图保留不变，已有结果可重新比较并另存，无需重新生图。
 
 ### 可选美化节点与权重
 
@@ -610,7 +622,7 @@ README 中的模型与参数描述当前源码行为；开发时可按任务改�
 | PIXLRelight 光照场请求与原尺寸调制 | `scripts/relighting.py`、`providers/comfyui_cosluma_relight/` |
 | 人脸美化会话、局部调整与界面 | `scripts/face_beauty.py`、`scripts/beauty_editor.py` |
 | FGTBT 分析与官方 BeautyGRPO 推理服务 | `providers/comfyui_cosluma_beauty/` |
-| 成片后局部修饰、蒙版合成与界面 | `scripts/local_retouch.py`、`scripts/local_editor.py`、`providers/comfyui_cosluma_local/` |
+| 成片后局部修饰、蒙版合成与界面 | `scripts/local_retouch.py`、`scripts/local_editor.py`、`providers/comfyui_cosluma_local/`、`providers/comfyui_cosluma_h3/` |
 | 图片解码、浮点数据、位深与色彩保存 | `scripts/image_io.py` |
 | 提示词目录、配置与凭据引用 | `scripts/prompt_library.py`、`scripts/settings.py` |
 | 桌面主窗、导航与首次欢迎 | `scripts/qt_workbench.py` |

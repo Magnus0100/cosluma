@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog
     QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
 from image_io import display_image, open_photo, save_image, save_json
-from local_retouch import LOCAL_DEFAULTS, TASKS, generate_local, retouch_crop, save_local
+from local_retouch import (H3_DEFAULTS, LOCAL_DEFAULTS, LOCAL_ENGINES, LOCAL_KEYS, TASKS,
+    generate_local, retouch_crop, save_local)
 from model_downloads import ModelDownloads
 from service_settings import endpoint_url
 from settings import load_settings
@@ -123,27 +124,39 @@ class LocalConnection(QDialog):
         super().__init__(parent)
         self.path = Path(path)
         self.config = load_settings(path)
-        values = {**LOCAL_DEFAULTS,'url':self.config.get('head',{}).get('url',LOCAL_DEFAULTS['url']),
-            **self.config.get('local_edit',{})}
+        stored = self.config.get('local_edit',{})
+        fallback = self.config.get('head',{}).get('url',LOCAL_DEFAULTS['url'])
+        self.engine = stored.get('engine') if stored.get('engine') in LOCAL_ENGINES else 'qwen'
+        # Both engines keep their own values; only the selected one runs, and neither is rewritten.
+        self.values = {'qwen':{key:stored.get(key,LOCAL_DEFAULTS[key]) for key in LOCAL_KEYS},
+            'h3':{key:(stored.get('h3') or {}).get(key,H3_DEFAULTS[key]) for key in LOCAL_KEYS}}
+        self.values['qwen']['url'] = stored.get('url',fallback)
         self.setWindowTitle('局部修饰连接')
-        self.resize(680,430)
+        self.resize(680,470)
         layout = QVBoxLayout(self)
-        note = ui_label('使用支持 Qwen-Image-2.1 的 ComfyUI。三个修饰任务共用以下固定模型，保存连接不开始生成。')
+        note = ui_label('使用支持所选引擎的 ComfyUI。两个引擎分别保存地址与权重文件名，三个修饰任务共用；保存连接不开始生成。')
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
+        self.engine_field = QComboBox()
+        for key,engine in LOCAL_ENGINES.items():
+            self.engine_field.addItem(engine['label'],key)
+        self.engine_field.setCurrentIndex(self.engine_field.findData(self.engine))
+        self.engine_field.currentIndexChanged.connect(self.change_engine)
+        form.addRow('局部编辑引擎',self.engine_field)
         self.fields = {}
-        for key,label in (('url','ComfyUI 地址'),('model','Qwen-Image-2.1 模型文件'),
-                ('clip','Qwen3-VL 编码器文件'),('vae','Qwen-Image-2.1 VAE')):
-            field = QLineEdit(str(values[key]))
+        for key,label in (('url','ComfyUI 地址'),('model','生成模型文件'),
+                ('clip','文本编码器文件'),('vae','VAE 文件')):
+            field = QLineEdit(str(self.values[self.engine][key]))
             self.fields[key] = field
             form.addRow(label,field)
         layout.addLayout(form)
-        note = ui_label('固定 1024 分辨率、40 步、seed 42。文本编码器和无损 KV 缓存放在内存，编码后释放文本编码器。原生输出不足时使用“分割与超分”中已配置的模型超分一次，再缩小到修改区域。')
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.note = ui_label('')
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+        self.show_note()
         download = QPushButton('模型下载与部署方法')
-        download.clicked.connect(lambda:ModelDownloads(self,model='local').exec())
+        download.clicked.connect(self.open_download)
         layout.addWidget(download)
         self.message = ui_label('')
         self.message.setWordWrap(True)
@@ -153,13 +166,41 @@ class LocalConnection(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def open_download(self):
+        if self.engine=='h3':
+            QDesktopServices.openUrl(QUrl(LOCAL_ENGINES['h3']['card']))
+            return
+        ModelDownloads(self,model='local').exec()
+
+    def field_values(self):
+        return {**self.values[self.engine],
+            **{key:field.text().strip() for key,field in self.fields.items()}}
+
+    def change_engine(self):
+        self.values[self.engine] = self.field_values()
+        self.engine = self.engine_field.currentData()
+        for key,field in self.fields.items():
+            field.setText(str(self.values[self.engine][key]))
+        self.show_note()
+
+    def show_note(self):
+        values = self.values[self.engine]
+        extra = {'qwen':'文本编码器在 CUDA 计算并卸载到 CPU，无损 KV 缓存放在内存，编码后释放文本编码器。',
+            'h3':'步数由权重蒸馏决定，不符时服务端直接报错；提示词以 <Picture N> 指代输入图片，不使用提示词增强模型。'}[self.engine]
+        self.note.setText(f"使用 {values['resolution']} 面积分辨率、{values['steps']} 步、seed {values['seed']}。"+extra+
+            '原生输出不足时使用“分割与超分”中已配置的模型超分一次，再缩小到修改区域。')
+
     def save(self):
         try:
-            values = {key:field.text().strip() for key,field in self.fields.items()}
-            if any(not value for value in values.values()):
-                raise ValueError('请填写实际服务地址和模型文件名')
-            values['url'] = endpoint_url(values['url'],'local_edit')
-            self.config['local_edit'] = {**LOCAL_DEFAULTS,**values}
+            self.values[self.engine] = self.field_values()
+            for key in ('url','model','clip','vae'):
+                if not self.values[self.engine][key]:
+                    raise ValueError('请填写实际服务地址和模型文件名')
+            self.values['qwen']['url'] = endpoint_url(self.values['qwen']['url'],'local_edit')
+            self.values['h3']['url'] = endpoint_url(self.values['h3']['url'],'local_edit')
+            self.config['local_edit'] = {'engine':self.engine,
+                **{key:self.values['qwen'][key] for key in LOCAL_KEYS},
+                'h3':{key:self.values['h3'][key] for key in LOCAL_KEYS}}
             save_json(self.path,self.config)
             self.accept()
         except (OSError,ValueError) as error:
@@ -283,6 +324,11 @@ class LocalRetouchEditor(QWidget):
         self.brief.setMaximumHeight(150)
         self.brief.textChanged.connect(self.invalidate_result)
         controls.addWidget(self.brief)
+        self.brief_hint = ui_label('MiniMax-H3-Image 会重新生成编辑视图，涂选范围只决定最终写回哪些像素：'
+            '这里描述希望得到的最终外观，尽量简短；例如：颈部皮肤自然平滑。')
+        self.brief_hint.setWordWrap(True)
+        self.brief_hint.setVisible(False)
+        controls.addWidget(self.brief_hint)
         self.reference = QLineEdit()
         self.reference.setPlaceholderText('可选：发色或发束参考图')
         self.reference.textChanged.connect(self.invalidate_result)
@@ -455,10 +501,18 @@ class LocalRetouchEditor(QWidget):
             native = state.get('model_output_dimensions',[])
             detail = state.get('detail_dimensions')
             x0,y0,x1,y1 = state['box']
-            info = f'模型原生 {native[0]} × {native[1]}' if native else '已有模型输出'
+            label = LOCAL_ENGINES.get(state.get('engine'),{}).get('label')
+            info = (label+' · ' if label else '')+(f'模型原生 {native[0]} × {native[1]}' if native else '已有模型输出')
             if state.get('superresolution'):
                 info += f'\n一次超分 {detail[0]} × {detail[1]}'
-            info += f'\n写回局部 {x1-x0} × {y1-y0}'
+            # The label has to say which pictures the engine actually received.
+            scope = state.get('input_scope')
+            if scope=='full_saved_photo':
+                info += f'\n处理画布 {x1-x0} × {y1-y0}；仅涂选像素写回'
+            elif scope=='detail_crop_with_full_photo_context':
+                info += f'\n编辑视图 {x1-x0} × {y1-y0}；完整照片作参考；仅涂选像素写回'
+            else:
+                info += f'\n写回局部 {x1-x0} × {y1-y0}'
             width,height = state['source_dimensions']
             info += f'\n另存整图 {width} × {height} · 16 位 PNG'
             self.result_info.setText(info)
@@ -494,9 +548,22 @@ class LocalRetouchEditor(QWidget):
         self.update_controls()
         self.busy_changed.emit()
 
+    def refresh_engine_note(self):
+        """H3 regenerates the editing view and the selection only decides the writeback, so its brief
+        asks for the final appearance only.
+
+        Only the hint and the placeholder change; draft or user text is never rewritten, and the
+        Qwen wording stays exactly as before.
+        """
+        h3 = (self.config or {}).get('engine')=='h3'
+        self.brief_hint.setVisible(h3)
+        self.brief.setPlaceholderText('描述希望得到的最终外观，尽量简短；例如：颈部皮肤自然平滑。'
+            if h3 else '可留空；发束造型可写方向、轮廓和幅度。')
+
     def update_controls(self):
         busy = self.is_busy()
         ready = self.pixels is not None
+        self.refresh_engine_note()
         for widget in (self.task,self.tool,self.brush,self.clear,self.brief,self.reference,
                 self.reference_button,self.canvas):
             widget.setEnabled(ready and not busy)
