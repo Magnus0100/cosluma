@@ -358,6 +358,7 @@ class PhotoCanvas(QGraphicsView):
         self.display.hide()
         self.display_key = None
         self.fitting = True
+        self.zoom_intent = None
         self.empty_message = ''
 
     def setPixmap(self, pixels, *, preserve_view=False):
@@ -380,6 +381,7 @@ class PhotoCanvas(QGraphicsView):
 
     def fit_photo(self):
         self.fitting = True
+        self.zoom_intent = 'fit'
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         if not self.photo.pixmap().isNull():
@@ -404,6 +406,7 @@ class PhotoCanvas(QGraphicsView):
         self.zoom_changed.emit()
 
     def actual_size(self):
+        self.zoom_intent = 'actual'
         self.set_zoom(1.0/self.devicePixelRatioF())
 
     def update_display_copy(self):
@@ -500,12 +503,18 @@ class PreviewSignals(QObject):
     finished = Signal()
 
 
+# Fit view never shows more than the viewport, so it reads a bounded copy instead
+# of the whole original. This is the same bound the face-range dialog passes to
+# open_display; the file's own pixels stay untouched until 100% asks for them.
+PREVIEW_MAX_EDGE = 2000
+
 
 class PreviewLoader(QRunnable):
-    """Decode native display pixels in the pool; create pixmaps on the GUI thread."""
-    def __init__(self, keys):
+    """Decode display pixels in the pool; create pixmaps on the GUI thread."""
+    def __init__(self, keys, max_edge=PREVIEW_MAX_EDGE):
         super().__init__()
         self.keys = keys
+        self.max_edge = max_edge
         self.signals = PreviewSignals()
         self.cancelled = Event()
 
@@ -514,7 +523,7 @@ class PreviewLoader(QRunnable):
             if self.cancelled.is_set():
                 break
             try:
-                image, error = open_display(key[0]), ''
+                image, error = open_display(key[0], max_edge=self.max_edge), ''
             except Exception as exception:
                 image, error = None, str(exception)
             if not self.cancelled.is_set():
@@ -553,6 +562,10 @@ class PhotoPreview(QWidget):
         self.source = None
         self.output = None
         self.direct_images = False
+        self.direct_sources = {}
+        self.native_requested = False
+        self.native_zoom = None
+        self.image_edges = {}
         self.preserve_view = False
         self.saved_views = {}
         self.choice = 'compare'
@@ -622,6 +635,7 @@ class PhotoPreview(QWidget):
         layout.addLayout(tools)
         for view in (self.preview,self.before,self.after):
             view.zoom_changed.connect(self.update_zoom_label)
+            view.zoom_changed.connect(lambda view=view:self.view_mode_changed(view))
         for view in (self.before,self.after):
             view.zoom_changed.connect(lambda view=view:self.synchronize(view,zoom=True))
             view.pan_changed.connect(lambda view=view:self.synchronize(view,zoom=False))
@@ -641,21 +655,38 @@ class PhotoPreview(QWidget):
     def read_preview(self, path, *, full=False):
         if not path:
             return None
+        edge = None if full else 360
         try:
-            key = (str(path), Path(path).stat().st_mtime_ns,full)
+            key = (str(path), Path(path).stat().st_mtime_ns,edge)
         except OSError:
             return None
         pixels = self.cached_preview(key)
         if pixels is None and key not in self.errors:
             try:
-                pixels = QPixmap.fromImage(open_display(path, max_edge=None if full else 360))
+                pixels = QPixmap.fromImage(open_display(path, max_edge=edge))
                 self.store_preview(key,pixels)
             except Exception as error:
                 self.store_preview(key,None,str(error))
         return pixels
 
+    def request_edge(self):
+        """Read size for the current view: file pixels only for an explicit 100% view."""
+        return None if self.native_requested else PREVIEW_MAX_EDGE
+
+    def rebuild_keys(self):
+        """Rebuild the cached keys for the current read size, keeping paths only."""
+        self.keys = {}
+        edge = self.request_edge()
+        for kind,path in (('source',self.source),('output',self.output)):
+            if path:
+                try:
+                    self.keys[kind] = (str(path),Path(path).stat().st_mtime_ns,edge)
+                except OSError:
+                    self.keys[kind] = None
+
     def set_photo(self, source=None, output=None, *, preserve_view=False):
         self.direct_images = False
+        self.direct_sources = {}
         self.preserve_view = preserve_view
         self.saved_views = {}
         if preserve_view:
@@ -665,15 +696,10 @@ class PhotoPreview(QWidget):
                         view.mapToScene(view.viewport().rect().center()))
         previous_keys, previous_images = self.keys,self.images
         self.source, self.output = source, output
-        self.keys = {}
-        for kind,path in (('source',source),('output',output)):
-            if path:
-                try:
-                    self.keys[kind] = (str(path),Path(path).stat().st_mtime_ns,True)
-                except OSError:
-                    self.keys[kind] = None
+        self.rebuild_keys()
         self.images = {kind:previous_images[kind] for kind,key in self.keys.items()
             if self.isVisible() and previous_keys.get(kind)==key and kind in previous_images}
+        self.image_edges = {kind:edge for kind,edge in self.image_edges.items() if kind in self.images}
         if self.loader is not None and previous_keys!=self.keys:
             self.loader.cancelled.set()
         self.mode.blockSignals(True)
@@ -684,11 +710,35 @@ class PhotoPreview(QWidget):
         if self.isVisible():
             self.load_timer.start()
 
+    def direct_images_at(self, native):
+        """Canvas pixmaps for the in-memory editor images at the current read size.
+
+        The editor keeps the 16-bit working image itself; this only decides how
+        many display pixels the canvas holds.
+        """
+        edge = None if native else PREVIEW_MAX_EDGE
+        images = {}
+        built = {}
+        for kind, image in self.direct_sources.items():
+            if image is None:
+                continue
+            # The editor often passes the same image for both sides; the pixmap
+            # is built once and shared, so the canvas holds one buffer.
+            if id(image) not in built:
+                display = image
+                if edge is not None and max(display.width(), display.height()) > edge:
+                    display = display.scaled(edge, edge, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                built[id(image)] = QPixmap.fromImage(display)
+            images[kind] = built[id(image)]
+        return images
+
     def set_image_pair(self, before, after):
         """Show the beauty editor's in-memory images with the same native canvas."""
         self.load_timer.stop()
         self.direct_images = True
-        self.images = {'source':QPixmap.fromImage(before), 'output':QPixmap.fromImage(after)} if self.isVisible() else {}
+        self.direct_sources = {'source':before, 'output':after}
+        self.images = self.direct_images_at(self.native_requested) if self.isVisible() else {}
+        self.image_edges = {kind:self.request_edge() for kind in self.images}
         self.mode.blockSignals(True)
         self.mode.setCurrentIndex(self.mode.findData(self.choice))
         self.mode.setEnabled(True)
@@ -700,15 +750,18 @@ class PhotoPreview(QWidget):
             return
         visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
         for kind in visible:
-            if kind not in self.images and self.keys.get(kind) is not None:
-                pixels = self.cached_preview(self.keys[kind])
+            key = self.keys.get(kind)
+            if key is not None and self.image_edges.get(kind)!=key[2] and key not in self.errors:
+                pixels = self.cached_preview(key)
                 if pixels is not None:
                     self.images[kind] = pixels
+                    self.image_edges[kind] = key[2]
         self.update_preview()
         missing = list(dict.fromkeys(self.keys[kind] for kind in visible
-            if self.keys.get(kind) is not None and kind not in self.images and self.keys[kind] not in self.errors))
+            if self.keys.get(kind) is not None and self.image_edges.get(kind)!=self.keys[kind][2]
+            and self.keys[kind] not in self.errors))
         if missing:
-            self.loader = PreviewLoader(missing[:1])
+            self.loader = PreviewLoader(missing[:1], max_edge=self.request_edge())
             self.loader.signals.loaded.connect(self.previews_loaded)
             self.loader.signals.finished.connect(self.previews_finished)
             QThreadPool.globalInstance().start(self.loader)
@@ -716,6 +769,10 @@ class PhotoPreview(QWidget):
     @Slot(object)
     def previews_loaded(self, images):
         if not self.isVisible() or self.direct_images:
+            return
+        edge = self.request_edge()
+        images = {key:value for key,value in images.items() if key[2]==edge}
+        if not images:
             return
         visible = ('source','output') if self.mode.currentData()=='compare' else (self.mode.currentData(),)
         for key,(image,error) in images.items():
@@ -725,6 +782,7 @@ class PhotoPreview(QWidget):
                 self.store_preview(key,pixels,error)
                 if pixels is not None:
                     self.images.update({kind:pixels for kind in matching})
+                    self.image_edges.update({kind:edge for kind in matching})
         self.update_preview()
 
     @Slot()
@@ -761,7 +819,14 @@ class PhotoPreview(QWidget):
         for label, kind in targets:
             pixels = self.images.get(kind)
             if pixels is not None:
+                anchor = self.anchor_for(label,pixels)
                 label.setPixmap(pixels, preserve_view=self.direct_images or self.preserve_view)
+                if anchor is not None:
+                    if self.native_requested and self.native_zoom=='actual':
+                        label.actual_size()
+                    else:
+                        label.set_zoom(anchor[2])
+                    label.centerOn(anchor[0]*pixels.width(),anchor[1]*pixels.height())
                 previous = self.saved_views.pop(label,None)
                 if previous is not None and previous[0]==pixels.size():
                     label.set_zoom(previous[1])
@@ -778,6 +843,8 @@ class PhotoPreview(QWidget):
                 label.setText('原片不在原来的位置\n已保存的成片仍可查看')
             else:
                 label.setText('原片暂时无法预览\n可使用“打开原片”查看文件')
+        for view in (self.preview,self.before,self.after):
+            view.zoom_intent = None
         self.syncing = False
         self.linked.setEnabled(bool(page))
         self.update_zoom_label()
@@ -786,6 +853,14 @@ class PhotoPreview(QWidget):
         self.load_timer.stop()
         if self.loader is not None:
             self.loader.cancelled.set()
+        # The page comes back at fit size: no native pixels and no in-memory
+        # editor images are kept while it is away.
+        self.native_requested = False
+        self.native_zoom = None
+        self.image_edges = {}
+        self.direct_sources = {}
+        if not self.direct_images:
+            self.rebuild_keys()
         self.syncing = True
         for view in (self.preview,self.before,self.after):
             if not view.fitting and not view.photo.pixmap().isNull():
@@ -819,6 +894,7 @@ class PhotoPreview(QWidget):
             if zoom:
                 target.set_zoom(source.transform().m11()*pixels.width()/other.width())
             target.centerOn(center.x()/pixels.width()*other.width(),center.y()/pixels.height()*other.height())
+        target.zoom_intent = None
         self.syncing = False
         self.update_zoom_label()
 
@@ -826,11 +902,74 @@ class PhotoPreview(QWidget):
         if linked:
             self.synchronize(self.after,zoom=True)
 
+    def anchor_for(self, label, incoming):
+        """Relative centre and scale to hold while the canvas changes read size."""
+        current = label.photo.pixmap()
+        if label.fitting or current.isNull() or current.size()==incoming.size():
+            return None
+        point = label.mapToScene(label.viewport().rect().center())
+        # Scene coordinates are image pixels, so a bigger read needs a smaller
+        # scale to keep the same picture on screen.
+        scale = label.transform().m11()*current.width()/incoming.width()
+        return (point.x()/current.width(),point.y()/current.height(),scale)
+
+    def request_native(self, native, *, exact_zoom=False):
+        """Read the file's own pixels only for an explicit 100% view."""
+        native = bool(native)
+        if native == self.native_requested:
+            return
+        self.native_requested = native
+        self.native_zoom = ('actual' if exact_zoom else 'keep') if native else None
+        if self.loader is not None:
+            self.loader.cancelled.set()
+        if self.direct_images:
+            self.images = self.direct_images_at(native) if self.isVisible() else {}
+            self.image_edges = {kind:self.request_edge() for kind in self.images}
+            self.update_preview()
+            return
+        self.rebuild_keys()
+        # The pixmap on screen stays until the read for the new size lands; the
+        # canvas then keeps its apparent zoom and centre (anchor_for), and only
+        # the replacement is held afterwards.
+        if self.isVisible():
+            self.load_timer.start()
+
+    def projected_long_edge(self, view):
+        """Long edge of the shown pixmap on screen, in device pixels."""
+        pixels = view.photo.pixmap()
+        if pixels.isNull():
+            return 0.0
+        return max(pixels.width(),pixels.height())*view.transform().m11()*view.devicePixelRatioF()
+
+    def view_mode_changed(self, view):
+        """Keyboard, wheel and toolbar zoom decide the read size for both sides."""
+        if self.syncing or view.photo.pixmap().isNull():
+            return
+        intent,view.zoom_intent = view.zoom_intent,None
+        if intent=='actual':
+            self.request_native(True,exact_zoom=True)
+            return
+        if intent=='fit':
+            self.request_native(False)
+            return
+        # Compare the size actually shown: a native 9504 px canvas zoomed out and
+        # a 2000 px preview zoomed to fit must not flip the read size back and forth.
+        shown = self.projected_long_edge(view)
+        if shown>=PREVIEW_MAX_EDGE and not self.native_requested:
+            self.request_native(True)
+        elif shown<=PREVIEW_MAX_EDGE/2 and self.native_requested:
+            self.request_native(False)
+
     def zoom_views(self, action):
         views = (self.before,self.after) if self.pages.currentIndex() else (self.preview,)
+        if action=='actual_size':
+            self.request_native(True, exact_zoom=True)
+        elif action=='fit_photo':
+            self.request_native(False)
         self.syncing = True
         for view in views:
             getattr(view,action)()
+            view.zoom_intent = None
         self.syncing = False
         self.update_zoom_label()
 
@@ -966,7 +1105,7 @@ class SampleComparison(QWidget):
         missing = list(dict.fromkeys(key for index,key in self.keys.items()
             if index not in self.images and key not in PhotoPreview.errors))
         if missing:
-            self.loader = PreviewLoader(missing[:1])
+            self.loader = PreviewLoader(missing[:1], max_edge=None)
             self.loader.signals.loaded.connect(self.previews_loaded)
             self.loader.signals.finished.connect(self.previews_finished)
             QThreadPool.globalInstance().start(self.loader)

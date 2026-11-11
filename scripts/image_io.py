@@ -115,9 +115,14 @@ def open_photo(path):
 
 def fit_photo(pixels, size):
     """Use Pillow's identical crop geometry on each floating-point channel."""
-    channels = [np.asarray(ImageOps.fit(Image.fromarray(pixels[..., channel]), tuple(size),
-        method=Image.Resampling.LANCZOS)) for channel in range(3)]
-    return np.clip(np.stack(channels, axis=-1), 0, 1)
+    result = np.empty((size[1], size[0], 3), np.float32)
+    for channel in range(3):
+        fitted = ImageOps.fit(Image.fromarray(pixels[..., channel]), tuple(size),
+            method=Image.Resampling.LANCZOS)
+        result[..., channel] = np.asarray(fitted)
+        del fitted
+    np.clip(result, 0, 1, out=result)
+    return result
 
 
 def _curve_points(points):

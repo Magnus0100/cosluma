@@ -88,6 +88,24 @@ def _edit_box(mask):
         min(height,np.ceil(yy.max()+padding+1))))
 
 
+def _blend_region(mask, size):
+    """The pixels one blend can touch: the tight selection bbox plus one background halo.
+
+    The single-pixel halo is needed because _gradient_writeback reads one pixel outside the
+    selection as a fixed boundary value and distanceTransform needs the surrounding zeros to
+    measure the selection's own thickness. Projected row/column flags avoid the full-size
+    index array np.nonzero would build. An empty selection keeps the recorded crop so the
+    existing "empty mask" error is still the one reported.
+    """
+    support = mask > 0
+    rows = np.flatnonzero(support.any(axis=1))
+    columns = np.flatnonzero(support.any(axis=0))
+    if not rows.size or not columns.size:
+        return 0,0,size[0],size[1]
+    return (max(int(columns[0])-1,0),max(int(rows[0])-1,0),
+        min(int(columns[-1])+2,size[0]),min(int(rows[-1])+2,size[1]))
+
+
 def _detail_fit(detail_size, size):
     """Describe how the recorded model return maps onto the native crop.
 
@@ -361,14 +379,16 @@ def _gradient_writeback(source_crop, generated, mask):
         raise RuntimeError('梯度域融合求解失败，已保留原始输出与蒙版：'+str(error)) from error
     if not np.isfinite(solved).all():
         raise RuntimeError('梯度域融合求解失败，已保留原始输出与蒙版：解中出现非有限值')
-    result = np.array(generated,np.float32,copy=True)
-    result[y0:y1,x0:x1][inside] = np.clip(solved,0.0,1.0)
+    # The caller owns this float work array and reads it back only through the
+    # selection, so the solved field is written in place instead of copying the
+    # whole blend region a second time.
+    generated[y0:y1,x0:x1][inside] = np.clip(solved,0.0,1.0)
     record = {'solver':'scipy.sparse.linalg.spsolve, float32, one system per RGB channel',
         'method':'model gradient guidance on inside-inside edges only',
         'boundary_guidance':'zero across the selection boundary; original neighbours are fixed Dirichlet values',
         'unknowns':unknowns,'internal_directed_edges':int(internal),'boundary_edges':boundary,
         'bbox':[int(x0),int(y0),int(x1),int(y1)]}
-    return result,record
+    return generated,record
 
 
 def retouch_crop(pixels, directory):
@@ -380,42 +400,61 @@ def retouch_crop(pixels, directory):
     size = (x1-x0,y1-y0)
     if list(pixels.shape[1::-1])!=state['source_dimensions']:
         raise ValueError('所选版本尺寸与本次局部修饰记录不一致')
-    with open_rgb(directory/state['detail_file']) as image:
-        fit_description,centre_crop = _detail_fit(image.size,size)
-        resized = fit_generated(image,size) if centre_crop else image.resize(size,Image.Resampling.LANCZOS)
-        generated = np.asarray(resized,np.float32)/255
     with Image.open(directory/'mask.png') as image:
         mask = np.array(image,dtype=np.uint8)
     if mask.shape != size[::-1]:
         raise ValueError('局部蒙版与生成区域尺寸不一致')
-    distance = cv2.distanceTransform(np.uint8(mask>0),cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
+    # Only the gradient-domain blend is a selection-local solve. The historical median
+    # offset reads unedited context up to min(size)*.03 around the selection, so it keeps
+    # the whole recorded crop exactly as before.
+    region = (_blend_region(mask,size) if state.get('blend_mode')=='poisson_gradient'
+        else (0,0,size[0],size[1]))
+    rx0,ry0,rx1,ry1 = region
+    local_mask = mask[ry0:ry1,rx0:rx1]
+    with open_rgb(directory/state['detail_file']) as image:
+        fit_description,centre_crop = _detail_fit(image.size,size)
+        resized = fit_generated(image,size) if centre_crop else image.resize(size,Image.Resampling.LANCZOS)
+        # The resample above still covers the whole recorded crop, so the sampled values are
+        # the ones the full-crop path produced; only the float conversion is limited to the
+        # blend region. Division by 255 keeps its exact float32 result.
+        patch = resized.crop((rx0,ry0,rx1,ry1))
+        del resized
+        generated = np.empty((ry1-ry0,rx1-rx0,3),np.float32)
+        np.divide(np.asarray(patch,np.float32),np.float32(255),out=generated)
+        del patch
+    distance = cv2.distanceTransform(np.uint8(local_mask>0),cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
     # Context padding must not dilute a small repair. Limit the inward edge
     # by the selection's own thickness, leaving an opaque interior.
+    # feather keeps the recorded crop's own scale (min(size)), not the blend region's.
     feather = max(1,min(min(size)*.01,float(distance.max())*.25))
     edge = np.clip(distance/feather,0,1)
-    alpha = mask.astype(np.float32)/255*(edge*edge*(3-2*edge))
+    alpha = local_mask.astype(np.float32)/255*(edge*edge*(3-2*edge))
     crop = pixels[y0:y1,x0:x1].copy()
+    blend = crop[ry0:ry1,rx0:rx1]
     colour_match = None
     gradient_match = None
     if state.get('blend_mode')=='poisson_gradient':
         # New H3 sessions solve the colour field as a gradient-domain problem for every task; this
         # replaces the plain paste and the historical median offset, with the accepted equations.
-        generated,gradient_match = _gradient_writeback(crop,generated,mask)
+        generated,gradient_match = _gradient_writeback(blend,generated,local_mask)
+        if gradient_match and 'bbox' in gradient_match:
+            left,top,right,bottom = gradient_match['bbox']
+            gradient_match['bbox'] = [left+rx0,top+ry0,right+rx0,bottom+ry0]
     elif state['task']=='neck':
         # Historical H3 records and every Qwen session keep this estimate of the incidental RGB
         # shift from neighbouring unedited context; never write that context or change the raw.
         radius = min(size)*.03
-        outside = np.uint8(mask==0)
+        outside = np.uint8(local_mask==0)
         distance_outside = cv2.distanceTransform(outside,cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
         context = (outside>0)&(distance_outside<=radius)
         if np.any(context):
-            offset = np.median((generated-crop)[context],axis=0).astype(np.float32)
+            offset = np.median((generated-blend)[context],axis=0).astype(np.float32)
             generated -= offset
             colour_match = {'method':'median RGB offset from unedited context',
                 'radius_pixels':float(radius),'offset':offset.tolist()}
-    support = mask>0
-    crop[support] += (generated[support]-crop[support])*alpha[support,None]
-    crop[support] = np.clip(crop[support],0,1)
+    support = local_mask>0
+    blend[support] += (generated[support]-blend[support])*alpha[support,None]
+    blend[support] = np.clip(blend[support],0,1)
     state['blend'] = {'method':('float32 gradient-domain writeback; inward smoothstep feather'
             if gradient_match else 'float32 masked writeback; inward smoothstep feather'),
         'feather_pixels':float(feather),'resize':fit_description,'colour_match':colour_match,
@@ -432,6 +471,9 @@ def save_local(pixels, directory):
     x0,y0,x1,y1 = state['box']
     final = pixels.copy()
     final[y0:y1,x0:x1] = crop
+    # The crop is fully copied into the saved frame; releasing it keeps the
+    # 16-bit save and the JPEG preview off a second full-size float copy.
+    del crop
     # Every explicit save gets its own version; saved photos are immutable.
     output = directory/('edit-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     output.mkdir()

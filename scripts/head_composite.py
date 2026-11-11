@@ -4,7 +4,6 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PIL import Image
-from scipy.ndimage import binary_fill_holes
 
 from image_io import save_image, to_preview
 from model_clients import extract_head_mask
@@ -80,6 +79,7 @@ def restore_head(original, generated, head_box, config, directory, progress, *, 
         # Face masks can contain holes at dark eyes and brows. Those are still
         # camera identity pixels; fill only holes enclosed by the face region.
         face = np.asarray(masks['face'].convert('L'),np.float32)/255
+        from scipy.ndimage import binary_fill_holes
         face = np.maximum(face,binary_fill_holes(face>.5).astype(np.float32))
         identity = face
         if headwear:

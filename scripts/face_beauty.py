@@ -14,7 +14,6 @@ import uuid
 import cv2
 import numpy as np
 from PIL import Image
-from scipy.interpolate import RBFInterpolator
 
 from image_io import open_photo, open_rgb, save_image, save_jpeg, save_json, to_preview
 from model_clients import multipart, post_json, request
@@ -265,6 +264,7 @@ def _slim_map(points, strength, size, *, topology):
         np.column_stack((np.zeros(4),line[1:-1])),np.column_stack((np.ones(4),line[1:-1]))])
     source = np.vstack((original, border))
     destination = np.vstack((target, border))
+    from scipy.interpolate import RBFInterpolator
     inverse = RBFInterpolator(destination, source-destination, kernel='thin_plate_spline', smoothing=1e-5)
     grid_width, grid_height = min(256,size[0]), min(256,size[1])
     yy,xx = np.mgrid[0:1:complex(0,grid_height),0:1:complex(0,grid_width)]
