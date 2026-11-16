@@ -83,7 +83,7 @@ jobs:
               assert (providers / relative).is_file(), relative
           assert not list(providers.rglob("__pycache__"))
           from PySide6.QtWidgets import QApplication, QDialog
-          from qt_workbench import ServiceSettings, endpoint_url
+          from service_settings import ServiceSettings, endpoint_url
           from settings import load_settings
           app = QApplication([])
           with tempfile.TemporaryDirectory() as directory:
