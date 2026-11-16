@@ -43,7 +43,7 @@ executable = EXE(archive,analysis.scripts,[],exclude_binaries=True,name='CosLuma
 )
 package = COLLECT(executable,analysis.binaries,analysis.datas,strip=False,upx=False,name='CosLuma')
 destination = Path(DISTPATH)/'CosLuma'
-for name in ('README.md','AGENTS.md','LICENSE'):
+for name in ('README.md','README.en.md','AGENTS.md','LICENSE'):
     shutil.copyfile(root/name,destination/name)
 for name in ('LICENSES','providers'):
     shutil.copytree(root/name,destination/name,dirs_exist_ok=True,
