@@ -213,6 +213,7 @@ class BatchResults(QWidget):
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
             self.beauty_version.hide()
+            self.details.setToolTip('')
             self.details.setPlainText(self.error if not self.sources else '')
             return
         source = self.sources[row]
@@ -269,6 +270,12 @@ class BatchResults(QWidget):
         else:
             message = f'{Path(source).name} · 未完成\n'+str(self.error or (
                 '本批次仍在制作，单张结果完成后会显示在这里。' if self.batch_status=='running' else '未保存完整成片。'))
+        timings = result.get('timings',[])
+        if timings:
+            message += f'\n制作耗时 {result["elapsed_seconds"]:.1f} 秒（含服务等待）'
+            self.details.setToolTip('\n'.join(f'{row["stage"]}：{row["seconds"]:.1f} 秒' for row in timings))
+        else:
+            self.details.setToolTip('')
         if self.details.toPlainText()!=message:
             self.details.setPlainText(message)
 

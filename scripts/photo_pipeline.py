@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
+from time import perf_counter
 import uuid
 
 from image_io import apply_tone_curve, fit_generated, image_size, open_photo, open_rgb, save_image, save_jpeg, save_json
@@ -50,7 +51,21 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         record.update(revision_of=art_direction['revision_of'],revision_brief=art_direction.get('revision_brief',''),
             revision_requirements=deepcopy(art_direction.get('revision_requirements',[])),
             revision_user_text=art_direction.get('revision_user_text',''))
+    started = perf_counter()
+    stage_started = started
+    record['timings'] = []
+    def finish_stage():
+        nonlocal stage_started
+        now = perf_counter()
+        record['timings'].append({'stage':record['stage'],'seconds':round(now-stage_started,3)})
+        record['elapsed_seconds'] = round(now-started,3)
+        stage_started = now
     def stage(name):
+        nonlocal stage_started
+        if record['stage'] != 'decode':
+            finish_stage()
+        else:
+            stage_started = perf_counter()
         record['stage'] = name
         save_json(directory/'run.json',record)
         report(name)
@@ -128,13 +143,17 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             record['finish_curve'] = config['finish_curve']
         stage('合成保存')
         record['files']['final'] = save_image(final,directory/'final.png')
+        stage('保存 JPEG 查看副本')
         record['files']['jpeg'] = save_jpeg(final,directory/'final.jpg')
         record['output_bit_depth'] = 16
+        finish_stage()
         record.update(status='complete',stage='完成')
         save_json(directory/'run.json',record)
         report('完成')
         return record
     except Exception as error:
+        if record['status'] == 'running':
+            finish_stage()
         from urllib.error import HTTPError,URLError
         if isinstance(error,HTTPError):
             message = 'Model service returned HTTP '+str(error.code)
@@ -149,6 +168,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         failure = RuntimeError(f'{record["stage"]}: {message}. Run: {directory}')
         failure.directory = str(directory)
         failure.stage = record['stage']
+        failure.timings = record['timings']
+        failure.elapsed_seconds = record.get('elapsed_seconds',0)
         raise failure from None
 
 
@@ -157,6 +178,8 @@ def _failed_photo(source, error):
     if getattr(error, 'directory', None):
         result['directory'] = str(error.directory)
         result['stage'] = getattr(error, 'stage', '')
+        result['timings'] = getattr(error, 'timings', [])
+        result['elapsed_seconds'] = getattr(error, 'elapsed_seconds', 0)
     return result
 
 

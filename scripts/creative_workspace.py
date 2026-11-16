@@ -1007,7 +1007,12 @@ class CreativeWorkspace(QWidget):
         summary,stage,button,thumbnail,_panel = self.cards[option['index']]
         summary.setText(option['summary'])
         stage.setText('样片完成' if option['status']=='complete' else '样片失败：'+option['error'])
-        stage.setToolTip(stage.text())
+        result = option['result']
+        timing_note = ''
+        if result.get('timings'):
+            timing_note = f'\n制作耗时 {result["elapsed_seconds"]:.1f} 秒（含服务等待）\n'+ '\n'.join(
+                f'{row["stage"]}：{row["seconds"]:.1f} 秒' for row in result['timings'])
+        stage.setToolTip(stage.text()+timing_note)
         button.setEnabled(True)
         if option['status']=='complete':
             pixels = self.canvas.read_preview(option['result']['files']['jpeg'])

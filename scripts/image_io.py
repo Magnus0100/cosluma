@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader
+from PySide6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader, QImageWriter
 
 Image.MAX_IMAGE_PIXELS = None
 QImageReader.setAllocationLimit(0)
@@ -232,10 +232,19 @@ def save_image(image, path):
                 image_format = QImage.Format_RGBA64
             encoded = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], image_format)
             encoded.setColorSpace(QColorSpace(QColorSpace.SRgb))
-            if not encoded.save(str(temporary), 'PNG'):
-                raise OSError(f'Cannot save {path}')
+            writer = QImageWriter(str(temporary), b'png')
+            # Qt's PNG handler maps 0..100 onto zlib levels 0..9. Level 1
+            # keeps lossless pixels/profile while avoiding costly compression.
+            writer.setCompression(11)
+            try:
+                if not writer.write(encoded):
+                    raise OSError(f'Cannot save {path}: {writer.errorString()}')
+            finally:
+                # Release Qt's output device before Windows replaces the file.
+                del writer
         else:
-            image.save(temporary, format='PNG', icc_profile=SRGB if image.mode in ('RGB', 'RGBA') else None)
+            image.save(temporary, format='PNG', compress_level=1,
+                icc_profile=SRGB if image.mode in ('RGB', 'RGBA') else None)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
