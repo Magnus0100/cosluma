@@ -72,6 +72,18 @@ def prepare_head(original, head_box):
     return original[y0:y1,x0:x1].copy(),box.tolist(),(width,height)
 
 
+def _inward_coverage(alpha):
+    """Soften the mask transition inside its support, without filtering RGB."""
+    coverage = np.clip(alpha,0,1)
+    width = max(1.0,min(12.0,min(coverage.shape)*.006))
+    # Pad with background so a head touching the crop edge has a real boundary.
+    support = np.pad((coverage>0).astype(np.uint8),1)
+    distance = cv2.distanceTransform(support,cv2.DIST_L2,cv2.DIST_MASK_PRECISE)[1:-1,1:-1]
+    transition = np.clip(distance/width,0,1)
+    transition *= transition*(3-2*transition)
+    return coverage*transition,width
+
+
 def restore_head(head, generated, box, original_size, config, directory, progress, *, edits=None, headwear=()):
     """Blend one detached original head crop onto the generated frame once."""
     edits = normalise_edits(edits)
@@ -119,7 +131,7 @@ def restore_head(head, generated, box, original_size, config, directory, progres
     np.divide(premultiplied,warped_alpha[...,None],out=restored,
         where=warped_alpha[...,None]>1e-6)
     np.clip(restored,0,1,out=restored)
-    coverage = np.clip(warped_alpha,0,1)
+    coverage,feather_width = _inward_coverage(warped_alpha)
     output = np.asarray(generated,np.float32)
     output /= 255
     target = output[low[1]:high[1],low[0]:high[0]].copy()
@@ -140,6 +152,7 @@ def restore_head(head, generated, box, original_size, config, directory, progres
         'source_head':save_image(restored,directory/'head-original.png'),
         'matched_head':save_image(matched,directory/'head-matched.png'),
         'alpha':save_image(np.repeat(coverage[...,None],3,axis=2),directory/'head-alpha.png'),
+        'boundary_feather_pixels':feather_width,
         'blend_bit_depth':32,'edits':edits,
         'headwear':list(headwear) if edits['hair'] else [],
         'preserved_region':'face, ears and headdress' if edits['hair'] else 'whole original head',
