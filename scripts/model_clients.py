@@ -7,10 +7,10 @@ import hashlib
 import http.client
 from io import BytesIO
 import json
+import logging
 import math
 import os
 from pathlib import Path
-import re
 import shutil
 import tempfile
 import time
@@ -211,8 +211,9 @@ def _describe(instruction, images, config, response_path, *, task, conversation=
             save_json(trace_path,trace)
         except OSError as error:
             if failure is None:
-                raise
-            failure.add_note('模型调用记录保存失败：'+str(error))
+                logging.getLogger(__name__).warning('模型调用记录未保存：%s：%s',trace_path,error)
+            else:
+                failure.add_note('模型调用记录保存失败：'+str(error))
 
 
 def _selection_sheets(sources, directory, report):
@@ -389,15 +390,18 @@ def _discussion_details(context, samples, image_ids):
 
 
 def user_requirement_text(*sources):
-    """Merge the user's own wording only; agent prose never enters this list."""
+    """Merge user wording in order, keeping the latest occurrence of repeated text."""
     text = []
     for source in sources:
         if source is None:
             continue
         values = [source] if isinstance(source, str) else list(source)
         for value in values:
-            if isinstance(value, str) and value.strip() and value.strip() not in text:
-                text.append(value.strip())
+            if isinstance(value, str) and value.strip():
+                value = value.strip()
+                if value in text:
+                    text.remove(value)
+                text.append(value)
     return text
 
 
@@ -431,76 +435,6 @@ def discussion_user_requirements(discussion, edits):
         else:
             quotes.append(evidence)
     return user_requirement_text(quotes, _typed_briefs(edits))
-
-
-_GauzeNameWords = frozenset({'veil','veils','tulle','gauze','chiffon','organza','voile','mantilla'})
-_VeilRequestTerms = ('头纱','面纱','纱巾','轻纱','白纱','透明纱','网纱')
-_VeilCancelCjk = ('不保留','不要保留','不需要','不用保留','取消','去掉','移除','去除','别保留','无需','不列入','不要','别','不')
-_VeilCancelWords = ('not','no','never','without','remove','removing','drop','exclude','omit')
-_VeilContext = 16
-
-
-def _veil_terms(text):
-    """Veil-like words in one headwear name or one sentence, matched as whole tokens."""
-    if not isinstance(text,str):
-        return []
-    words = {value for value in re.findall(r'[a-z]+',text.casefold()) if value in _GauzeNameWords}
-    words.update(term for term in _VeilRequestTerms if term in text)
-    return sorted(words)
-
-
-def _veil_cancel_marker(window):
-    """The cancellation wording right before one veil word, if any."""
-    for marker in _VeilCancelCjk:
-        if marker in window:
-            return marker
-    for marker in _VeilCancelWords:
-        if re.search(r'(?<![a-z])'+re.escape(marker)+r'(?![a-z])',window):
-            return marker
-    return ''
-
-
-def _veil_requests(requirements):
-    """Explicit veil request versus explicit cancellation, judged on the wording beside the veil word."""
-    requested,cancelled = [],[]
-    for item in requirements:
-        for sentence in re.split(r'[。；;！!？?、，,\n]',item if isinstance(item,str) else ''):
-            folded = sentence.casefold()
-            for term in _veil_terms(sentence):
-                start = 0
-                while True:
-                    index = folded.find(term.casefold(),start)
-                    if index < 0:
-                        break
-                    window = folded[max(0,index-_VeilContext):index]
-                    if _veil_cancel_marker(window):
-                        cancelled.append(term)
-                    else:
-                        requested.append(term)
-                    start = index + len(term)
-    return sorted(set(requested)),sorted(set(cancelled))
-
-
-def review_headwear(names, requirements):
-    """Drop gauze-like headwear unless the user asked in their own words to keep it."""
-    requested,cancelled = _veil_requests(requirements)
-    gauze = [name for name in names if _veil_terms(name)]
-    keep = list(names) if requested else [name for name in names if name not in gauze]
-    if not gauze:
-        reason = '本次没有返回纱质头饰条目'
-    elif requested:
-        reason = '用户明确要求保留原片头纱，纱质条目保留'
-    elif cancelled:
-        reason = '用户明确取消保留原片头纱，纱质条目剔除'
-    else:
-        reason = '用户原话未明确要求保留原片头纱，纱质条目按衣装随生成场景受光，从原片身份保留区剔除'
-    audit = {'raw_headwear':list(names),'headwear':keep,
-        'removed':[name for name in names if name not in keep],'gauze_headwear':gauze,
-        'explicit_user_request':bool(requested),'explicit_user_cancellation':bool(cancelled),
-        'requested_terms':requested,'cancelled_terms':cancelled,'user_requirements':list(requirements),
-        'reason':reason,
-        'rule':'veil/tulle/gauze/chiffon/organza/voile/mantilla 纱质名称按整词匹配；仅当用户原话明确要求保留原片头纱或面纱时保留'}
-    return keep,audit
 
 
 def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None, edits=None):
@@ -671,11 +605,7 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
             and 0<=left<right<=1000 and 0<=top<bottom<=1000):
         raise ValueError('头部范围须满足 0<=左<右<=1000 与 0<=上<下<=1000（按原片归一化坐标）；原始响应已保存')
     if edits['hair']:
-        names = description['headwear']
-        names = list(dict.fromkeys(name.strip() for name in names))
-        description['headwear'],audit = review_headwear(names,verbatim)
-        audit['prompt_response'] = str(directory/'llm-response.json')
-        save_json(directory/'headwear-audit.json',audit)
+        description['headwear'] = list(dict.fromkeys(name.strip() for name in description['headwear']))
     return description
 
 

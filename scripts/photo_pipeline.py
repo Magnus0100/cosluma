@@ -96,7 +96,6 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         record['head_box'] = description['head_box']
         if edits['hair']:
             record['headwear'] = description['headwear']
-            record['headwear_audit'] = str(directory/'headwear-audit.json')
         prompt_path = directory/'prompt.txt'
         prompt_path.write_text(prompt,encoding='utf-8')
         record['files']['prompt'] = str(prompt_path)
