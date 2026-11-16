@@ -25,6 +25,7 @@ from batch_results import BatchResults
 from delivery_view import DeliveryView
 from beauty_editor import BeautyConnection, BeautyEditor
 from local_editor import LocalConnection, LocalRetouchEditor
+from tone_editor import ToneEditor
 from image_io import IMAGE_EXTENSIONS
 from model_clients import select_photos, _discussion_preview
 from photo_pipeline import finish_batch, load_style
@@ -908,6 +909,8 @@ class Workbench(QMainWindow):
 
     def update_setup_hint(self):
         exists = Path(self.config.text()).expanduser().is_file()
+        if self.delivery_view is not None:
+            self.delivery_view.config_path = self.config.text()
         self.setup_banner.setVisible(not exists and self.pages.currentIndex()!=self.welcome_index)
 
     def import_config(self):
@@ -1354,7 +1357,8 @@ class Workbench(QMainWindow):
         elif self.selection_worker is not None:
             next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
         elif self.beauty_editor is not None and self.beauty_editor.is_busy():
-            next_step = ('正在处理可选局部修饰，可切页查看已有照片。'
+            next_step = ('正在处理曝光与曲线，可切页查看已有照片。' if isinstance(self.beauty_editor,ToneEditor) else
+                '正在处理可选局部修饰，可切页查看已有照片。'
                 if isinstance(self.beauty_editor,LocalRetouchEditor) else '正在处理可选人脸美化，可切页查看已有照片。')
         elif self.delivery_view is not None and self.delivery_view.is_busy():
             next_step = '正在复制所选版本到交付文件夹，可切页查看已有照片。'
@@ -1415,7 +1419,8 @@ class Workbench(QMainWindow):
         self.open_folder_button.setVisible(not delivering)
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
         self.results_caption.setText('项目作品 · 选择版本与交付' if delivering else
-            ('成片后的可选局部修饰' if isinstance(self.beauty_editor,LocalRetouchEditor) else '成片后的可选人脸美化') if beautifying else
+            ('成片后的曝光与曲线' if isinstance(self.beauty_editor,ToneEditor) else
+                '成片后的可选局部修饰' if isinstance(self.beauty_editor,LocalRetouchEditor) else '成片后的可选人脸美化') if beautifying else
             '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
     def dragEnterEvent(self, event):
@@ -1757,6 +1762,7 @@ class Workbench(QMainWindow):
                 workspace.show_selected_style(chosen)
             workspace.discussion_saved.connect(self.remember_discussion)
             workspace.style_selected.connect(self.select_style)
+            workspace.batch_requested.connect(self.produce_from_chat)
             workspace.state_changed.connect(self.creative_state_changed)
             workspace.back_requested.connect(lambda: self.navigate(0))
             self.creative_layout.addWidget(workspace)
@@ -1801,8 +1807,12 @@ class Workbench(QMainWindow):
         workspace = self.creative_workspace
         self.style_context = (workspace.character, workspace.brief)
         self.save_workspace()
-        self.status.setText('已定稿“' + option['title'] + '”。确认这张真实样片后，单独点击批量制作。')
-        self.show_current_batch()
+        self.status.setText('已定稿“' + option['title'] + '”。可用对话或批量制作按钮开始制作。')
+
+    def produce_from_chat(self, message):
+        self.produce()
+        if self.worker is None:
+            message.update(operation_status='failed',operation_error=self.status.text())
 
 
     def view_chosen(self):
@@ -1816,6 +1826,7 @@ class Workbench(QMainWindow):
         view.back_requested.connect(lambda: self.navigate(0))
         view.beauty_requested.connect(self.open_beauty)
         view.retouch_requested.connect(self.open_retouch)
+        view.tone_requested.connect(self.open_tone)
         self.result_views.addWidget(view)
         return view
 
@@ -1839,7 +1850,7 @@ class Workbench(QMainWindow):
             if self.beauty_editor is not None and not self.beauty_editor.save_draft():
                 self.status.setText(self.beauty_editor.message.text())
                 return
-            editor = BeautyEditor(context,config['beauty'],self.result_views)
+            editor = BeautyEditor(context,config['beauty'],self.result_views,llm_config=config['llm'])
             editor.back_requested.connect(self.return_from_beauty)
             editor.saved.connect(self.beauty_saved)
             editor.busy_changed.connect(self.beauty_busy_changed)
@@ -1860,7 +1871,9 @@ class Workbench(QMainWindow):
         try:
             dialog = BeautyConnection(self.config.text(),self)
             if dialog.exec()==QDialog.Accepted:
-                self.beauty_editor.config = load_settings(self.config.text())['beauty']
+                config = load_settings(self.config.text())
+                self.beauty_editor.config = config['beauty']
+                self.beauty_editor.llm_config = config['llm']
                 self.beauty_editor.message.setText('美化连接已保存，下次主动分析或生成美肤基础时使用。')
         except (OSError,ValueError,KeyError) as error:
             self.beauty_editor.message.setText('保存美化连接失败：'+str(error))
@@ -1884,7 +1897,8 @@ class Workbench(QMainWindow):
             if self.beauty_editor is not None and not self.beauty_editor.save_draft():
                 self.status.setText(self.beauty_editor.message.text())
                 return
-            editor = LocalRetouchEditor(context,config['local_edit'],self.result_views,sr_config=config.get('sr'))
+            editor = LocalRetouchEditor(context,config['local_edit'],self.result_views,
+                sr_config=config.get('sr'),llm_config=config['llm'])
             editor.back_requested.connect(self.return_from_beauty)
             editor.saved.connect(self.beauty_saved)
             editor.busy_changed.connect(self.beauty_busy_changed)
@@ -1900,12 +1914,60 @@ class Workbench(QMainWindow):
         except (OSError,ValueError,KeyError) as error:
             self.status.setText('打开局部修饰失败：'+str(error))
 
+    def open_tone(self, context):
+        def fail(text):
+            self.status.setText(text)
+            if context.get('delivery_message') is not None:
+                context['delivery_message']['operation_status'] = text
+                self.delivery_view.discussion_changed()
+
+        same_editor = isinstance(self.beauty_editor,ToneEditor) and self.beauty_editor.context['base']==context['base']
+        if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
+            fail('当前项目仍在处理中，结束后可打开曝光与曲线。')
+            return
+        if same_editor:
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
+            self.beauty_editor.context = context
+            self.beauty_editor.config_path = self.config.text()
+            if context.get('delivery_message') is not None:
+                if not self.beauty_editor.accept_delivery(context['delivery_message'],context['delivery_user_text']):
+                    fail(self.beauty_editor.message.text())
+                    return
+            self.result_views.setCurrentWidget(self.beauty_editor)
+            self.navigate(2)
+            return
+        try:
+            if self.beauty_editor is not None and not self.beauty_editor.save_draft():
+                fail(self.beauty_editor.message.text())
+                return
+            editor = ToneEditor(context,self.config.text(),self.result_views)
+            editor.back_requested.connect(self.return_from_beauty)
+            editor.saved.connect(self.beauty_saved)
+            editor.busy_changed.connect(self.beauty_busy_changed)
+            editor.external_changed.connect(self.delivery_tone_changed)
+            if context.get('delivery_message') is not None:
+                if not editor.accept_delivery(context['delivery_message'],context['delivery_user_text']):
+                    fail(editor.message.text())
+                    editor.deleteLater()
+                    return
+            if self.beauty_editor is not None:
+                self.result_views.removeWidget(self.beauty_editor)
+                self.beauty_editor.deleteLater()
+            self.beauty_editor = editor
+            self.beauty_return_delivery = context.get('return_to_delivery',False)
+            self.result_views.addWidget(editor)
+            self.result_views.setCurrentWidget(editor)
+            self.navigate(2)
+        except (OSError,ValueError,KeyError) as error:
+            fail('打开曝光与曲线失败：'+str(error))
+
     def configure_local(self):
         try:
             if LocalConnection(self.config.text(),self).exec()==QDialog.Accepted:
                 config = load_settings(self.config.text())
                 self.beauty_editor.config = config['local_edit']
                 self.beauty_editor.sr_config = config.get('sr')
+                self.beauty_editor.llm_config = config['llm']
                 self.beauty_editor.message.setText('局部修饰连接已保存，下次主动生成时使用。')
         except (OSError,ValueError,KeyError) as error:
             self.beauty_editor.message.setText('保存局部修饰连接失败：'+str(error))
@@ -1913,6 +1975,9 @@ class Workbench(QMainWindow):
     def beauty_busy_changed(self):
         self.update_actions()
         self.finish_background_work()
+
+    def delivery_tone_changed(self):
+        self.delivery_view.discussion_changed()
 
     def return_from_beauty(self):
         if self.beauty_return_delivery:
@@ -1923,7 +1988,14 @@ class Workbench(QMainWindow):
 
     def beauty_saved(self, result):
         self.return_from_beauty()
-        self.status.setText(('已另存局部修饰版：' if result.get('task') else '已另存美化版：')+result['files']['final'])
+        if result.get('kind')=='tone' and self.beauty_return_delivery and self.beauty_editor.context.get('delivery_photo_key'):
+            try:
+                self.delivery_view.compare_saved_result(self.beauty_editor.context['delivery_photo_key'],result['files']['final'])
+            except (OSError,ValueError,KeyError,StopIteration) as error:
+                self.status.setText('光调版已保存，显示比较失败：'+str(error))
+                return
+        self.status.setText(('已另存光调版：' if result.get('kind')=='tone' else
+            '已另存局部修饰版：' if result.get('task') else '已另存美化版：')+result['files']['final'])
 
 
     def show_current_batch(self):
@@ -1932,9 +2004,10 @@ class Workbench(QMainWindow):
 
     def ensure_delivery(self):
         if self.delivery_view is None:
-            self.delivery_view = DeliveryView(self.project,self.result_views)
+            self.delivery_view = DeliveryView(self.project,self.result_views,config_path=self.config.text())
             self.delivery_view.beauty_requested.connect(self.open_beauty)
             self.delivery_view.retouch_requested.connect(self.open_retouch)
+            self.delivery_view.tone_requested.connect(self.open_tone)
             self.delivery_view.revision_requested.connect(self.start_photo_revision)
             self.delivery_view.batch_created.connect(self.remember_revision_batch)
             self.delivery_view.state_changed.connect(self.update_actions)
@@ -1994,10 +2067,6 @@ def main():
         del sys.argv[1]
         from project_cli import main as command_line
         return command_line()
-    if sys.argv[1:2] == ['--server']:
-        del sys.argv[1]
-        from backend_server import main as server
-        return server()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='version', version='CosLuma ' + VERSION)
     parser.add_argument('--root', type=Path)

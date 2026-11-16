@@ -1,4 +1,4 @@
-"""One finishing chain shared by desktop, CLI and HTTP."""
+"""One finishing chain shared by desktop and CLI."""
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -91,7 +91,8 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
             user_requirements=art_direction.get('user_requirements') if art_direction is not None else None,
             revision_brief=art_direction.get('revision_brief','') if art_direction is not None else '',
             revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],
-            revision_user_text=art_direction.get('revision_user_text','') if art_direction is not None else '',edits=edits)
+            revision_user_text=art_direction.get('revision_user_text','') if art_direction is not None else '',
+            edits=edits,generate=generated is None,progress=stage)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         if edits['hair']:
@@ -211,7 +212,7 @@ def beautify_completed(run_path, config, *, skin=0.0, slim=0.0, protect_features
             raise ValueError('美化会话对应另一张成片，请使用该成片的会话')
         pixels = open_photo(base)
     if skin and prepared.delta is None:
-        prepared = prepare_skin(prepared,beauty_config(),progress,pixels=pixels)
+        prepared = prepare_skin(prepared,beauty_config(),progress,pixels=pixels,llm_config=config['llm'])
     result = save_beauty(pixels,prepared,parameters)
     save_json(path.parent/'beauty-session.json',{'session':prepared.directory.name,
         'parameters':{'skin':skin,'slim':slim,'protect_features':protect_features}})

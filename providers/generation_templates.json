@@ -1,0 +1,23 @@
+{
+  "scene": {
+    "version": 1,
+    "writer": "依据本次场景编辑模板和任务资料编写单张整图编辑提示词，遵守下方本次设置与字段格式。仅编写提示词和头部定位，不调用生图，不修改文件或制作参数。",
+    "reviewer": "独立审查 candidate 是否忠实表达已采纳的用户要求和本次场景模板。对照原片、摄影方向、风格参考、修发和重打光开关以及 writer_instruction，检查身份、构图、服装和道具取舍是否一致，光色是否连续，head_box 是否对应原片主体整头，开启修发时 headwear 是否来自实际原片。摄影措辞和合理创作差异无需否决；只有具体冲突、遗漏关键要求或图像职责错误才拒绝。不改写提示词，不追加审批或画质评分。返回 JSON：approved 布尔值，issues 具体问题字符串数组；通过时 issues 为空。"
+  },
+  "qwen_local": {
+    "version": 1,
+    "writer": "按提供的 template_prompt 编写 Qwen 局部编辑提示词。task 指定唯一修饰任务，user_request 是用户原话，image_roles 对应实际图片顺序。保持模板的原图、单独蒙版、造型标记和风格参考职责，只按用户要求细化目标，不增加美化、场景重设计或其他任务。蒙版为模型参考，软件最终只写回用户涂选范围。返回 JSON：prompt。",
+    "reviewer": "独立对照 task、user_request、template_prompt、实际图片和 image_roles 审查 candidate.prompt。检查是否完成本次修饰、使用正确的图片编号与蒙版含义，保留模板画幅，移除造型标记，不擅自美化脸或增加任务。不改写，不评分；仅具体违背要求时拒绝。返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+  },
+  "h3_local": {
+    "version": 1,
+    "writer": "按提供的 template_prompt 编写 MiniMax-H3-Image 原生图片编辑提示词，使用 <Picture N> 图片标记。保留 task 的单一任务、user_request 原话意图和 image_roles 的实际图片职责；头发编辑输出第一张细节图，完整照片只供上下文，颈部编辑输出整图。H3 不接收蒙版，最终涂选范围由软件写回；不要臆造蒙版输入或像素锁定承诺。提示词简洁，不堆叠额外保护词和负面要求，不额外美化脸或重设计场景。返回 JSON：prompt。",
+    "reviewer": "独立对照 task、user_request、template_prompt、实际图片和 image_roles 审查 candidate.prompt。检查任务与图片编号，发丝细节图和整图参考职责，颈部整图输出，造型标记应从结果移除。H3 没有蒙版图片，不得要求依照虚构蒙版；不得擅自增加人脸美化或场景改造。合理措辞差异无需否决。不改写、不评分；返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+  },
+  "beauty": {
+    "version": 1,
+    "fixed_prompt": "Beautify this person's face while maintaining a natural and realistic appearance",
+    "writer": "本任务是用户主动发起的 BeautyGRPO 美肤基础生成。模板使用官方固定提示词，唯一输出为 JSON 的 prompt 字段，逐字填写：Beautify this person's face while maintaining a natural and realistic appearance。不得追加、翻译或改写；强度和五官保护由后续固定算法处理。",
+    "reviewer": "独立审查 candidate.prompt 是否逐字等于官方指令 Beautify this person's face while maintaining a natural and realistic appearance，且任务为用户主动发起的美肤基础生成。不要追加提示词、调节强度或评价照片。返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+  }
+}

@@ -189,7 +189,7 @@ def prepare_face(base, region, root, config, progress=None):
     return BeautySession(directory), pixels
 
 
-def prepare_skin(session, config, progress=None, *, pixels=None):
+def prepare_skin(session, config, progress=None, *, pixels=None, llm_config):
     report = progress or (lambda message:None)
     directory = session.directory/('skin-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
@@ -200,6 +200,10 @@ def prepare_skin(session, config, progress=None, *, pixels=None):
     image = to_preview(pixels[top:bottom,left:right]).resize((1024,1024),Image.Resampling.BILINEAR)
     del pixels
     image.save(directory/'input.png')
+    from generation_prompts import write_generation_prompt
+    from image_io import preview_data_url
+    write_generation_prompt('beauty',[('用户主动生成美肤基础的人脸',preview_data_url(image))],
+        llm_config,directory,task={'task':'user_requested_skin_base'},progress=report)
     filename = _upload(image, config)
     report('BeautyGRPO · NF4 底座 / 完整 LoRA · 28 步' if config['memory']=='bnb_nf4'
         else 'BeautyGRPO 官方 BF16 完整推理 · 28 步')

@@ -40,6 +40,9 @@ jobs:
           from image_io import open_photo, save_image
           from face_beauty import BeautySession
           from local_editor import LocalRetouchEditor
+          from tone_editor import ToneEditor
+          from delivery_view import DeliveryView
+          from tone_edit import ToneParameters, render_tone
           from local_retouch import TASKS
           from relighting import RELIGHT_DEFAULTS
           for path in [*Path("scripts").glob("*.py"), *Path("providers").rglob("*.py")]:
@@ -47,6 +50,7 @@ jobs:
           assert set(TASKS) == {"hair_repair", "hair_shape", "neck"}
           cv2.SIFT_create()
           source = np.random.default_rng(0).uniform(.1, .8, (16, 16, 3)).astype(np.float32)
+          assert render_tone(source, ToneParameters()) is source
           matched = _colour_match(source, source * .8 + .1, np.ones((16, 16), np.float32))
           assert matched.dtype == np.float32 and np.isfinite(matched).all()
           with tempfile.TemporaryDirectory() as directory:
@@ -58,14 +62,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B scripts/project_cli.py --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -B scripts/backend_server.py --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build portable application
         run: python -m PyInstaller --noconfirm --distpath "$env:RUNNER_TEMP/package" --workpath "$env:RUNNER_TEMP/build" CosLuma.spec
       - name: Check packaged application
         run: |
           @'
-          import json, os, socket, subprocess, sys, tempfile, time, urllib.request
+          import json, os, subprocess, sys, tempfile, time
           from pathlib import Path
           sys.path.insert(0, "scripts")
           from app_version import VERSION
@@ -99,7 +101,7 @@ jobs:
               assert not (config.parent / "prompts.json").exists()
               assert endpoint_url("https://example.invalid/v1", "image").endswith("/v1/images/edits")
               dialog.close()
-          for arguments in (["--version"], ["--cli", "--version"], ["--server", "--version"]):
+          for arguments in (["--version"], ["--cli", "--version"]):
               subprocess.run([str(executable), *arguments], check=True)
           heif = next((executable.parent / "_internal").glob("_pillow_heif*.pyd"))
           subprocess.run([sys.executable, "-I", "-S", "-c",
@@ -113,21 +115,6 @@ jobs:
               if process.poll() is None:
                   process.terminate()
               process.wait()
-          with tempfile.TemporaryDirectory() as directory:
-              with socket.socket() as reservation:
-                  reservation.bind(("127.0.0.1", 0))
-                  port = reservation.getsockname()[1]
-              process = subprocess.Popen([str(executable), "--server", "--root", directory,
-                  "--config", str(Path("providers/settings.example.json").resolve()), "--port", str(port)])
-              try:
-                  time.sleep(3)
-                  assert process.poll() is None, "The HTTP adapter exited during startup"
-                  with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=10) as response:
-                      assert json.load(response)["version"] == VERSION
-              finally:
-                  if process.poll() is None:
-                      process.terminate()
-                  process.wait()
           '@ | python -B -
       - name: Prepare release archives
         run: |

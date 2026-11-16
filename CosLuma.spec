@@ -13,7 +13,7 @@ analysis = Analysis(
     [str(sources/'qt_workbench.py')],
     pathex=[str(sources)],
     datas=[],
-    hiddenimports=['backend_server','project_cli','rawpy','color_matcher'],
+    hiddenimports=['project_cli','rawpy','color_matcher'],
     excludes=['torch','torchvision','torchaudio','transformers','diffusers','cupy','cupyx','cupy_backends','cuda',
               'onnxruntime','triton','nvidia','matplotlib','pandas','IPython',
               'pytest','tkinter','PySide6.QtWebEngineCore','PySide6.QtWebEngineWidgets',

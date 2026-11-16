@@ -18,6 +18,7 @@ class BatchResults(QWidget):
     back_requested = Signal()
     beauty_requested = Signal(dict)
     retouch_requested = Signal(dict)
+    tone_requested = Signal(dict)
 
     def __init__(self, directory, parent=None):
         super().__init__(parent)
@@ -88,6 +89,9 @@ class BatchResults(QWidget):
         self.retouch = QPushButton('局部修发／发束／双下巴')
         self.retouch.clicked.connect(self.open_retouch)
         controls.addWidget(self.retouch)
+        self.tone = QPushButton('曝光与曲线')
+        self.tone.clicked.connect(self.open_tone)
+        controls.addWidget(self.tone)
         self.beauty_version = QCheckBox('美化版')
         self.beauty_version.toggled.connect(self.change_beauty_version)
         controls.addWidget(self.beauty_version)
@@ -212,6 +216,7 @@ class BatchResults(QWidget):
             self.work.hide()
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
+            self.tone.setEnabled(False)
             self.beauty_version.hide()
             self.details.setToolTip('')
             self.details.setPlainText(self.error if not self.sources else '')
@@ -229,6 +234,7 @@ class BatchResults(QWidget):
         self.base_path = self.saved_path(result,result.get('files',{}).get('final')) if result.get('status')=='complete' else None
         self.beauty.setEnabled(bool(self.base_path) and Path(self.base_path).is_file())
         self.retouch.setEnabled(self.beauty.isEnabled())
+        self.tone.setEnabled(self.beauty.isEnabled())
         latest = Path(self.work_directory)/'beauty-latest.json'
         beauty_error = ''
         beauty_files = None
@@ -297,13 +303,19 @@ class BatchResults(QWidget):
             self.details.setPlainText('无法打开人脸美化：'+str(error))
 
     def open_retouch(self):
+        self.open_saved_editor(self.retouch_requested,'局部修饰')
+
+    def open_tone(self):
+        self.open_saved_editor(self.tone_requested,'曝光与曲线')
+
+    def open_saved_editor(self, requested, label):
         row = self.listing.currentRow()
         if row>=0 and self.base_path:
             try:
                 photo = next(photo for photo in project_photos([self.directory]) if photo['source']==self.sources[row])
                 version = next(version for version in photo['versions'] if version['files']['PNG']==self.png_path)
-                self.retouch_requested.emit({'name':Path(self.sources[row]).name,'base':self.png_path,
+                requested.emit({'name':Path(self.sources[row]).name,'base':self.png_path,
                     'directory':self.work_directory,'batch_directory':str(self.directory),
                     'parent_version':retouch_parent(version)})
             except (OSError,ValueError,KeyError,StopIteration) as error:
-                self.details.setPlainText('无法打开局部修饰：'+str(error))
+                self.details.setPlainText('无法打开'+label+'：'+str(error))

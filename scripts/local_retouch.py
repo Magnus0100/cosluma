@@ -147,7 +147,7 @@ def prepare_local_output(directory, sr_config, progress=None):
 
 
 def generate_local(base, root, mask, guide, task, brief, reference, config, progress=None, *, pixels=None,
-        parent_version=None, sr_config=None):
+        parent_version=None, sr_config=None, llm_config):
     report = progress or (lambda message:None)
     if task not in TASKS:
         raise ValueError('请选择补发、发束造型或双下巴修饰')
@@ -207,6 +207,7 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
                     'return the edited view of '+label.format(1)+'.')
         else:
             model_mask = Image.fromarray(cropped).convert('RGB')
+            roles.append('image2: separate edit mask, white editable and black unchanged')
             prompt = (label.format(1)+' is the source photograph. '+label.format(2)+
                 ' is its separate edit mask: white is editable, '
                 'black must stay unchanged. '+TASKS[task][1]+' Do not display the mask or any guide marks in the output. '
@@ -233,6 +234,13 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
             roles.append('style/strand reference only, not the person to render')
             prompt += (f' {label.format(len(images))} is a style/strand reference only; '
                 f'keep the person and scene from {label.format(1)}.')
+        from generation_prompts import write_generation_prompt
+        from image_io import preview_data_url
+        prompt = write_generation_prompt(config['engine']+'_local',
+            [(label.format(index)+': '+role,preview_data_url(image,1536))
+                for index,(role,image) in enumerate(zip(roles,images),1)],
+            llm_config,directory,task={'task':task,'user_request':brief.strip(),
+                'template_prompt':prompt,'image_roles':roles},progress=report)['prompt']
         names = [_upload(image,config) for image in images]
         # Only the pictures go to the model: no mask node, no sampler noise_mask and no grid tail on the
         # desktop path, so the edit is the plain full-context graph the released node documents.

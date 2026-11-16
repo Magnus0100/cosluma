@@ -107,13 +107,32 @@ def project_photos(batches):
                     photo['versions'].append({'id':str(path),'kind':'retouch',
                         'label':local_label,'short_label':local_label,
                         'task':saved['task'],'retouches':retouches,'parent_version':parent,'files':files,**local_common})
+                for edit_number,path in enumerate(sorted(Path(work).glob('tone-*/tone.json')),1):
+                    if any(version['id']==str(path) for version in photo['versions']):
+                        continue
+                    saved = json.loads(path.read_text(encoding='utf-8'))
+                    if saved['status']!='complete':
+                        continue
+                    parent = saved['parent_version']
+                    parameters = saved['parameters']
+                    label = f'制作 {number}{revision_label} · {treatment} · 光调 {edit_number}（曝光 {parameters["exposure_ev"]:+g} EV）'
+                    tone_common = {**common,'description':parent.get('description',description)+
+                        f'\n整图光调：曝光 {parameters["exposure_ev"]:+g} EV；曲线输出 '
+                        f'{parameters["shadows"]:g} / {parameters["midtones"]:g} / {parameters["highlights"]:g}'}
+                    for key in ('parameters','retouches'):
+                        if key in parent:
+                            tone_common[key] = deepcopy(parent[key])
+                    photo['versions'].append({'id':str(path),'kind':'tone','label':label,'short_label':label,
+                        'tone_parameters':parameters,'parent_version':parent,
+                        'files':{kind:str(path.parent/Path(saved['files'][field]).name)
+                            for kind,field in (('PNG','final'),('JPEG','jpeg'))},**tone_common})
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise ValueError(f'读取项目成片失败：{directory}\n{error}') from error
     return list(photos.values())
 
 
 def retouch_parent(version):
-    return {key:deepcopy(version[key]) for key in ('id','kind','label','description','parameters','retouches')
+    return {key:deepcopy(version[key]) for key in ('id','kind','label','description','parameters','retouches','tone_parameters')
         if key in version}
 
 

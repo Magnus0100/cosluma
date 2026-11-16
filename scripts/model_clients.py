@@ -25,6 +25,8 @@ from image_io import SRGB, image_size, open_rgb, preview_data_url, save_json, to
 from prompt_library import ReferenceLibrary
 from settings import credential
 from creative_edits import normalise_edits, edit_instructions
+from photography_tools import PhotographyActions
+from generation_prompts import write_generation_prompt
 
 
 _AGENT_RULES = (
@@ -120,7 +122,8 @@ def multipart(fields, name, filename, data, content_type='image/png', *, additio
     return b''.join(parts), 'multipart/form-data; boundary=' + boundary
 
 
-def _describe(instruction, images, config, response_path, *, task, conversation=(), references=None):
+def _describe(instruction, images, config, response_path, *, task, conversation=(), references=None,
+        actions=None, agent_role='CosLuma 的 COS 摄影 Agent'):
     task = dict(task)
     if references is not None:
         instruction += (
@@ -131,7 +134,8 @@ def _describe(instruction, images, config, response_path, *, task, conversation=
     for label,url in images:
         content.extend([{'type':'text','text':label},
             {'type':'image_url','image_url':{'url':url}}])
-    messages = [{'role':'system','content':_AGENT_RULES+'\n当前阶段要求：\n'+instruction}]
+    rules = _AGENT_RULES.replace('CosLuma 的 COS 摄影 Agent',agent_role)
+    messages = [{'role':'system','content':rules+'\n当前阶段要求：\n'+instruction}]
     if conversation:
         messages.extend(conversation[:-1])
         content.insert(0,{'type':'text','text':conversation[-1]['content']})
@@ -146,16 +150,21 @@ def _describe(instruction, images, config, response_path, *, task, conversation=
                 'detail':part['image_url'].get('detail','auto')}
                 if part.get('type')=='image_url' else dict(part)) for part in value]
         input_messages.append({'role':row['role'],'content':value})
-    trace = {'model':config['model'],'input_messages':input_messages,'calls':[]}
+    trace = {'model':config['model'],'agent_role':agent_role,'input_messages':input_messages,'calls':[]}
     response_path = Path(response_path)
     trace_path = response_path.with_name(response_path.stem+'-calls.json')
     started = time.perf_counter()
     operation = 'request'
     failure = None
     try:
-        for phase in range(3 if references is not None else 1):
+        reference_phase = 0
+        for phase in range(1 + (2 if references is not None else 0) + (1 if actions is not None else 0)):
             payload = {'model':config['model'], 'stream':False, 'messages':messages}
-            tools = references.tools(phase) if references is not None else []
+            tools = references.tools(reference_phase) if references is not None else []
+            if actions is not None:
+                tools += actions.tools()
+                if actions.request is not None:
+                    tools = []
             if tools:
                 payload.update(tools=tools, tool_choice='auto', parallel_tool_calls=False)
             entry = {'phase':phase+1,'offered_tools':[tool['function']['name'] for tool in tools],
@@ -174,18 +183,24 @@ def _describe(instruction, images, config, response_path, *, task, conversation=
             calls = message.get('tool_calls')
             if not calls:
                 break
-            if not tools or len(calls)!=1 or calls[0]['function']['name'] != tools[0]['function']['name']:
-                raise ValueError('摄影 Agent 每步只能调用一次当前提供的参考工具；原始响应已保存')
+            if len(calls)!=1 or calls[0]['function']['name'] not in [tool['function']['name'] for tool in tools]:
+                raise ValueError('Agent 每步只能调用一个当前提供的工具；原始响应已保存')
             lookup_path = response_path.with_name(response_path.stem+f'-lookup-{phase+1}.json')
             save_json(lookup_path,response)
             entry['response_file'] = str(lookup_path)
             call = calls[0]
             arguments = json.loads(call['function']['arguments'])
-            operation = 'reference_tool'
-            result = references.call(call['function']['name'], arguments)
+            operation = call['function']['name']
+            if actions is not None and operation in [tool['function']['name'] for tool in actions.tools()]:
+                result = actions.call(**arguments)
+                entry['requested_operation'] = actions.request
+            else:
+                result = references.call(operation, arguments)
+                reference_phase += 1
             messages.append({'role':'assistant', 'content':message.get('content'), 'tool_calls':calls})
             messages.append({'role':'tool', 'tool_call_id':call['id'], 'content':json.dumps(result,ensure_ascii=False)})
-            save_json(response_path.with_name(response_path.stem+'-references.json'), references.lookups)
+            if references is not None:
+                save_json(response_path.with_name(response_path.stem+'-references.json'), references.lookups)
         operation = 'output_json'
         content = message.get('content')
         if isinstance(content,list):
@@ -351,6 +366,10 @@ def _discussion_messages(conversation):
             anchors['edits'] = normalise_edits(context.get('edits'))
             anchors['samples'] = [{key:sample[key] for key in ('id','label','source','status')} for sample in context['samples']]
             content = json.dumps({'user_message':content,'discussion_context':anchors},ensure_ascii=False)
+        if row['role']=='assistant' and row.get('operation') is not None:
+            content = json.dumps({'reply':content,'operation':row['operation'],
+                'operation_status':row.get('operation_status','not_dispatched'),
+                'operation_error':row.get('operation_error')},ensure_ascii=False)
         messages.append({'role':row['role'],'content':content})
     return messages
 
@@ -438,7 +457,7 @@ def discussion_user_requirements(discussion, edits):
 
 
 def discuss_style(sources, character, brief, library_path, config, directory, conversation, *, direction='', context=None, edits=None):
-    """Discuss the current photographs and samples without submitting production."""
+    """Discuss photographs and request one explicit operation through local tools."""
     images = []
     selected = _representatives(sources) if context is None else context['sources']
     for source in selected:
@@ -456,25 +475,30 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         'samples 模式下 viewed_samples 是同时可见样片，selected_sample 是独立保存的定稿。'
         'has_image 标记本次实际附图，其他历史样片可依据已有文字资料讨论。'
         '创作建议由当前素材形成；修发与重打光按 edits 状态讨论，特效按单张构图决定。'
-        '本阶段负责讨论；探索、沿样片改稿、定稿与批量均由用户通过对应按钮发起。'
+        '用户本条明确要求试样、改稿、采用样片或制作整组时，调用 request_photography。'
+        '操作只在回复保存后执行，reply 说明即将开始，不声称操作已完成。普通讨论、建议、比较与浏览不调用。'
+        '改稿和定稿使用上下文的完整样片 ID；明确采用并制作可用 batch 和该 sample_id。'
+        '只说开始批量时沿用 selected_sample；未定稿且用户未指定时先询问选哪张，不自行替用户定稿。'
         '返回 JSON：reply、direction_update、direction_evidence。reply 为自然对话。'
         'current_creative_direction 是现有完整要求；只有本条用户明确增加、修改、取消要求或采纳建议时才更新。'
         '更新时 direction_update 写完整新要求，保留未取消的内容；空字符串表示明确清空。'
+        '单纯“采用这张”“开始制作”等操作指令不改写视觉要求，也不将操作步骤写入 direction_update。'
         'direction_evidence 逐字引用本条用户表达修改或采纳的完整短句。普通询问、比较与浏览时两者均为 null。'
         '要求只写已采纳的视觉意图；样片引用写清轮次与名称，物件取舍按用户实际表达。'
         +edit_instructions(edits))
+    actions = PhotographyActions(context) if context is not None else None
     result = _describe(instruction,images,config,directory/('chat-'+uuid.uuid4().hex[:8]+'-response.json'),
         task={'character':character,'initial_brief':brief,'current_creative_direction':direction,
             'discussion_context':_discussion_details(context,samples,image_ids) if context is not None else None,
             'edits':normalise_edits(edits)},
-        conversation=_discussion_messages(conversation), references=ReferenceLibrary(library_path))
+        conversation=_discussion_messages(conversation), references=ReferenceLibrary(library_path),actions=actions)
     update = result['direction_update']
     evidence = result['direction_evidence']
     if (update is None and evidence is not None) or (update is not None and
             (not isinstance(evidence,str) or not evidence.strip() or evidence not in conversation[-1]['content'])):
         raise ValueError('创作要求更新没有引用本条用户原文的明确依据；原始响应已保存，已有要求保持')
     return {'reply':result['reply'].strip(),'direction_update':update.strip() if update is not None else None,
-        'direction_evidence':evidence}
+        'direction_evidence':evidence,'operation':actions.request if actions is not None else None}
 
 
 def plan_photos(sources, character, brief, library_path, config, directory, *, option_count=None, creative_direction='', discussion=None, edits=None):
@@ -559,7 +583,7 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
 
 def write_prompt(source, character, brief, library, config, directory, *, direction='', style_reference=None,
         creative_direction='', revision_brief='', revision_requirements=None, edits=None, user_requirements=None,
-        revision_user_text=''):
+        revision_user_text='', generate=True, progress=None):
     edits = normalise_edits(edits)
     verbatim = user_requirement_text(brief, _typed_briefs(edits), user_requirements,
         [value for value in (revision_requirements or []) if isinstance(value, str)], revision_user_text)
@@ -594,11 +618,15 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
     if style_reference is not None:
         with open_rgb(style_reference) as image:
             images.append(('用户选定的真实风格样片，仅参考摄影风格',preview_data_url(image,1280)))
-    description = _describe(instruction,images,config,directory/'llm-response.json',
-        task={'character':character,'initial_brief':brief,'current_creative_direction':creative_direction,
+    task = {'character':character,'initial_brief':brief,'current_creative_direction':creative_direction,
             'group_direction':direction,'revision_requirements':revision_requirements or [],
             'latest_revision_brief':revision_brief,'user_requirements':verbatim,
-            'selected_references':[{key:item[key] for key in ('title','text')} for item in library],'edits':edits})
+            'selected_references':[{key:item[key] for key in ('title','text')} for item in library],'edits':edits}
+    if generate:
+        description = write_generation_prompt('scene',images,config,directory,
+            task=task,instruction=instruction,progress=progress)
+    else:
+        description = _describe(instruction,images,config,directory/'llm-response.json',task=task)
     box = description['head_box']
     left,top,right,bottom = box
     if not (all(type(value) in (int,float) and math.isfinite(value) for value in box)

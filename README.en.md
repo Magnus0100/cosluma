@@ -6,15 +6,18 @@
 
 [Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.27.5) · [Third-party licenses](LICENSES/README.md) · [Development guidelines](AGENTS.md)
 
-Windows x64 · Chinese UI · Source 0.27.6 (unreleased) · Public release 0.27.5
+Windows x64 · Chinese UI · Source / local build 0.30.0 (not publicly released) · Public release 0.27.5
 
 ## What it does
 
+- **Work through chat or controls.** Explicitly request three directions, a revision from a named sample, sample approval or batch production in chat. All manual controls remain available.
 - **Explore with real samples.** Use the character, original photos and discussion to create three complete directions from one representative photo. Refine a selected sample individually.
 - **Finish a consistent batch.** Apply the approved direction and sample to selected photos, with four concurrent photos by default. Reuse the approved sample when its original is included.
 - **Preserve identity.** Align the original identity region with a similarity transform, match its lighting and color, and composite in floating point. Hair editing and subject relighting are independent options, both off by default.
 - **Retouch saved results.** Optionally adjust skin, slim the face, repair or reshape hair, or edit the neck while keeping the base result and version history.
+- **Adjust light through chat or controls.** Apply fixed full-frame exposure and luminance curves to a saved version, then save a separate tone version.
 - **Manage projects and delivery.** Keep photos, discussions, samples and versions together. Choose a delivery version per photo and copy its existing PNG / JPEG files.
+- **Continue discussing saved photos.** Discuss the current photo on the delivery page, explicitly compare or adopt existing versions, or request fixed-algorithm tone editing directly.
 
 ## Get started
 
@@ -34,8 +37,8 @@ Services may run locally or remotely. Remote services receive the photos and pro
 
 1. **Create a project and connect services.** Follow the setup wizard or import an existing configuration. “模型下载” in connection settings provides upstream links, target paths and commands.
 2. **Import photos and enter the character.** Common image formats, HEIC / HEIF and camera RAW are supported. Checkboxes select photos for production; row highlighting only changes the preview. Choose a representative photo separately.
-3. **Discuss and sample.** Describe what to keep and change. Enable hair editing or relighting if needed, then choose “探索三个方向”. Refine one selected sample or explore three new directions.
-4. **Approve and run the batch.** Finalize a complete sample and process the checked photos. A failed photo does not stop the others; its error appears at the relevant step.
+3. **Discuss and sample.** Describe what to keep and change. Enable hair editing or relighting if needed, then say “探索三个方向” or use its button. Ask for a revision from the viewed sample or explore three new directions.
+4. **Approve and run the batch.** Finalize a complete sample, or explicitly ask to adopt the second sample and produce the batch. Production uses checked photos. A failed photo does not stop the others; its error appears at the relevant step.
 5. **Choose versions and export.** In “项目作品 / 交付”, select a version for each photo and export existing files. Start optional beauty retouching, local editing or a single-photo revision when needed.
 
 Opening projects, switching pages and browsing load saved records. Production, revisions and optional retouching start on user action.
@@ -45,7 +48,7 @@ Opening projects, switching pages and browsing load saved records. Production, r
 The default requested **long edge is 6000 pixels**. Results are saved as **16-bit PNG with an sRGB profile** and a matching **8-bit JPEG**. Originals are read-only; results are saved separately.
 
 ```text
-Original + character and direction → per-photo prompt → full-image generation
+Original + character and direction → template prompt writer → independent prompt review → full-image generation
 → one model upscale if needed → SAM3.1 original identity region
 → SIFT similarity alignment → MKL color match / optional relighting
 → float32 mask composite → optional luminance curve → PNG + JPEG
@@ -56,6 +59,14 @@ Original + character and direction → per-photo prompt → full-image generatio
 - Full-image generation reconstructs the scene; the body, background and other regions may change. Fine hair, translucent materials, hard shadows and large geometry changes can leave visible seams.
 - Model stages include 8-bit inputs and outputs; 16-bit saving does not imply original precision throughout. Upscaling runs once; insufficient coverage is saved at the actual available size.
 - Failures keep existing files and error records. The user initiates another run. Models and devices follow connection settings.
+
+The chat Agent receives reference-library and photography-operation tools for its current stage. Local Python calls run the existing pipeline; no code editing, Shell or arbitrary file tools are provided. Each message can request one photography operation. Questions and browsing do not start production, and restored conversation records never execute old operations. Creative chat supports exploration, revision, approval and batch production. Delivery chat supports comparing, adopting and adjusting saved versions. Tone-editor chat supports exposure, curves and explicitly requested saves. Beauty editing and painted local edits remain in their respective interfaces.
+
+Expand **与 Agent 讨论当前作品** in project delivery. Each message freezes its photo, right-hand delivery version, left-hand comparison and actual viewing mode; only images shown in that mode are attached. Browsing during a call never changes its target. The `request_saved_photo` tool accepts only existing version IDs for that photo. Comparison and adoption share the manual entry points; adoption preserves delivery inclusion. Tone requests pass directly to the existing editor without another model conversation, using the specified saved PNG as their base. Preview is the default; saving requires an explicit request. The saved result appears as the left-hand comparison while the right-hand delivery version stays unchanged. Discussion, input drafts and actual execution status are saved with the project. Restoration and browsing never replay operations.
+
+Click **曝光与曲线** from a saved batch or project delivery to edit the selected saved PNG. Exposure is calculated in linear light over ±2 EV, followed by the existing full-frame luminance curve with fixed black/white endpoints and output controls at 25%, 50% and 75% luminance. Their output ranges are 0.05–0.40, 0.40–0.60 and 0.60–0.95. The same parameters apply throughout the image without changing geometry or separately beautifying the face; increased exposure can clip highlights. Manual editing needs no model. Chat uses only the `llm` connection and an `adjust_tone` tool bound to this image, with no image generation. Parameters are relative to the opened version; resetting preserves its pixels exactly. Changes save a draft; a separate version requires the save button or an explicit chat request. Preview and saving start from full-resolution float32 pixels, with native-size display images for 100% viewing. Hidden editors release full-resolution buffers; returning reloads the saved image and draft without replaying chat operations. A new version records its parent and saves a 16-bit PNG plus matching JPEG. Delivery changes only when the user explicitly adopts a version.
+
+Full-image generation, Qwen / H3 local generation and BeautyGRPO skin-base generation use built-in task templates and separate prompt-writing and prompt-review subagents. Both calls use the `llm` connection with independent contexts. Review checks the prompt against the task, without scoring the finished photo or asking users to perform extra validation. A rejected prompt preserves responses and displays specific issues; it is not automatically rewritten or retried. BeautyGRPO retains its exact official instruction. Analysis, upscaling, sliders, compositing and saving keep their existing fixed implementations and bypass these prompt calls. Full-image generation adds one review to its existing writer call; local and skin-base generation each add two LLM calls. Records are saved as `generation-prompt.json` and raw responses in the operation's working directory.
 
 <details>
 <summary><strong>Model service deployment and configuration</strong></summary>
@@ -128,13 +139,16 @@ The CLI provides `styles` (three samples), `stylize` (batch), `compose` (reuse a
 
 ```powershell
 python -B scripts/project_cli.py --root D:/output --config D:/config/cosluma.json styles --source D:/photos --sample D:/photos/a.jpg --character "Character name"
-python -B scripts/backend_server.py --root D:/output --config D:/config/cosluma.json
 ```
 
-HTTP listens on `127.0.0.1:8765` by default: `POST /api/styles`, `/api/stylize`, `/api/compose`, `/api/beautify`; query jobs with `GET /api/jobs/<id>` and service status with `GET /api/status`. In the desktop package, use `CosLuma.exe --cli` or `CosLuma.exe --server` for these entry points.
+Use `CosLuma.exe --cli` for the packaged CLI. Source 0.28.0 removes the application's own HTTP server and `--server` entry point. The desktop calls Python APIs directly; external model services still use their configured HTTP interfaces.
 
 - [photo_pipeline.py](scripts/photo_pipeline.py): sole single-photo entry `finish_photo` and batch entry `finish_batch`.
 - [model_clients.py](scripts/model_clients.py): photography Agent, image editing and model service calls.
+- [photography_tools.py](scripts/photography_tools.py): photography operations bound to sample IDs in the message context.
+- [delivery_chat.py](scripts/delivery_chat.py): frozen saved-photo context and bounded comparison, adoption and tone tools.
+- [tone_edit.py](scripts/tone_edit.py) / [tone_editor.py](scripts/tone_editor.py): fixed exposure and luminance curves, bounded chat tools, full-resolution editing and separate versions.
+- [generation_prompts.py](scripts/generation_prompts.py) / [task templates](providers/generation_templates.json): prompt writing and independent review for generation.
 - [image_io.py](scripts/image_io.py) / [head_composite.py](scripts/head_composite.py): image I/O, identity alignment and compositing.
 - [providers/](providers/): service nodes and configuration template.
 

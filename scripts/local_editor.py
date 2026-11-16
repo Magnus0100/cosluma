@@ -212,11 +212,13 @@ class LocalWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, phase, context, config, *, pixels=None, before=None, directory=None, inputs=None, sr_config=None):
+    def __init__(self, phase, context, config, *, pixels=None, before=None, directory=None, inputs=None,
+            sr_config=None, llm_config=None):
         super().__init__()
         self.phase,self.context,self.config = phase,context,config
         self.pixels,self.before,self.directory,self.inputs = pixels,before,directory,inputs
         self.sr_config = sr_config
+        self.llm_config = llm_config
 
     def run(self):
         try:
@@ -226,7 +228,8 @@ class LocalWorker(QThread):
             elif self.phase=='generate':
                 directory,_ = generate_local(self.context['base'],self.context['directory'],
                     **self.inputs,config=self.config,progress=self.progress.emit,pixels=self.pixels,
-                    parent_version=self.context.get('parent_version'),sr_config=self.sr_config)
+                    parent_version=self.context.get('parent_version'),sr_config=self.sr_config,
+                    llm_config=self.llm_config)
                 result = self.comparison(directory)
             elif self.phase=='compare':
                 result = self.comparison(self.directory)
@@ -252,10 +255,11 @@ class LocalRetouchEditor(QWidget):
     busy_changed = Signal()
     saved = Signal(dict)
 
-    def __init__(self, context, config, parent=None, *, sr_config=None):
+    def __init__(self, context, config, parent=None, *, sr_config=None, llm_config=None):
         super().__init__(parent)
         self.context,self.config = context,config
         self.sr_config = sr_config
+        self.llm_config = llm_config
         self.worker = None
         self.pixels = self.before = None
         self.result_directory = None
@@ -475,7 +479,7 @@ class LocalRetouchEditor(QWidget):
             self.loaded_failure_state = (self.failure_phase,self.failure_message)
         self.failed = False
         self.worker = LocalWorker(phase,self.context,self.config,pixels=self.pixels,before=self.before,
-            directory=self.result_directory,inputs=inputs,sr_config=self.sr_config)
+            directory=self.result_directory,inputs=inputs,sr_config=self.sr_config,llm_config=self.llm_config)
         self.worker.progress.connect(self.message.setText)
         self.worker.ready.connect(self.action_ready)
         self.worker.failed.connect(self.action_failed)

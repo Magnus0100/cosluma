@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
 import json
 from pathlib import Path
 from threading import Event
+import uuid
 
 from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, QThread, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
@@ -16,6 +18,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 from delivery_store import export_delivery, photo_choices, project_photos, retouch_parent, revision_context, selected_version, source_key
 from creative_edits import normalise_edits
 from image_io import open_display
+from delivery_chat import discuss_delivery
+from settings import load_settings
 from studio_widgets import PhotoPreview, StatusText, ui_label
 
 
@@ -171,17 +175,35 @@ class RevisionDialog(QDialog):
         return next(version for version in self.versions if version['id']==self.basis.currentData())
 
 
+class DeliveryChatWorker(QThread):
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, context, conversation, config_path, directory):
+        super().__init__()
+        self.context,self.conversation,self.config_path,self.directory = context,conversation,config_path,directory
+
+    def run(self):
+        try:
+            self.ready.emit(discuss_delivery(self.context,self.conversation,
+                load_settings(self.config_path)['llm'],self.directory))
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class DeliveryView(QWidget):
     beauty_requested = Signal(dict)
     retouch_requested = Signal(dict)
+    tone_requested = Signal(object)
     revision_requested = Signal(dict)
     batch_created = Signal(str)
     busy_changed = Signal()
     state_changed = Signal()
 
-    def __init__(self, project, parent=None):
+    def __init__(self, project, parent=None, *, config_path=None):
         super().__init__(parent)
         self.project = project
+        self.config_path = config_path
         self.state = deepcopy(project.data.get('delivery',{}))
         self.state.setdefault('choices',{})
         self.state.setdefault('exports',[])
@@ -189,9 +211,12 @@ class DeliveryView(QWidget):
         self.state.setdefault('comparisons',{})
         self.state.setdefault('revision_drafts',{})
         self.state.setdefault('latest_revisions',{})
+        self.state.setdefault('discussion',{'messages':[],'input':'','open':False})
         self.photos = []
         self.rows = {}
         self.worker = None
+        self.chat_worker = None
+        self.pending_chat_operation = None
         self.operation = ''
         self.draft_timer = QTimer(self)
         self.draft_timer.setSingleShot(True)
@@ -262,6 +287,7 @@ class DeliveryView(QWidget):
         self.empty = ui_label('本项目还没有完整成片。完成制作后，可以在这里挑选并导出。')
         self.empty.setWordWrap(True)
         column.addWidget(self.empty)
+        discussion_column = column
         splitter.addWidget(left)
         right = QWidget()
         right.setMinimumWidth(380)
@@ -305,6 +331,10 @@ class DeliveryView(QWidget):
         self.retouch.clicked.connect(self.open_retouch)
         self.retouch.setEnabled(False)
         details.addWidget(self.retouch)
+        self.tone = QPushButton('曝光与曲线')
+        self.tone.clicked.connect(self.open_tone)
+        self.tone.setEnabled(False)
+        details.addWidget(self.tone)
         column.addLayout(details)
         revision_row = QHBoxLayout()
         self.revise = QPushButton('给这张改稿')
@@ -318,6 +348,32 @@ class DeliveryView(QWidget):
         self.adopt_revision.clicked.connect(self.adopt_comparison)
         revision_row.addWidget(self.adopt_revision,1)
         column.addLayout(revision_row)
+        self.chat_toggle = QPushButton('与 Agent 讨论当前作品')
+        self.chat_toggle.setCheckable(True)
+        self.chat_toggle.setChecked(self.state['discussion']['open'])
+        discussion_column.addWidget(self.chat_toggle)
+        self.chat_panel = QWidget()
+        chat_column = QVBoxLayout(self.chat_panel)
+        chat_column.setContentsMargins(0,0,0,0)
+        self.chat_history = QPlainTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setMinimumHeight(120)
+        self.chat_history.setMaximumHeight(200)
+        chat_column.addWidget(self.chat_history)
+        chat_row = QHBoxLayout()
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setMaximumHeight(62)
+        self.chat_input.setPlaceholderText('例如：当前版本整体提亮 0.2 EV 并另存；或采用左侧版本为交付。')
+        self.chat_input.setPlainText(self.state['discussion']['input'])
+        self.chat_input.textChanged.connect(self.remember_chat_input)
+        chat_row.addWidget(self.chat_input,1)
+        self.chat_send = QPushButton('发送')
+        self.chat_send.clicked.connect(self.send_chat)
+        chat_row.addWidget(self.chat_send)
+        chat_column.addLayout(chat_row)
+        self.chat_panel.setVisible(self.chat_toggle.isChecked())
+        self.chat_toggle.toggled.connect(self.toggle_chat)
+        discussion_column.addWidget(self.chat_panel)
         splitter.addWidget(right)
         splitter.setSizes([530,650])
         layout.addWidget(splitter,1)
@@ -349,10 +405,11 @@ class DeliveryView(QWidget):
         self.message = StatusText('交付复制所选版本的已有成片，原片和制作文件保留原位置。')
         layout.addWidget(self.message)
         self.refresh_history()
+        self.refresh_discussion()
         self.refresh()
 
     def is_busy(self):
-        return self.worker is not None
+        return self.worker is not None or self.chat_worker is not None
 
     def set_production_busy(self, busy):
         self.production_busy = busy
@@ -485,6 +542,7 @@ class DeliveryView(QWidget):
         return super().eventFilter(watched,event)
 
     def hideEvent(self, event):
+        self.save_state()
         self.thumbnail_timer.stop()
         if self.thumbnail_loader is not None:
             self.thumbnail_loader.cancelled.set()
@@ -545,6 +603,134 @@ class DeliveryView(QWidget):
             self.state['current'] = self.photos[row]['key']
             self.save_state()
 
+    def toggle_chat(self, opened):
+        self.chat_panel.setVisible(opened)
+        self.state['discussion']['open'] = opened
+        self.save_state()
+
+    def remember_chat_input(self):
+        self.state['discussion']['input'] = self.chat_input.toPlainText()
+        self.draft_timer.start()
+
+    def refresh_discussion(self):
+        lines = []
+        for row in self.state['discussion']['messages']:
+            context = row.get('context')
+            label = ('\n发送时：'+context['name']+' · '+context['selected_label']+
+                ' · '+context['view_mode']) if context else ''
+            status = '\n执行状态：'+row['operation_status'] if row.get('operation_status') else ''
+            lines.append(('你：' if row['role']=='user' else '摄影 Agent：')+row['content']+label+status)
+        self.chat_history.setPlainText('\n\n'.join(lines))
+        bar = self.chat_history.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def chat_context(self):
+        photo = self.current_photo()
+        if photo is None:
+            raise ValueError('请先选择一张已保存作品')
+        version = selected_version(photo,self.state['choices'][photo['key']])
+        comparison = self.state['comparisons'].get(photo['key'])
+        previous = selected_version(photo,{'version':comparison}) if comparison is not None else None
+        mode = self.preview.mode.currentData()
+        images = []
+        if mode in ('source','compare'):
+            images.append({'label':'左侧比较对象：'+(previous['label'] if previous else '原片'),
+                'path':previous['files']['JPEG'] if previous else photo['source']})
+        if mode in ('output','compare'):
+            images.append({'label':'右侧交付版本：'+version['label'],'path':version['files']['JPEG']})
+        return {'photo_key':photo['key'],'name':photo['name'],'selected_version':version['id'],
+            'selected_label':version['label'],'comparison_version':comparison,
+            'view_mode':{'source':'只看左侧比较对象','output':'只看右侧交付版本','compare':'左右比较'}[mode],
+            'versions':[{'id':item['id'],'label':item['label'],'description':item['description']}
+                for item in reversed(photo['versions'])],'images':images}
+
+    def send_chat(self):
+        text = self.chat_input.toPlainText().strip()
+        if not text or self.is_busy() or self.production_busy:
+            return
+        try:
+            context = self.chat_context()
+            frozen = {key:context[key] for key in ('photo_key','name','selected_version','selected_label',
+                'comparison_version','view_mode')}
+            frozen['attached_images'] = [image['label'] for image in context['images']]
+            self.state['discussion']['messages'].append({'role':'user','content':text,'context':frozen})
+            self.chat_input.clear()
+            self.refresh_discussion()
+            if not self.save_state():
+                return
+            directory = self.project.path.parent/'discussion'/('delivery-'+
+                datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+            worker = DeliveryChatWorker(context,deepcopy(self.state['discussion']['messages']),self.config_path,directory)
+            self.chat_worker = worker
+            self.operation = 'chat'
+            worker.ready.connect(self.chat_ready)
+            worker.failed.connect(self.chat_failed)
+            worker.finished.connect(self.chat_finished)
+            self.update_controls()
+            self.busy_changed.emit()
+            self.message.setPlainText('Agent 正在讨论发送时的 '+context['name']+'，可以继续浏览其他作品。')
+            worker.start()
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('无法发送作品讨论：'+str(error))
+
+    def chat_ready(self, result):
+        row = {'role':'assistant','content':result['reply'],'operation':result['operation']}
+        self.state['discussion']['messages'].append(row)
+        self.refresh_discussion()
+        self.message.setPlainText('讨论已完成：'+self.chat_worker.context['name'])
+        if self.save_state() and row['operation'] is not None:
+            self.pending_chat_operation = row
+
+    def chat_failed(self, error):
+        self.state['discussion']['messages'].append({'role':'assistant','content':'本次讨论失败：'+error})
+        self.refresh_discussion()
+        self.save_state()
+        self.message.setPlainText('作品讨论失败：'+error)
+
+    def chat_finished(self):
+        worker,self.chat_worker = self.chat_worker,None
+        self.operation = ''
+        row,self.pending_chat_operation = self.pending_chat_operation,None
+        if row is not None:
+            self.execute_chat_operation(row,worker.context)
+        self.update_controls()
+        self.busy_changed.emit()
+        worker.deleteLater()
+
+    def execute_chat_operation(self, row, context):
+        try:
+            photo = next(photo for photo in self.photos if photo['key']==context['photo_key'])
+            operation = row['operation']
+            action = operation['action']
+            identifier = operation['version_id']
+            version = selected_version(photo,{'version':identifier}) if identifier is not None else None
+            if action=='tone':
+                row['operation_status'] = '光调已请求'
+                self.tone_requested.emit({'name':photo['name'],'base':version['files']['PNG'],
+                    'directory':version['work'],'batch_directory':version['batch'],'return_to_delivery':True,
+                    'delivery_photo_key':photo['key'],
+                    'parent_version':retouch_parent(version),'delivery_message':row,
+                    'delivery_user_text':self.state['discussion']['messages'][-2]['content']})
+            else:
+                self.listing.setCurrentRow(self.rows[photo['key']])
+                if action=='adopt':
+                    self.adopt_saved_version(photo,version)
+                    row['operation_status'] = '已采用交付版本：'+version['label']
+                else:
+                    self.compare_saved_version(photo,identifier)
+                    row['operation_status'] = '已切换比较对象：'+(version['label'] if version else '原片')
+        except (OSError,ValueError,KeyError,StopIteration) as error:
+            row['operation_status'] = '操作失败：'+str(error)
+            self.message.setPlainText(row['operation_status'])
+        self.discussion_changed()
+
+    def discussion_changed(self):
+        self.refresh_discussion()
+        row = self.state['discussion']['messages'][-1]
+        if row.get('operation_status'):
+            self.message.setPlainText(row['operation_status'])
+        self.save_state()
+
     def show_photo(self, row):
         self.update_revision_controls()
         self.version.blockSignals(True)
@@ -564,6 +750,7 @@ class DeliveryView(QWidget):
             self.comparison_note.setText('')
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
+            self.tone.setEnabled(False)
             return
         photo = self.photos[row]
         self.photo_title.setText(photo['name'])
@@ -595,6 +782,7 @@ class DeliveryView(QWidget):
             self.comparison_note.setText('')
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
+            self.tone.setEnabled(False)
             return
         width,height = version['dimensions']
         self.base_path = version['base']
@@ -603,6 +791,7 @@ class DeliveryView(QWidget):
         self.update_comparison(photo,version)
         self.beauty.setEnabled(not self.is_busy() and not self.production_busy and Path(version['base']).is_file())
         self.retouch.setEnabled(not self.is_busy() and not self.production_busy and Path(version['files']['PNG']).is_file())
+        self.tone.setEnabled(self.retouch.isEnabled())
 
     def update_comparison(self, photo, version):
         reference = self.reference.currentData()
@@ -631,11 +820,20 @@ class DeliveryView(QWidget):
         photo = self.current_photo()
         if photo is None or self.reference.currentIndex()<0:
             return
-        self.state['comparisons'][photo['key']] = self.reference.currentData()
+        self.compare_saved_version(photo,self.reference.currentData())
+
+    def compare_saved_version(self, photo, identifier):
+        self.state['comparisons'][photo['key']] = identifier
         self.preview.choice = 'compare'
         self.preview_key = None
-        self.show_photo(self.listing.currentRow())
+        self.show_photo(self.rows[photo['key']])
         self.save_state()
+
+    def compare_saved_result(self, photo_key, png):
+        photo = self.photos[self.rows[photo_key]]
+        version = next(version for version in photo['versions'] if version['files']['PNG']==png)
+        self.listing.setCurrentRow(self.rows[photo_key])
+        self.compare_saved_version(photo,version['id'])
 
     def change_linked_comparison(self, linked):
         self.state['linked_comparison'] = linked
@@ -667,7 +865,7 @@ class DeliveryView(QWidget):
         self.summary.setToolTip('这些交付选择没有对应的当前作品；选择仍保留，导出时会在交付记录中'
             '列出失败并说明原因。' if retained else '')
         busy = self.is_busy()
-        self.listing.setEnabled(not busy or self.operation=='revision')
+        self.listing.setEnabled(not busy or self.operation in ('revision','chat'))
         self.version.setEnabled(not busy and self.current_photo() is not None)
         self.reference.setEnabled(self.current_photo() is not None)
         self.select_all.setEnabled(not busy and bool(visible))
@@ -685,11 +883,16 @@ class DeliveryView(QWidget):
             try:
                 version = selected_version(photo,self.state['choices'][photo['key']])
                 self.retouch.setEnabled(not busy and not self.production_busy and Path(version['files']['PNG']).is_file())
+                self.tone.setEnabled(self.retouch.isEnabled())
             except ValueError:
                 self.retouch.setEnabled(False)
+                self.tone.setEnabled(False)
         else:
             self.retouch.setEnabled(False)
+            self.tone.setEnabled(False)
         self.update_revision_controls()
+        self.chat_send.setEnabled(not busy and not self.production_busy and self.current_photo() is not None)
+        self.chat_input.setEnabled(self.chat_worker is None)
 
     def update_revision_controls(self):
         photo = self.current_photo()
@@ -711,14 +914,17 @@ class DeliveryView(QWidget):
             return
         try:
             reference = selected_version(photo,{'version':self.state['comparisons'][photo['key']]})
-            for path in reference['files'].values():
-                if not Path(path).is_file():
-                    raise FileNotFoundError('所选版本文件不存在：'+path)
-            previous = self.state['choices'][photo['key']]['version']
-            self.state['comparisons'][photo['key']] = previous
-            self.version.setCurrentIndex(self.version.findData(reference['id']))
+            self.adopt_saved_version(photo,reference)
         except (OSError,ValueError,KeyError) as error:
             self.message.setPlainText('无法采用比较版本：'+str(error))
+
+    def adopt_saved_version(self, photo, version):
+        for path in version['files'].values():
+            if not Path(path).is_file():
+                raise FileNotFoundError('所选版本文件不存在：'+path)
+        previous = self.state['choices'][photo['key']]['version']
+        self.state['comparisons'][photo['key']] = previous
+        self.version.setCurrentIndex(self.version.findData(version['id']))
 
     def remember_revision_draft(self, version, draft):
         self.state['revision_drafts'][version] = draft
@@ -802,14 +1008,20 @@ class DeliveryView(QWidget):
             self.message.setPlainText('无法打开人脸美化：'+str(error))
 
     def open_retouch(self):
+        self.open_saved_editor(self.retouch_requested,'局部修饰')
+
+    def open_tone(self):
+        self.open_saved_editor(self.tone_requested,'曝光与曲线')
+
+    def open_saved_editor(self, requested, label):
         try:
             photo = self.current_photo()
             version = selected_version(photo,self.state['choices'][photo['key']])
-            self.retouch_requested.emit({'name':photo['name'],'base':version['files']['PNG'],
+            requested.emit({'name':photo['name'],'base':version['files']['PNG'],
                 'directory':version['work'],'batch_directory':version['batch'],'return_to_delivery':True,
                 'parent_version':retouch_parent(version)})
         except (OSError,ValueError,KeyError) as error:
-            self.message.setPlainText('无法打开局部修饰：'+str(error))
+            self.message.setPlainText('无法打开'+label+'：'+str(error))
 
     def choose_export(self):
         parent = QFileDialog.getExistingDirectory(self,'选择交付文件夹的保存位置',

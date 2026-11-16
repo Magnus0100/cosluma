@@ -172,11 +172,13 @@ class BeautyWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, phase, *, context, config, session=None, pixels=None, parameters=None, before=None):
+    def __init__(self, phase, *, context, config, session=None, pixels=None, parameters=None, before=None,
+            llm_config=None):
         super().__init__()
         self.phase, self.context, self.config = phase,context,config
         self.session,self.pixels,self.parameters = session,pixels,parameters
         self.before = before
+        self.llm_config = llm_config
 
     def run(self):
         try:
@@ -189,7 +191,8 @@ class BeautyWorker(QThread):
                 pixels = open_photo(self.context['base'])
                 result = (session,pixels,display_image(pixels))
             elif self.phase == 'skin':
-                result = prepare_skin(self.session,self.config,self.progress.emit,pixels=self.pixels)
+                result = prepare_skin(self.session,self.config,self.progress.emit,pixels=self.pixels,
+                    llm_config=self.llm_config)
             elif self.phase == 'render':
                 result = self.before
                 if self.parameters.skin or self.parameters.slim:
@@ -213,9 +216,10 @@ class BeautyEditor(QWidget):
     busy_changed = Signal()
     connection_requested = Signal()
 
-    def __init__(self, context, config, parent=None):
+    def __init__(self, context, config, parent=None, *, llm_config=None):
         super().__init__(parent)
         self.context, self.config = dict(context),dict(config)
+        self.llm_config = llm_config
         self.session = None
         self.pixels = None
         self.before = None
@@ -363,7 +367,8 @@ class BeautyEditor(QWidget):
         if phase!='resume':
             self.failure_message = ''
         worker = BeautyWorker(phase, context=self.context,config=self.config,
-            session=self.session,pixels=self.pixels,parameters=self.parameters(),before=self.before)
+            session=self.session,pixels=self.pixels,parameters=self.parameters(),before=self.before,
+            llm_config=self.llm_config)
         worker.ready.connect(self.action_ready)
         worker.failed.connect(self.action_failed)
         worker.progress.connect(self.message.setText)

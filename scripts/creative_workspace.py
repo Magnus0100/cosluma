@@ -72,6 +72,7 @@ class CreativeWorkspace(QWidget):
     style_selected = Signal(dict)
     state_changed = Signal()
     back_requested = Signal()
+    batch_requested = Signal(object)
 
     def __init__(self, sources, sample_source, character, brief, root, config, parent=None, *, previous=None, discussion=None):
         super().__init__(parent)
@@ -80,6 +81,7 @@ class CreativeWorkspace(QWidget):
         self.production_busy = False
         self.worker = None
         self.chat_worker = None
+        self.pending_operation = None
         self.messages = []
         self.creative_direction = ''
         self.samples_direction = ''
@@ -342,7 +344,7 @@ class CreativeWorkspace(QWidget):
         composer_layout.setSpacing(8)
         self.chat_input = QPlainTextEdit()
         self.chat_input.setProperty('role','composer')
-        self.chat_input.setPlaceholderText('聊聊你想要的感觉，或指出样片里想改的地方…')
+        self.chat_input.setPlaceholderText('聊聊想法，也可直接说“探索三个方向”“沿这张改稿”“采用第二张并制作整组”…')
         self.chat_input.setFixedHeight(58)
         self.chat_input.textChanged.connect(self.draft_changed)
         composer_layout.addWidget(self.chat_input)
@@ -750,7 +752,7 @@ class CreativeWorkspace(QWidget):
             'viewed_samples':viewed_samples,
             'comparison_sample':self.comparison_sample,
             'next_sample_source':next_source,'selected_sample':self.chosen_file or None,
-            'sources':sources,'samples':samples,'edits':self.current_edits()}
+            'sources':sources,'production_count':len(self.sources),'samples':samples,'edits':self.current_edits()}
 
     def refresh_discussion_target(self):
         label = '当前讨论：'+self.discussion_context()['label']
@@ -844,7 +846,7 @@ class CreativeWorkspace(QWidget):
             self.chat_history.show_messages([*self.messages,self.pending_message],
                 {'role':'assistant','content':'正在查看原片与样片…'},scroll_to_bottom=True)
             self.chat_input.clear()
-            self.message.setPlainText('Agent 正在结合角色、原片与已有样片回复；这一步只讨论。')
+            self.message.setPlainText('Agent 正在查看原片与样片，并处理本条明确提出的操作。')
             self.update_creative_actions()
             self.state_changed.emit()
             self.chat_worker.start()
@@ -859,7 +861,7 @@ class CreativeWorkspace(QWidget):
         changed = update is not None and update!=self.creative_direction
         self.messages.extend([self.pending_message,{'role':'assistant','content':reply['reply'],
             'direction_update':update,'direction_evidence':reply['direction_evidence'],'direction_changed':changed,
-            'direction_before':self.creative_direction}])
+            'direction_before':self.creative_direction,'operation':reply.get('operation')}])
         self.pending_message = None
         if update is not None:
             self.creative_direction = update
@@ -871,6 +873,8 @@ class CreativeWorkspace(QWidget):
         except OSError as error:
             self.message.setPlainText('回复已收到，保存对话失败：'+str(error))
             return
+        if reply.get('operation') is not None:
+            self.pending_operation = self.messages[-1]
         self.message.setPlainText('创作要求已更新。可继续讨论；按当前讨论生成新样片后，再定稿用于批量。' if
             changed and self.options and self.samples_direction!=self.creative_direction else
             '可以继续讨论、查看已有样片，或按当前讨论主动生成样片。由你决定何时定稿。')
@@ -893,6 +897,37 @@ class CreativeWorkspace(QWidget):
         self.update_creative_actions()
         self.state_changed.emit()
         worker.deleteLater()
+        operation,self.pending_operation = self.pending_operation,None
+        if operation is not None:
+            self.execute_operation(operation)
+
+    def execute_operation(self, message):
+        """Dispatch only this live reply; restored discussion records never run commands."""
+        operation = message['operation']
+        try:
+            action,sample_id = operation['action'],operation['sample_id']
+            sample = load_style(sample_id) if sample_id is not None else None
+            if action=='explore':
+                if not self.start_samples():
+                    raise ValueError(self.message.toPlainText())
+            elif action=='revise':
+                if not self.start_samples(base_style=sample):
+                    raise ValueError(self.message.toPlainText())
+            else:
+                if sample is not None and not self.adopt_sample(sample):
+                    raise ValueError(self.message.toPlainText())
+            message['operation_status'] = 'complete' if action=='select' else 'dispatched'
+            if action=='batch':
+                self.batch_requested.emit(message)
+                if message['operation_status']=='failed':
+                    self.message.setPlainText('摄影操作未开始：'+message['operation_error'])
+        except Exception as error:
+            message.update(operation_status='failed',operation_error=str(error))
+            self.message.setPlainText('摄影操作未开始：'+str(error))
+        try:
+            self.save_discussion()
+        except OSError as error:
+            self.message.setPlainText('操作记录保存失败：'+str(error))
 
     def inspect(self, index):
         self.show_option(index)
@@ -1209,6 +1244,7 @@ class CreativeWorkspace(QWidget):
         self.update_creative_actions()
         self.state_changed.emit()
         self.worker.start()
+        return True
 
     def directory_ready(self, directory):
         self.directory = directory
@@ -1320,12 +1356,17 @@ class CreativeWorkspace(QWidget):
             self.message.setPlainText('这段输入尚未发送，未纳入当前创作要求。先发送或清空输入，再决定是否定稿。')
             self.chat_input.setFocus()
             return
-        if not self.samples_are_current():
+        return self.adopt_sample(self.options[index])
+
+    def adopt_sample(self, option):
+        """The same explicit adoption operation for the button and the chat tool."""
+        direction = option['art_direction']
+        if (direction.get('creative_direction','')!=self.creative_direction or
+                not edits_match(direction.get('edits'),self.current_edits())):
             self.message.setPlainText('创作要求或修发、光照设置已改变，请先按当前设置生成样片，再定稿。已有样片仍可对比查看。')
-            return
+            return False
         try:
             self.ensure_discussion()
-            option = self.options[index]
             self.chosen_file = option['selection_file']
             self.frozen_direction = option['art_direction']['direction']
             save_json(Path(self.discussion_directory)/'chosen-direction.json',{
@@ -1343,3 +1384,4 @@ class CreativeWorkspace(QWidget):
         self.update_creative_actions()
         self.style_selected.emit(option)
         self.state_changed.emit()
+        return True
