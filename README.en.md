@@ -1,81 +1,86 @@
 # CosLuma
 
-A photo-editing workspace for cosplay photography. Discuss a look, compare samples and finish a batch, with manual adjustments when needed.
+Photo editing for cosplay. Discuss a look, produce finished photographs and retouch the details yourself.
 
-[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.47.0) · [Getting started](#getting-started) · [简体中文](README.md)
+**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
-Windows 64-bit · Chinese interface · 0.47.0
+![Finished photograph with scene editing, styled hair, flowing fabric and final relighting](docs/images/readme/finished.jpg)
 
-| Original | Finished photograph |
-| :---: | :---: |
-| ![Original photograph of 奶糕Naige](docs/images/readme/original.jpg) | ![Lotus scene with relighting, styled hair and flowing fabric](docs/images/readme/finished.jpg) |
+Scene, hair and clothing edits, followed by relighting of the complete frame. Cosplayer: **奶糕Naige on Douyin**, shown with permission for this project's README.
 
-The finished version includes scene editing, subject relighting, hair editing and clothing motion. Cosplayer: **奶糕Naige on Douyin**, shown with permission for this project's README.
+<details>
+<summary>View the original and native-pixel crops</summary>
 
-## Compare samples before choosing a look
+![Original photograph of 奶糕Naige](docs/images/readme/original.jpg)
+
+The original and saved result are both 6000 × 4000. Full photographs on this page are reduced copies. Face beauty was not used.
+
+Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · [finished photograph](docs/images/readme/finished-face.png).
+
+</details>
+
+## Compare samples, then choose a look
+
+Describe the setting and mood, compare three directions, then use your chosen direction for the set.
 
 | Lotus pond | Golden light | Clear water |
 | :---: | :---: | :---: |
 | ![Lotus pond sample](docs/images/readme/style-1.jpg) | ![Golden light sample](docs/images/readme/style-2.jpg) | ![Clear water sample](docs/images/readme/style-3.jpg) |
 
-Three initial samples from the same original, with hair editing, relighting and face beauty disabled.
+Initial samples from the same original, with hair editing, relighting and face beauty disabled.
 
-## How it works
+## Refine the details
 
-1. **Choose photographs:** import photos and character information, then check the photos to process.
-2. **Describe the look:** discuss the setting and mood, compare three samples and choose a direction.
-3. **Finish the set:** produce the batch, retouch as needed, compare saved versions and export.
+Paint the fabric you want to edit, describe its movement and compare the result.
+
+| Before clothing editing | After clothing editing |
+| :---: | :---: |
+| ![Fabric before editing](docs/images/readme/clothing-before.jpg) | ![The same crop after adding fabric motion](docs/images/readme/clothing-after.jpg) |
+
+- **Hair:** fill gaps, repair visible wig netting or reshape strands.
+- **Face:** select a face and control skin retouching and slimming.
+- **Light and color:** adjust exposure and color, or relight the complete photograph after hair and clothing edits.
+
+Keep the original and saved versions. Choose the version to deliver, then export PNG or JPEG.
+
+## From selection to export
+
+1. **Import photos**, enter character information and check the photos to process.
+2. **Discuss the look**, compare samples and finish the set in your chosen direction.
+3. **Retouch as needed**, compare saved versions and export your selection.
 
 ![Actual CosLuma interface comparing three samples](docs/images/readme/workspace.jpg)
 
-## Keep editing the finished photograph
-
-| What to adjust | What you can do |
-| --- | --- |
-| Light and color | Adjust exposure, warmth, saturation and brightness, including batch changes; relight the complete frame after local edits |
-| Face | Select a face and control skin retouching and slimming yourself |
-| Hair and clothing | Paint the part to edit, style strands or add flowing fabric |
-| Delivery | Keep originals and saved versions; choose the PNG or JPEG to export |
-
-Hair editing and subject relighting are optional. Clothing motion is a separate edit after production. You initiate generation, saving and adoption.
-
-After saving hair or clothing edits, select that version and open **Light and color → Relighting**, or request relighting and saving in its chat. The model sees the complete frame, including the added content. Unsaved manual tone changes are excluded.
-
 <details>
-<summary>See hair editing and relighting separately</summary>
-
-| Hair editing only | Subject relighting only |
-| :---: | :---: |
-| ![Hair editing result](docs/images/readme/hair.jpg) | ![Subject relighting result](docs/images/readme/relight.jpg) |
-
-These are full-image revisions of the lotus sample, so background details also change. Hair editing retains the original face, ears and physical headwear; disabling it retains the original whole head. Relighting coordinates the person, clothing, props and environment.
-
-</details>
-
-<details>
-<summary>Usage and retouching details</summary>
+<summary>More usage details</summary>
 
 Common images, HEIC / HEIF and camera RAW are supported. Checkboxes choose the production set, row highlighting controls preview, and the representative original is selected separately. Batches process four photos concurrently by default and save each independently.
 
 For face beauty, select and analyze a face, explicitly generate a skin base, then adjust skin retouching and slimming. Both strengths start at zero; returning to zero restores the base.
 
-Hair repair uses a detail view with full-photo context and writes back only inside the selection. Strand styling and clothing motion generate from the complete photograph and extract the actual old and new part silhouettes. Blue strokes protect regions to retain. Appearance references and shape marks are optional. All three local tasks use Qwen-Image-2.1 or MiniMax-H3-Image as selected in connection settings.
+Hair repair writes back only inside the selection. Strand styling and clothing motion use the actual generated silhouettes; blue strokes protect regions to retain. Appearance references and shape marks are optional. All three local tasks use Qwen-Image-2.1 or MiniMax-H3-Image as selected in Connections.
 
 After generation, adjust the selection and explicitly recompose to reuse the existing output. Changes to text, marks or references save a draft; another generation requires an explicit action. Browsing, page changes and project restoration do not call models.
+
+After saving hair or clothing edits, select that version and open **Light and color → Relighting**, or request relighting and saving in its chat. The model sees the complete frame. Unsaved manual tone changes are excluded.
 
 Delivery copies existing saved files. New edits do not automatically replace the chosen delivery version.
 
 </details>
 
 <p align="center">
-  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="400">
+  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="320">
 </p>
 
 ## Getting started
 
-Download `CosLuma-0.47.0-windows-x64.zip`, extract the complete archive and open `CosLuma/CosLuma.exe`. Enter service addresses and credentials in Connections, then create a project and import photos.
+Windows 64-bit. Chinese interface.
 
-**Photography-assistant, image-editing, and segmentation / upscaling services must be configured before use.** The desktop package includes the runtime, with models and weights configured separately. Connection settings fetch model lists automatically, with manual entry available. Remote services receive the photos and prompts sent to them.
+1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
+2. Enter model-service addresses and credentials in **Connections**. The application fetches model lists automatically.
+3. Create a project and import photos.
+
+**Model services must be configured before first use.** The desktop package includes the runtime; models and weights are configured separately. See **Connections and deployment** below. Remote services receive the photographs and prompts sent to them.
 
 ## Configuration and technical details
 
@@ -127,9 +132,9 @@ Relighting uses `models/cosluma_relight/pixlrelight` (upstream source, `model.sa
 <details>
 <summary>Showcase dimensions and native-pixel crops</summary>
 
-The opening result passes the complete composite, including edited hair and clothing, into its final relighting step. The example was made in stages through existing interfaces. Full-frame relighting of saved versions is available from 0.47.0.
+The opening result passes the complete composite, including edited hair and clothing, into its final relighting step. It uses the 0.47.0 implementation with an aligned lighting reference. The example was made in stages through existing interfaces. The clothing comparison shows the same crop before and after one local edit, before final relighting.
 
-The original and saved result are 6000 × 4000. Base generation and clothing editing each produce 1536 × 1024 images, with one 4× model upscale and downsampling where needed in each stage. Final PIXLRelight estimates fields on a 512 analysis canvas and modulates the full-size float32 composite; lighting-reference RGB does not replace its detail. A subsequent 0.2 EV exposure adjustment uses the tone tool. Outputs are an sRGB 16-bit PNG and matching JPEG. Full photographs on this page are reduced copies. Face beauty was not used.
+The original and saved result are 6000 × 4000. Base generation and clothing editing each produce 1536 × 1024 images, with one 4× model upscale and downsampling where needed in each stage. The final lighting reference is natively 1248 × 832. PIXLRelight estimates fields on a 512 analysis canvas and modulates the full-size float32 composite; lighting-reference RGB does not replace its detail. A subsequent 0.2 EV exposure adjustment uses the tone tool. Outputs are an sRGB 16-bit PNG and matching JPEG. Full photographs on this page are reduced copies. Face beauty was not used.
 
 Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · [finished result](docs/images/readme/finished-face.png).
 
