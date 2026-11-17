@@ -345,6 +345,14 @@ class ServiceSettings(QDialog):
         self.cancel.clicked.connect(self.reject)
         navigation.addWidget(self.cancel)
         navigation.addStretch(1)
+        self.previous_button = QPushButton('上一步')
+        self.previous_button.setProperty('kind', 'quiet')
+        self.previous_button.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.currentIndex()-1))
+        navigation.addWidget(self.previous_button)
+        self.next_button = QPushButton('下一步')
+        self.next_button.setProperty('kind', 'primary')
+        self.next_button.clicked.connect(lambda: self.tabs.setCurrentIndex(self.tabs.currentIndex()+1))
+        navigation.addWidget(self.next_button)
         self.save_button = QPushButton('保存')
         self.save_button.setProperty('kind', 'primary')
         self.save_button.clicked.connect(self.save)
@@ -485,6 +493,10 @@ class ServiceSettings(QDialog):
     def update_navigation(self):
         index = self.tabs.currentIndex()
         self.steps.setCurrentRow(index)
+        last_page = index == self.tabs.count()-1
+        self.previous_button.setVisible(not self.existing and index > 0)
+        self.next_button.setVisible(not self.existing and not last_page)
+        self.save_button.setVisible(self.existing or last_page)
         self.message.clear()
 
     def provider_connection(self, service):

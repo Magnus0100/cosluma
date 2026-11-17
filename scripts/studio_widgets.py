@@ -104,7 +104,7 @@ def apply_theme(app):
         QPushButton[role="workspaceTab"]:checked { color: #12665e; border-bottom-color: #16796f; font-weight: 600; }
         QFrame[role="decisionBar"] { background: #ffffff; border: 1px solid #cbd8e3; border-radius: 10px; }
         QLabel[role="chosenPreview"] { background: #252e2b; color: #c0ccd7; border-radius: 6px; }
-        QLabel[role="dropArea"] { background: #f8faf8; color: #6c7c75; border: 1px dashed #c3d0c6; border-radius: 8px; padding: 18px; }
+        QFrame[role="dropArea"] { background: #f8faf8; border: 1px dashed #c3d0c6; border-radius: 8px; }
         QPushButton:disabled, QToolButton:disabled { color: #8a9b90; background: #edf2ee; border-color: #e0e8e1; }
         QPushButton[kind="primary"] { background: #16796f; color: #ffffff; border: 1px solid #16796f; font-weight: 600; }
         QPushButton[kind="primary"]:hover { background: #208b7f; }

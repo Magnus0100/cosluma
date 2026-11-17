@@ -77,10 +77,12 @@ Delivery copies existing saved files. New edits do not automatically replace the
 Windows 64-bit. Chinese interface.
 
 1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
-2. Enter model-service addresses and credentials in **Connections**. The application fetches model lists automatically.
-3. Create a project and import photos.
+2. Create a project, import photos and enter the character.
+3. Enter model-service addresses and credentials in **Settings → Connections**. The application fetches model lists automatically. Open **Create** to make samples.
 
-**Model services must be configured before first use.** The desktop package includes the runtime; models and weights are configured separately. See **Connections and deployment** below. Remote services receive the photographs and prompts sent to them.
+**Making samples requires model services.** The desktop package includes the runtime; models and weights are configured separately. See **Connections and deployment** below. Remote services receive the photographs and prompts sent to them.
+
+In the current source, a new project opens the Photos page, and Create prompts for connections when needed. First-time connection setup goes one page at a time. If the 0.47.0 portable package shows the connection screen first, choose **Set up later** to import photos.
 
 ## Configuration and technical details
 

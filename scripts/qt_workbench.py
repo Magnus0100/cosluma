@@ -267,18 +267,6 @@ class Workbench(QMainWindow):
         settings_button.setMenu(settings_menu)
         rail_layout.addWidget(settings_button)
         layout.addWidget(header_host)
-        self.setup_banner = QFrame()
-        self.setup_banner.setProperty('role', 'decisionBar')
-        setup_row = QHBoxLayout(self.setup_banner)
-        setup_row.setContentsMargins(16, 12, 16, 12)
-        self.setup_hint = ui_label('尚未配置连接')
-        self.setup_hint.setWordWrap(True)
-        setup_row.addWidget(self.setup_hint, 1)
-        self.setup_guide_button = QPushButton('开始配置')
-        self.setup_guide_button.setProperty('kind', 'primary')
-        self.setup_guide_button.clicked.connect(self.configure_services)
-        setup_row.addWidget(self.setup_guide_button)
-        layout.addWidget(self.setup_banner)
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
 
@@ -348,10 +336,20 @@ class Workbench(QMainWindow):
         queue_layout.setContentsMargins(14, 14, 14, 14)
         queue_layout.setSpacing(12)
         self.queue_pages = QStackedWidget()
-        empty = QLabel('一次拖入多张照片或多个文件夹\n勾选“包含子文件夹”可连同各层照片导入\n\nJPEG、PNG、TIFF、HEIC / HEIF、WebP、BMP 和相机 RAW')
-        empty.setAlignment(Qt.AlignCenter)
-        empty.setWordWrap(True)
+        empty = QFrame()
         empty.setProperty('role', 'dropArea')
+        empty_queue = QVBoxLayout(empty)
+        empty_queue.addStretch(1)
+        add_first = QPushButton('选择照片')
+        add_first.setProperty('kind', 'primary')
+        add_first.clicked.connect(self.select_sources)
+        empty_queue.addWidget(add_first, 0, Qt.AlignHCenter)
+        self.inputs.append(add_first)
+        drop_hint = ui_label('也可以拖入照片或文件夹')
+        drop_hint.setWordWrap(True)
+        drop_hint.setAlignment(Qt.AlignCenter)
+        empty_queue.addWidget(drop_hint)
+        empty_queue.addStretch(1)
         self.queue_pages.addWidget(empty)
         self.listing = QTableWidget(0, 2)
         self.listing.setHorizontalHeaderLabels(['照片', '状态'])
@@ -473,7 +471,8 @@ class Workbench(QMainWindow):
         self.creative_empty = QFrame()
         empty_layout = QVBoxLayout(self.creative_empty)
         empty_layout.addStretch(1)
-        empty_layout.addWidget(ui_label('暂无原片', 'title'), 0, Qt.AlignCenter)
+        self.creative_empty_title = ui_label('添加照片', 'title')
+        empty_layout.addWidget(self.creative_empty_title, 0, Qt.AlignCenter)
         self.creative_next = ui_label('请添加照片并填写角色')
         self.creative_next.setWordWrap(True)
         self.creative_next.setAlignment(Qt.AlignCenter)
@@ -589,40 +588,6 @@ class Workbench(QMainWindow):
         results_layout.addWidget(self.readiness)
         self.pages.addWidget(results_page)
 
-        self.welcome_page = QWidget()
-        welcome_layout = QVBoxLayout(self.welcome_page)
-        welcome_layout.setContentsMargins(36, 24, 36, 24)
-        welcome_layout.addStretch(1)
-        welcome_body = QHBoxLayout()
-        welcome_body.addStretch(1)
-        connection = QFrame()
-        connection.setProperty('role', 'panel')
-        connection.setMaximumWidth(520)
-        connection_layout = QVBoxLayout(connection)
-        connection_layout.setContentsMargins(24, 24, 24, 24)
-        connection_layout.setSpacing(16)
-        connection_layout.addWidget(ui_label('连接服务', 'title'))
-        note = ui_label('需配置图文、图像编辑与 ComfyUI 服务。模型和账号需自行准备。')
-        note.setWordWrap(True)
-        connection_layout.addWidget(note)
-        begin = QPushButton('开始配置')
-        begin.setProperty('kind', 'primary')
-        begin.clicked.connect(self.configure_services)
-        connection_layout.addWidget(begin)
-        imported = QPushButton('导入已有配置')
-        imported.clicked.connect(self.import_config)
-        connection_layout.addWidget(imported)
-        later = QPushButton('暂不配置')
-        later.setProperty('kind', 'quiet')
-        later.clicked.connect(self.defer_setup)
-        connection_layout.addWidget(later)
-        connection.setToolTip('保存设置不调用模型。主动发送或制作时，照片会交给所配置的服务。')
-        welcome_body.addWidget(connection,1)
-        welcome_body.addStretch(1)
-        welcome_layout.addLayout(welcome_body)
-        welcome_layout.addStretch(1)
-        self.welcome_index = self.pages.addWidget(self.welcome_page)
-
         self.project_browser = ProjectBrowser(self)
         self.projects_index = self.pages.addWidget(self.project_browser)
         self.project_browser.create_requested.connect(self.new_project)
@@ -641,12 +606,11 @@ class Workbench(QMainWindow):
         self.status.setMaximumHeight(42)
         layout.addWidget(self.status)
         self.inputs.extend([self.character, self.brief, output_row, advanced, self.setup_button,
-            self.import_button, self.setup_guide_button])
+            self.import_button, self.creative_prepare, self.creative_import])
         for edit in (self.character, self.brief, self.root, self.config, self.edge):
             edit.textChanged.connect(self.update_actions)
             edit.textChanged.connect(self.schedule_workspace_save)
-        self.config.textChanged.connect(self.update_setup_hint)
-        self.update_setup_hint()
+        self.config.textChanged.connect(self.update_delivery_config)
         self.workspace_restoring = False
         self.show_projects()
         self.update_actions()
@@ -780,9 +744,6 @@ class Workbench(QMainWindow):
             self.ensure_delivery()
             self.result_views.setCurrentWidget(self.delivery_view)
         self.navigate(self.restored_page)
-        if (not Path(self.config.text()).expanduser().is_file() and not self.sources and not self.last_batch_directory
-                and not self.preferences.value('setup_deferred', False, type=bool)):
-            self.navigate(self.welcome_index)
         self.update_actions()
         if not self.save_workspace():
             self.status.setText('项目已打开，保存失败。请检查项目文件夹的写入权限。')
@@ -950,16 +911,9 @@ class Workbench(QMainWindow):
     def choose_style(self):
         self.navigate(1)
 
-    def defer_setup(self):
-        self.preferences.setValue('setup_deferred', True)
-        self.preferences.sync()
-        self.navigate(0)
-
-    def update_setup_hint(self):
-        exists = Path(self.config.text()).expanduser().is_file()
+    def update_delivery_config(self):
         if self.delivery_view is not None:
             self.delivery_view.config_path = self.config.text()
-        self.setup_banner.setVisible(not exists and self.pages.currentIndex()!=self.welcome_index)
 
     def import_config(self):
         filename, _ = QFileDialog.getOpenFileName(self, '导入已有服务配置', self.config.text(), 'JSON (*.json)')
@@ -1014,19 +968,14 @@ class Workbench(QMainWindow):
                 if self.project is not None:
                     self.root.setText(str(Path(dialog.output_root.text()).expanduser().resolve()))
                 self.remember_preferences()
-                self.status.setText('设置已保存。'+('可以继续与 Agent 讨论。' if self.sources else
+                self.status.setText('设置已保存。'+('可以继续创作。' if self.sources else
                     '下一步：批量导入照片，填写角色。' if self.project is not None else '新建或打开项目后开始创作。'))
                 self.refresh_creative_preparation()
-            elif self.pages.currentIndex()==self.welcome_index:
-                self.defer_setup()
         except Exception as error:
             self.status.setText('无法打开连接设置：' + str(error))
 
     def refresh_creative_preparation(self):
-        self.update_setup_hint()
-        if self.pages.currentIndex()==self.welcome_index:
-            self.navigate(0)
-        elif self.pages.currentIndex()==1:
+        if self.pages.currentIndex()==1:
             self.navigate(1)
         else:
             self.update_actions()
@@ -1348,7 +1297,7 @@ class Workbench(QMainWindow):
         for button in self.nav_buttons:
             button.setEnabled(has_project)
         self.project_title.setEnabled(not running)
-        self.project_title.setVisible(has_project and self.pages.currentIndex() not in (self.projects_index,self.welcome_index))
+        self.project_title.setVisible(has_project and self.pages.currentIndex() != self.projects_index)
         self.workspace_context.setVisible(self.pages.currentIndex() in (0,1,2))
         self.project_title.setText(self.project.data['name'] if has_project else '新建项目')
         self.project_title.setToolTip(str(self.project.path) if has_project else '开始一组新的创作')
@@ -1773,10 +1722,9 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('读取本次结果失败：' + str(error))
         self.pages.setCurrentIndex(index)
-        self.workspace_heading.setText({0:'照片',1:'创作',2:'作品',self.projects_index:'项目',self.welcome_index:'连接设置'}.get(index,''))
+        self.workspace_heading.setText({0:'照片',1:'创作',2:'作品',self.projects_index:'项目'}[index])
         if index in (0, 1, 2):
             self.restored_page = index
-        self.update_setup_hint()
         self.projects_button.setChecked(index == self.projects_index)
         for number, button in enumerate(self.nav_buttons):
             button.setChecked(number == index)
@@ -1793,10 +1741,17 @@ class Workbench(QMainWindow):
         missing_config = not Path(self.config.text()).expanduser().is_file()
         if missing_photos or missing_character or missing_config:
             self.creative_empty.show()
-            self.creative_next.setText(('请先在照片页勾选要制作的照片，或让 Agent 选片。' if self.sources else '先批量导入这组照片。') if missing_photos else
-                '请填写角色，补充要求可以留空。' if missing_character else
-                '照片与角色已准备好。连接模型服务或导入已有配置后，即可开始讨论。')
-            self.creative_prepare.setText(('返回照片选片' if self.sources else '批量导入照片') if missing_photos else '填写角色' if missing_character else '连接设置')
+            if missing_photos:
+                title = '选照片' if self.sources else '添加照片'
+                note = '勾选要制作的照片。' if self.sources else '可以一次选多张。'
+                action = '返回照片页' if self.sources else '选择照片'
+            elif missing_character:
+                title, note, action = '填写角色', '补充要求可以留空。', '返回填写'
+            else:
+                title, note, action = '连接模型服务', '连接摄影助手、图像编辑和 ComfyUI 后，即可开始制作样片。', '连接设置'
+            self.creative_empty_title.setText(title)
+            self.creative_next.setText(note)
+            self.creative_prepare.setText(action)
             self.creative_import.setVisible(not missing_photos and not missing_character and missing_config)
             if self.creative_workspace is not None:
                 self.creative_workspace.hide()
