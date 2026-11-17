@@ -13,14 +13,16 @@ from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
     QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
-    QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
+    QMenu, QPlainTextEdit, QScrollArea, QSplitter, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
-from delivery_store import export_delivery, photo_choices, project_photos, retouch_parent, revision_context, selected_version, source_key
+from delivery_store import (adopt_delivery_versions, export_delivery, photo_choices, project_photos,
+    retouch_parent, revision_context, saved_tone_batch, selected_version, source_key)
 from creative_edits import normalise_edits
 from image_io import open_display
-from delivery_chat import discuss_delivery
+from delivery_chat import discuss_delivery, tone_target_summary
 from settings import load_settings
-from studio_widgets import PhotoPreview, StatusText, ui_label
+from studio_widgets import PhotoPreview, StatusText, chat_shortcuts, chat_composer, ConversationView, ui_label
+from tone_edit import ToneParameters, save_tone_batch
 
 
 class ThumbnailSignals(QObject):
@@ -55,15 +57,32 @@ class ExportWorker(QThread):
     ready = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, photos, choices, parent, name, formats):
+    def __init__(self, photos, choices, parent, name, formats, *, adoption=None):
         super().__init__()
         self.arguments = (deepcopy(photos),deepcopy(choices),parent,name,list(formats))
+        self.adoption = deepcopy(adoption)
 
     def run(self):
         try:
-            self.ready.emit(export_delivery(*self.arguments,progress=self.progress.emit))
+            self.ready.emit(export_delivery(*self.arguments,progress=self.progress.emit,adoption=self.adoption))
         except Exception as error:
             self.failed.emit('导出失败：'+str(error))
+
+
+class ToneBatchWorker(QThread):
+    progress = Signal(str)
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, targets, parameters, directory):
+        super().__init__()
+        self.targets,self.parameters,self.directory = deepcopy(targets),parameters,Path(directory)
+
+    def run(self):
+        try:
+            self.ready.emit(save_tone_batch(self.targets,self.parameters,self.directory,progress=self.progress.emit))
+        except Exception as error:
+            self.failed.emit('批量光色未完成：'+str(error)+'。工作目录：'+str(self.directory))
 
 
 class RevisionWorker(QThread):
@@ -195,7 +214,7 @@ class DeliveryView(QWidget):
     beauty_requested = Signal(dict)
     retouch_requested = Signal(dict)
     tone_requested = Signal(object)
-    revision_requested = Signal(dict)
+    revision_requested = Signal(object)
     batch_created = Signal(str)
     busy_changed = Signal()
     state_changed = Signal()
@@ -212,11 +231,18 @@ class DeliveryView(QWidget):
         self.state.setdefault('revision_drafts',{})
         self.state.setdefault('latest_revisions',{})
         self.state.setdefault('discussion',{'messages':[],'input':'','open':False})
+        self.state['discussion'].pop('open',None)
         self.photos = []
         self.rows = {}
         self.worker = None
         self.chat_worker = None
         self.pending_chat_operation = None
+        self.revision_message = None
+        self.revision_comparison = None
+        self.tone_batch_message = None
+        self.tone_batch_result = None
+        self.export_message_row = None
+        self.export_prefix = ''
         self.operation = ''
         self.draft_timer = QTimer(self)
         self.draft_timer.setSingleShot(True)
@@ -248,24 +274,37 @@ class DeliveryView(QWidget):
         self.only_selected = QCheckBox('只看已选交付')
         self.only_selected.toggled.connect(self.apply_filters)
         tools.addWidget(self.only_selected)
-        self.select_all = QPushButton('勾选当前显示')
-        self.select_all.clicked.connect(lambda:self.mark_visible(True))
-        tools.addWidget(self.select_all)
-        self.select_none = QPushButton('取消当前显示')
-        self.select_none.clicked.connect(lambda:self.mark_visible(False))
-        tools.addWidget(self.select_none)
-        self.refresh_button = QPushButton('刷新作品')
-        self.refresh_button.clicked.connect(self.refresh)
-        tools.addWidget(self.refresh_button)
+        more = QToolButton()
+        more.setText('管理作品')
+        more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(more)
+        self.select_all = menu.addAction('勾选当前显示',lambda:self.mark_visible(True))
+        self.select_none = menu.addAction('取消当前显示',lambda:self.mark_visible(False))
+        menu.addSeparator()
+        self.refresh_button = menu.addAction('刷新作品',self.refresh)
+        self.tone_batch_record = menu.addAction('最近批量光色记录',self.show_tone_batch_record)
+        self.adopt_tone_batch = menu.addAction('采用最近光调成功版',self.adopt_latest_tone_batch)
+        more.setMenu(menu)
+        tools.addWidget(more)
         layout.addLayout(tools)
-        self.note = ui_label('勾选决定交付范围；点图检查细节，选择每张作品要交付的版本。')
+        delivery_settings = QWidget()
+        settings_column = QVBoxLayout(delivery_settings)
+        settings_column.addWidget(ui_label('交付位置','heading'))
+        self.delivery_location = QLineEdit(self.state.get('parent',''))
+        self.delivery_location.setReadOnly(True)
+        self.delivery_location.setPlaceholderText('首次导出时选择文件夹')
+        settings_column.addWidget(self.delivery_location)
+        self.location_button = QPushButton('设置交付位置')
+        self.location_button.clicked.connect(self.choose_delivery_location)
+        settings_column.addWidget(self.location_button)
+        self.note = ui_label('勾选交付照片，选择版本')
         self.note.setWordWrap(True)
-        layout.addWidget(self.note)
+        settings_column.addWidget(self.note)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(12)
         left = QWidget()
-        left.setMinimumWidth(300)
+        left.setMinimumWidth(194)
         column = QVBoxLayout(left)
         column.setContentsMargins(0,0,0,0)
         self.listing = QListWidget()
@@ -275,7 +314,7 @@ class DeliveryView(QWidget):
         self.listing.setMovement(QListView.Static)
         self.listing.setSelectionMode(QAbstractItemView.SingleSelection)
         self.listing.setIconSize(QSize(160,150))
-        self.listing.setGridSize(QSize(190,216))
+        self.listing.setGridSize(QSize(178,210))
         self.listing.setSpacing(4)
         self.listing.setWordWrap(True)
         self.listing.setTextElideMode(Qt.ElideRight)
@@ -284,16 +323,18 @@ class DeliveryView(QWidget):
         self.listing.verticalScrollBar().valueChanged.connect(lambda _value:self.thumbnail_timer.start(80))
         self.listing.viewport().installEventFilter(self)
         column.addWidget(self.listing,1)
-        self.empty = ui_label('本项目还没有完整成片。完成制作后，可以在这里挑选并导出。')
+        self.empty = ui_label('暂无成片')
         self.empty.setWordWrap(True)
         column.addWidget(self.empty)
-        discussion_column = column
+        chat_host = QWidget()
+        discussion_column = QVBoxLayout(chat_host)
+        discussion_column.setContentsMargins(0,0,0,0)
         splitter.addWidget(left)
         right = QWidget()
-        right.setMinimumWidth(380)
+        right.setMinimumWidth(300)
         column = QVBoxLayout(right)
         column.setContentsMargins(0,0,0,0)
-        self.photo_title = ui_label('选择作品检查细节','heading')
+        self.photo_title = ui_label('选择作品','heading')
         self.photo_title.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
         column.addWidget(self.photo_title)
         self.version = QComboBox()
@@ -311,98 +352,104 @@ class DeliveryView(QWidget):
         self.reference.setToolTip('选择左侧比较对象；只改变查看，不改变交付版本')
         self.reference.currentIndexChanged.connect(self.change_reference)
         comparison_row.addWidget(self.reference,1)
-        column.addLayout(comparison_row)
+        settings_column.addWidget(ui_label('版本比较','heading'))
+        settings_column.addLayout(comparison_row)
         self.preview = PhotoPreview(source_label='比较对象',output_label='交付版本')
         self.preview.linked.setChecked(self.state.get('linked_comparison',True))
         self.preview.linked.toggled.connect(self.change_linked_comparison)
         column.addWidget(self.preview,1)
         self.comparison_note = ui_label('')
         self.comparison_note.setWordWrap(True)
-        column.addWidget(self.comparison_note)
+        settings_column.addWidget(self.comparison_note)
         details = QHBoxLayout()
         self.details = ui_label('')
         self.details.setWordWrap(True)
         details.addWidget(self.details,1)
-        self.beauty = QPushButton('人脸美化')
-        self.beauty.clicked.connect(self.open_beauty)
+        edit_button = QToolButton()
+        edit_button.setText('调整照片')
+        edit_button.setPopupMode(QToolButton.InstantPopup)
+        edit_menu = QMenu(edit_button)
+        self.beauty = edit_menu.addAction('人脸美化',self.open_beauty)
         self.beauty.setEnabled(False)
-        details.addWidget(self.beauty)
-        self.retouch = QPushButton('局部修发／发束／双下巴')
-        self.retouch.clicked.connect(self.open_retouch)
+        self.retouch = edit_menu.addAction('局部修饰',self.open_retouch)
         self.retouch.setEnabled(False)
-        details.addWidget(self.retouch)
-        self.tone = QPushButton('曝光与曲线')
-        self.tone.clicked.connect(self.open_tone)
+        self.tone = edit_menu.addAction('光色调整',self.open_tone)
         self.tone.setEnabled(False)
-        details.addWidget(self.tone)
+        edit_button.setMenu(edit_menu)
+        details.addWidget(edit_button)
         column.addLayout(details)
         revision_row = QHBoxLayout()
-        self.revise = QPushButton('给这张改稿')
-        self.revise.clicked.connect(self.open_revision)
-        revision_row.addWidget(self.revise,1)
+        edit_menu.addSeparator()
+        self.revise = edit_menu.addAction('重新创作这张',self.open_revision)
         self.compare_revision = QPushButton('比较新稿')
         self.compare_revision.clicked.connect(self.compare_new_revision)
         revision_row.addWidget(self.compare_revision,1)
-        self.adopt_revision = QPushButton('采用左侧为交付')
-        self.adopt_revision.setProperty('kind','primary')
+        self.adopt_revision = QPushButton('采用比较版本')
         self.adopt_revision.clicked.connect(self.adopt_comparison)
         revision_row.addWidget(self.adopt_revision,1)
         column.addLayout(revision_row)
-        self.chat_toggle = QPushButton('与 Agent 讨论当前作品')
-        self.chat_toggle.setCheckable(True)
-        self.chat_toggle.setChecked(self.state['discussion']['open'])
-        discussion_column.addWidget(self.chat_toggle)
         self.chat_panel = QWidget()
         chat_column = QVBoxLayout(self.chat_panel)
         chat_column.setContentsMargins(0,0,0,0)
-        self.chat_history = QPlainTextEdit()
-        self.chat_history.setReadOnly(True)
-        self.chat_history.setMinimumHeight(120)
-        self.chat_history.setMaximumHeight(200)
-        chat_column.addWidget(self.chat_history)
-        chat_row = QHBoxLayout()
+        self.chat_history = ConversationView()
+        chat_column.addWidget(self.chat_history,1)
         self.chat_input = QPlainTextEdit()
-        self.chat_input.setMaximumHeight(62)
-        self.chat_input.setPlaceholderText('例如：当前版本整体提亮 0.2 EV 并另存；或采用左侧版本为交付。')
+        self.chat_input.setFixedHeight(54)
+        self.chat_input.setPlaceholderText('输入要求')
         self.chat_input.setPlainText(self.state['discussion']['input'])
         self.chat_input.textChanged.connect(self.remember_chat_input)
-        chat_row.addWidget(self.chat_input,1)
         self.chat_send = QPushButton('发送')
         self.chat_send.clicked.connect(self.send_chat)
-        chat_row.addWidget(self.chat_send)
-        chat_column.addLayout(chat_row)
-        self.chat_panel.setVisible(self.chat_toggle.isChecked())
-        self.chat_toggle.toggled.connect(self.toggle_chat)
-        discussion_column.addWidget(self.chat_panel)
+        self.send_shortcuts = chat_shortcuts(self.chat_input,self.send_chat)
+        chat_column.addWidget(chat_composer(self.chat_input,self.chat_send))
+        discussion_column.addWidget(self.chat_panel,1)
         splitter.addWidget(right)
-        splitter.setSizes([530,650])
+        self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.setMinimumWidth(280)
+        self.sidebar_tabs.setMaximumWidth(360)
+        self.sidebar_tabs.addTab(chat_host,'对话')
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(delivery_settings)
+        self.sidebar_tabs.addTab(settings_scroll,'交付设置')
+        splitter.addWidget(self.sidebar_tabs)
+        splitter.setStretchFactor(1,1)
+        splitter.setSizes([200,700,310])
         layout.addWidget(splitter,1)
         footer = QHBoxLayout()
         self.summary = ui_label('已选交付 0 张')
         footer.addWidget(self.summary,1)
+        settings_column.addWidget(ui_label('导出格式','heading'))
         self.formats = {}
         for name,text in (('JPEG','JPEG（8 位）'),('PNG','PNG（16 位）')):
             check = QCheckBox(text)
             check.setChecked(name in self.state['formats'])
             check.toggled.connect(self.change_formats)
             self.formats[name] = check
-            footer.addWidget(check)
+            settings_column.addWidget(check)
         self.history = QComboBox()
         self.history.setMinimumWidth(170)
         self.history.setMaximumWidth(240)
         self.history.setPlaceholderText('尚未导出')
         self.history.setToolTip('查看本项目已保存的交付记录')
         self.history.currentIndexChanged.connect(self.show_export_record)
-        footer.addWidget(self.history)
+        settings_column.addWidget(ui_label('交付记录','heading'))
+        settings_column.addWidget(self.history)
         self.open_export = QPushButton('打开交付文件夹')
         self.open_export.clicked.connect(self.open_selected_export)
-        footer.addWidget(self.open_export)
+        settings_column.addWidget(self.open_export)
+        settings_column.addStretch(1)
+        settings_button = QPushButton('导出设置')
+        settings_button.setProperty('kind','quiet')
+        settings_button.clicked.connect(lambda:self.sidebar_tabs.setCurrentIndex(1))
+        footer.addWidget(settings_button)
         self.export = QPushButton('导出所选作品')
         self.export.setProperty('kind','primary')
-        self.export.clicked.connect(self.choose_export)
+        self.export.clicked.connect(self.export_selected)
         footer.addWidget(self.export)
         layout.addLayout(footer)
-        self.message = StatusText('交付复制所选版本的已有成片，原片和制作文件保留原位置。')
+        self.message = StatusText('')
+        self.message.setMaximumHeight(48)
         layout.addWidget(self.message)
         self.refresh_history()
         self.refresh_discussion()
@@ -574,7 +621,7 @@ class DeliveryView(QWidget):
         self.listing.setCurrentRow(selected_row if selected_row in visible else visible[0] if visible else -1)
         self.listing.blockSignals(False)
         self.empty.setText('没有匹配的作品，请调整文件名或“只看已选交付”。' if self.photos else
-            '本项目还没有完整成片。完成制作后，可以在这里挑选并导出。')
+            '暂无成片')
         self.empty.setVisible(not visible)
         self.show_photo(self.listing.currentRow())
         self.update_controls()
@@ -603,26 +650,18 @@ class DeliveryView(QWidget):
             self.state['current'] = self.photos[row]['key']
             self.save_state()
 
-    def toggle_chat(self, opened):
-        self.chat_panel.setVisible(opened)
-        self.state['discussion']['open'] = opened
-        self.save_state()
-
     def remember_chat_input(self):
         self.state['discussion']['input'] = self.chat_input.toPlainText()
         self.draft_timer.start()
 
     def refresh_discussion(self):
-        lines = []
+        entries = []
         for row in self.state['discussion']['messages']:
             context = row.get('context')
-            label = ('\n发送时：'+context['name']+' · '+context['selected_label']+
+            label = (context['name']+' · '+context['selected_label']+
                 ' · '+context['view_mode']) if context else ''
-            status = '\n执行状态：'+row['operation_status'] if row.get('operation_status') else ''
-            lines.append(('你：' if row['role']=='user' else '摄影 Agent：')+row['content']+label+status)
-        self.chat_history.setPlainText('\n\n'.join(lines))
-        bar = self.chat_history.verticalScrollBar()
-        bar.setValue(bar.maximum())
+            entries.append(dict(row,context={'label':label} if label else None))
+        self.chat_history.show_messages(entries)
 
     def chat_context(self):
         photo = self.current_photo()
@@ -638,11 +677,45 @@ class DeliveryView(QWidget):
                 'path':previous['files']['JPEG'] if previous else photo['source']})
         if mode in ('output','compare'):
             images.append({'label':'右侧交付版本：'+version['label'],'path':version['files']['JPEG']})
+        bases = {item['work']:item['id'] for item in photo['versions'] if item['kind']=='base'}
         return {'photo_key':photo['key'],'name':photo['name'],'selected_version':version['id'],
             'selected_label':version['label'],'comparison_version':comparison,
             'view_mode':{'source':'只看左侧比较对象','output':'只看右侧交付版本','compare':'左右比较'}[mode],
-            'versions':[{'id':item['id'],'label':item['label'],'description':item['description']}
-                for item in reversed(photo['versions'])],'images':images}
+            'versions':[{'id':item['id'],'label':item['label'],'description':item['description'],
+                'kind':item['kind'],'edits':deepcopy(item['edits']),
+                'revision_basis':bases[item['work']]}
+                for item in reversed(photo['versions'])],'images':images,'tone_targets':self.tone_targets(),
+            'tone_batches':self.tone_batch_context(),
+            'export':{'photos':deepcopy(self.photos),'choices':deepcopy(self.state['choices']),
+                'parent':self.state.get('parent'),'formats':list(self.state['formats'])}}
+
+    def tone_batch_context(self):
+        batches = []
+        for path in reversed(self.state.get('tone_batches',[])[-3:]):
+            try:
+                batches.append(saved_tone_batch(path))
+            except (OSError,ValueError,KeyError) as error:
+                batches.append({'id':path,'error':str(error),'targets':[]})
+        return batches
+
+    def tone_targets(self):
+        targets = []
+        photos = {photo['key']:photo for photo in self.photos}
+        for key,choice in self.state['choices'].items():
+            if not choice['included']:
+                continue
+            target = {'photo_key':key,'name':Path(choice['source']).name}
+            try:
+                photo = photos.get(key)
+                if photo is None:
+                    raise ValueError('交付选择的原片不在当前作品记录中：'+choice['source'])
+                version = selected_version(photo,choice)
+                target.update(base=version['files']['PNG'],directory=version['work'],
+                    parent_version=retouch_parent(version))
+            except (ValueError,KeyError) as error:
+                target['error'] = str(error)
+            targets.append(target)
+        return targets
 
     def send_chat(self):
         text = self.chat_input.toPlainText().strip()
@@ -653,6 +726,10 @@ class DeliveryView(QWidget):
             frozen = {key:context[key] for key in ('photo_key','name','selected_version','selected_label',
                 'comparison_version','view_mode')}
             frozen['attached_images'] = [image['label'] for image in context['images']]
+            frozen['tone_targets'] = tone_target_summary(context['tone_targets'])
+            frozen['export'] = {'parent':context['export']['parent'],'formats':context['export']['formats'],
+                'choices':{key:choice for key,choice in context['export']['choices'].items() if choice['included']}}
+            frozen['tone_batches'] = [{key:value for key,value in item.items() if key!='targets'} for item in context['tone_batches']]
             self.state['discussion']['messages'].append({'role':'user','content':text,'context':frozen})
             self.chat_input.clear()
             self.refresh_discussion()
@@ -702,15 +779,27 @@ class DeliveryView(QWidget):
             photo = next(photo for photo in self.photos if photo['key']==context['photo_key'])
             operation = row['operation']
             action = operation['action']
+            if action in ('adopt_batch','export','adopt_batch_and_export'):
+                self.complete_delivery(row,context)
+                return
             identifier = operation['version_id']
             version = selected_version(photo,{'version':identifier}) if identifier is not None else None
-            if action=='tone':
+            if action=='tone_batch':
+                if not self.start_tone_batch(context['tone_targets'],operation['parameters'],message=row):
+                    raise ValueError(self.message.toPlainText())
+            elif action=='tone':
                 row['operation_status'] = '光调已请求'
                 self.tone_requested.emit({'name':photo['name'],'base':version['files']['PNG'],
                     'directory':version['work'],'batch_directory':version['batch'],'return_to_delivery':True,
                     'delivery_photo_key':photo['key'],
                     'parent_version':retouch_parent(version),'delivery_message':row,
                     'delivery_user_text':self.state['discussion']['messages'][-2]['content']})
+            elif action=='revise':
+                revision = revision_context(photo,version)
+                revision['art_direction']['edits'] = operation['edits']
+                revision.update(revision_brief=operation['revision_brief'],delivery_message=row)
+                row['operation_status'] = '单张改稿已请求：'+version['label']
+                self.revision_requested.emit(revision)
             else:
                 self.listing.setCurrentRow(self.rows[photo['key']])
                 if action=='adopt':
@@ -740,7 +829,7 @@ class DeliveryView(QWidget):
         if row<0:
             self.version.blockSignals(False)
             self.reference.blockSignals(False)
-            self.photo_title.setText('选择作品检查细节')
+            self.photo_title.setText('选择作品')
             self.preview.set_photo()
             self.preview_key = None
             self.preview_photo = None
@@ -786,7 +875,7 @@ class DeliveryView(QWidget):
             return
         width,height = version['dimensions']
         self.base_path = version['base']
-        self.details.setText(f'{width} × {height} · '+version['label'])
+        self.details.setText(f'{width} × {height}')
         self.details.setToolTip(version['description']+('\n摄影方向：'+version['direction'] if version['direction'] else ''))
         self.update_comparison(photo,version)
         self.beauty.setEnabled(not self.is_busy() and not self.production_busy and Path(version['base']).is_file())
@@ -865,12 +954,15 @@ class DeliveryView(QWidget):
         self.summary.setToolTip('这些交付选择没有对应的当前作品；选择仍保留，导出时会在交付记录中'
             '列出失败并说明原因。' if retained else '')
         busy = self.is_busy()
-        self.listing.setEnabled(not busy or self.operation in ('revision','chat'))
+        self.listing.setEnabled(not busy or self.operation in ('revision','chat','tone_batch'))
         self.version.setEnabled(not busy and self.current_photo() is not None)
         self.reference.setEnabled(self.current_photo() is not None)
         self.select_all.setEnabled(not busy and bool(visible))
         self.select_none.setEnabled(not busy and bool(visible))
         self.refresh_button.setEnabled(not busy)
+        self.location_button.setEnabled(not busy and not self.production_busy)
+        self.adopt_tone_batch.setEnabled(not busy and not self.production_busy and bool(self.state.get('tone_batches')))
+        self.tone_batch_record.setEnabled(not busy and bool(self.state.get('tone_batches')))
         for check in self.formats.values():
             check.setEnabled(not busy)
         self.export.setText(f'导出所选 {count} 张' if count else '先勾选交付作品')
@@ -919,12 +1011,65 @@ class DeliveryView(QWidget):
             self.message.setPlainText('无法采用比较版本：'+str(error))
 
     def adopt_saved_version(self, photo, version):
-        for path in version['files'].values():
-            if not Path(path).is_file():
-                raise FileNotFoundError('所选版本文件不存在：'+path)
-        previous = self.state['choices'][photo['key']]['version']
-        self.state['comparisons'][photo['key']] = previous
+        result = adopt_delivery_versions(self.photos,self.state['choices'],
+            [{'photo_key':photo['key'],'version_id':version['id'],'name':photo['name']}])
+        item = result['items'][0]
+        if item['status']=='failed':
+            raise ValueError(item['error'])
+        self.state['comparisons'][photo['key']] = item['previous_version']
         self.version.setCurrentIndex(self.version.findData(version['id']))
+
+    def adopt_tone_results(self, batch):
+        if batch.get('error'):
+            raise ValueError(batch['error'])
+        result = adopt_delivery_versions(self.photos,self.state['choices'],batch['targets'])
+        result['batch_id'] = batch['id']
+        result['created_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+        for item in result['items']:
+            if item['status']=='complete':
+                self.state['comparisons'][item['photo_key']] = item['previous_version']
+        self.state.setdefault('adoptions',[]).append(result)
+        if not self.save_state():
+            raise OSError(self.message.toPlainText())
+        self.refresh()
+        return result
+
+    @staticmethod
+    def adoption_summary(result):
+        complete = sum(item['status']=='complete' for item in result['items'])
+        failed = [item['name']+'：'+item['error'] for item in result['items'] if item['status']=='failed']
+        text = f'已采用本轮光调成功版 {complete}/{len(result["items"])} 张；交付勾选保持原样。'
+        return text+('\n未采用：'+'\n'.join(failed) if failed else '')
+
+    def adopt_latest_tone_batch(self):
+        try:
+            result = self.adopt_tone_results(saved_tone_batch(self.state['tone_batches'][-1]))
+            self.message.setPlainText(self.adoption_summary(result))
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('采用本轮光调失败：'+str(error))
+
+    def complete_delivery(self, row, context):
+        operation = row['operation']
+        snapshot = deepcopy(context['export'])
+        prefix = ''
+        if operation['action']!='export':
+            batch = next(item for item in context['tone_batches'] if item['id']==operation['batch_id'])
+            result = self.adopt_tone_results(batch)
+            snapshot['adoption'] = result
+            prefix = self.adoption_summary(result)
+            adopted = {item['photo_key']:item['version_id'] for item in result['items'] if item['status']=='complete'}
+            for key,choice in snapshot['choices'].items():
+                if key in adopted:
+                    choice['version'] = adopted[key]
+                else:
+                    choice['included'] = False
+        if operation['action']=='adopt_batch':
+            row['operation_status'] = prefix
+            self.discussion_changed()
+        else:
+            if not self.start_export(snapshot['parent'],snapshot=snapshot,formats=operation['formats'],
+                    message=row,prefix=prefix):
+                raise ValueError(self.message.toPlainText())
 
     def remember_revision_draft(self, version, draft):
         self.state['revision_drafts'][version] = draft
@@ -952,13 +1097,18 @@ class DeliveryView(QWidget):
 
     def start_revision(self, context, root, config):
         self.operation = 'revision'
+        self.revision_message = context.get('delivery_message')
+        self.revision_comparison = None
         self.worker = RevisionWorker(context,root,config)
         self.worker.progress.connect(self.message.setPlainText)
         self.worker.directory_created.connect(self.batch_created.emit)
         self.worker.ready.connect(self.revision_ready)
-        self.worker.failed.connect(self.message.setPlainText)
+        self.worker.failed.connect(self.revision_failed)
         self.worker.finished.connect(self.revision_finished)
         self.message.setPlainText('正在沿所选基础版制作这张的新稿。旧版、整组定稿与交付选择保留。')
+        if self.revision_message is not None:
+            self.revision_message['operation_status'] = '正在制作单张改稿'
+            self.discussion_changed()
         self.update_controls()
         self.busy_changed.emit()
         self.worker.start()
@@ -968,13 +1118,30 @@ class DeliveryView(QWidget):
             self.state['latest_revisions'][source_key(result['source'])] = result['exports']['PNG']
             self.save_state()
             self.message.setPlainText(Path(result['source']).name+' 的新稿已另存。点击“比较新稿”查看；采用时在“交付版本”中选择新稿。')
+            if self.revision_message is not None:
+                self.revision_comparison = (source_key(result['source']),result['exports']['PNG'])
+                self.revision_message['operation_status'] = '新稿已另存：'+result['exports']['PNG']+'；交付选择保持原样'
+                self.discussion_changed()
         else:
-            self.message.setPlainText('这张改稿未完成：'+str(result['error']))
+            self.revision_failed('这张改稿未完成：'+str(result['error']))
+
+    def revision_failed(self, error):
+        self.message.setPlainText(error)
+        if self.revision_message is not None:
+            self.revision_message['operation_status'] = error
+            self.discussion_changed()
 
     def revision_finished(self):
         worker,self.worker = self.worker,None
         self.operation = ''
         self.refresh()
+        if self.revision_comparison is not None:
+            try:
+                self.compare_saved_result(*self.revision_comparison)
+            except (OSError,ValueError,KeyError,StopIteration) as error:
+                self.revision_failed('新稿已另存，显示比较失败：'+str(error))
+        self.revision_message = None
+        self.revision_comparison = None
         self.update_controls()
         self.busy_changed.emit()
         worker.deleteLater()
@@ -1011,7 +1178,92 @@ class DeliveryView(QWidget):
         self.open_saved_editor(self.retouch_requested,'局部修饰')
 
     def open_tone(self):
-        self.open_saved_editor(self.tone_requested,'曝光与曲线')
+        self.open_saved_editor(self.tone_requested,'光色调整')
+
+    def start_tone_batch(self, targets, parameters, *, message=None):
+        if self.is_busy() or self.production_busy:
+            return False
+        if not targets:
+            self.message.setPlainText('请先勾选要批量另存光色的交付照片。')
+            return False
+        parameters = ToneParameters(**parameters)
+        if not self.save_state():
+            return False
+        directory = self.project.path.parent/'tone-batches'/('tone-'+
+            datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+        self.operation = 'tone_batch'
+        self.tone_batch_message = message
+        self.tone_batch_result = None
+        self.worker = ToneBatchWorker(targets,parameters,directory)
+        self.worker.progress.connect(self.message.setPlainText)
+        self.worker.ready.connect(self.tone_batch_ready)
+        self.worker.failed.connect(self.tone_batch_failed)
+        self.worker.finished.connect(self.tone_batch_finished)
+        self.message.setPlainText(f'正在按固定参数另存 {len(targets)} 张光调版；交付版本保持原样。')
+        if message is not None:
+            message['operation_status'] = self.message.toPlainText()
+            self.discussion_changed()
+        self.update_controls()
+        self.busy_changed.emit()
+        self.worker.start()
+        return True
+
+    @staticmethod
+    def tone_batch_summary(result):
+        complete = sum(item['status']=='complete' for item in result['items'])
+        failed = [item['name']+'：'+item['error'] for item in result['items'] if item['status']=='failed']
+        text = f'批量光色已另存 {complete}/{len(result["items"])} 张'
+        text += (f'，失败 {len(failed)} 张' if failed else '')+'；交付版本保持原样。\n记录：'+result['record']
+        if failed:
+            text += '\n'+'\n'.join(failed)
+        return text
+
+    def tone_batch_ready(self, result):
+        self.tone_batch_result = result
+        self.state.setdefault('tone_batches',[]).append(result['record'])
+        self.save_state()
+        text = self.tone_batch_summary(result)
+        self.message.setPlainText(text)
+        if self.tone_batch_message is not None:
+            self.tone_batch_message['operation_status'] = text
+            self.discussion_changed()
+
+    def tone_batch_failed(self, error):
+        self.message.setPlainText(error)
+        if self.tone_batch_message is not None:
+            self.tone_batch_message['operation_status'] = error
+            self.discussion_changed()
+
+    def show_tone_batch_record(self):
+        try:
+            path = Path(self.state['tone_batches'][-1])
+            result = json.loads(path.read_text(encoding='utf-8'))
+            self.message.setPlainText(self.tone_batch_summary(result))
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setPlainText('读取批量光色记录失败：'+str(error))
+
+    def tone_batch_finished(self):
+        worker,self.worker = self.worker,None
+        self.operation = ''
+        self.refresh()
+        if self.tone_batch_result is not None:
+            try:
+                for item in self.tone_batch_result['items']:
+                    if item['status']=='complete':
+                        photo = self.photos[self.rows[item['photo_key']]]
+                        version = next(version for version in photo['versions'] if version['files']['PNG']==item['files']['final'])
+                        self.state['comparisons'][photo['key']] = version['id']
+                self.preview.choice = 'compare'
+                self.preview_key = None
+                self.show_photo(self.listing.currentRow())
+                if self.save_state():
+                    self.message.setPlainText(self.tone_batch_summary(self.tone_batch_result))
+            except (OSError,ValueError,KeyError,StopIteration) as error:
+                self.tone_batch_failed('光调文件已保留，显示比较失败：'+str(error))
+        self.tone_batch_message = self.tone_batch_result = None
+        self.update_controls()
+        self.busy_changed.emit()
+        worker.deleteLater()
 
     def open_saved_editor(self, requested, label):
         try:
@@ -1023,37 +1275,68 @@ class DeliveryView(QWidget):
         except (OSError,ValueError,KeyError) as error:
             self.message.setPlainText('无法打开'+label+'：'+str(error))
 
-    def choose_export(self):
+    def choose_delivery_location(self):
         parent = QFileDialog.getExistingDirectory(self,'选择交付文件夹的保存位置',
             self.state.get('parent',str(self.project.path.parent)))
         if parent:
-            self.start_export(parent)
+            self.state['parent'] = str(parent)
+            self.delivery_location.setText(str(parent))
+            self.save_state()
 
-    def start_export(self, parent):
+    def export_selected(self):
+        if not self.state.get('parent'):
+            self.choose_delivery_location()
+        if self.state.get('parent'):
+            self.start_export(self.state['parent'])
+
+    def start_export(self, parent, *, snapshot=None, formats=None, message=None, prefix=''):
         if self.is_busy() or self.production_busy:
-            return
+            self.message.setPlainText('当前任务尚未结束，无法开始导出。')
+            return False
+        if not parent:
+            self.message.setPlainText('请先设置交付位置。')
+            return False
         self.state['parent'] = str(parent)
+        self.delivery_location.setText(str(parent))
         if not self.save_state():
-            return
+            return False
+        snapshot = snapshot if snapshot is not None else {'photos':self.photos,'choices':self.state['choices']}
         self.operation = 'export'
-        self.worker = ExportWorker(self.photos,self.state['choices'],str(parent),
-            self.project.data['name'],self.state['formats'])
+        self.export_message_row,self.export_prefix = message,prefix
+        self.worker = ExportWorker(snapshot['photos'],snapshot['choices'],str(parent),
+            self.project.data['name'],self.state['formats'] if formats is None else formats,
+            adoption=snapshot.get('adoption'))
         self.worker.progress.connect(self.message.setPlainText)
         self.worker.ready.connect(self.export_ready)
-        self.worker.failed.connect(self.message.setPlainText)
+        self.worker.failed.connect(self.export_failed)
         self.worker.finished.connect(self.export_finished)
+        if message is not None:
+            message['operation_status'] = (prefix+'\n' if prefix else '')+'正在复制发送时选定的保存版本到交付文件夹。'
+            self.discussion_changed()
         self.update_controls()
         self.busy_changed.emit()
         self.worker.start()
+        return True
 
     def export_ready(self, result):
         self.state['exports'].append(result)
         self.refresh_history()
         message = self.export_message(result)
+        if self.export_message_row is not None:
+            self.export_message_row['operation_status'] = message
+            self.refresh_discussion()
         if self.save_state():
             self.message.setPlainText(message)
         else:
             self.message.setPlainText(message+'\n'+self.message.toPlainText())
+
+    def export_failed(self, error):
+        text = (self.export_prefix+'\n' if self.export_prefix else '')+error
+        self.message.setPlainText(text)
+        if self.export_message_row is not None:
+            self.export_message_row['operation_status'] = text
+            self.refresh_discussion()
+            self.save_state()
 
     @staticmethod
     def export_message(result):
@@ -1062,6 +1345,10 @@ class DeliveryView(QWidget):
         message = f'已导出 {complete} 张'+(f'，失败 {len(failed)} 张' if failed else '')+'。文件夹：'+result['directory']
         if failed:
             message += '\n'+'\n'.join(failed)
+        if result.get('manifest'):
+            message += '\n逐张清单：'+result['manifest']
+        if result.get('adoption'):
+            message = DeliveryView.adoption_summary(result['adoption'])+'\n'+message
         return message
 
     def refresh_history(self):
@@ -1071,7 +1358,9 @@ class DeliveryView(QWidget):
             result = self.state['exports'][index]
             complete = sum(item['status']=='complete' for item in result['items'])
             failed = len(result['items'])-complete
-            self.history.addItem(f'交付 {index+1} · {complete} 张'+(f' · 失败 {failed} 张' if failed else ''),index)
+            adoption_failed = result.get('adoption',{}).get('status','complete')!='complete'
+            self.history.addItem(f'交付 {index+1} · {complete} 张'+(f' · 失败 {failed} 张' if failed else '')+
+                (' · 采用未全部完成' if adoption_failed else ''),index)
             self.history.setItemData(self.history.count()-1,result['created_at']+'\n'+result['directory'],Qt.ToolTipRole)
         self.history.setCurrentIndex(0 if self.state['exports'] else -1)
         self.history.blockSignals(False)
@@ -1086,6 +1375,7 @@ class DeliveryView(QWidget):
     def export_finished(self):
         worker,self.worker = self.worker,None
         self.operation = ''
+        self.export_message_row,self.export_prefix = None,''
         self.update_controls()
         self.busy_changed.emit()
         worker.deleteLater()

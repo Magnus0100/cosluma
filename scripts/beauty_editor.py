@@ -2,21 +2,26 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
+import uuid
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import QPointF, QRectF, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QGraphicsView, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSplitter,
-    QScrollArea, QVBoxLayout, QWidget)
+    QMenu, QPlainTextEdit, QScrollArea, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
+from beauty_chat import discuss_beauty
 from face_beauty import (BEAUTY_DEFAULTS, BeautyParameters, BeautySession,
     prepare_face, prepare_skin, render_beauty_crop, save_beauty)
 from image_io import display_image, image_size, open_display, open_photo, save_json
 from settings import load_settings
 from model_downloads import ModelDownloads
-from studio_widgets import PhotoCanvas, PhotoPreview, ui_label
+from studio_widgets import PhotoCanvas, PhotoPreview, StatusText, chat_shortcuts, chat_composer, ConversationView, ui_label
 
 
 class FaceRangeCanvas(PhotoCanvas):
@@ -173,12 +178,13 @@ class BeautyWorker(QThread):
     progress = Signal(str)
 
     def __init__(self, phase, *, context, config, session=None, pixels=None, parameters=None, before=None,
-            llm_config=None):
+            llm_config=None, inputs=None, directory=None):
         super().__init__()
         self.phase, self.context, self.config = phase,context,config
         self.session,self.pixels,self.parameters = session,pixels,parameters
         self.before = before
         self.llm_config = llm_config
+        self.inputs,self.directory = inputs,directory
 
     def run(self):
         try:
@@ -193,6 +199,9 @@ class BeautyWorker(QThread):
             elif self.phase == 'skin':
                 result = prepare_skin(self.session,self.config,self.progress.emit,pixels=self.pixels,
                     llm_config=self.llm_config)
+            elif self.phase == 'chat':
+                result = discuss_beauty(self.pixels,self.session,config=self.llm_config,
+                    directory=self.directory,**self.inputs)
             elif self.phase == 'render':
                 result = self.before
                 if self.parameters.skin or self.parameters.slim:
@@ -230,6 +239,14 @@ class BeautyEditor(QWidget):
         self.failure_message = ''
         self.needs_restore = True
         self.restored = BeautyParameters()
+        self.messages = []
+        self.pending_chat = None
+        self.pending_save = False
+        self.operation_message = None
+        self.discussion_timer = QTimer(self)
+        self.discussion_timer.setSingleShot(True)
+        self.discussion_timer.setInterval(250)
+        self.discussion_timer.timeout.connect(self.save_draft)
         self.draft_timer = QTimer(self)
         self.draft_timer.setSingleShot(True)
         self.draft_timer.setInterval(150)
@@ -238,10 +255,14 @@ class BeautyEditor(QWidget):
         layout.setContentsMargins(0,0,0,0)
         header = QHBoxLayout()
         header.addWidget(ui_label('人脸美化 · '+context['name'],'heading'),1)
-        self.connection_button = QPushButton('美化连接')
-        self.connection_button.setProperty('kind','quiet')
-        self.connection_button.clicked.connect(self.connection_requested.emit)
-        header.addWidget(self.connection_button)
+        more = QToolButton()
+        more.setText('更多')
+        more.setProperty('kind','quiet')
+        more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(more)
+        self.connection_button = menu.addAction('连接设置',self.connection_requested.emit)
+        more.setMenu(menu)
+        header.addWidget(more)
         back = QPushButton('返回成片')
         back.setProperty('kind','quiet')
         back.clicked.connect(self.back_requested.emit)
@@ -252,15 +273,14 @@ class BeautyEditor(QWidget):
         self.preview = PhotoPreview(source_label='美化前',output_label='美化后')
         self.preview.set_photo(context['base'])
         splitter.addWidget(self.preview)
-        panel = QFrame()
-        panel.setProperty('role','panel')
-        controls = QVBoxLayout(panel)
-        controls.setContentsMargins(18,18,18,18)
-        controls.setSpacing(14)
-        controls.addWidget(ui_label('按自己的审美调整','heading'))
-        note = ui_label('默认不改变原成片。滑杆归零可还原，满意后另存美化版。')
-        note.setWordWrap(True)
-        controls.addWidget(note)
+        panel = QWidget()
+        side = QVBoxLayout(panel)
+        side.setContentsMargins(0,0,0,0)
+        self.editor_tabs = QTabWidget()
+        manual = QWidget()
+        controls = QVBoxLayout(manual)
+        controls.setContentsMargins(14,14,14,14)
+        controls.setSpacing(12)
         self.sliders = {}
         self.values = {}
         for key,label in (('skin','美肤'),('slim','瘦脸')):
@@ -281,47 +301,61 @@ class BeautyEditor(QWidget):
                 self.protect_features.setToolTip('开启时仅调整皮肤，保留眼睛、眉毛与嘴唇；关闭后允许模型调整这些部位。瘦脸仍固定五官位置。')
                 self.protect_features.toggled.connect(self.parameters_changed)
                 controls.addWidget(self.protect_features)
-                explanation = ui_label('关闭后允许美肤调整眼睛、眉毛和嘴唇；切换复用当前基础。')
-                explanation.setWordWrap(True)
-                controls.addWidget(explanation)
         self.skin_button = QPushButton('生成美肤基础')
         self.skin_button.setEnabled(False)
         self.skin_button.clicked.connect(lambda:self.start('skin'))
         controls.addWidget(self.skin_button)
-        self.source_note = ui_label('生成完整 BF16 模型输出后，再调整应用强度。模型原始输出单独保留，可直接查看。')
+        self.source_note = ui_label('未生成美肤基础')
         self.source_note.setWordWrap(True)
         controls.addWidget(self.source_note)
-        self.raw_button = QPushButton('查看模型原始输出')
-        self.raw_button.setProperty('kind','quiet')
+        self.raw_button = menu.addAction('查看模型原始输出',self.open_raw)
         self.raw_button.setEnabled(False)
-        self.raw_button.clicked.connect(self.open_raw)
-        controls.addWidget(self.raw_button)
         self.reset_button = QPushButton('全部归零')
         self.reset_button.setProperty('kind','quiet')
         self.reset_button.clicked.connect(self.reset_parameters)
         controls.addWidget(self.reset_button)
         controls.addStretch(1)
+        self.chat_panel = QWidget()
+        chat_column = QVBoxLayout(self.chat_panel)
+        chat_column.setContentsMargins(0,0,0,0)
+        self.chat_history = ConversationView()
+        chat_column.addWidget(self.chat_history,1)
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setPlaceholderText('输入美化要求')
+        self.chat_input.setFixedHeight(54)
+        self.chat_input.textChanged.connect(self.discussion_timer.start)
+        self.chat_send = QPushButton('发送')
+        self.chat_send.clicked.connect(self.send_message)
+        self.send_shortcuts = chat_shortcuts(self.chat_input,self.send_message)
+        chat_column.addWidget(chat_composer(self.chat_input,self.chat_send))
+        self.editor_tabs.addTab(self.chat_panel,'对话')
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(manual)
+        self.editor_tabs.addTab(scroll,'手动调整')
+        side.addWidget(self.editor_tabs,1)
         self.analyze_button = QPushButton('选择人脸并分析')
         self.analyze_button.setProperty('kind','quiet')
         self.analyze_button.clicked.connect(self.choose_face)
-        controls.addWidget(self.analyze_button)
+        side.addWidget(self.analyze_button)
         self.save_button = QPushButton('另存美化版')
         self.save_button.setProperty('kind','primary')
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(lambda:self.start('save'))
-        controls.addWidget(self.save_button)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(270)
-        scroll.setMaximumWidth(330)
-        scroll.setWidget(panel)
-        splitter.addWidget(scroll)
-        splitter.setSizes([900,280])
+        side.addWidget(self.save_button)
+        panel.setMinimumWidth(290)
+        panel.setMaximumWidth(360)
+        splitter.addWidget(panel)
+        splitter.setStretchFactor(0,1)
+        splitter.setSizes([900,320])
         layout.addWidget(splitter,1)
-        self.message = ui_label('选择本张人脸范围后开始分析；已有美化草稿会直接恢复。')
+        self.message = StatusText('请选择人脸')
+        self.message.setMaximumHeight(48)
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.message)
+        self.restore_discussion()
+        self.editor_tabs.currentChanged.connect(lambda _index:self.discussion_timer.start())
 
     def is_busy(self):
         return self.worker is not None
@@ -329,6 +363,84 @@ class BeautyEditor(QWidget):
     def parameters(self):
         return BeautyParameters(skin=self.sliders['skin'].value()/100,
             slim=self.sliders['slim'].value()/100,protect_features=self.protect_features.isChecked())
+
+    def refresh_discussion(self):
+        entries = []
+        for row in self.messages:
+            label = ''
+            if row.get('context'):
+                mode = {'source':'美化前','output':'美化后','compare':'左右比较'}[row['context']['view_mode']]
+                values = row['context']['parameters']
+                label = f'{mode} · 美肤 {round(values["skin"]*100)} / 瘦脸 {round(values["slim"]*100)}'
+            entries.append(dict(row,context={'label':label} if label else None))
+        self.chat_history.show_messages(entries)
+
+    def restore_discussion(self):
+        path = Path(self.context['directory'])/'beauty-discussion.json'
+        if not path.is_file():
+            return
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+            self.messages = state['messages']
+            self.chat_input.setPlainText(state['input'])
+            self.editor_tabs.setCurrentIndex(state.get('tab',0))
+            self.refresh_discussion()
+        except (OSError,ValueError,KeyError) as error:
+            self.message.setText('读取美化讨论失败：'+str(error))
+
+    def chat_context(self):
+        return {'base':self.context['base'],'session':str(self.session.directory) if self.session else None,
+            'face_box':list(self.session.box) if self.session else None,
+            'analysis_region':list(self.session.analysis_region) if self.session else None,
+            'skin_ready':self.session is not None and self.session.delta is not None,
+            'parameters':asdict(self.parameters()),'preview_parameters':asdict(self.rendered),
+            'view_mode':self.preview.mode.currentData()}
+
+    def send_message(self):
+        text = self.chat_input.toPlainText().strip()
+        if not text or self.is_busy():
+            return
+        self.draft_timer.stop()
+        self.pending = self.parameters() if self.parameters()!=self.rendered else None
+        context = self.chat_context()
+        self.messages.append({'role':'user','content':text,'context':context})
+        self.chat_input.clear()
+        self.refresh_discussion()
+        if self.save_draft():
+            directory = Path(self.context['directory'])/('beauty-chat-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+            self.start('chat',inputs={'context':context,'conversation':deepcopy(self.messages)},directory=directory)
+
+    def operation_status(self, text, *, terminal=False):
+        if self.operation_message is not None:
+            self.operation_message['operation_status'] = text
+            self.refresh_discussion()
+            self.save_draft()
+            if terminal:
+                self.operation_message = None
+
+    def execute_chat(self, row):
+        operation = row['operation']
+        self.operation_message = row
+        self.set_parameters(BeautyParameters(**operation['parameters']))
+        self.pending_save = operation['save']
+        self.pending = None
+        if not self.save_draft():
+            self.pending_save = False
+            self.operation_status(self.message.text(),terminal=True)
+            return
+        if operation['action']=='generate_skin':
+            self.operation_status('正在生成美肤基础')
+            self.start('skin')
+        elif self.pending_save:
+            self.pending_save = False
+            self.operation_status('正在另存美化版')
+            self.start('save')
+        elif self.isVisible():
+            self.operation_status('正在更新美化预览')
+            self.start('render')
+        else:
+            self.operation_status('美化参数已存草稿，返回时显示',terminal=True)
+            self.release_pixels()
 
     def restore_or_prepare(self):
         if not self.isVisible() or self.worker is not None or not self.needs_restore:
@@ -358,17 +470,18 @@ class BeautyEditor(QWidget):
         except (OSError,ValueError) as error:
             self.message.setText('选择人脸范围失败：'+str(error))
 
-    def start(self, phase):
+    def start(self, phase, *, inputs=None, directory=None):
         if self.worker is not None:
             return
         self.draft_timer.stop()
         self.needs_restore = False
-        self.failed = False
-        if phase!='resume':
+        if phase!='chat':
+            self.failed = False
+        if phase not in ('resume','chat'):
             self.failure_message = ''
         worker = BeautyWorker(phase, context=self.context,config=self.config,
             session=self.session,pixels=self.pixels,parameters=self.parameters(),before=self.before,
-            llm_config=self.llm_config)
+            llm_config=self.llm_config,inputs=inputs,directory=directory)
         worker.ready.connect(self.action_ready)
         worker.failed.connect(self.action_failed)
         worker.progress.connect(self.message.setText)
@@ -391,35 +504,71 @@ class BeautyEditor(QWidget):
                 self.failed = True
                 self.message.setText(self.failure_message+'\n已载入基础成片；调整参数后更新预览。')
             else:
-                self.message.setText('人脸已准备。调整瘦脸，或主动生成美肤基础。')
+                self.message.setText('人脸已就绪')
             self.save_draft()
         elif phase == 'skin':
             self.session = result
-            if self.sliders['skin'].value() == 0:
-                self.sliders['skin'].setValue(30)
             self.pending = self.parameters()
             self.save_draft()
-            self.message.setText('美肤基础已生成，可以调整强度并对比。')
+            self.message.setText('美肤基础已生成')
         elif phase == 'render':
             if self.worker.parameters == self.parameters():
                 self.preview.set_image_pair(self.before,result)
                 self.rendered = self.worker.parameters
-                self.message.setText('预览已更新。满意后另存美化版；全部归零恢复原成片。')
+                self.message.setText('预览已更新')
+            self.operation_status('美化预览已更新，尚未另存',terminal=True)
+        elif phase == 'chat':
+            row = {'role':'assistant','content':result['reply']}
+            if result['operation'] is not None:
+                row.update(operation=result['operation'],operation_status='操作已登记')
+            self.messages.append(row)
+            self.refresh_discussion()
+            if self.save_draft() and result['operation'] is not None:
+                self.pending_chat = row
+            self.message.setText(result['reply'])
         elif phase == 'save':
             self.save_draft()
             self.message.setText('美化版已另存为 16 位 PNG 和 JPEG。')
-            self.saved.emit(result)
+            self.operation_status('已另存美化版：'+result['files']['final'],terminal=True)
+            self.saved_result = result
 
     def action_failed(self, error):
+        self.pending_save = False
+        self.pending_chat = None
+        if self.worker.phase=='chat':
+            self.messages.append({'role':'assistant','content':'本次美化对话失败：'+error})
+            self.refresh_discussion()
+            self.save_draft()
+            self.message.setText('本次美化对话失败：'+error)
+            return
         self.failed = True
         self.pending = None
         self.failure_message = '人脸美化失败：'+error
         self.message.setText(self.failure_message+'。当前画面保留上次成功预览。')
+        self.operation_status(self.failure_message,terminal=True)
 
     def action_finished(self):
         worker,self.worker = self.worker,None
         worker.pixels = worker.session = worker.before = None
         worker.deleteLater()
+        if worker.phase=='save' and not self.failed:
+            result = self.saved_result
+            del self.saved_result
+            self.saved.emit(result)
+        if self.pending_chat is not None:
+            row,self.pending_chat = self.pending_chat,None
+            self.execute_chat(row)
+            if self.worker is not None:
+                return
+        if worker.phase=='skin' and not self.failed and self.operation_message is not None:
+            if self.pending_save:
+                self.pending_save = False
+                self.pending = None
+                self.operation_status('美肤基础已生成，正在另存美化版')
+                self.start('save')
+                return
+            self.operation_status('美肤基础已生成，尚未另存',
+                terminal=not self.isVisible() or self.pending==self.rendered)
         if not self.isVisible():
             self.release_pixels()
             self.update_controls()
@@ -468,13 +617,13 @@ class BeautyEditor(QWidget):
             self.start('render')
 
     def save_draft(self):
-        if self.session is None:
-            return True
         try:
-            parameters = self.parameters()
-            save_json(Path(self.context['directory'])/'beauty-session.json',
-                {'session':self.session.directory.name,'parameters':{'skin':parameters.skin,'slim':parameters.slim,
-                    'protect_features':parameters.protect_features}})
+            save_json(Path(self.context['directory'])/'beauty-discussion.json',
+                {'base':self.context['base'],'messages':self.messages,'input':self.chat_input.toPlainText(),
+                    'tab':self.editor_tabs.currentIndex()})
+            if self.session is not None:
+                save_json(Path(self.context['directory'])/'beauty-session.json',
+                    {'session':self.session.directory.name,'parameters':asdict(self.parameters())})
         except OSError as error:
             self.message.setText('保存美化草稿失败：'+str(error))
             return False
@@ -482,9 +631,8 @@ class BeautyEditor(QWidget):
 
     def release_pixels(self):
         self.draft_timer.stop()
+        self.discussion_timer.stop()
         self.pending = None
-        if self.pixels is None:
-            return
         if not self.save_draft():
             return
         if self.worker is not None:
@@ -509,7 +657,7 @@ class BeautyEditor(QWidget):
 
     def update_controls(self):
         busy = self.worker is not None
-        rendering = busy and self.worker.phase == 'render'
+        rendering = busy and self.worker.phase == 'render' and self.operation_message is None
         self.sliders['slim'].setEnabled(self.session is not None and (not busy or rendering))
         self.sliders['skin'].setEnabled(self.session is not None and self.session.delta is not None and (not busy or rendering))
         self.protect_features.setEnabled(self.session is not None and self.session.delta is not None and (not busy or rendering))
@@ -517,12 +665,15 @@ class BeautyEditor(QWidget):
         self.skin_button.setText('重新生成美肤基础' if self.session is not None and self.session.delta is not None else '生成美肤基础')
         self.raw_button.setEnabled(self.session is not None and self.session.delta is not None)
         if self.session is not None and self.session.delta is not None:
-            self.source_note.setText('当前基础：官方 BF16 推理。滑杆调整应用强度；模型原始输出单独保留。')
+            self.source_note.setText('已有美肤基础')
         else:
-            self.source_note.setText('生成完整 BF16 模型输出后，再调整应用强度。模型原始输出单独保留，可直接查看。')
+            self.source_note.setText('未生成美肤基础')
         self.analyze_button.setEnabled(not busy)
+        self.analyze_button.setText('选择人脸并分析' if self.session is None else '重新选择人脸')
         self.connection_button.setEnabled(not busy)
         self.reset_button.setEnabled(self.session is not None and (not busy or rendering))
         parameters = self.parameters()
         self.save_button.setEnabled(self.pixels is not None and not busy and
             parameters == self.rendered and bool(parameters.skin or parameters.slim))
+        self.chat_input.setEnabled(not busy)
+        self.chat_send.setEnabled(not busy)

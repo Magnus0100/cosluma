@@ -11,6 +11,7 @@ import shutil
 import uuid
 
 from creative_edits import edits_description, edits_label, normalise_edits
+from image_io import save_json
 
 
 def source_key(source):
@@ -119,6 +120,9 @@ def project_photos(batches):
                     tone_common = {**common,'description':parent.get('description',description)+
                         f'\n整图光调：曝光 {parameters["exposure_ev"]:+g} EV；曲线输出 '
                         f'{parameters["shadows"]:g} / {parameters["midtones"]:g} / {parameters["highlights"]:g}'}
+                    if any(name in parameters for name in ('warmth','tint','saturation')):
+                        tone_common['description'] += (f'；暖冷 {parameters.get("warmth",0):+g}；'
+                            f'绿洋红 {parameters.get("tint",0):+g}；饱和度 {parameters.get("saturation",1):g}')
                     for key in ('parameters','retouches'):
                         if key in parent:
                             tone_common[key] = deepcopy(parent[key])
@@ -167,7 +171,48 @@ def photo_choices(photos, saved):
     return choices
 
 
-def export_delivery(photos, choices, parent, name, formats, *, progress=None):
+def saved_tone_batch(path):
+    """Read actual saved outputs from one recorded round, including its failed photos."""
+    path = Path(path)
+    saved = json.loads(path.read_text(encoding='utf-8'))
+    targets = []
+    for item in saved['items']:
+        target = {'photo_key':item['photo_key'],'name':item['name']}
+        if item['status']=='complete':
+            target['version_id'] = item['saved_record']
+        else:
+            target['error'] = item.get('error','该轮照片尚未完成')
+        targets.append(target)
+    return {'id':str(path),'created_at':saved['created_at'],'status':saved['status'],
+        'parameters':saved['parameters'],'targets':targets,
+        'photos':[{'name':item['name'],'status':item['status']} for item in saved['items']]}
+
+
+def adopt_delivery_versions(photos, choices, targets):
+    """Explicitly adopt known saved versions, retaining every delivery checkbox."""
+    records = {photo['key']:photo for photo in photos}
+    items = []
+    for target in targets:
+        item = dict(target)
+        try:
+            if 'error' in target:
+                raise ValueError(target['error'])
+            photo = records[target['photo_key']]
+            version = selected_version(photo,{'version':target['version_id']})
+            for path in version['files'].values():
+                if not Path(path).is_file():
+                    raise FileNotFoundError('所选版本文件不存在：'+path)
+            choice = choices[photo['key']]
+            item.update(status='complete',previous_version=choice['version'],label=version['label'])
+            choice['version'] = version['id']
+        except (OSError,ValueError,KeyError) as error:
+            item.update(status='failed',error=str(error))
+        items.append(item)
+    complete = sum(item['status']=='complete' for item in items)
+    return {'status':'complete' if complete==len(items) else 'partial' if complete else 'failed','items':items}
+
+
+def export_delivery(photos, choices, parent, name, formats, *, progress=None, adoption=None):
     """Copy the explicitly selected saved versions; preserve every image byte."""
     report = progress or (lambda message:None)
     selected = [dict(choice,key=key) for key,choice in choices.items() if choice['included']]
@@ -183,7 +228,13 @@ def export_delivery(photos, choices, parent, name, formats, *, progress=None):
     records = {photo['key']:photo for photo in photos}
     names = {Path(choice['source']).stem.casefold() for choice in selected}
     used_names = set()
-    items = []
+    result = {'directory':str(directory),'formats':list(formats),'items':[],
+        'status':'running','manifest':str(directory/'delivery.json'),
+        'created_at':datetime.now().astimezone().isoformat(timespec='seconds'),
+        'selection':selected}
+    if adoption is not None:
+        result['adoption'] = deepcopy(adoption)
+    save_json(directory/'delivery.json',result)
     for number,choice in enumerate(selected,1):
         stem = Path(choice['source']).stem
         candidate = stem
@@ -201,6 +252,8 @@ def export_delivery(photos, choices, parent, name, formats, *, progress=None):
                     '；请检查对应批次记录是否已被移动或删除')
             version = selected_version(photo,choice)
             item['label'] = version['label']
+            item['saved_files'] = dict(version['files'])
+            item['dimensions'] = version['dimensions']
             for kind in formats:
                 target = directory/kind/(candidate+('.jpg' if kind=='JPEG' else '.png'))
                 temporary = target.with_name(target.name+'.tmp')
@@ -212,6 +265,11 @@ def export_delivery(photos, choices, parent, name, formats, *, progress=None):
                 item['files'][kind] = str(target)
         except (OSError,ValueError,KeyError) as error:
             item.update(status='failed',error=str(error))
-        items.append(item)
-    return {'directory':str(directory),'formats':list(formats),'items':items,
-        'created_at':datetime.now().astimezone().isoformat(timespec='seconds')}
+        result['items'].append(item)
+        save_json(directory/'delivery.json',result)
+    complete = sum(item['status']=='complete' for item in result['items'])
+    result['status'] = 'complete' if complete==len(selected) else 'partial' if complete else 'failed'
+    if result['status']=='complete' and adoption is not None and adoption['status']!='complete':
+        result['status'] = 'partial'
+    save_json(directory/'delivery.json',result)
+    return result

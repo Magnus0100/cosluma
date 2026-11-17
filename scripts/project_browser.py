@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
-    QSplitter, QVBoxLayout, QWidget)
+    QSplitter, QStackedWidget, QFrame, QVBoxLayout, QWidget)
 
 from project_store import Project
 from studio_widgets import PhotoPreview, ui_label
@@ -24,11 +24,12 @@ def _project_record(project, *, active=False):
     delivery = project.data.get('delivery',{})
     included = sum(choice['included'] for choice in delivery.get('choices',{}).values())
     delivery_info = f'\n已选交付 {included} 张 · 已导出 {len(delivery.get("exports",[]))} 次' if delivery else ''
-    info = (state.get('character') or '角色待填写')+f' · {len(state["sources"])} 张原片 · {complete} 张已有成片 · {len(project.data["batches"])} 个批次'+delivery_info+'\n'+str(project.path.parent)
+    info = (state.get('character') or '角色待填写')+f'\n{len(state["sources"])} 张原片　{complete} 张成片记录　{len(project.data["batches"])} 次制作'+delivery_info
+    stage = '已有制作记录' if complete or project.data['batches'] else '已导入照片' if state['sources'] else '等待导入照片'
     source = state.get('representative_source') or next(iter(state['sources']),None)
     result = next((item for item in state['results'] if item['source']==source and item['status']=='complete'),None)
     output = (result.get('exports',{}).get('JPEG') or result.get('files',{}).get('jpeg')) if result else None
-    return {'path':str(project.path),'label':label,'title':title,'info':info,'preview':(source,output)}
+    return {'path':str(project.path),'label':label,'title':title,'info':info,'stage':stage,'preview':(source,output)}
 
 
 class NewProject(QDialog):
@@ -38,10 +39,7 @@ class NewProject(QDialog):
         self.resize(650, 330)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
-        layout.addWidget(ui_label('开始一组新的创作', 'title'))
-        note = ui_label('照片、讨论、样片与成片保存在这个项目中。原片保留在原位置。')
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        layout.addWidget(ui_label('新建项目', 'title'))
         form = QFormLayout()
         self.name = QLineEdit()
         self.name.setPlaceholderText('例如：守岸人 · 海边外景')
@@ -118,11 +116,11 @@ class ProjectBrowser(QWidget):
         self.active_project = None
         self.preview_key = None
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 10, 8, 4)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(20)
         header = QHBoxLayout()
         intro = QVBoxLayout()
-        intro.addWidget(ui_label('你的创作项目', 'title'))
-        intro.addWidget(ui_label('从上次的讨论继续，或开始一组新的照片。'))
+        intro.addWidget(ui_label('最近项目', 'title'))
         header.addLayout(intro, 1)
         self.browse = QPushButton('打开项目')
         self.browse.clicked.connect(self.browse_requested.emit)
@@ -134,31 +132,45 @@ class ProjectBrowser(QWidget):
         layout.addLayout(header)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
-        sidebar = QWidget()
+        self.sidebar = sidebar = QWidget()
         column = QVBoxLayout(sidebar)
-        column.setContentsMargins(0, 16, 16, 0)
+        column.setContentsMargins(0, 0, 12, 0)
         self.search = QLineEdit()
         self.search.setPlaceholderText('搜索项目名称或角色')
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.filter_projects)
         column.addWidget(self.search)
         self.listing = QListWidget()
+        self.listing.setObjectName('projectList')
+        self.listing.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.listing.setTextElideMode(Qt.ElideRight)
         self.listing.setSpacing(6)
         self.listing.currentRowChanged.connect(self.show_project)
         self.listing.itemDoubleClicked.connect(lambda _item:self.open_selected())
         column.addWidget(self.listing, 1)
-        self.empty = ui_label('还没有项目。新建项目后，就可以导入照片、讨论和试样。')
+        self.empty = ui_label('暂无项目')
         self.empty.setWordWrap(True)
         column.addWidget(self.empty)
         splitter.addWidget(sidebar)
-        detail = QWidget()
+        self.detail_pages = QStackedWidget()
+        detail = QFrame()
+        detail.setObjectName('projectDetail')
         column = QVBoxLayout(detail)
-        column.setContentsMargins(12, 16, 0, 0)
-        self.title = ui_label('选择一个项目', 'heading')
+        column.setContentsMargins(22, 20, 22, 20)
+        column.setSpacing(12)
+        self.stage = ui_label('','projectStage')
+        column.addWidget(self.stage,0,Qt.AlignLeft)
+        self.title = ui_label('选择一个项目', 'title')
         self.title.setWordWrap(True)
         column.addWidget(self.title)
         self.preview = PhotoPreview()
-        column.addWidget(self.preview, 1)
+        self.cover_pages = QStackedWidget()
+        self.cover_pages.addWidget(self.preview)
+        placeholder = ui_label('暂无照片','dropArea')
+        placeholder.setAlignment(Qt.AlignCenter)
+        placeholder.setWordWrap(True)
+        self.cover_pages.addWidget(placeholder)
+        column.addWidget(self.cover_pages, 1)
         self.info = ui_label('')
         self.info.setWordWrap(True)
         self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -176,11 +188,25 @@ class ProjectBrowser(QWidget):
         self.continue_button.clicked.connect(self.open_selected)
         controls.addWidget(self.continue_button)
         column.addLayout(controls)
-        splitter.addWidget(detail)
-        splitter.setSizes([380, 760])
+        self.detail_pages.addWidget(detail)
+        welcome = QFrame()
+        welcome.setObjectName('projectWelcome')
+        welcome_column = QVBoxLayout(welcome)
+        welcome_column.setContentsMargins(36,32,36,32)
+        welcome_column.setSpacing(18)
+        welcome_column.addStretch(1)
+        self.welcome_title = ui_label('暂无项目','heading')
+        welcome_column.addWidget(self.welcome_title,0,Qt.AlignCenter)
+        self.welcome_note = ui_label('')
+        self.welcome_note.setWordWrap(True)
+        welcome_column.addWidget(self.welcome_note)
+        welcome_column.addStretch(1)
+        self.detail_pages.addWidget(welcome)
+        splitter.addWidget(self.detail_pages)
+        splitter.setSizes([320, 760])
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter, 1)
-        self.message = ui_label('打开项目只恢复已有内容，制作由你主动开始。')
+        self.message = ui_label('')
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.switching_enabled = True
@@ -217,9 +243,9 @@ class ProjectBrowser(QWidget):
             item.setHidden(not match)
             if match:
                 visible.append(row)
-        self.empty.setVisible(not visible)
-        self.empty.setText('没有匹配的项目，请修改搜索条件。' if self.records else
-            '还没有项目。新建项目后，就可以导入照片、讨论和试样。')
+        self.sidebar.setVisible(bool(self.records))
+        self.empty.setVisible(not visible and bool(self.records))
+        self.empty.setText('无匹配项目' if self.records else '暂无项目')
         current = self.listing.currentRow()
         if current not in visible:
             self.listing.setCurrentRow(visible[0] if visible else -1)
@@ -239,15 +265,23 @@ class ProjectBrowser(QWidget):
         self.rename.setEnabled(enabled)
         self.folder.setEnabled(record is not None)
         if not valid:
+            self.detail_pages.setCurrentIndex(1)
+            self.welcome_title.setText('项目暂时无法打开' if record else '没有找到匹配项目' if self.records else '暂无项目')
+            self.welcome_note.setText('读取失败：'+record['error'] if record else
+                '')
             self.title.setText('选择一个项目')
             if self.preview_key is not None:
                 self.preview.set_photo()
                 self.preview_key = None
             self.info.setText(record['error'] if record else '')
             return
+        self.detail_pages.setCurrentIndex(0)
+        self.stage.setText(record['stage'])
         self.title.setText(record['title'])
         self.info.setText(record['info'])
+        self.folder.setToolTip(str(Path(record['path']).parent))
         key = record['preview']
+        self.cover_pages.setCurrentIndex(0 if any(key) else 1)
         if key != self.preview_key:
             self.preview.set_photo(*key)
             self.preview_key = key
@@ -257,7 +291,7 @@ class ProjectBrowser(QWidget):
         self.create.setEnabled(not busy)
         self.browse.setEnabled(not busy)
         self.message.setText('当前项目正在处理中，可查看项目列表；处理结束后可以切换。' if busy else
-            '打开项目只恢复已有内容，制作由你主动开始。')
+            '')
         self.show_project()
 
     def open_selected(self):

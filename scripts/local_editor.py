@@ -1,10 +1,13 @@
 """Optional painted edits and explicit saved versions, after production."""
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
+import uuid
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -12,15 +15,16 @@ from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGraphicsView, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton,
-    QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget)
+    QMenu, QScrollArea, QSlider, QSplitter, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from image_io import display_image, open_photo, save_image, save_json
 from local_retouch import (H3_DEFAULTS, LOCAL_DEFAULTS, LOCAL_ENGINES, LOCAL_KEYS, TASKS,
-    generate_local, retouch_crop, save_local)
+    generate_local, local_engine, retouch_crop, save_local)
+from local_chat import discuss_local
 from model_downloads import ModelDownloads
 from service_settings import endpoint_url
 from settings import load_settings
-from studio_widgets import PhotoCanvas, PhotoPreview, ui_label
+from studio_widgets import PhotoCanvas, PhotoPreview, StatusText, chat_shortcuts, chat_composer, ConversationView, ui_label
 
 
 def _pixmap(image):
@@ -236,6 +240,8 @@ class LocalWorker(QThread):
             elif self.phase=='save':
                 self.progress.emit('另存原尺寸 16 位 PNG 与 JPEG')
                 result = save_local(self.pixels,self.directory)
+            elif self.phase=='chat':
+                result = discuss_local(self.pixels,config=self.llm_config,directory=self.directory,**self.inputs)
             self.ready.emit(result)
         except Exception as error:
             self.failed.emit(str(error)+'。工作目录：'+self.context['directory'])
@@ -263,6 +269,10 @@ class LocalRetouchEditor(QWidget):
         self.worker = None
         self.pixels = self.before = None
         self.result_directory = None
+        self.messages = []
+        self.pending_chat = None
+        self.pending_save = False
+        self.operation_message = None
         self.failed = False
         self.failure_phase = None
         self.failure_message = ''
@@ -280,9 +290,14 @@ class LocalRetouchEditor(QWidget):
         layout.setContentsMargins(0,0,0,0)
         header = QHBoxLayout()
         header.addWidget(ui_label('局部修饰 · '+context['name'],'heading'),1)
-        self.connection = QPushButton('局部修饰连接')
-        self.connection.clicked.connect(self.connection_requested.emit)
-        header.addWidget(self.connection)
+        more = QToolButton()
+        more.setText('更多')
+        more.setProperty('kind','quiet')
+        more.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(more)
+        self.connection = menu.addAction('连接设置',self.connection_requested.emit)
+        more.setMenu(menu)
+        header.addWidget(more)
         back = QPushButton('返回成片')
         back.clicked.connect(self.back_requested.emit)
         header.addWidget(back)
@@ -295,41 +310,47 @@ class LocalRetouchEditor(QWidget):
         self.pages.addTab(self.preview,'比较本次结果')
         self.pages.currentChanged.connect(self.page_changed)
         splitter.addWidget(self.pages)
-        panel = QFrame()
-        panel.setProperty('role','panel')
-        controls = QVBoxLayout(panel)
-        controls.setContentsMargins(18,18,18,18)
+        panel = QWidget()
+        side = QVBoxLayout(panel)
+        side.setContentsMargins(0,0,0,0)
         self.task = QComboBox()
         for key,(label,_) in TASKS.items():
             self.task.addItem(label,key)
         self.task.currentIndexChanged.connect(self.change_task)
-        controls.addWidget(self.task)
+        side.addWidget(self.task)
         self.note = ui_label('')
         self.note.setWordWrap(True)
-        controls.addWidget(self.note)
+        self.note.setMaximumHeight(42)
+        side.addWidget(self.note)
         self.tool = QComboBox()
         for text,value in (('涂选修改范围','mask'),('保护／擦除范围','protect'),
                 ('画发束形状标记','shape'),('擦除形状标记','erase_shape'),('移动查看','move')):
             self.tool.addItem(text,value)
         self.tool.currentIndexChanged.connect(lambda:self.canvas.set_tool(self.tool.currentData()))
-        controls.addWidget(self.tool)
-        controls.addWidget(ui_label('画笔大小'))
+        side.addWidget(self.tool)
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(ui_label('画笔'))
         self.brush = QSlider(Qt.Horizontal)
         self.brush.setRange(4,180)
         self.brush.setValue(36)
         self.brush.valueChanged.connect(lambda value:setattr(self.canvas,'brush',value))
-        controls.addWidget(self.brush)
+        brush_row.addWidget(self.brush,1)
         self.clear = QPushButton('清空修改范围')
         self.clear.clicked.connect(self.canvas.clear_selection)
-        controls.addWidget(self.clear)
-        controls.addWidget(ui_label('这次具体要求','heading'))
+        self.clear.setText('清空')
+        self.clear.setProperty('kind','quiet')
+        brush_row.addWidget(self.clear)
+        side.addLayout(brush_row)
+        self.editor_tabs = QTabWidget()
+        manual = QWidget()
+        controls = QVBoxLayout(manual)
+        controls.addWidget(ui_label('具体要求','heading'))
         self.brief = QPlainTextEdit()
         self.brief.setPlaceholderText('可留空；发束造型可写方向、轮廓和幅度。')
         self.brief.setMaximumHeight(150)
         self.brief.textChanged.connect(self.invalidate_result)
         controls.addWidget(self.brief)
-        self.brief_hint = ui_label('MiniMax-H3-Image 会重新生成编辑视图，涂选范围只决定最终写回哪些像素：'
-            '这里描述希望得到的最终外观，尽量简短；例如：颈部皮肤自然平滑。')
+        self.brief_hint = ui_label('简短描述希望得到的外观，例如：颈部皮肤自然平滑。')
         self.brief_hint.setWordWrap(True)
         self.brief_hint.setVisible(False)
         controls.addWidget(self.brief_hint)
@@ -340,36 +361,52 @@ class LocalRetouchEditor(QWidget):
         self.reference_button = QPushButton('选择参考图')
         self.reference_button.clicked.connect(self.choose_reference)
         controls.addWidget(self.reference_button)
-        note = ui_label('粉色范围决定最终写回区域；脸、头饰、衣领和配饰请留在范围外。青色线只表达形状，需另涂相应修改范围。涂画预览最长边 1600，比较结果可看原尺寸。')
+        note = ui_label('粉色是修改范围，青色是形状提示。请将需要保留的脸、头饰和衣领留在范围外。')
         note.setWordWrap(True)
         controls.addWidget(note)
         controls.addStretch(1)
+        self.chat_panel = QWidget()
+        chat_column = QVBoxLayout(self.chat_panel)
+        chat_column.setContentsMargins(0,0,0,0)
+        self.chat_history = ConversationView()
+        chat_column.addWidget(self.chat_history,1)
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setPlaceholderText('输入修饰要求')
+        self.chat_input.setFixedHeight(54)
+        self.chat_input.textChanged.connect(self.discussion_edited)
+        self.chat_send = QPushButton('发送')
+        self.chat_send.clicked.connect(self.send_message)
+        self.send_shortcuts = chat_shortcuts(self.chat_input,self.send_message)
+        chat_column.addWidget(chat_composer(self.chat_input,self.chat_send))
+        self.editor_tabs.addTab(self.chat_panel,'对话')
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(manual)
+        self.editor_tabs.addTab(scroll,'手动设置')
+        self.editor_tabs.currentChanged.connect(lambda _index:self.discussion_edited())
+        side.addWidget(self.editor_tabs,1)
         self.generate = QPushButton('生成本次修饰')
         self.generate.setProperty('kind','primary')
         self.generate.clicked.connect(lambda:self.start('generate'))
-        controls.addWidget(self.generate)
+        side.addWidget(self.generate)
         self.result_info = ui_label('')
         self.result_info.setWordWrap(True)
         self.result_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        controls.addWidget(self.result_info)
-        self.raw_button = QPushButton('查看模型原始输出')
-        self.raw_button.clicked.connect(self.open_raw)
-        controls.addWidget(self.raw_button)
-        self.reload_button = QPushButton('重新读取所选版本')
-        self.reload_button.clicked.connect(lambda:self.start('load'))
-        controls.addWidget(self.reload_button)
+        self.result_info.setMaximumHeight(42)
+        side.addWidget(self.result_info)
+        self.raw_button = menu.addAction('查看模型原始输出',self.open_raw)
+        self.reload_button = menu.addAction('重新读取所选版本',lambda:self.start('load'))
         self.save_button = QPushButton('另存这个修饰版本')
         self.save_button.clicked.connect(lambda:self.start('save'))
-        controls.addWidget(self.save_button)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(290)
-        scroll.setMaximumWidth(340)
-        scroll.setWidget(panel)
-        splitter.addWidget(scroll)
-        splitter.setSizes([900,310])
+        side.addWidget(self.save_button)
+        panel.setMinimumWidth(290)
+        panel.setMaximumWidth(360)
+        splitter.addWidget(panel)
+        splitter.setStretchFactor(0,1)
+        splitter.setSizes([900,320])
         layout.addWidget(splitter,1)
-        self.message = ui_label('正在读取已保存版本；打开界面不调用模型。')
+        self.message = StatusText('正在读取照片')
+        self.message.setMaximumHeight(48)
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.message)
@@ -386,6 +423,68 @@ class LocalRetouchEditor(QWidget):
 
     def is_busy(self):
         return self.worker is not None
+
+    def discussion_edited(self):
+        if not self.restoring:
+            self.draft_timer.start()
+
+    def refresh_discussion(self):
+        entries = []
+        for row in self.messages:
+            label = ''
+            if row.get('context'):
+                mode = {'paint':'涂画范围','source':'只看底图','output':'只看修饰结果','compare':'左右比较'}[row['context']['view_mode']]
+                label = row['context']['task_label']+' · '+mode
+            entries.append(dict(row,context={'label':label} if label else None))
+        self.chat_history.show_messages(entries)
+
+    def chat_context(self):
+        return {'base':self.context['base'],'task':self.task_key,'task_label':TASKS[self.task_key][0],
+            'engine':local_engine(self.config)['engine'],'brief':self.brief.toPlainText(),
+            'mask_dimensions':list(self.canvas.mask.size),'selection_box':self.canvas.mask.getbbox(),
+            'selection_sha256':hashlib.sha256(self.canvas.mask.tobytes()).hexdigest(),
+            'guide_sha256':hashlib.sha256(self.canvas.guide.tobytes()).hexdigest(),
+            'reference':self.reference.text().strip() or None,
+            'result':self.result_directory if not self.failed else None,
+            'view_mode':self.preview.mode.currentData() if self.pages.currentIndex()==1 else 'paint'}
+
+    def send_message(self):
+        text = self.chat_input.toPlainText().strip()
+        if not text or self.is_busy():
+            return
+        context = self.chat_context()
+        self.messages.append({'role':'user','content':text,'context':context})
+        self.chat_input.clear()
+        self.refresh_discussion()
+        self.start('chat',inputs={'mask':self.canvas.mask.copy(),'guide':self.canvas.guide.copy(),
+            'context':context,'conversation':deepcopy(self.messages)})
+
+    def operation_status(self, text, *, terminal=False):
+        if self.operation_message is not None:
+            self.operation_message['operation_status'] = text
+            self.refresh_discussion()
+            if not self.save_draft():
+                self.operation_message['operation_status'] = self.message.text()
+                self.refresh_discussion()
+            if terminal:
+                self.operation_message = None
+
+    def execute_chat(self, row):
+        operation = row['operation']
+        self.operation_message = row
+        if operation['action']!='save' and operation['brief'] is not None:
+            self.brief.setPlainText(operation['brief'])
+        action = operation['action']
+        if action=='draft':
+            self.operation_status('具体要求已存草稿，尚未生成',terminal=True)
+        else:
+            self.pending_save = operation['save']
+            phase = 'generate' if action=='generate' else 'save'
+            if self.start(phase):
+                self.operation_status('正在生成本次修饰' if phase=='generate' else '正在另存当前修饰结果')
+            else:
+                self.pending_save = False
+                self.operation_status(self.message.text(),terminal=True)
 
     def choose_reference(self):
         path,_ = QFileDialog.getOpenFileName(self,'选择参考图',self.reference.text())
@@ -432,6 +531,11 @@ class LocalRetouchEditor(QWidget):
             state = self.drafts.get(self.task_key,{})
             self.brief.setPlainText(state.get('brief',''))
             self.reference.setText(state.get('reference',''))
+            discussion = state.get('discussion',{})
+            self.messages = deepcopy(discussion.get('messages',[]))
+            self.chat_input.setPlainText(discussion.get('input',''))
+            self.editor_tabs.setCurrentIndex(discussion.get('tab',0))
+            self.refresh_discussion()
             mask_path = self.draft_directory/(self.task_key+'-mask.png')
             guide_path = self.draft_directory/(self.task_key+'-guide.png')
             mask = Image.open(mask_path).convert('L') if mask_path.is_file() else None
@@ -457,36 +561,46 @@ class LocalRetouchEditor(QWidget):
             save_image(self.canvas.mask,self.draft_directory/(self.task_key+'-mask.png'))
             save_image(self.canvas.guide,self.draft_directory/(self.task_key+'-guide.png'))
             self.drafts[self.task_key] = {'brief':self.brief.toPlainText(),'reference':self.reference.text(),
-                'result':os.path.relpath(self.result_directory,self.context['directory']) if self.result_directory else None}
+                'result':os.path.relpath(self.result_directory,self.context['directory']) if self.result_directory else None,
+                'discussion':{'messages':self.messages,'input':self.chat_input.toPlainText(),
+                    'tab':self.editor_tabs.currentIndex()}}
             save_json(self.draft_directory/'draft.json',{'task':self.task_key,'tasks':self.drafts})
             return True
         except (OSError,ValueError) as error:
             self.message.setText('保存局部修饰草稿失败：'+str(error))
             return False
 
-    def start(self, phase):
+    def start(self, phase, *, inputs=None):
         if self.worker is not None or (phase=='load' and not self.isVisible()):
-            return
+            return False
         if phase!='load' and not self.save_draft():
-            return
+            return False
         if phase=='generate' and not self.canvas.mask.getbbox():
             self.message.setText('请先涂出本次要修改的范围。')
-            return
-        inputs = {'mask':self.canvas.mask.copy(),'guide':self.canvas.guide.copy(),
-            'task':self.task_key,'brief':self.brief.toPlainText(),'reference':self.reference.text().strip() or None} if phase=='generate' else None
+            return False
+        if phase=='generate':
+            inputs = {'mask':self.canvas.mask.copy(),'guide':self.canvas.guide.copy(),
+                'task':self.task_key,'brief':self.brief.toPlainText(),'reference':self.reference.text().strip() or None}
         if phase=='load':
             self.loaded_failure = self.failed and self.failure_phase!='load'
             self.loaded_failure_state = (self.failure_phase,self.failure_message)
-        self.failed = False
+        self.worker_failed = False
+        if phase!='chat':
+            self.failed = False
+        directory = (self.draft_directory/('chat-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+            if phase=='chat' else self.result_directory)
         self.worker = LocalWorker(phase,self.context,self.config,pixels=self.pixels,before=self.before,
-            directory=self.result_directory,inputs=inputs,sr_config=self.sr_config,llm_config=self.llm_config)
+            directory=directory,inputs=inputs,sr_config=self.sr_config,llm_config=self.llm_config)
         self.worker.progress.connect(self.message.setText)
         self.worker.ready.connect(self.action_ready)
         self.worker.failed.connect(self.action_failed)
         self.worker.finished.connect(self.action_finished)
         self.update_controls()
         self.busy_changed.emit()
+        if phase=='chat':
+            self.message.setText('Agent 正在讨论本次局部修饰，涂选范围和任务保持发送时状态。')
         self.worker.start()
+        return True
 
     def action_ready(self, result):
         phase = self.worker.phase
@@ -497,7 +611,14 @@ class LocalRetouchEditor(QWidget):
                 self.failed = True
                 self.failure_phase,self.failure_message = self.loaded_failure_state
             self.message.setText(self.failure_message+'。已重新读取所选版本，下一次生成仍需主动点击。' if self.loaded_failure else
-                '先涂范围并填写要求，再主动生成；基础成片保留。')
+                '请涂选修改范围')
+        elif phase=='chat':
+            row = {'role':'assistant','content':result['reply'],'operation':result['operation']}
+            self.messages.append(row)
+            self.refresh_discussion()
+            self.message.setText('已回复')
+            if self.save_draft() and row['operation'] is not None:
+                self.pending_chat = row
         elif phase in ('generate','compare'):
             self.result_directory,preview,state = result
             native = state.get('model_output_dimensions',[])
@@ -528,20 +649,44 @@ class LocalRetouchEditor(QWidget):
             self.save_draft()
             self.message.setText(TASKS[self.task_key][0]+('本次结果已读取，可切到比较页查看后另存。'
                 if phase=='compare' else '已生成。比较后可另存，范围外沿用所选版本像素。'))
+            if phase=='generate':
+                self.operation_status('本次修饰已生成，正在另存' if self.pending_save else
+                    '本次修饰已生成，尚未另存',terminal=not self.pending_save)
         elif phase=='save':
             self.message.setText('已另存：'+result['files']['final'])
+            self.operation_status('已另存修饰版：'+result['files']['final'],terminal=True)
             self.saved.emit(result)
 
     def action_failed(self, error):
-        self.failed = True
-        self.failure_phase = self.worker.phase
-        self.failure_message = '局部修饰失败：'+error
-        self.message.setText(self.failure_message+'。已有文件和涂画保留。')
+        self.worker_failed = True
+        self.pending_chat = None
+        self.pending_save = False
+        if self.worker.phase=='chat':
+            self.messages.append({'role':'assistant','content':'本次局部修饰讨论失败：'+error})
+            self.refresh_discussion()
+            self.save_draft()
+            self.message.setText('本次局部修饰讨论失败：'+error)
+        else:
+            self.failed = True
+            self.failure_phase = self.worker.phase
+            self.failure_message = '局部修饰失败：'+error
+            self.message.setText(self.failure_message+'。已有文件和涂画保留。')
+            self.operation_status(self.failure_message,terminal=True)
 
     def action_finished(self):
         worker,self.worker = self.worker,None
         worker.pixels = worker.before = worker.inputs = None
         worker.deleteLater()
+        row,self.pending_chat = self.pending_chat,None
+        if row is not None:
+            self.execute_chat(row)
+            if self.worker is not None:
+                return
+        elif not self.worker_failed and worker.phase=='generate' and self.pending_save:
+            self.pending_save = False
+            if self.start('save'):
+                return
+            self.operation_status(self.message.text(),terminal=True)
         if not self.isVisible():
             self.release_pixels()
         elif (worker.phase=='load' and self.result_directory and not self.failed
@@ -570,6 +715,8 @@ class LocalRetouchEditor(QWidget):
                 self.reference_button,self.canvas):
             widget.setEnabled(ready and not busy)
         self.connection.setEnabled(not busy)
+        self.chat_send.setEnabled(ready and not busy)
+        self.chat_input.setEnabled(not busy)
         self.generate.setEnabled(ready and not busy)
         self.reload_button.setEnabled(not busy)
         self.save_button.setEnabled(ready and not busy and not self.failed and bool(self.result_directory))

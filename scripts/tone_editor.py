@@ -9,11 +9,11 @@ import uuid
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QHBoxLayout, QPlainTextEdit,
-    QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget)
+    QPushButton, QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
 from image_io import display_image, open_photo, save_json
 from settings import load_settings
-from studio_widgets import PhotoPreview, ui_label
+from studio_widgets import PhotoPreview, StatusText, chat_shortcuts, chat_composer, ConversationView, ui_label
 from tone_edit import ToneParameters, discuss_tone, render_tone, save_tone
 
 
@@ -52,6 +52,7 @@ class ToneEditor(QWidget):
     saved = Signal(dict)
     busy_changed = Signal()
     external_changed = Signal()
+    batch_requested = Signal(object)
 
     def __init__(self, context, config_path, parent=None):
         super().__init__(parent)
@@ -75,7 +76,7 @@ class ToneEditor(QWidget):
         self.render_timer.timeout.connect(self.render)
         layout = QVBoxLayout(self)
         heading = QHBoxLayout()
-        heading.addWidget(ui_label('曝光与明度曲线 · '+context['name']))
+        heading.addWidget(ui_label('光色调整 · '+context['name']))
         heading.addStretch()
         back = QPushButton('返回作品')
         back.clicked.connect(self.back_requested.emit)
@@ -86,17 +87,22 @@ class ToneEditor(QWidget):
         split.addWidget(self.preview)
         panel = QWidget()
         column = QVBoxLayout(panel)
-        note = ui_label('整图统一调整光调。参数相对本次打开的版本；恢复初始值可还原该版本像素。')
-        note.setWordWrap(True)
-        column.addWidget(note)
+        column.setContentsMargins(0,0,0,0)
+        self.editor_tabs = QTabWidget()
+        manual = QWidget()
+        manual_column = QVBoxLayout(manual)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
         self.controls = {}
         self.sliders = {}
         for name,label,low,high,value,step in (
                 ('exposure_ev','曝光（EV）',-2,2,0,.05),
-                ('shadows','曲线：暗部 25% →',.05,.4,.25,.01),
-                ('midtones','曲线：中间调 50% →',.4,.6,.5,.01),
-                ('highlights','曲线：亮部 75% →',.6,.95,.75,.01)):
+                ('shadows','暗部',.05,.4,.25,.01),
+                ('midtones','中间调',.4,.6,.5,.01),
+                ('highlights','亮部',.6,.95,.75,.01),
+                ('warmth','暖冷',-1,1,0,.05),
+                ('tint','绿洋红',-1,1,0,.05),
+                ('saturation','饱和度',0,2,1,.05)):
             control = QDoubleSpinBox()
             control.setRange(low,high)
             control.setDecimals(3)
@@ -114,33 +120,47 @@ class ToneEditor(QWidget):
             row.addWidget(slider,1)
             row.addWidget(control)
             form.addRow(label,row)
-        column.addLayout(form)
-        buttons = QHBoxLayout()
+        manual_column.addLayout(form)
         self.reset = QPushButton('恢复初始值')
         self.reset.clicked.connect(lambda:self.set_parameters(ToneParameters()))
-        buttons.addWidget(self.reset)
+        manual_column.addWidget(self.reset)
         self.save = QPushButton('另存光调版')
         self.save.setProperty('kind','primary')
         self.save.clicked.connect(self.save_version)
-        buttons.addWidget(self.save)
-        column.addLayout(buttons)
-        self.history = QPlainTextEdit()
-        self.history.setReadOnly(True)
-        column.addWidget(self.history,1)
+        self.batch_save = QPushButton('按此参数另存交付勾选照片')
+        self.batch_save.setToolTip('对交付中勾选照片各自选定的版本应用当前参数，逐张另存；不改变交付版本。')
+        self.batch_save.clicked.connect(self.save_batch)
+        manual_column.addWidget(self.batch_save)
+        manual_column.addStretch(1)
+        chat = QWidget()
+        chat_column = QVBoxLayout(chat)
+        chat_column.setContentsMargins(0,0,0,0)
+        self.history = ConversationView()
+        chat_column.addWidget(self.history,1)
         self.chat_input = QPlainTextEdit()
-        self.chat_input.setPlaceholderText('例如：整体提亮半档，稍微压住亮部。满意后可说“另存这一版”。')
-        self.chat_input.setMaximumHeight(90)
+        self.chat_input.setPlaceholderText('输入光色要求')
+        self.chat_input.setFixedHeight(54)
         self.chat_input.textChanged.connect(self.draft_timer.start)
-        column.addWidget(self.chat_input)
         self.send = QPushButton('发送')
         self.send.clicked.connect(self.send_message)
-        column.addWidget(self.send)
+        self.send_shortcuts = chat_shortcuts(self.chat_input,self.send_message)
+        chat_column.addWidget(chat_composer(self.chat_input,self.send))
+        self.editor_tabs.addTab(chat,'对话')
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(manual)
+        self.editor_tabs.addTab(scroll,'手动调整')
+        column.addWidget(self.editor_tabs,1)
+        column.addWidget(self.save)
+        panel.setMinimumWidth(290)
+        panel.setMaximumWidth(360)
         split.addWidget(panel)
         split.setStretchFactor(0,3)
         split.setStretchFactor(1,1)
         split.setSizes([900,350])
         layout.addWidget(split,1)
-        self.message = ui_label('手动调整无需模型连接；对话使用摄影 Agent 连接。')
+        self.message = StatusText('')
+        self.message.setMaximumHeight(48)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.restore_draft()
@@ -173,6 +193,8 @@ class ToneEditor(QWidget):
             control.setEnabled(editing)
         self.reset.setEnabled(editing)
         self.save.setEnabled(not busy and self.pixels is not None)
+        self.batch_save.setVisible(self.context.get('return_to_delivery',False))
+        self.batch_save.setEnabled(not busy and self.pixels is not None)
         self.send.setEnabled(not busy and self.pixels is not None)
         self.chat_input.setEnabled(not busy)
 
@@ -199,6 +221,11 @@ class ToneEditor(QWidget):
             self.save_message = None
             self.render_timer.stop()
             self.start('save')
+
+    def save_batch(self):
+        if not self.is_busy() and self.save_draft():
+            self.render_timer.stop()
+            self.batch_requested.emit(self.parameters().record())
 
     def accept_delivery(self, message, user_text):
         """Apply the delivery Agent's already parsed request without another model call."""
@@ -271,7 +298,7 @@ class ToneEditor(QWidget):
             self.saved_result = result
         if phase in ('load','render') and self.isVisible():
             self.preview.set_image_pair(self.before,self.after)
-            self.message.setText('预览已更新；另存时从原尺寸浮点像素处理。')
+            self.message.setText('预览已更新')
         if phase in ('load','render') and self.worker.parameters==self.parameters():
             self.update_external('光调参数已应用，正在另存' if self.pending_save else '已更新光调预览，尚未另存',
                 terminal=not self.pending_save)
@@ -320,20 +347,17 @@ class ToneEditor(QWidget):
         self.busy_changed.emit()
 
     def refresh_history(self):
-        lines = []
+        entries = []
         for row in self.messages:
-            text = ('你：' if row['role']=='user' else '摄影 Agent：')+row['content']
             status = row.get('operation_status','')
             if status=='parameters_applied':
-                text += '\n已应用光调参数。'
+                status = '已应用光调参数。'
             elif status.startswith('saved: '):
-                text += '\n已另存光调版：'+status[len('saved: '):]
+                status = '已另存光调版：'+status[len('saved: '):]
             elif status.startswith('save_failed: '):
-                text += '\n另存失败：'+status[len('save_failed: '):]
-            lines.append(text)
-        self.history.setPlainText('\n\n'.join(lines))
-        bar = self.history.verticalScrollBar()
-        bar.setValue(bar.maximum())
+                status = '另存失败：'+status[len('save_failed: '):]
+            entries.append(dict(row,context=None,operation_status=status))
+        self.history.show_messages(entries)
 
     def save_draft(self):
         try:

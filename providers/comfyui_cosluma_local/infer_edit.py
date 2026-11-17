@@ -26,18 +26,28 @@ def checkpoint_storage(path):
 def infer(args):
     sys.path.insert(0,args.comfy_root)
     # One layout, selected before loading; checkpoint quantization is explicit.
-    sys.argv = [sys.argv[0],'--disable-dynamic-vram','--disable-cuda-malloc',
+    sys.argv = [sys.argv[0],'--enable-dynamic-vram','--disable-cuda-malloc',
         '--disable-pinned-memory','--bf16-vae','--cuda-device','0']
     import comfy.options
     comfy.options.enable_args_parsing()
+    import comfy_aimdo.control
+    comfy_aimdo.control.init(nvml_pressure=True)
     import numpy as np
     from PIL import Image
     import torch
     import comfy.model_management as memory
     import comfy.sd
     import comfy.utils
+    import comfy.memory_management
+    import comfy.model_patcher
     import nodes
     from comfy_extras.nodes_qwen import TextEncodeQwenImage21, QwenImage21Cache
+
+    # Match ComfyUI's native setup: assign file-backed weights without a second full CPU copy.
+    if not comfy_aimdo.control.init_devices([(memory.get_torch_device().index,0)]):
+        raise RuntimeError('Qwen DynamicVRAM 初始化失败')
+    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    comfy.memory_management.aimdo_enabled = True
 
     directory = Path(args.directory)
     settings = json.loads((directory/'request.json').read_text(encoding='utf-8'))
@@ -94,7 +104,7 @@ def infer(args):
         'cfg':1.,'sampler':'euler','scheduler':'simple','vae_tile_pixels':512,'vae_overlap_pixels':64,
         'model_input_bit_depth':8,'model_output_bit_depth':8,
         'timings':{**timings,'total_seconds':time.perf_counter()-started},
-        'memory':'text encoder released before transformer; process memory released on exit'}
+        'memory':'ComfyUI DynamicVRAM file-backed weights; text encoder released before transformer; process memory released on exit'}
     (directory/'model.json').write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
 
 

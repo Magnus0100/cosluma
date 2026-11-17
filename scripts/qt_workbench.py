@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer
+from PySide6.QtCore import QItemSelectionModel, QSettings, QThread, Signal, Slot, Qt, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDialog,
     QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDial
     QVBoxLayout, QWidget)
 
 from app_version import VERSION
-from studio_widgets import apply_theme, ui_label, PhotoPreview
+from studio_widgets import apply_theme, ui_label, StatusText, PhotoPreview, studio_icon
 from creative_workspace import CreativeWorkspace
 from batch_results import BatchResults
 from delivery_view import DeliveryView
@@ -193,49 +193,85 @@ class Workbench(QMainWindow):
 
         panel = QWidget()
         self.setCentralWidget(panel)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 12, 18, 12)
+        shell = QHBoxLayout(panel)
+        shell.setContentsMargins(0,0,0,0)
+        shell.setSpacing(0)
+        rail = QFrame()
+        rail.setObjectName('workspaceRail')
+        rail.setFixedWidth(88)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(8,20,8,14)
+        rail_layout.setSpacing(8)
+        brand = ui_label('CosLuma','brand')
+        brand.setAlignment(Qt.AlignCenter)
+        rail_layout.addWidget(brand)
+        rail_layout.addSpacing(22)
+        shell.addWidget(rail)
+        body = QWidget()
+        shell.addWidget(body,1)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(18, 14, 18, 12)
         layout.setSpacing(10)
-        header = QHBoxLayout()
+        header_host = QWidget()
+        header_host.setObjectName('workspaceHeader')
+        header = QHBoxLayout(header_host)
+        header.setContentsMargins(0,0,0,8)
         header.setSpacing(10)
-        header.addWidget(ui_label('CosLuma', 'title'))
-        self.projects_button = QPushButton('项目')
-        self.projects_button.setProperty('role', 'workspaceTab')
+        self.workspace_heading = ui_label('项目','heading')
+        header.addWidget(self.workspace_heading)
+        self.projects_button = QToolButton()
+        self.projects_button.setText('项目')
+        self.projects_button.setProperty('role', 'railTab')
+        self.projects_button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.projects_button.setIcon(studio_icon('projects','#b9ceca'))
+        self.projects_button.setIconSize(QSize(22,22))
+        self.projects_button.setFixedSize(72,64)
         self.projects_button.setCheckable(True)
         self.projects_button.clicked.connect(self.show_projects)
-        header.addWidget(self.projects_button)
+        rail_layout.addWidget(self.projects_button)
+        rail_layout.addSpacing(16)
         self.project_title = QPushButton('新建项目')
         self.project_title.setProperty('kind', 'quiet')
         self.project_title.clicked.connect(self.rename_active_project)
         self.project_title.setMaximumWidth(230)
         header.addWidget(self.project_title)
         self.nav_buttons = []
-        for index, text in enumerate(('照片', '创作', '成片')):
-            button = QPushButton(text)
-            button.setProperty('role', 'workspaceTab')
+        for index, (text, icon) in enumerate((('照片','photos'),('创作','create'),('作品','works'))):
+            button = QToolButton()
+            button.setText(text)
+            button.setProperty('role', 'railTab')
+            button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            button.setIcon(studio_icon(icon,'#b9ceca'))
+            button.setIconSize(QSize(22,22))
+            button.setFixedSize(72,64)
             button.setCheckable(True)
-            button.setMinimumWidth(76)
             button.clicked.connect(lambda _checked=False, index=index: self.navigate(index))
             self.nav_buttons.append(button)
-            header.addWidget(button)
+            rail_layout.addWidget(button)
+        rail_layout.addStretch(1)
         header.addStretch(1)
         self.workspace_context = ui_label('先添加照片与角色')
         self.workspace_context.setMaximumWidth(260)
         header.addWidget(self.workspace_context)
-        self.import_button = QPushButton('导入配置')
-        self.import_button.setProperty('kind', 'quiet')
-        self.import_button.clicked.connect(self.import_config)
-        header.addWidget(self.import_button)
-        self.setup_button = QPushButton('连接设置')
-        self.setup_button.setProperty('kind', 'quiet')
-        self.setup_button.clicked.connect(self.configure_services)
-        header.addWidget(self.setup_button)
-        layout.addLayout(header)
+        settings_button = QToolButton()
+        settings_button.setText('设置')
+        settings_button.setProperty('role','railTab')
+        settings_button.setIcon(studio_icon('settings','#b9ceca'))
+        settings_button.setIconSize(QSize(22,22))
+        settings_button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        settings_button.setFixedSize(72,64)
+        settings_button.setPopupMode(QToolButton.InstantPopup)
+        settings_menu = QMenu(settings_button)
+        self.setup_button = settings_menu.addAction('连接设置',self.configure_services)
+        self.import_button = settings_menu.addAction('导入配置',self.import_config)
+        settings_button.setMenu(settings_menu)
+        rail_layout.addWidget(settings_button)
+        layout.addWidget(header_host)
         self.setup_banner = QFrame()
         self.setup_banner.setProperty('role', 'decisionBar')
         setup_row = QHBoxLayout(self.setup_banner)
         setup_row.setContentsMargins(16, 12, 16, 12)
-        self.setup_hint = ui_label('首次使用：连接模型服务后，即可与 Agent 讨论你的照片。')
+        self.setup_hint = ui_label('尚未配置连接')
         self.setup_hint.setWordWrap(True)
         setup_row.addWidget(self.setup_hint, 1)
         self.setup_guide_button = QPushButton('开始配置')
@@ -252,7 +288,7 @@ class Workbench(QMainWindow):
         photos_layout.setSpacing(10)
         toolbar = QHBoxLayout()
         import_photos = QToolButton()
-        import_photos.setText('批量导入')
+        import_photos.setText('添加照片')
         import_photos.setPopupMode(QToolButton.InstantPopup)
         import_menu = QMenu(import_photos)
         import_menu.addAction('选择照片（可多选）',self.select_sources)
@@ -260,20 +296,31 @@ class Workbench(QMainWindow):
         import_photos.setMenu(import_menu)
         toolbar.addWidget(import_photos)
         self.inputs.append(import_photos)
-        self.import_recursive = QCheckBox('包含子文件夹')
+        import_menu.addSeparator()
+        self.import_recursive = import_menu.addAction('包含子文件夹')
+        self.import_recursive.setCheckable(True)
         self.import_recursive.setToolTip('导入或拖入文件夹时，连同其中各层子文件夹的照片一起添加')
         self.import_recursive.toggled.connect(self.schedule_workspace_save)
-        toolbar.addWidget(self.import_recursive)
         self.inputs.append(self.import_recursive)
-        for title, action in (('移除高亮照片', self.remove_selected), ('清空', self.clear_sources),
+        manage = QToolButton()
+        manage.setText('整理照片')
+        manage.setPopupMode(QToolButton.InstantPopup)
+        manage_menu = QMenu(manage)
+        for title, action in (('移除高亮照片', self.remove_selected), ('清空照片', self.clear_sources),
                 ('全选',lambda:self.set_all_included(True)), ('全不选',lambda:self.set_all_included(False))):
-            button = QPushButton(title)
-            button.clicked.connect(action)
-            toolbar.addWidget(button)
-            self.inputs.append(button)
+            self.inputs.append(manage_menu.addAction(title,action))
+        manage.setMenu(manage_menu)
+        toolbar.addWidget(manage)
+        selection_toggle = QToolButton()
+        selection_toggle.setText('帮我选片')
+        selection_toggle.setCheckable(True)
+        toolbar.addWidget(selection_toggle)
         self.count = ui_label('尚未添加照片')
         toolbar.addWidget(self.count, 1)
         photos_layout.addLayout(toolbar)
+        self.selection_panel = QWidget()
+        selection_layout = QVBoxLayout(self.selection_panel)
+        selection_layout.setContentsMargins(0,0,0,0)
         selection_row = QHBoxLayout()
         selection_row.addWidget(ui_label('选片要求'))
         self.selection_brief = QLineEdit()
@@ -285,10 +332,13 @@ class Workbench(QMainWindow):
         self.selection_button.clicked.connect(self.request_photo_selection)
         selection_row.addWidget(self.selection_button)
         self.inputs.append(self.selection_brief)
-        photos_layout.addLayout(selection_row)
+        selection_layout.addLayout(selection_row)
         self.selection_summary = ui_label('勾选用于制作，点击行查看原片；Agent 会查看全部导入照片。')
         self.selection_summary.setWordWrap(True)
-        photos_layout.addWidget(self.selection_summary)
+        selection_layout.addWidget(self.selection_summary)
+        self.selection_panel.hide()
+        selection_toggle.toggled.connect(self.selection_panel.setVisible)
+        photos_layout.addWidget(self.selection_panel)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(14)
@@ -304,13 +354,18 @@ class Workbench(QMainWindow):
         empty.setProperty('role', 'dropArea')
         self.queue_pages.addWidget(empty)
         self.listing = QTableWidget(0, 2)
-        self.listing.setHorizontalHeaderLabels(['勾选制作 · 点击查看', '制作进度'])
+        self.listing.setHorizontalHeaderLabels(['照片', '状态'])
+        self.listing.setToolTip('勾选决定制作范围；点击行查看照片。星标表示当前试样原片。')
+        self.listing.setWordWrap(False)
+        self.listing.setShowGrid(False)
+        self.listing.verticalHeader().setDefaultSectionSize(42)
         self.listing.verticalHeader().setVisible(True)
         self.listing.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.listing.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.listing.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.listing.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.listing.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.listing.setTextElideMode(Qt.ElideMiddle)
         self.listing.setAcceptDrops(False)
         self.listing.viewport().setAcceptDrops(False)
         self.listing.itemSelectionChanged.connect(self.show_selected)
@@ -330,7 +385,6 @@ class Workbench(QMainWindow):
         form.addRow('补充要求', self.brief)
         self.root = QLineEdit(str(root))
         output_row = self.path_row(self.root, directory=True)
-        form.addRow('保存到', output_row)
         queue_layout.addWidget(form_host)
         advanced = QWidget()
         advanced_layout = QVBoxLayout(advanced)
@@ -343,6 +397,7 @@ class Workbench(QMainWindow):
         advanced_layout.addWidget(advanced_toggle)
         advanced_panel = QWidget()
         advanced_form = QFormLayout(advanced_panel)
+        advanced_form.addRow('保存到', output_row)
         self.config = QLineEdit(str(config))
         advanced_form.addRow('配置文件', self.path_row(self.config))
         self.edge = QLineEdit(self.preferences.value('output_edge', '', type=str))
@@ -378,27 +433,34 @@ class Workbench(QMainWindow):
         self.selection_reason.hide()
         preview_layout.addWidget(self.selection_reason)
         photo_controls = QHBoxLayout()
+        photo_more = QToolButton()
+        photo_more.setText('文件')
+        photo_more.setProperty('kind','quiet')
+        photo_more.setPopupMode(QToolButton.InstantPopup)
+        photo_menu = QMenu(photo_more)
         for name, text, action in (('open_source_button', '打开原片', self.open_source),
                 ('open_work_button', '打开此照片文件夹', self.open_work_directory),
                 ('open_photo_button', '打开 JPEG', self.open_selected_output),
-                ('open_png_button', '打开 16 位 PNG', self.open_selected_png),
-                ('representative_button', '设为试样原片', self.set_representative)):
-            button = QPushButton(text)
-            button.setProperty('kind', 'quiet')
+                ('open_png_button', '打开 16 位 PNG', self.open_selected_png)):
+            button = photo_menu.addAction(text,action)
             button.setEnabled(False)
-            button.clicked.connect(action)
             setattr(self, name, button)
-            photo_controls.addWidget(button)
+        photo_more.setMenu(photo_menu)
+        photo_controls.addWidget(photo_more)
         photo_controls.addStretch(1)
+        self.representative_button = QPushButton('设为试样原片')
+        self.representative_button.setProperty('kind','quiet')
+        self.representative_button.clicked.connect(self.set_representative)
+        photo_controls.addWidget(self.representative_button)
         preview_layout.addLayout(photo_controls)
         splitter.addWidget(preview_panel)
         splitter.setSizes([350, 880])
         photos_layout.addWidget(splitter, 1)
         next_row = QHBoxLayout()
-        self.style_hint = ui_label('先添加照片、填写角色，再一起讨论摄影方向。')
+        self.style_hint = ui_label('请添加照片并填写角色')
         self.style_hint.setWordWrap(True)
         next_row.addWidget(self.style_hint, 1)
-        self.style_button = QPushButton('与 Agent 讨论风格')
+        self.style_button = QPushButton('进入创作')
         self.style_button.setProperty('kind', 'primary')
         self.style_button.clicked.connect(self.choose_style)
         next_row.addWidget(self.style_button)
@@ -411,8 +473,8 @@ class Workbench(QMainWindow):
         self.creative_empty = QFrame()
         empty_layout = QVBoxLayout(self.creative_empty)
         empty_layout.addStretch(1)
-        empty_layout.addWidget(ui_label('从你的原片开始', 'title'), 0, Qt.AlignCenter)
-        self.creative_next = ui_label('添加照片和角色后，在这里与摄影 Agent 一起确定方向。')
+        empty_layout.addWidget(ui_label('暂无原片', 'title'), 0, Qt.AlignCenter)
+        self.creative_next = ui_label('请添加照片并填写角色')
         self.creative_next.setWordWrap(True)
         self.creative_next.setAlignment(Qt.AlignCenter)
         empty_layout.addWidget(self.creative_next)
@@ -435,43 +497,44 @@ class Workbench(QMainWindow):
         results_layout = QVBoxLayout(results_page)
         results_layout.setContentsMargins(0, 0, 0, 0)
         results_layout.setSpacing(10)
-        results_header = QHBoxLayout()
+        self.results_header = QWidget()
+        results_header = QHBoxLayout(self.results_header)
+        results_header.setContentsMargins(0,0,0,0)
         self.results_caption = ui_label('本次制作', 'heading')
         results_header.addWidget(self.results_caption, 1)
-        self.delivery_button = QPushButton('项目作品 / 交付')
+        self.production_settings = QToolButton()
+        self.production_settings.setText('制作设置')
+        self.production_settings.setProperty('kind','quiet')
+        self.production_settings.setCheckable(True)
+        self.production_settings.toggled.connect(self.update_actions)
+        results_header.addWidget(self.production_settings)
+        self.delivery_button = QPushButton('全部作品')
         self.delivery_button.setProperty('kind','quiet')
         self.delivery_button.clicked.connect(self.show_delivery)
         results_header.addWidget(self.delivery_button)
-        self.return_current = QPushButton('回到本次制作')
-        self.return_current.setProperty('kind', 'quiet')
-        self.return_current.clicked.connect(self.show_current_batch)
-        self.return_current.hide()
-        results_header.addWidget(self.return_current)
         self.last_batch_button = QToolButton()
-        self.last_batch_button.setText('查看已有结果')
-        self.last_batch_button.setPopupMode(QToolButton.MenuButtonPopup)
+        self.last_batch_button.setText('制作记录')
+        self.last_batch_button.setPopupMode(QToolButton.InstantPopup)
         saved_menu = QMenu(self)
+        self.return_current = saved_menu.addAction('回到本次制作',self.show_current_batch)
+        self.return_current.setVisible(False)
         self.project_batches_menu = saved_menu.addMenu('本项目的制作批次')
         self.last_batch_action = saved_menu.addAction('查看上次制作', self.open_last_batch)
         saved_menu.addAction('选择其他批次文件夹', self.choose_saved_batch)
         self.last_batch_button.setMenu(saved_menu)
-        self.last_batch_button.clicked.connect(self.open_last_batch)
         results_header.addWidget(self.last_batch_button)
-        self.open_folder_button = QPushButton('打开当前批次文件夹')
-        self.open_folder_button.setProperty('kind', 'quiet')
+        self.open_folder_button = saved_menu.addAction('打开当前批次文件夹',self.open_results)
         self.open_folder_button.setEnabled(False)
-        self.open_folder_button.clicked.connect(self.open_results)
-        results_header.addWidget(self.open_folder_button)
-        results_layout.addLayout(results_header)
+        results_layout.addWidget(self.results_header)
         self.result_views = QStackedWidget()
         self.results_empty = QFrame()
         waiting = QVBoxLayout(self.results_empty)
         waiting.addStretch(1)
-        self.results_next = ui_label('定稿后，准备制作这一组照片', 'heading')
+        self.results_next = ui_label('暂无制作记录', 'heading')
         self.results_next.setAlignment(Qt.AlignCenter)
         self.results_next.setWordWrap(True)
         waiting.addWidget(self.results_next)
-        self.results_note = ui_label('先在创作页比较三个真实样片，选择喜欢的方向。')
+        self.results_note = ui_label('请先在创作页定稿')
         self.results_note.setAlignment(Qt.AlignCenter)
         self.results_note.setWordWrap(True)
         waiting.addWidget(self.results_note)
@@ -494,10 +557,10 @@ class Workbench(QMainWindow):
         decision_layout.addWidget(self.chosen_thumbnail)
         chosen_text = QVBoxLayout()
         chosen_text.setSpacing(4)
-        self.chosen_title = ui_label('先选择真实样片', 'heading')
+        self.chosen_title = ui_label('未选择样片', 'heading')
         self.chosen_title.setWordWrap(True)
         chosen_text.addWidget(self.chosen_title)
-        self.chosen_source = ui_label('定稿只保存方向，制作由你另行开始。')
+        self.chosen_source = ui_label('')
         chosen_text.addWidget(self.chosen_source)
         self.chosen_summary = ui_label('')
         self.chosen_summary.setWordWrap(True)
@@ -521,7 +584,7 @@ class Workbench(QMainWindow):
         controls.addWidget(self.remaining_button)
         decision_layout.addLayout(controls)
         results_layout.addWidget(decision)
-        self.readiness = ui_label('先比较样片并定稿，再制作当前照片队列。')
+        self.readiness = ui_label('尚未定稿')
         self.readiness.setWordWrap(True)
         results_layout.addWidget(self.readiness)
         self.pages.addWidget(results_page)
@@ -531,29 +594,15 @@ class Workbench(QMainWindow):
         welcome_layout.setContentsMargins(36, 24, 36, 24)
         welcome_layout.addStretch(1)
         welcome_body = QHBoxLayout()
-        welcome_body.setSpacing(44)
-        introduction = QVBoxLayout()
-        introduction.setSpacing(16)
-        introduction.addWidget(ui_label('从你的原片，开始一组创作', 'title'))
-        note = ui_label('先与摄影 Agent 聊想法，比较三个真实样片；\n选定喜欢的方向，再制作整组照片。')
-        note.setWordWrap(True)
-        introduction.addWidget(note)
-        for title, description in (('先讨论', '提供照片和角色，一起确定摄影方向。'),
-                ('看样片', '同一张原片做三个方向，由你决定定稿。'),
-                ('整组出片', '沿用定稿制作，原片和基础成片分别保留。')):
-            introduction.addWidget(ui_label(title, 'heading'))
-            text = ui_label(description)
-            text.setWordWrap(True)
-            introduction.addWidget(text)
-        welcome_body.addLayout(introduction, 1)
+        welcome_body.addStretch(1)
         connection = QFrame()
         connection.setProperty('role', 'panel')
-        connection.setMaximumWidth(410)
+        connection.setMaximumWidth(520)
         connection_layout = QVBoxLayout(connection)
         connection_layout.setContentsMargins(24, 24, 24, 24)
         connection_layout.setSpacing(16)
-        connection_layout.addWidget(ui_label('先连接你的模型服务', 'heading'))
-        note = ui_label('你需要图文模型、图像编辑服务，以及已部署分割与超分模型的 ComfyUI。软件包不含服务、账号或模型权重。')
+        connection_layout.addWidget(ui_label('连接服务', 'title'))
+        note = ui_label('需配置图文、图像编辑与 ComfyUI 服务。模型和账号需自行准备。')
         note.setWordWrap(True)
         connection_layout.addWidget(note)
         begin = QPushButton('开始配置')
@@ -563,14 +612,13 @@ class Workbench(QMainWindow):
         imported = QPushButton('导入已有配置')
         imported.clicked.connect(self.import_config)
         connection_layout.addWidget(imported)
-        later = QPushButton('先整理照片，稍后配置')
+        later = QPushButton('暂不配置')
         later.setProperty('kind', 'quiet')
         later.clicked.connect(self.defer_setup)
         connection_layout.addWidget(later)
-        note = ui_label('保存设置不调用模型。照片只会在你主动选片、发送讨论或制作时交给所配服务。')
-        note.setWordWrap(True)
-        connection_layout.addWidget(note)
-        welcome_body.addWidget(connection, 1)
+        connection.setToolTip('保存设置不调用模型。主动发送或制作时，照片会交给所配置的服务。')
+        welcome_body.addWidget(connection,1)
+        welcome_body.addStretch(1)
         welcome_layout.addLayout(welcome_body)
         welcome_layout.addStretch(1)
         self.welcome_index = self.pages.addWidget(self.welcome_page)
@@ -587,7 +635,7 @@ class Workbench(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('等待开始')
         layout.addWidget(self.progress_bar)
-        self.status = ui_label('新建或打开项目，继续照片创作。')
+        self.status = StatusText('')
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status.setMaximumHeight(42)
@@ -1300,7 +1348,8 @@ class Workbench(QMainWindow):
         for button in self.nav_buttons:
             button.setEnabled(has_project)
         self.project_title.setEnabled(not running)
-        self.project_title.setVisible(has_project)
+        self.project_title.setVisible(has_project and self.pages.currentIndex() not in (self.projects_index,self.welcome_index))
+        self.workspace_context.setVisible(self.pages.currentIndex() in (0,1,2))
         self.project_title.setText(self.project.data['name'] if has_project else '新建项目')
         self.project_title.setToolTip(str(self.project.path) if has_project else '开始一组新的创作')
         self.setWindowTitle('CosLuma '+VERSION+(' · '+self.project.data['name'] if has_project else ''))
@@ -1347,39 +1396,43 @@ class Workbench(QMainWindow):
         self.remaining_button.setVisible(has_previous)
         self.remaining_button.setEnabled(not running and has_photos and has_character and ready)
         self.style_button.setEnabled((has_photos or chosen is not None) and has_character)
-        self.style_button.setText('继续创作' if self.style_discussion_context == context or chosen else '与 Agent 讨论风格')
+        self.style_button.setText('继续创作' if self.style_discussion_context == context or chosen else '进入创作')
         self.view_chosen_button.setEnabled(chosen is not None)
         self.workspace_context.setText((context[0] + ' · ' if has_character else '') + f'已选 {len(included)}/{len(self.sources)} 张')
         if self.worker is not None:
-            next_step = '正在按定稿制作，可切页查看原片、样片和已有成片。'
+            next_step = '制作中'
         elif self.import_worker is not None:
-            next_step = '正在整理导入的照片和子文件夹，可切页查看已有内容。'
+            next_step = '导入中'
         elif self.selection_worker is not None:
-            next_step = 'Agent 正在查看全部导入照片，完成后可继续调整勾选。'
+            next_step = '选片中'
         elif self.beauty_editor is not None and self.beauty_editor.is_busy():
-            next_step = ('正在处理曝光与曲线，可切页查看已有照片。' if isinstance(self.beauty_editor,ToneEditor) else
-                '正在处理可选局部修饰，可切页查看已有照片。'
-                if isinstance(self.beauty_editor,LocalRetouchEditor) else '正在处理可选人脸美化，可切页查看已有照片。')
+            next_step = ('光色处理中' if isinstance(self.beauty_editor,ToneEditor) else
+                '局部修饰处理中'
+                if isinstance(self.beauty_editor,LocalRetouchEditor) else '人脸美化处理中')
         elif self.delivery_view is not None and self.delivery_view.is_busy():
-            next_step = '正在复制所选版本到交付文件夹，可切页查看已有照片。'
+            operation = self.delivery_view.operation
+            next_step = ('导出中' if operation=='export' else
+                '批量光调中' if operation=='tone_batch' else
+                '改稿制作中' if operation=='revision' else
+                '正在回复')
         elif not has_photos:
-            next_step = '先勾选要制作的照片，或让 Agent 从已导入照片中选片。' if self.sources else '先在照片页批量导入原片。'
+            next_step = '请勾选制作照片' if self.sources else '请添加照片'
         elif not has_character:
-            next_step = '先填写角色，补充要求可以留空。'
+            next_step = '请填写角色'
         elif running:
-            next_step = 'Agent 或样片正在处理中，可切页浏览，完成后再决定下一步。'
+            next_step = '处理中'
         elif not has_config:
-            next_step = '先连接模型服务：打开“连接设置”或导入已有配置，保存后即可开始讨论。'
+            next_step = '请配置连接'
         elif self.creative_context == context and self.creative_draft:
-            next_step = '创作页还有未发送的输入；发送或清空后，再按当前讨论制作。'
+            next_step = '有未发送草稿'
         elif chosen is not None and not ready:
-            next_step = '创作要求或修发、光照设置已改变；原定稿仍可查看，按当前设置主动试样后再定稿。'
+            next_step = '设置已变更，请重新试样并定稿'
         elif chosen is None:
-            next_step = '到创作页讨论并比较三个真实样片，选定一张后再批量制作。'
+            next_step = '尚未定稿'
         elif not pending:
-            next_step = '勾选照片已处理。可添加新照片，或明确选择“勾选照片另做一批”。'
+            next_step = '勾选照片已处理'
         else:
-            next_step = f'已定稿。勾选照片中有 {pending} 张尚未制作，点击制作后才会开始。'
+            next_step = f'待制作 {pending} 张'
         self.readiness.setText(next_step)
         self.style_hint.setText(next_step)
         self.start.setToolTip(next_step)
@@ -1397,29 +1450,33 @@ class Workbench(QMainWindow):
                     self.chosen_thumbnail.setText('样片无法读取')
                 self.chosen_preview_key = path
         else:
-            self.chosen_title.setText('先选择真实样片')
-            self.chosen_source.setText('定稿只保存方向，制作由你另行开始。')
+            self.chosen_title.setText('未选择样片')
+            self.chosen_source.setText('')
             self.chosen_summary.clear()
             self.chosen_thumbnail.setText('尚未定稿')
             self.chosen_preview_key = None
         self.results_next.setText('准备制作这一组照片' if ready else '从一张真实样片开始')
         self.results_note.setText(next_step)
-        self.last_batch_button.setText('查看已有批次')
+        self.last_batch_button.setText('制作记录')
         self.last_batch_button.setEnabled(True)
         self.last_batch_action.setEnabled(bool(self.last_batch_directory))
         view = self.result_views.currentWidget()
         archived = self.archive_view is not None and view is self.archive_view
         beautifying = view is self.beauty_editor and self.beauty_editor is not None
+        self.results_header.setVisible(not beautifying)
         delivering = self.delivery_view is not None and view is self.delivery_view
         self.return_current.setVisible(archived or delivering)
-        self.decision_bar.setVisible(not (archived or beautifying or delivering))
-        self.readiness.setVisible(not (archived or beautifying or delivering))
+        show_production = not (archived or beautifying or delivering)
+        self.production_settings.setVisible(show_production and view is not self.results_empty)
+        show_production = show_production and (view is self.results_empty or self.production_settings.isChecked())
+        self.decision_bar.setVisible(show_production)
+        self.readiness.setVisible(show_production)
         self.delivery_button.setEnabled(has_project)
         self.delivery_button.setVisible(not delivering)
         self.open_folder_button.setVisible(not delivering)
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
-        self.results_caption.setText('项目作品 · 选择版本与交付' if delivering else
-            ('成片后的曝光与曲线' if isinstance(self.beauty_editor,ToneEditor) else
+        self.results_caption.setText('挑选与交付' if delivering else
+            ('成片后的光色调整' if isinstance(self.beauty_editor,ToneEditor) else
                 '成片后的可选局部修饰' if isinstance(self.beauty_editor,LocalRetouchEditor) else '成片后的可选人脸美化') if beautifying else
             '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
 
@@ -1716,6 +1773,7 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('读取本次结果失败：' + str(error))
         self.pages.setCurrentIndex(index)
+        self.workspace_heading.setText({0:'照片',1:'创作',2:'作品',self.projects_index:'项目',self.welcome_index:'连接设置'}.get(index,''))
         if index in (0, 1, 2):
             self.restored_page = index
         self.update_setup_hint()
@@ -1863,7 +1921,7 @@ class Workbench(QMainWindow):
             self.result_views.addWidget(editor)
             self.result_views.setCurrentWidget(editor)
             self.navigate(2)
-            self.status.setText('基础成片已完成。可分别调整美肤与瘦脸，满意后另存美化版。')
+            self.status.setText('')
         except (OSError,ValueError,KeyError) as error:
             self.status.setText('打开人脸美化失败：'+str(error))
 
@@ -1923,7 +1981,7 @@ class Workbench(QMainWindow):
 
         same_editor = isinstance(self.beauty_editor,ToneEditor) and self.beauty_editor.context['base']==context['base']
         if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
-            fail('当前项目仍在处理中，结束后可打开曝光与曲线。')
+            fail('当前项目仍在处理中，结束后可打开光色调整。')
             return
         if same_editor:
             self.beauty_return_delivery = context.get('return_to_delivery',False)
@@ -1945,6 +2003,7 @@ class Workbench(QMainWindow):
             editor.saved.connect(self.beauty_saved)
             editor.busy_changed.connect(self.beauty_busy_changed)
             editor.external_changed.connect(self.delivery_tone_changed)
+            editor.batch_requested.connect(self.apply_tone_to_delivery)
             if context.get('delivery_message') is not None:
                 if not editor.accept_delivery(context['delivery_message'],context['delivery_user_text']):
                     fail(editor.message.text())
@@ -1959,7 +2018,7 @@ class Workbench(QMainWindow):
             self.result_views.setCurrentWidget(editor)
             self.navigate(2)
         except (OSError,ValueError,KeyError) as error:
-            fail('打开曝光与曲线失败：'+str(error))
+            fail('打开光色调整失败：'+str(error))
 
     def configure_local(self):
         try:
@@ -1978,6 +2037,19 @@ class Workbench(QMainWindow):
 
     def delivery_tone_changed(self):
         self.delivery_view.discussion_changed()
+
+    def apply_tone_to_delivery(self, parameters):
+        editor = self.beauty_editor
+        try:
+            targets = self.delivery_view.tone_targets()
+            if not targets:
+                editor.message.setText('请先返回作品勾选要批量另存光色的交付照片。')
+                return
+            if self.delivery_view.start_tone_batch(targets,parameters):
+                self.result_views.setCurrentWidget(self.delivery_view)
+                self.navigate(2)
+        except (OSError,ValueError,KeyError) as error:
+            editor.message.setText('无法开始批量光色：'+str(error))
 
     def return_from_beauty(self):
         if self.beauty_return_delivery:
@@ -2037,6 +2109,9 @@ class Workbench(QMainWindow):
             self.delivery_view.start_revision(context,self.root.text(),config)
         except (OSError,ValueError,KeyError) as error:
             self.delivery_view.message.setPlainText('无法开始改稿：'+str(error))
+            if context.get('delivery_message') is not None:
+                context['delivery_message']['operation_status'] = '无法开始改稿：'+str(error)
+                self.delivery_view.discussion_changed()
 
     def remember_revision_batch(self, directory):
         if directory not in self.project_batches:

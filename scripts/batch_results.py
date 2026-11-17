@@ -6,8 +6,8 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QListWidget, QPlainTextEdit,
-    QPushButton, QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QListWidget, QMenu, QPlainTextEdit,
+    QPushButton, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from studio_widgets import PhotoPreview, ui_label
 from delivery_store import project_photos, result_path, retouch_parent
@@ -64,11 +64,12 @@ class BatchResults(QWidget):
         self.match_count = ui_label('显示 0/0')
         filters.addWidget(self.match_count)
         sidebar_layout.addLayout(filters)
-        self.no_matches = ui_label('没有匹配的照片，请修改文件名或筛选条件。')
+        self.no_matches = ui_label('无匹配照片')
         self.no_matches.setWordWrap(True)
         sidebar_layout.addWidget(self.no_matches)
         self.listing = QListWidget()
-        self.listing.setTextElideMode(Qt.ElideRight)
+        self.listing.setTextElideMode(Qt.ElideMiddle)
+        self.listing.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         sidebar_layout.addWidget(self.listing,1)
         splitter.addWidget(sidebar)
         self.preview = PhotoPreview()
@@ -78,37 +79,38 @@ class BatchResults(QWidget):
         layout.addWidget(splitter,1)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
+        self.details.setProperty('role','batchDetails')
         self.details.setMinimumHeight(42)
         self.details.setMaximumHeight(68)
         layout.addWidget(self.details)
         controls = QHBoxLayout()
-        self.beauty = QPushButton('人脸美化')
+        self.edit_menu = QToolButton()
+        self.edit_menu.setText('调整照片')
+        self.edit_menu.setPopupMode(QToolButton.InstantPopup)
+        edits = QMenu(self.edit_menu)
+        self.beauty = edits.addAction('人脸美化',self.open_beauty)
         self.beauty.setToolTip('完成后可选：分别调整美肤与瘦脸，另存美化版')
-        self.beauty.clicked.connect(self.open_beauty)
-        controls.addWidget(self.beauty)
-        self.retouch = QPushButton('局部修发／发束／双下巴')
-        self.retouch.clicked.connect(self.open_retouch)
-        controls.addWidget(self.retouch)
-        self.tone = QPushButton('曝光与曲线')
-        self.tone.clicked.connect(self.open_tone)
-        controls.addWidget(self.tone)
+        self.retouch = edits.addAction('局部修饰',self.open_retouch)
+        self.tone = edits.addAction('光色调整',self.open_tone)
+        self.edit_menu.setMenu(edits)
+        controls.addWidget(self.edit_menu)
         self.beauty_version = QCheckBox('美化版')
         self.beauty_version.toggled.connect(self.change_beauty_version)
         controls.addWidget(self.beauty_version)
-        self.output = QPushButton('打开 JPEG')
+        self.files_menu = QToolButton()
+        self.files_menu.setText('文件')
+        self.files_menu.setProperty('kind','quiet')
+        self.files_menu.setPopupMode(QToolButton.InstantPopup)
+        files = QMenu(self.files_menu)
+        self.output = files.addAction('打开 JPEG',lambda:self.open_path(self.output_path))
         self.output.setToolTip('打开同一结果的 8 位 JPEG 查看副本')
-        self.output.clicked.connect(lambda:self.open_path(self.output_path))
-        controls.addWidget(self.output)
-        self.png_output = QPushButton('打开 16 位 PNG')
+        self.png_output = files.addAction('打开 16 位 PNG',lambda:self.open_path(self.png_path))
         self.png_output.setToolTip('打开已保存的 16 位 PNG 成片')
-        self.png_output.clicked.connect(lambda:self.open_path(self.png_path))
-        controls.addWidget(self.png_output)
-        self.work = QPushButton('打开此照片文件夹')
-        self.work.clicked.connect(lambda:self.open_path(self.work_directory))
-        controls.addWidget(self.work)
-        folder = QPushButton('打开本批次文件夹')
-        folder.clicked.connect(lambda:self.open_path(str(self.directory)))
-        controls.addWidget(folder)
+        files.addSeparator()
+        self.work = files.addAction('照片文件夹',lambda:self.open_path(self.work_directory))
+        files.addAction('批次文件夹',lambda:self.open_path(str(self.directory)))
+        self.files_menu.setMenu(files)
+        controls.addWidget(self.files_menu)
         controls.addStretch(1)
         back = QPushButton('返回照片')
         back.setProperty('kind','quiet')
@@ -132,7 +134,7 @@ class BatchResults(QWidget):
     def row_text(self, source):
         result = self.items.get(source,{})
         stage = {'complete':'完成','failed':'失败'}.get(result.get('status'),'未完成')
-        return f'{Path(source).name} · {stage}'
+        return f'{Path(source).name}\n{stage}'
 
     def update_summary(self):
         complete = sum(result['status']=='complete' for result in self.items.values())
@@ -140,8 +142,7 @@ class BatchResults(QWidget):
         pending = len(self.sources)-complete-failed
         status = {'running':'制作中','complete':'已完成','unfinished':'未全部完成','failed':'制作失败'}[self.batch_status]
         self.heading.setText(self.character+' · '+status if self.character else '本批次 · '+status)
-        note = '单张结果会陆续显示，可随时切换页面。' if self.batch_status=='running' else '选择照片查看成片或失败原因。'
-        self.summary.setText(f'完成 {complete} 张，失败 {failed} 张，未完成 {pending} 张。'+note)
+        self.summary.setText(f'完成 {complete}　失败 {failed}　未完成 {pending}')
 
     def matches_filter(self, source):
         query = self.search.text().strip().casefold()
@@ -166,7 +167,7 @@ class BatchResults(QWidget):
             self.listing.setCurrentRow(selected)
         self.listing.blockSignals(False)
         self.match_count.setText(f'显示 {len(visible)}/{len(self.sources)}')
-        self.no_matches.setText('没有匹配的照片，请修改文件名或筛选条件。' if self.sources else '此批次暂无照片记录。')
+        self.no_matches.setText('无匹配照片' if self.sources else '暂无照片记录')
         self.no_matches.setVisible(not visible)
         self.show_photo(selected)
 
@@ -213,7 +214,8 @@ class BatchResults(QWidget):
             self.output.setEnabled(False)
             self.png_output.setEnabled(False)
             self.work.setEnabled(False)
-            self.work.hide()
+            self.work.setVisible(False)
+            self.edit_menu.setEnabled(False)
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
             self.tone.setEnabled(False)
@@ -235,6 +237,7 @@ class BatchResults(QWidget):
         self.beauty.setEnabled(bool(self.base_path) and Path(self.base_path).is_file())
         self.retouch.setEnabled(self.beauty.isEnabled())
         self.tone.setEnabled(self.beauty.isEnabled())
+        self.edit_menu.setEnabled(self.beauty.isEnabled())
         latest = Path(self.work_directory)/'beauty-latest.json'
         beauty_error = ''
         beauty_files = None
@@ -265,11 +268,11 @@ class BatchResults(QWidget):
         if result.get('status')=='complete':
             width,height = result['output_dimensions']
             version = '美化版' if selected_beauty else '基础成片'
-            message = f'{Path(source).name} · {version} {width} × {height} · 16 位 PNG 和 JPEG'+beauty_error
+            message = f'{Path(source).name}　{version}　{width} × {height}'+beauty_error
             if not self.output.isEnabled():
-                message += '\nJPEG 文件已移动或删除，请在照片文件夹中查找。'
+                message += '\nJPEG 文件不存在'
             if not self.png_output.isEnabled():
-                message += '\n16 位 PNG 文件已移动或删除，请在照片文件夹中查找。'
+                message += '\nPNG 文件不存在'
         elif result.get('status')=='failed':
             stage = result.get('stage','')
             message = f'{Path(source).name} · 失败'+(f' · {stage}' if stage else '')+'\n'+str(result['error'])
@@ -278,8 +281,8 @@ class BatchResults(QWidget):
                 '本批次仍在制作，单张结果完成后会显示在这里。' if self.batch_status=='running' else '未保存完整成片。'))
         timings = result.get('timings',[])
         if timings:
-            message += f'\n制作耗时 {result["elapsed_seconds"]:.1f} 秒（含服务等待）'
-            self.details.setToolTip('\n'.join(f'{row["stage"]}：{row["seconds"]:.1f} 秒' for row in timings))
+            self.details.setToolTip(f'总耗时 {result["elapsed_seconds"]:.1f} 秒（含服务等待）\n'+
+                '\n'.join(f'{row["stage"]}：{row["seconds"]:.1f} 秒' for row in timings))
         else:
             self.details.setToolTip('')
         if self.details.toPlainText()!=message:
@@ -306,7 +309,7 @@ class BatchResults(QWidget):
         self.open_saved_editor(self.retouch_requested,'局部修饰')
 
     def open_tone(self):
-        self.open_saved_editor(self.tone_requested,'曝光与曲线')
+        self.open_saved_editor(self.tone_requested,'光色调整')
 
     def open_saved_editor(self, requested, label):
         row = self.listing.currentRow()
