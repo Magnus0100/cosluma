@@ -2,9 +2,9 @@
 
 Cosplay 摄影后期工作台。通过对话制作样片、批量成片，并保留手动精修与版本选择。
 
-[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/tag/v0.44.0) · [English](README.en.md) · [开始使用](#开始使用) · [部署](#部署) · [许可](LICENSES/README.md)
+[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/tag/v0.46.0) · [English](README.en.md) · [开始使用](#开始使用) · [部署](#部署) · [许可](LICENSES/README.md)
 
-Windows x64 · 中文界面 · 源码 **0.46.0** · 下载包 **0.44.0**（尚未包含当前源码的全部更新）
+Windows x64 · 中文界面 · **0.46.0**
 
 | 原片 | 成片 · 开启修发与重打光 |
 | :---: | :---: |
@@ -52,7 +52,7 @@ Windows x64 · 中文界面 · 源码 **0.46.0** · 下载包 **0.44.0**（尚�
 
 ## 开始使用
 
-下载 `CosLuma-0.44.0-windows-x64.zip`，完整解压后运行 `CosLuma/CosLuma.exe`。桌面包包含 Python 和图像处理依赖，模型服务与权重另行配置。
+下载 `CosLuma-0.46.0-windows-x64.zip`，完整解压后运行 `CosLuma/CosLuma.exe`。桌面包包含 Python 和图像处理依赖，模型服务与权重另行配置。
 
 | 必需连接 | 要求 |
 | --- | --- |

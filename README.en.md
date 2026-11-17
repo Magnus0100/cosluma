@@ -2,9 +2,9 @@
 
 A post-production workspace for cosplay photography. Create samples and finish batches through conversation, with manual retouching and version selection.
 
-[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.44.0) · [简体中文](README.md) · [Getting started](#getting-started) · [Deployment](#deployment) · [Licenses](LICENSES/README.md)
+[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.46.0) · [简体中文](README.md) · [Getting started](#getting-started) · [Deployment](#deployment) · [Licenses](LICENSES/README.md)
 
-Windows x64 · Chinese interface · Source **0.46.0** · Download **0.44.0** (does not include all current source changes)
+Windows x64 · Chinese interface · **0.46.0**
 
 | Original | Finished · hair editing and relighting enabled |
 | :---: | :---: |
@@ -52,7 +52,7 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
 
 ## Getting started
 
-Download `CosLuma-0.44.0-windows-x64.zip`, extract the complete archive and run `CosLuma/CosLuma.exe`. The package includes Python and image-processing dependencies. Model services and weights are configured separately.
+Download `CosLuma-0.46.0-windows-x64.zip`, extract the complete archive and run `CosLuma/CosLuma.exe`. The package includes Python and image-processing dependencies. Model services and weights are configured separately.
 
 | Required connection | Requirements |
 | --- | --- |
