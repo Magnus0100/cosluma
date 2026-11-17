@@ -1,98 +1,101 @@
 # CosLuma
 
-A post-production workspace for cosplay photography. Create samples and finish batches through conversation, with manual retouching and version selection.
+A photo-editing workspace for cosplay photography. Discuss a look, compare samples and finish a batch, with manual adjustments when needed.
 
-[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.46.0) · [简体中文](README.md) · [Getting started](#getting-started) · [Deployment](#deployment) · [Licenses](LICENSES/README.md)
+[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.46.1) · [Getting started](#getting-started) · [简体中文](README.md)
 
-Windows x64 · Chinese interface · **0.46.0**
+Windows 64-bit · Chinese interface · 0.46.1
 
-| Original | Finished · hair editing and relighting enabled |
+| Original | Finished photograph |
 | :---: | :---: |
-| ![Original photograph of 奶糕Naige](docs/images/readme/original.jpg) | ![Finished photograph with hair editing and relighting](docs/images/readme/hair-relight.jpg) |
+| ![Original photograph of 奶糕Naige](docs/images/readme/original.jpg) | ![Lotus scene with relighting, styled hair and flowing fabric](docs/images/readme/finished.jpg) |
 
-Cosplayer: **奶糕Naige on Douyin**, shown with permission for this project's README.
+The finished version includes scene editing, subject relighting, hair editing and clothing motion. Cosplayer: **奶糕Naige on Douyin**, shown with permission for this project's README.
 
-## Features
+## Compare samples before choosing a look
 
-| Feature | Use |
-| --- | --- |
-| Samples and batches | Discuss requirements, explore three real samples, then reuse the approved direction and references for a batch |
-| Identity preservation | Extract the original identity region, align with a similarity transform and blend light and color |
-| Hair editing and relighting | Two independent base-production options, disabled by default |
-| Tone and face | Fixed-algorithm color adjustments; optional skin retouching and face slimming, starting at zero strength |
-| Hair and clothing | Repair hair, style strands or add clothing motion on a saved version |
-| Versions and delivery | Compare, save and choose delivery versions; copy existing PNG / JPEG files |
-
-Chat and manual controls share processing functions. Browsing, page changes and project restoration read saved records. Users initiate generation, saving, adoption and export.
-
-![CosLuma creative workspace with three saved samples](docs/images/readme/workspace.jpg)
-
-## Results
-
-| 碧荷映绯弦 · Green lotus | 金汀听玉声 · Golden shore | 晴水照白莲 · White lotus |
+| Lotus pond | Golden light | Clear water |
 | :---: | :---: | :---: |
-| ![Green lotus direction](docs/images/readme/style-1.jpg) | ![Golden shore direction](docs/images/readme/style-2.jpg) | ![White lotus direction](docs/images/readme/style-3.jpg) |
+| ![Lotus pond sample](docs/images/readme/style-1.jpg) | ![Golden light sample](docs/images/readme/style-2.jpg) | ![Clear water sample](docs/images/readme/style-3.jpg) |
 
-Three base samples from the same original, with hair editing, relighting and face beauty disabled.
+Three initial samples from the same original, with hair editing, relighting and face beauty disabled.
+
+## How it works
+
+1. **Choose photographs:** import photos and character information, then check the photos to process.
+2. **Describe the look:** discuss the setting and mood, compare three samples and choose a direction.
+3. **Finish the set:** produce the batch, retouch as needed, compare saved versions and export.
+
+![Actual CosLuma interface comparing three samples](docs/images/readme/workspace.jpg)
+
+## Keep editing the finished photograph
+
+| What to adjust | What you can do |
+| --- | --- |
+| Light and color | Adjust exposure, warmth, saturation and brightness, including batch changes |
+| Face | Select a face and control skin retouching and slimming yourself |
+| Hair and clothing | Paint the part to edit, style strands or add flowing fabric |
+| Delivery | Keep originals and saved versions; choose the PNG or JPEG to export |
+
+Hair editing and subject relighting are optional. Clothing motion is a separate edit after production. You initiate generation, saving and adoption.
+
+<details>
+<summary>See hair editing and relighting separately</summary>
 
 | Hair editing only | Subject relighting only |
 | :---: | :---: |
-| ![Tidied stray hair and flowing strands](docs/images/readme/hair.jpg) | ![Warm golden side lighting](docs/images/readme/relight.jpg) |
+| ![Hair editing result](docs/images/readme/hair.jpg) | ![Subject relighting result](docs/images/readme/relight.jpg) |
 
 These are full-image revisions of the lotus sample, so background details also change. Hair editing retains the original face, ears and physical headwear; disabling it retains the original whole head. Relighting coordinates the person, clothing, props and environment.
 
+</details>
+
 <details>
-<summary>Dimensions and native-pixel crops</summary>
+<summary>Usage and retouching details</summary>
 
-Examples come from actual production: a 6000 × 4000 original, 1536 × 1024 native generation, then one 4× model upscale and downsampling to a 6000 × 4000 16-bit PNG and matching JPEG. Full photographs on this page are reduced copies. Saved-photo beauty and local retouching were not used.
+Common images, HEIC / HEIF and camera RAW are supported. Checkboxes choose the production set, row highlighting controls preview, and the representative original is selected separately. Batches process four photos concurrently by default and save each independently.
 
-Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · [base result](docs/images/readme/result-face.png) · [relighting only](docs/images/readme/relight-face.png) · [hair editing and relighting](docs/images/readme/hair-relight-face.png).
+For face beauty, select and analyze a face, explicitly generate a skin base, then adjust skin retouching and slimming. Both strengths start at zero; returning to zero restores the base.
+
+Hair repair uses a detail view with full-photo context and writes back only inside the selection. Strand styling and clothing motion generate from the complete photograph and extract the actual old and new part silhouettes. Blue strokes protect regions to retain. Appearance references and shape marks are optional. All three local tasks use Qwen-Image-2.1 or MiniMax-H3-Image as selected in connection settings.
+
+After generation, adjust the selection and explicitly recompose to reuse the existing output. Changes to text, marks or references save a draft; another generation requires an explicit action. Browsing, page changes and project restoration do not call models.
+
+Delivery copies existing saved files. New edits do not automatically replace the chosen delivery version.
 
 </details>
 
+<p align="center">
+  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="400">
+</p>
+
 ## Getting started
 
-Download `CosLuma-0.46.0-windows-x64.zip`, extract the complete archive and run `CosLuma/CosLuma.exe`. The package includes Python and image-processing dependencies. Model services and weights are configured separately.
+Download `CosLuma-0.46.1-windows-x64.zip`, extract the complete archive and open `CosLuma/CosLuma.exe`. Enter service addresses and credentials in Connections, then create a project and import photos.
 
-| Required connection | Requirements |
+**Photography-assistant, image-editing, and segmentation / upscaling services must be configured before use.** The desktop package includes the runtime, with models and weights configured separately. Connection settings fetch model lists automatically, with manual entry available. Remote services receive the photos and prompts sent to them.
+
+## Configuration and technical details
+
+<details>
+<summary>Connections and deployment</summary>
+
+| Connection | Service requirements |
 | --- | --- |
 | Photography assistant | Chat Completions with images, tool calls and JSON output |
-| Image editing | Multipart `image[]` edits, accepting both an original and a style reference, returning an image URL or `b64_json` |
+| Image editing | Multipart `image[]` edits, accepting an original and a style reference, returning an image URL or `b64_json` |
 | Segmentation and upscaling | ComfyUI with SAM3.1, an upscale model and standard job interfaces |
-
-1. **Create a project:** configure connections, import photographs and enter the character. Common images, HEIC / HEIF and camera RAW are supported.
-2. **Select originals:** check the production set and separately choose a representative photograph. Row highlighting controls preview only.
-3. **Make samples:** discuss requirements, optionally enable hair editing or relighting, then explore three directions.
-4. **Approve and produce:** adopt a sample and process checked photographs, four concurrently by default, saving each result.
-5. **Retouch and deliver:** compare and edit in Works, choose delivery versions and export existing files.
-
-Connection settings fetch model lists from the address and credentials; manual entry is also available. Remote services receive the photographs and prompts sent to them.
-
-### Editing saved photographs
-
-Open an editor from the selected saved version. Results are saved separately, retaining the parent.
-
-| Edit | Scope and controls |
-| --- | --- |
-| Tone | Full-image exposure, warmth, green–magenta tint, saturation and luminance curve; batch application to delivery-checked photos |
-| Face beauty | Select and analyze a face, explicitly generate a skin base, then adjust skin and slimming; zero restores the base |
-| Hair repair and exposed-wig coverage | Detail editing with full-photo context, written back only inside the selection |
-| Strand styling and clothing motion | Full-image generation; extract actual old and new part silhouettes, excluding original foreground and user protection |
-
-All three local tasks use Qwen-Image-2.1 or MiniMax-H3-Image as selected in connection settings. Painting identifies the original part; shape marks and appearance references are optional. The model determines new silhouettes from the full photograph. Blue strokes protect regions to retain.
-
-After generation, users can adjust the mask and explicitly recompose from the existing output. Text and reference changes save drafts; generation requires another explicit action. Clothing motion is a separate saved-photo edit.
-
-## Deployment
 
 Template: [settings.example.json](providers/settings.example.json). Configuration defaults to `~/CosplayWorkbench/config/cosluma.json`, overridable with `--config` or `COSLUMA_CONFIG`. Projects default to `~/CosLuma/projects/`. Keep models, photographs and private configuration outside the repository. Credentials can use environment variables or separate files.
 
 <details>
-<summary>Models, weights and inference parameters</summary>
+<summary>Version 0.46.1 desktop models, weights and inference parameters</summary>
 
 Basic ComfyUI uses `models/checkpoints/sam3.1_multiplex_fp16.safetensors` and `models/upscale_models/4xNomos2_hq_atd.safetensors`. Apply the [SAM3 text-encoder projection patch](providers/patches/comfyui-sam3-clip-projection.patch) if the service lacks that fix.
 
 For optional features, copy the corresponding `providers/comfyui_cosluma_*` directory into the service's `custom_nodes/`, install required dependencies in its existing Python and restart. Service nodes need separate updates; weights are not bundled with the desktop application.
+
+The Qwen node accepts up to five images, keeping the clean source and painted instructions separate.
 
 | Feature / node directory | Default model and parameters |
 | --- | --- |
@@ -114,6 +117,19 @@ Select the local engine with `local_edit.engine`; H3 parameters are under `local
 BeautyGRPO uses `models/diffusers/FLUX.1-Kontext-dev/`, `models/loras/beautygrpo.safetensors` and analysis weights `models/cosluma_face/{facexformer,fgtbt}.safetensors`, extracted with the [FaceXFormer](providers/convert_facexformer.py) / [FGTBT](providers/convert_fgtbt.py) converters. Default `beauty.memory=bnb_nf4`: Transformer NF4 / double quant / BF16 compute, full BF16 T5 with Accelerate CPU offload, BF16 CLIP / VAE. The `cuda` layout keeps the full model in VRAM. `beauty.analysis_device` selects analysis placement; generation uses `cuda:0`. Windows beauty services set `PYTORCH_ALLOC_CONF=backend:native` and `PYTORCH_CUDA_ALLOC_CONF=backend:native`, using `--disable-dynamic-vram --disable-cuda-malloc`.
 
 Relighting uses `models/cosluma_relight/pixlrelight` (upstream source, `model.safetensors`, `config.yaml`) and the adjacent `marigold-iid-lighting-v1-1` directory. The node also requires `addict==2.4.0` and OmegaConf. Set `relight.device` explicitly to `cuda:0` or `cpu`. Model downloads in connection settings provides files and installation commands. Weight licenses are listed in [LICENSES](LICENSES/README.md).
+
+</details>
+
+</details>
+
+<details>
+<summary>Showcase dimensions and native-pixel crops</summary>
+
+The opening result passes the complete composite, including edited hair and clothing, into its final relighting step. The example was made in stages through the existing editing and relighting interfaces. The desktop application does not yet provide full-frame relighting of a saved result.
+
+The original and saved result are 6000 × 4000. Base generation and clothing editing each produce 1536 × 1024 images, with one 4× model upscale and downsampling where needed in each stage. Final PIXLRelight estimates fields on a 512 analysis canvas and modulates the full-size float32 composite; lighting-reference RGB does not replace its detail. A subsequent 0.2 EV exposure adjustment uses the tone tool. Outputs are an sRGB 16-bit PNG and matching JPEG. Full photographs on this page are reduced copies. Face beauty was not used.
+
+Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · [finished result](docs/images/readme/finished-face.png).
 
 </details>
 

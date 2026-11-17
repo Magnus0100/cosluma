@@ -238,17 +238,11 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
             marked = source.convert('RGBA')
             drawing = guide.resize((width,height),Image.Resampling.NEAREST).crop(box)
             marked.alpha_composite(drawing)
-            if config['engine']=='qwen' and not full_canvas:
-                # Keep all user inputs within the node's four image slots: detail + mask +
-                # context + optional appearance reference. The clean source is saved separately.
-                images[0] = marked.convert('RGB')
-                roles[0] += '; includes the user\'s colored edit marks'
-                guide_index = 1
-                save_image(images[0],directory/'marked-input.png')
-            else:
-                images.append(marked.convert('RGB'))
-                guide_index = len(images)
-                roles.append('image'+str(guide_index)+': user-colored edit marks on the same view')
+            # Keep the clean editing input separate from painted instructions.
+            images.append(marked.convert('RGB'))
+            guide_index = len(images)
+            roles.append('image'+str(guide_index)+': user-colored edit marks on the same view')
+            save_image(images[-1],directory/'marked-input.png')
             prompt += (' '+label.format(guide_index)+' shows the user\'s edit marks; '
                 'apply the requested edit and remove the marks in the finished photograph.')
             save_image(drawing,directory/'guide.png')
@@ -345,8 +339,6 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
                 instruction='补发只修复涂选缺口与露网，按需借鉴参考库中的发丝质感和受光，不加入造型任务。')
         prompt = candidate['prompt']
         names = [_upload(image,config) for image in images]
-        # Only the pictures go to the model: no mask node, no sampler noise_mask and no grid tail on the
-        # desktop path, so the edit is the plain full-context graph the released node documents.
         graph = {'8':{'class_type':engine['node'],'inputs':{
             **{key:config[key] for key in ('model','clip','vae','steps','resolution','seed')},
             'prompt':prompt,'filename_prefix':'CosLuma/local-'+uuid.uuid4().hex}}}
@@ -383,8 +375,6 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
             if context is not None:
                 # the 8-bit context preview that was actually sent, never the full 6K pixels
                 state['context_dimensions'] = list(context.size)
-            # One fusion strategy for every new H3 session, whatever the task. Saved records without
-            # this field keep their deterministic historical behaviour.
             state['blend_mode'] = 'poisson_gradient'
         if config['engine']=='qwen':
             # QwenImage21Cache keeps a lossless KV cache in CPU memory; the H3 engine has no such cache.
@@ -642,9 +632,10 @@ def revise_writeback(directory, mask, *, protected):
     return str(revised)
 
 
-def save_local(pixels, directory):
+def save_local(pixels, directory, *, prepared=None):
+    """Save native pixels, reusing the current session's prepared crop when open."""
     directory = Path(directory)
-    crop,state = retouch_crop(pixels,directory)
+    crop,state = prepared if prepared is not None else retouch_crop(pixels,directory)
     x0,y0,x1,y1 = state['box']
     final = pixels.copy()
     final[y0:y1,x0:x1] = crop

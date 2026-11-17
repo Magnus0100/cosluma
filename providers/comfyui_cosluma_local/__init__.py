@@ -26,7 +26,7 @@ class CosLumaQwenLocalEdit:
             'resolution':('INT',{'default':1024,'min':512,'max':2048,'step':32}),
             'seed':('INT',{'default':42,'min':0,'max':2**32-1}),
             'filename_prefix':('STRING',{'default':'CosLuma/local'})},
-            'optional':{'image3':('IMAGE',),'image4':('IMAGE',)}}
+            'optional':{'image3':('IMAGE',),'image4':('IMAGE',),'image5':('IMAGE',)}}
 
     RETURN_TYPES = ()
     FUNCTION = 'edit'
@@ -34,12 +34,13 @@ class CosLumaQwenLocalEdit:
     OUTPUT_NODE = True
 
     @torch.inference_mode()
-    def edit(self,image1,image2,model,clip,vae,prompt,steps,resolution,seed,filename_prefix,image3=None,image4=None):
+    def edit(self,image1,image2,model,clip,vae,prompt,steps,resolution,seed,filename_prefix,
+            image3=None,image4=None,image5=None):
         output = Path(folder_paths.get_output_directory())
         directory = output/filename_prefix/uuid.uuid4().hex[:8]
         directory.mkdir(parents=True,exist_ok=False)
         inputs = []
-        for number,tensor in enumerate((image1,image2,image3,image4),1):
+        for number,tensor in enumerate((image1,image2,image3,image4,image5),1):
             if tensor is None:
                 continue
             path = directory/f'input-{number}.png'

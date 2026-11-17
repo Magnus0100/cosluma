@@ -226,11 +226,12 @@ class LocalWorker(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, phase, context, config, *, pixels=None, before=None, directory=None, inputs=None,
-            sr_config=None, llm_config=None, head_config=None, library_path=None):
+    def __init__(self, phase, context, config, *, pixels=None, directory=None, inputs=None,
+            sr_config=None, llm_config=None, head_config=None, library_path=None, prepared=None):
         super().__init__()
         self.phase,self.context,self.config = phase,context,config
-        self.pixels,self.before,self.directory,self.inputs = pixels,before,directory,inputs
+        self.pixels,self.directory,self.inputs = pixels,directory,inputs
+        self.prepared = prepared
         self.sr_config = sr_config
         self.llm_config = llm_config
         self.head_config = head_config
@@ -256,20 +257,17 @@ class LocalWorker(QThread):
                 result = self.comparison(self.directory)
             elif self.phase=='save':
                 self.progress.emit('另存原尺寸 16 位 PNG 与 JPEG')
-                result = save_local(self.pixels,self.directory)
+                result = save_local(self.pixels,self.directory,prepared=self.prepared)
             elif self.phase=='chat':
-                result = discuss_local(self.pixels,config=self.llm_config,directory=self.directory,**self.inputs)
+                result = discuss_local(self.pixels,config=self.llm_config,directory=self.directory,
+                    prepared=self.prepared,**self.inputs)
             self.ready.emit(result)
         except Exception as error:
             self.failed.emit(str(error)+'。工作目录：'+self.context['directory'])
 
     def comparison(self, directory):
         crop,state = retouch_crop(self.pixels,directory)
-        preview = self.before.copy()
-        painter = QPainter(preview)
-        painter.drawImage(state['box'][0],state['box'][1],display_image(crop))
-        painter.end()
-        return directory,preview,state
+        return directory,crop,state
 
 
 class LocalRetouchEditor(QWidget):
@@ -289,6 +287,7 @@ class LocalRetouchEditor(QWidget):
         self.worker = None
         self.pixels = self.before = None
         self.result_directory = None
+        self.prepared = None
         self.writeback_dirty = False
         self.generation_dirty = False
         self.messages = []
@@ -549,10 +548,22 @@ class LocalRetouchEditor(QWidget):
     def page_changed(self, index):
         if index!=1 or self.before is None or self.worker is not None:
             return
-        if self.result_directory and not self.failed:
+        if self.prepared is not None and not self.failed:
+            self.render_result()
+        elif self.result_directory and not self.failed:
             self.start('compare')
         else:
             self.preview.set_image_pair(self.before,self.before)
+
+    def render_result(self):
+        if self.prepared is None or self.before is None or not self.isVisible() or self.pages.currentIndex()!=1:
+            return
+        crop,state = self.prepared
+        preview = self.before.copy()
+        painter = QPainter(preview)
+        painter.drawImage(state['box'][0],state['box'][1],display_image(crop))
+        painter.end()
+        self.preview.set_image_pair(self.before,preview)
 
     def generation_edited(self):
         if self.restoring:
@@ -584,6 +595,7 @@ class LocalRetouchEditor(QWidget):
         self.restore_task()
 
     def restore_task(self):
+        self.prepared = None
         self.failed = False
         self.failure_phase = None
         self.failure_message = ''
@@ -663,9 +675,10 @@ class LocalRetouchEditor(QWidget):
             self.failed = False
         directory = (self.draft_directory/('chat-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
             if phase=='chat' else self.result_directory)
-        self.worker = LocalWorker(phase,self.context,self.config,pixels=self.pixels,before=self.before,
+        self.worker = LocalWorker(phase,self.context,self.config,pixels=self.pixels,
             directory=directory,inputs=inputs,sr_config=self.sr_config,llm_config=self.llm_config,
-            head_config=self.head_config,library_path=self.library_path)
+            head_config=self.head_config,library_path=self.library_path,
+            prepared=self.prepared)
         self.worker.progress.connect(self.message.setText)
         self.worker.ready.connect(self.action_ready)
         self.worker.failed.connect(self.action_failed)
@@ -695,7 +708,8 @@ class LocalRetouchEditor(QWidget):
             if self.save_draft() and row['operation'] is not None:
                 self.pending_chat = row
         elif phase in ('generate','compare','recompose'):
-            self.result_directory,preview,state = result
+            self.result_directory,crop,state = result
+            self.prepared = (crop,state)
             if phase in ('generate','recompose'):
                 self.writeback_dirty = False
             if phase=='generate':
@@ -736,7 +750,7 @@ class LocalRetouchEditor(QWidget):
             if phase in ('generate','recompose') and self.isVisible():
                 self.pages.setCurrentIndex(1)
             if self.isVisible() and self.pages.currentIndex()==1:
-                self.preview.set_image_pair(self.before,preview)
+                self.render_result()
             self.save_draft()
             self.message.setText(TASKS[self.task_key][0]+('本次结果已读取，可切到比较页查看后另存。'
                 if phase=='compare' else '已生成。比较后可另存，范围外沿用所选版本像素。'))
@@ -771,7 +785,7 @@ class LocalRetouchEditor(QWidget):
 
     def action_finished(self):
         worker,self.worker = self.worker,None
-        worker.pixels = worker.before = worker.inputs = None
+        worker.pixels = worker.prepared = worker.inputs = None
         worker.deleteLater()
         row,self.pending_chat = self.pending_chat,None
         if row is not None:
@@ -823,7 +837,7 @@ class LocalRetouchEditor(QWidget):
     def release_pixels(self):
         if not self.save_draft() or self.worker is not None:
             return
-        self.pixels = self.before = None
+        self.pixels = self.before = self.prepared = None
         self.canvas.release()
         self.preview.release_images()
 

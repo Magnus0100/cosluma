@@ -46,7 +46,7 @@ class LocalActions:
             'message':'操作已登记，回复保存后由编辑页执行，尚未生成或另存。'}
 
 
-def discuss_local(pixels, mask, guide, context, conversation, config, directory, protected=None):
+def discuss_local(pixels, mask, guide, context, conversation, config, directory, protected=None, prepared=None):
     from local_retouch import retouch_crop
     from model_clients import _describe, discussion_preview
     actions = LocalActions(context,conversation[-1]['content'])
@@ -72,7 +72,7 @@ def discuss_local(pixels, mask, guide, context, conversation, config, directory,
                 images.append(('本次保存底图',preview_data_url(original,1280)))
             if mode in ('output','compare'):
                 if context['result']:
-                    crop,state = retouch_crop(pixels,context['result'])
+                    crop,state = prepared if prepared is not None else retouch_crop(pixels,context['result'])
                     width,height = pixels.shape[1],pixels.shape[0]
                     x0,y0,x1,y1 = state['box']
                     box = tuple(round(value*scale) for value,scale in zip(
