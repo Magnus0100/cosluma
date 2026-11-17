@@ -4,14 +4,14 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 
 **[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
 
-![完成场景、修发、衣物动态和最终重打光的成片](docs/images/readme/finished.jpg)
+| 原片 | 最终成片 |
+| :---: | :---: |
+| ![奶糕Naige原片](docs/images/readme/original.jpg) | ![完成场景、修发、衣物动态和最终重打光的成片](docs/images/readme/finished.jpg) |
 
 场景、修发、衣物动态，最后统一重打光。出镜：抖音 **「奶糕Naige」**，照片已授权用于本项目 README 展示。
 
 <details>
-<summary>查看原片与 100% 局部</summary>
-
-![奶糕Naige原片](docs/images/readme/original.jpg)
+<summary>查看 100% 局部</summary>
 
 原片与最终保存成片均为 6000 × 4000，整图展示为缩略图。未使用人脸美化。
 

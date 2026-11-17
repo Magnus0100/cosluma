@@ -4,14 +4,14 @@ Photo editing for cosplay. Discuss a look, produce finished photographs and reto
 
 **[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
-![Finished photograph with scene editing, styled hair, flowing fabric and final relighting](docs/images/readme/finished.jpg)
+| Original | Finished photograph |
+| :---: | :---: |
+| ![Original photograph of 奶糕Naige](docs/images/readme/original.jpg) | ![Finished photograph with scene editing, styled hair, flowing fabric and final relighting](docs/images/readme/finished.jpg) |
 
 Scene, hair and clothing edits, followed by relighting of the complete frame. Cosplayer: **奶糕Naige on Douyin**, shown with permission for this project's README.
 
 <details>
-<summary>View the original and native-pixel crops</summary>
-
-![Original photograph of 奶糕Naige](docs/images/readme/original.jpg)
+<summary>View native-pixel crops</summary>
 
 The original and saved result are both 6000 × 4000. Full photographs on this page are reduced copies. Face beauty was not used.
 
