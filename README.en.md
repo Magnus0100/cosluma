@@ -58,7 +58,7 @@ Keep the original and saved versions. Choose the version to deliver, then export
 <details>
 <summary>More usage details</summary>
 
-Common images, HEIC / HEIF and camera RAW are supported. Checkboxes choose the production set, row highlighting controls preview, and the representative original is selected separately. Batches process four photos concurrently by default and save each independently.
+Common images, HEIC / HEIF and camera RAW are supported. Checkboxes choose the production set, the preview follows the current row, and the representative original is selected separately. Returning to Photos keeps the list position and the current photo. Batches process four photos concurrently by default and save each independently.
 
 For face beauty, select and analyze a face, explicitly generate a skin base, then adjust skin retouching and slimming. Both strengths start at zero; returning to zero restores the base.
 

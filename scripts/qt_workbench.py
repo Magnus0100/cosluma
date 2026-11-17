@@ -366,7 +366,7 @@ class Workbench(QMainWindow):
         self.listing.setTextElideMode(Qt.ElideMiddle)
         self.listing.setAcceptDrops(False)
         self.listing.viewport().setAcceptDrops(False)
-        self.listing.itemSelectionChanged.connect(self.show_selected)
+        self.listing.currentCellChanged.connect(self.show_selected)
         self.listing.itemChanged.connect(self.photo_check_changed)
         self.queue_pages.addWidget(self.listing)
         queue_layout.addWidget(self.queue_pages, 1)
@@ -1712,8 +1712,6 @@ class Workbench(QMainWindow):
             except (OSError, ValueError, KeyError) as error:
                 self.status.setText('打开创作页失败：' + str(error))
                 return
-        elif index == 0:
-            self.refresh_queue()
         elif index == 2 and self.current_batch_view is None and self.batch_directory:
             try:
                 self.current_batch_view = self.make_results_view(self.batch_directory)
