@@ -2,7 +2,7 @@
 
 Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精修。
 
-**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
+**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v0.47.1/CosLuma-0.47.1-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
 
 | 原片 | 最终成片 |
 | :---: | :---: |
@@ -76,13 +76,11 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 
 Windows 64 位，中文界面。
 
-1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
-2. 新建项目，导入照片并填写角色。
-3. 在「设置 → 连接设置」填写模型服务地址与密钥，软件会自动获取模型列表。进入「创作」制作样片。
+1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v0.47.1/CosLuma-0.47.1-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
+2. 新建项目，在照片页选择照片并填写角色。
+3. 进入「创作」。首次按页填写模型服务地址与密钥，软件会自动获取模型列表。保存后即可开始制作样片。
 
 **制作前需要配置模型服务。** 桌面包自带运行环境，模型与权重需单独配置，见下方「连接与部署」。使用远端服务时，照片与提示词会发送至该服务。
-
-当前源码中新建项目直接进入照片页，创作时会提示配置连接；首次连接设置可逐页填写。0.47.0 便携包在新项目中若先显示连接页，可点「暂不配置」去导入照片。
 
 ## 配置与技术说明
 
@@ -98,7 +96,7 @@ Windows 64 位，中文界面。
 配置模板：[settings.example.json](providers/settings.example.json)。默认配置为 `~/CosplayWorkbench/config/cosluma.json`，可用 `--config` 或 `COSLUMA_CONFIG` 指定。项目默认保存至 `~/CosLuma/projects/`。模型、照片与私人配置放在仓库外；密钥可使用环境变量或独立文件。
 
 <details>
-<summary>0.47.0 桌面版模型、权重与推理参数</summary>
+<summary>0.47.1 桌面版模型、权重与推理参数</summary>
 
 基础 ComfyUI 使用 `models/checkpoints/sam3.1_multiplex_fp16.safetensors` 与 `models/upscale_models/4xNomos2_hq_atd.safetensors`。服务缺少 SAM3 文本编码器投影修正时，应用 [对应补丁](providers/patches/comfyui-sam3-clip-projection.patch)。
 

@@ -2,7 +2,7 @@
 
 Photo editing for cosplay. Discuss a look, produce finished photographs and retouch the details yourself.
 
-**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
+**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v0.47.1/CosLuma-0.47.1-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
 | Original | Finished photograph |
 | :---: | :---: |
@@ -76,13 +76,11 @@ Delivery copies existing saved files. New edits do not automatically replace the
 
 Windows 64-bit. Chinese interface.
 
-1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v0.47.0/CosLuma-0.47.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
-2. Create a project, import photos and enter the character.
-3. Enter model-service addresses and credentials in **Settings → Connections**. The application fetches model lists automatically. Open **Create** to make samples.
+1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v0.47.1/CosLuma-0.47.1-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
+2. Create a project, select photos on the Photos page and enter the character.
+3. Open **Create**. On first use, enter model-service addresses and credentials one page at a time. The application fetches model lists automatically. Save the connection settings to start making samples.
 
 **Making samples requires model services.** The desktop package includes the runtime; models and weights are configured separately. See **Connections and deployment** below. Remote services receive the photographs and prompts sent to them.
-
-In the current source, a new project opens the Photos page, and Create prompts for connections when needed. First-time connection setup goes one page at a time. If the 0.47.0 portable package shows the connection screen first, choose **Set up later** to import photos.
 
 ## Configuration and technical details
 
@@ -98,7 +96,7 @@ In the current source, a new project opens the Photos page, and Create prompts f
 Template: [settings.example.json](providers/settings.example.json). Configuration defaults to `~/CosplayWorkbench/config/cosluma.json`, overridable with `--config` or `COSLUMA_CONFIG`. Projects default to `~/CosLuma/projects/`. Keep models, photographs and private configuration outside the repository. Credentials can use environment variables or separate files.
 
 <details>
-<summary>Version 0.47.0 desktop models, weights and inference parameters</summary>
+<summary>Version 0.47.1 desktop models, weights and inference parameters</summary>
 
 Basic ComfyUI uses `models/checkpoints/sam3.1_multiplex_fp16.safetensors` and `models/upscale_models/4xNomos2_hq_atd.safetensors`. Apply the [SAM3 text-encoder projection patch](providers/patches/comfyui-sam3-clip-projection.patch) if the service lacks that fix.
 
