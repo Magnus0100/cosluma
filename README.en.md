@@ -19,6 +19,10 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
 
 </details>
 
+<p align="center">
+  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="400">
+</p>
+
 ## Compare samples, then choose a look
 
 Describe the setting and mood, compare three directions, then use your chosen direction for the set.
@@ -67,10 +71,6 @@ After saving hair or clothing edits, select that version and open **Light and co
 Delivery copies existing saved files. New edits do not automatically replace the chosen delivery version.
 
 </details>
-
-<p align="center">
-  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="320">
-</p>
 
 ## Getting started
 

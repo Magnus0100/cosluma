@@ -19,6 +19,10 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 
 </details>
 
+<p align="center">
+  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧" width="400">
+</p>
+
 ## 先看样片，再选风格
 
 说说想要的场景和氛围，比较三个方向。选定后，沿用这个方向制作整组照片。
@@ -67,10 +71,6 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 交付直接复制已有文件，新修改不会自动替换已选交付版本。
 
 </details>
-
-<p align="center">
-  <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧" width="320">
-</p>
 
 ## 开始使用
 
