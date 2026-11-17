@@ -1889,7 +1889,7 @@ class Workbench(QMainWindow):
         return view
 
     def open_beauty(self, context):
-        same_editor = isinstance(self.beauty_editor,BeautyEditor) and self.beauty_editor.context['directory']==context['directory']
+        same_editor = isinstance(self.beauty_editor,BeautyEditor) and self.beauty_editor.context.get('edit_id',self.beauty_editor.context['base'])==context.get('edit_id',context['base'])
         if self.work_in_progress() and not (same_editor and self.beauty_editor.is_busy()):
             self.status.setText('当前项目仍在处理中，结束后可打开另一张照片的人脸美化。')
             return
@@ -1942,6 +1942,7 @@ class Workbench(QMainWindow):
             self.status.setText('当前项目仍在处理中，结束后可打开局部修饰。')
             return
         if same_editor:
+            self.beauty_editor.apply_request(context)
             self.beauty_return_delivery = context.get('return_to_delivery',False)
             self.result_views.setCurrentWidget(self.beauty_editor)
             self.navigate(2)
@@ -1956,7 +1957,8 @@ class Workbench(QMainWindow):
                 self.status.setText(self.beauty_editor.message.text())
                 return
             editor = LocalRetouchEditor(context,config['local_edit'],self.result_views,
-                sr_config=config.get('sr'),llm_config=config['llm'])
+                sr_config=config.get('sr'),llm_config=config['llm'],head_config=config.get('head'),
+                library_path=config.get('prompt_library'))
             editor.back_requested.connect(self.return_from_beauty)
             editor.saved.connect(self.beauty_saved)
             editor.busy_changed.connect(self.beauty_busy_changed)
@@ -2027,6 +2029,8 @@ class Workbench(QMainWindow):
                 self.beauty_editor.config = config['local_edit']
                 self.beauty_editor.sr_config = config.get('sr')
                 self.beauty_editor.llm_config = config['llm']
+                self.beauty_editor.head_config = config.get('head')
+                self.beauty_editor.library_path = config.get('prompt_library')
                 self.beauty_editor.message.setText('局部修饰连接已保存，下次主动生成时使用。')
         except (OSError,ValueError,KeyError) as error:
             self.beauty_editor.message.setText('保存局部修饰连接失败：'+str(error))

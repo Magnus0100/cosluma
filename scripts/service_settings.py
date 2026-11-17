@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (QComboBox, QCompleter, QDialog, QFileDialog, QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QLineEdit, QListWidget, QPushButton, QScrollArea,
-    QSizePolicy, QStackedWidget, QStyle, QToolButton, QVBoxLayout, QWidget)
+    QSizePolicy, QSpinBox, QStackedWidget, QStyle, QToolButton, QVBoxLayout, QWidget)
 
 from settings import credential, editable_settings, resource_path, save_settings
 from model_downloads import ModelDownloads
@@ -101,6 +101,8 @@ class ModelPicker(QWidget):
         self.combo.clear()
         self.combo.setCurrentText(current)
         self.status.clear()
+        self.status.setToolTip('')
+        self.schedule()
 
     def schedule(self):
         if self.dirty and self.isVisible():
@@ -243,6 +245,13 @@ class ServiceSettings(QDialog):
                 form.addRow(reuse)
             self.add_field(form, service, 'url', 'ComfyUI 地址', '例如 http://127.0.0.1:8188')
             self.add_field(form, service, 'model', '模型文件名', '填写服务机器上实际安装的权重文件名')
+            if service=='sr':
+                self.sr_scale = QSpinBox()
+                self.sr_scale.setRange(1,16)
+                self.sr_scale.setValue(self.values.get('sr',{}).get('scale',4))
+                self.sr_scale.setSuffix(' ×')
+                self.sr_scale.setToolTip('填写所选模型的实际倍率；Nomos2 为 4×。用于确定生成画布尺寸。')
+                form.addRow('模型倍率',self.sr_scale)
             download = QPushButton('下载 SAM3.1 分割模型' if service == 'head' else '下载 Nomos2 超分模型')
             download.clicked.connect(lambda _checked=False, service=service: ModelDownloads(self, model=service).exec())
             form.addRow(download)
@@ -253,7 +262,6 @@ class ServiceSettings(QDialog):
             if service in self.credentials:
                 mode, value = self.credentials[service]
                 mode.currentIndexChanged.connect(lambda _index, picker=picker: picker.invalidate())
-                mode.currentIndexChanged.connect(lambda _index, picker=picker: picker.schedule())
                 value.textChanged.connect(lambda _text, picker=picker: picker.invalidate())
                 value.editingFinished.connect(picker.schedule)
         self.relight_group = QGroupBox('人物重打光 · PIXLRelight')
@@ -479,19 +487,17 @@ class ServiceSettings(QDialog):
         self.steps.setCurrentRow(index)
         self.message.clear()
 
-    def provider_settings(self, service):
+    def provider_connection(self, service):
         provider = deepcopy(self.values.get(service, {}))
-        for key, label in (('url','服务地址'), ('model','模型名称')):
-            edit = self.fields[service,key]
-            value = edit.text().strip()
-            try:
-                if not value:
-                    raise ValueError('请填写'+self.service_names[service]+'的'+label)
-                provider[key] = endpoint_url(value, service) if key == 'url' else value
-            except ValueError:
-                self.tabs.setCurrentIndex(self.service_pages[service])
-                edit.setFocus()
-                raise
+        edit = self.fields[service, 'url']
+        try:
+            if not edit.text().strip():
+                raise ValueError('请填写'+self.service_names[service]+'的服务地址')
+            provider['url'] = endpoint_url(edit.text(), service)
+        except ValueError:
+            self.tabs.setCurrentIndex(self.service_pages[service])
+            edit.setFocus()
+            raise
         secret = None
         if service in self.credentials:
             mode, edit = self.credentials[service]
@@ -511,9 +517,22 @@ class ServiceSettings(QDialog):
                     provider[source] = value
         return provider, secret
 
+    def provider_settings(self, service):
+        provider, secret = self.provider_connection(service)
+        edit = self.fields[service, 'model']
+        model = edit.text().strip()
+        if not model:
+            self.tabs.setCurrentIndex(self.service_pages[service])
+            edit.setFocus()
+            raise ValueError('请填写'+self.service_names[service]+'的模型名称')
+        provider['model'] = model
+        if service=='sr':
+            provider['scale'] = self.sr_scale.value()
+        return provider, secret
+
     def use_prompt_service(self):
         try:
-            provider, secret = self.provider_settings('llm')
+            provider, secret = self.provider_connection('llm')
             url = urlsplit(provider['url'])
             if not url.path.endswith('/chat/completions'):
                 raise ValueError('摄影助手使用自定义路径，请分别填写完整接口地址')

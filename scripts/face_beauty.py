@@ -54,7 +54,7 @@ def _upload(image, config):
     return '/'.join(part for part in (result.get('subfolder'), result['name']) if part)
 
 
-def _run(graph, outputs, config, directory, name):
+def _run(graph, outputs, config, directory, name, *, label='人脸美化'):
     base = config['url'].rstrip('/')
     save_json(directory/(name+'-workflow.json'), graph)
     submission = post_json(base+'/prompt', {'prompt':graph, 'client_id':'cosluma-'+uuid.uuid4().hex})
@@ -69,14 +69,14 @@ def _run(graph, outputs, config, directory, name):
             if status.get('status_str') == 'error':
                 details = '; '.join(row[1].get('exception_message','') for row in status.get('messages', [])
                     if row[0] == 'execution_error')
-                raise RuntimeError('人脸美化服务失败：'+details)
+                raise RuntimeError(label+'服务失败：'+details)
             if all(result.get('outputs', {}).get(node, {}).get('images') for node in outputs):
                 for node, filename in outputs.items():
                     image = result['outputs'][node]['images'][0]
                     download(base+'/view?'+urllib.parse.urlencode(image),directory/filename)
                 return result
             if status.get('completed'):
-                raise RuntimeError('人脸美化服务未返回所需图片；已保留服务记录')
+                raise RuntimeError(label+'服务未返回所需图片；已保留服务记录')
         time.sleep(1)
 
 
@@ -317,13 +317,13 @@ def render_beauty(pixels, session, parameters):
     return output
 
 
-def save_beauty(pixels, session, parameters):
+def save_beauty(pixels, session, parameters, *, parent_version=None):
     directory = session.directory/('edit-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
     final = render_beauty(pixels,session,parameters)
     result = {'parameters':{'skin':parameters.skin,'slim':parameters.slim,
             'protect_features':parameters.protect_features},
-        'source':str(session.base_path),'source_dimensions':session.state['source_dimensions'],
+        'parent_version':parent_version,'source':str(session.base_path),'source_dimensions':session.state['source_dimensions'],
         'session':os.path.relpath(session.directory,session.directory.parent), 'box':list(session.box),
         'analysis':session.state['analysis'],'landmark_topology':session.topology,
         'skin':session.state.get('skin') if parameters.skin else None,

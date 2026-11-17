@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
     QLineEdit, QListView, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
     QMenu, QPlainTextEdit, QScrollArea, QSplitter, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
-from delivery_store import (adopt_delivery_versions, export_delivery, photo_choices, project_photos,
+from delivery_store import (saved_editor_context, beauty_editor_context, adopt_delivery_versions, export_delivery, photo_choices, project_photos,
     retouch_parent, revision_context, saved_tone_batch, selected_version, source_key)
 from creative_edits import normalise_edits
 from image_io import open_display
@@ -139,11 +139,11 @@ class RevisionDialog(QDialog):
         options.addWidget(self.relight)
         options.addStretch(1)
         layout.addLayout(options)
-        option_note = ui_label('补发请主动开启修发；改变人物光向请开启重打光。两项初始沿用基础版的实际设置。')
+        option_note = ui_label('沿用基础版设置。衣物动态在局部修饰中处理。')
         option_note.setWordWrap(True)
         layout.addWidget(option_note)
         self.requirements = QPlainTextEdit()
-        self.requirements.setPlaceholderText('说明这张要改什么、保留什么，例如：补右侧假发缺口，保留刘海、头饰与衣服纹样。')
+        self.requirements.setPlaceholderText('说明这张要改什么、保留什么，例如：改为黄昏侧光，保留当前构图与服装。')
         self.requirements.setMinimumHeight(110)
         layout.addWidget(self.requirements,1)
         boundary = ui_label('改稿会重新生成整幅画面，未指定的其他细节也可能变化。新稿另存，交付选择由你决定。')
@@ -372,6 +372,7 @@ class DeliveryView(QWidget):
         self.beauty = edit_menu.addAction('人脸美化',self.open_beauty)
         self.beauty.setEnabled(False)
         self.retouch = edit_menu.addAction('局部修饰',self.open_retouch)
+        self.clothing = edit_menu.addAction('衣物动态',lambda:self.open_retouch('clothing'))
         self.retouch.setEnabled(False)
         self.tone = edit_menu.addAction('光色调整',self.open_tone)
         self.tone.setEnabled(False)
@@ -794,6 +795,11 @@ class DeliveryView(QWidget):
                     'delivery_photo_key':photo['key'],
                     'parent_version':retouch_parent(version),'delivery_message':row,
                     'delivery_user_text':self.state['discussion']['messages'][-2]['content']})
+            elif action=='local':
+                row['operation_status'] = '已打开局部修饰；涂选范围后生成'
+                self.retouch_requested.emit({**saved_editor_context(photo,version),
+                    'return_to_delivery':True,'local_task':operation['local_task'],
+                    'local_brief':operation['local_brief']})
             elif action=='revise':
                 revision = revision_context(photo,version)
                 revision['art_direction']['edits'] = operation['edits']
@@ -982,6 +988,7 @@ class DeliveryView(QWidget):
         else:
             self.retouch.setEnabled(False)
             self.tone.setEnabled(False)
+        self.clothing.setEnabled(self.retouch.isEnabled())
         self.update_revision_controls()
         self.chat_send.setEnabled(not busy and not self.production_busy and self.current_photo() is not None)
         self.chat_input.setEnabled(self.chat_worker is None)
@@ -1164,18 +1171,10 @@ class DeliveryView(QWidget):
             self.message.setPlainText('新稿无法读取：'+str(error))
 
     def open_beauty(self):
-        try:
-            photo = self.current_photo()
-            version = selected_version(photo,self.state['choices'][photo['key']])
-            run = json.loads((Path(version['work'])/'run.json').read_text(encoding='utf-8'))
-            self.beauty_requested.emit({'name':photo['name'],'base':version['base'],
-                'region':run['head']['region'],'directory':version['work'],'batch_directory':version['batch'],
-                'return_to_delivery':True})
-        except (OSError,ValueError,KeyError) as error:
-            self.message.setPlainText('无法打开人脸美化：'+str(error))
+        self.open_saved_editor(self.beauty_requested,'人脸美化',beauty=True)
 
-    def open_retouch(self):
-        self.open_saved_editor(self.retouch_requested,'局部修饰')
+    def open_retouch(self, task=None):
+        self.open_saved_editor(self.retouch_requested,'局部修饰',local_task=task if isinstance(task,str) else None)
 
     def open_tone(self):
         self.open_saved_editor(self.tone_requested,'光色调整')
@@ -1265,13 +1264,12 @@ class DeliveryView(QWidget):
         self.busy_changed.emit()
         worker.deleteLater()
 
-    def open_saved_editor(self, requested, label):
+    def open_saved_editor(self, requested, label, *, beauty=False, local_task=None):
         try:
             photo = self.current_photo()
             version = selected_version(photo,self.state['choices'][photo['key']])
-            requested.emit({'name':photo['name'],'base':version['files']['PNG'],
-                'directory':version['work'],'batch_directory':version['batch'],'return_to_delivery':True,
-                'parent_version':retouch_parent(version)})
+            context = beauty_editor_context(photo,version) if beauty else saved_editor_context(photo,version)
+            requested.emit({**context,'return_to_delivery':True,'local_task':local_task})
         except (OSError,ValueError,KeyError) as error:
             self.message.setPlainText('无法打开'+label+'：'+str(error))
 

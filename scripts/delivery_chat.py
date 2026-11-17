@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from creative_edits import normalise_edits
+from local_retouch import TASKS
 from tone_edit import TONE_PROPERTIES, ToneParameters
 
 
@@ -25,24 +26,26 @@ class DeliveryActions:
         if self.request is not None:
             return []
         return [{'type':'function','function':{'name':'request_saved_photo',
-            'description':'按本条明确要求调整光色、比较、采用或生成一张新稿。'
+            'description':'按本条明确要求调整光色、打开局部修饰、比较、采用或生成一张新稿。local 只打开对应局部任务并保存本条原文，不自动生成。'
                 'tone 参数相对指定已保存版本，保存不等于采用为交付。compare 只改左侧查看对象；'
                 'tone_batch 将完整参数用于发送时交付勾选的各自版本并另存；不改勾选或采用版本。'
                 'adopt 只改交付版本并保留勾选。revise 沿所选版本所属的基础成片整图改稿，'
                 '使用本条用户原文，只制作一张且不采用为交付。普通询问和建议不调用。',
             'parameters':{'type':'object','properties':{
-                'action':{'type':'string','enum':['tone','tone_batch','compare','adopt','revise']},
+                'action':{'type':'string','enum':['tone','tone_batch','compare','adopt','revise','local']},
                 'version_id':{'type':['string','null'],'enum':[*self.versions,None],
-                    'description':'任务资料中的完整版本 ID；tone / revise 为 null 时使用发送时交付版本；compare 为 null 时查看原片，tone_batch 填 null。'},
+                    'description':'任务资料中的完整版本 ID；tone / revise / local 为 null 时使用发送时交付版本；compare 为 null 时查看原片，tone_batch 填 null。'},
                 'parameters':{'type':['object','null'],'properties':TONE_PROPERTIES,
                     'required':list(TONE_PROPERTIES),
                     'description':'tone / tone_batch 填完整参数；曝光/暖冷/色调默认 0，曲线 0.25/0.5/0.75，饱和度 1；其他操作为 null。'},
                 'save':{'type':'boolean','description':'tone 且本条明确要求另存时才为 true；tone_batch 明确批量另存须为 true；revise 本身就是明确发起新稿。'},
+                'local_task':{'type':['string','null'],'enum':[*TASKS,None],
+                    'description':'local 操作指定修饰任务；衣物微风使用 clothing。其他操作填 null。'},
                 'revision_edits':{'type':['object','null'],'properties':{
                     'hair':{'type':['boolean','null']},'relight':{'type':['boolean','null']}},
                     'required':['hair','relight'],
                     'description':'仅 revise 使用；明确要求开启/关闭修发或人物重打光才填布尔值，null 沿用基础版设置。其他操作填 null。'}},
-                'required':['action','version_id','parameters','save','revision_edits']}}},
+                'required':['action','version_id','parameters','save','revision_edits','local_task']}}},
             {'type':'function','function':{'name':'complete_delivery',
                 'description':'用户明确要求时采用已记录的一轮批量光色成功结果、导出现有勾选版本，或采用该轮并导出。'
                     'adopt_batch 保留勾选；export 复制发送时勾选版本；adopt_batch_and_export 只导出该轮成功采用且发送时勾选的照片。'
@@ -56,7 +59,7 @@ class DeliveryActions:
                         'description':'本条明确指定的导出格式；null 沿用发送时界面设置。仅采用时填 null。'}},
                     'required':['action','batch_id','formats']}}}]
 
-    def call(self, action, version_id=None, parameters=None, save=False, revision_edits=None, *, batch_id=None, formats=None):
+    def call(self, action, version_id=None, parameters=None, save=False, revision_edits=None, *, batch_id=None, formats=None, local_task=None):
         if action in ('adopt_batch','export','adopt_batch_and_export'):
             if action!='export':
                 self.batches[batch_id]
@@ -68,11 +71,11 @@ class DeliveryActions:
                     raise ValueError('请选择 JPEG 或 PNG 导出格式')
             self.request = {'action':action,'batch_id':batch_id,'formats':formats}
             return {'status':'requested','operation':self.request,'message':'已登记交付操作，回复保存后执行；尚未采用或导出。'}
-        if action not in ('tone','tone_batch','compare','adopt','revise'):
+        if action not in ('tone','tone_batch','compare','adopt','revise','local'):
             raise ValueError('未知成片操作：'+action)
         if not isinstance(save,bool):
             raise TypeError('save 须为布尔值')
-        if action in ('tone','revise') and version_id is None:
+        if action in ('tone','revise','local') and version_id is None:
             version_id = self.context['selected_version']
         if version_id is not None:
             self.versions[version_id]
@@ -88,6 +91,9 @@ class DeliveryActions:
             self.request.update(version_id=None,parameters=ToneParameters(**parameters).record(),save=True)
         elif action=='tone':
             self.request.update(parameters=ToneParameters(**parameters).record(),save=save)
+        elif action=='local':
+            TASKS[local_task]
+            self.request.update(local_task=local_task,local_brief=self.user_text)
         elif action=='revise':
             version = self.versions[version_id]
             basis = self.versions[version['revision_basis']]
@@ -144,9 +150,10 @@ def discuss_delivery(context, conversation, config, directory):
         '其他参数保持默认，除非本条有明确要求。'
         'revise 复用原片身份与 revision_basis 基础版的方向、参考和该分支已采纳要求；'
         '美化、局部修饰和光调版本只指向所属基础版，其后期像素不继承到整图改稿。'
-        '新要求直接使用本条用户原文。修发和重打光默认沿用基础版 edits，只有明确要求才修改开关。'
+        '新要求直接使用本条用户原文。修发与重打光默认沿用基础版 edits，只有明确要求才修改开关。'
+        '用户明确要求衣物动态、补发或发束造型时使用 local，指定 local_task；基于指定保存版本打开局部编辑，将本条原文存为要求，用户涂选范围后主动生成。衣物动态不走 revise。'
         '改稿会重新生成整幅画面，未指定区域也可能变化，新稿另存后用于比较，不自动采用交付。'
-        '用户要涂选范围内的局部修饰或单独修脸时说明应使用对应编辑入口。'
+        '单独修脸使用人脸美化入口；单纯曝光、色彩和曲线调整使用固定算法 tone，不走生图。'
         '只有本条明确要求保存才 save=true；另存不采用交付，采用只接受已有版本。'
         '工具登记后回复即将执行，不声称已完成；返回 JSON 的 reply 字段。',
         images,config,directory/'response.json',task=task,conversation=history,actions=actions,

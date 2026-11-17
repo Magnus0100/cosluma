@@ -67,7 +67,7 @@ MODELS = {
         'note': '面部定位填写 fgtbt.safetensors。美化页明确选择本张人脸范围，FGTBT 直接分析该裁片，使用统一 124 点的 WFLW 98 点子集。'},
     'local': {
         'title':'可选局部修饰 · Qwen-Image-2.1',
-        'use':'补发、发束造型和双下巴共用。INT8 ConvRot 生成模型约 7.26 GB、Qwen3-VL 8B BF16 编码器约 17.53 GB、BF16 VAE 约 676 MB。',
+        'use':'补发、发束造型和衣物动态共用。INT8 ConvRot 生成模型约 7.26 GB、Qwen3-VL 8B BF16 编码器约 17.53 GB、BF16 VAE 约 676 MB。',
         'page':'https://huggingface.co/Comfy-Org/Qwen-Image-2.1',
         'target':'models',
         'note':'需支持 TextEncodeQwenImage21、QwenImage21Cache 与 INT8 ConvRot 的 ComfyUI；复制 providers/comfyui_cosluma_local 到 custom_nodes 后重启。CosLumaQwenLocalEdit 在独立进程中编码，释放 CPU BF16 文本编码器后加载指定生成模型；无损 KV 缓存使用 CPU 内存，VAE 固定分块。命令下载固定 INT8 生成模型及 BF16 编码器、VAE，不更改 BeautyGRPO 所用 Diffusers。'}

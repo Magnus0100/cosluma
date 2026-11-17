@@ -3,6 +3,9 @@
 项目代码许可见根目录 [LICENSE](../LICENSE)。本目录中的上游许可证与版权声明
 保持原文，各组件版权归其作者所有。
 
+README 中的例图出镜为抖音「奶糕Naige」。照片已获授权用于本项目 README 展示；
+`docs/images/readme/` 中的照片、衍生展示图及截图中的照片不适用项目代码的 GPL 许可。
+
 当前代码直接使用 PySide6/Qt、NumPy、Pillow、pillow-heif/libheif、OpenCV、SciPy、rawpy/LibRaw、
 color-matcher。相关依赖的许可文本保存在各组件目录中。
 Windows 发布包同时包含 Python 与 PyInstaller 引导程序及其许可；发布源码包含构建配置。
@@ -42,7 +45,7 @@ Qt/PySide、LibRaw 等组件保留各自许可。Windows 包使用独立的动�
 
 [PIXLRelight](https://github.com/mlfarinha/pixlrelight/tree/f8cb2dba4d08b3dfcd392cf9b2946a11f1f48c23) 上游源码、DINOv3 层及相关声明由部署者原样保留在仓库外模型目录；本仓库提供独立编写的节点与光照场适配，不打包这些源码和权重。上游代码声明 MIT，模型为 CC-BY-NC-4.0；其第三方 DINOv3 部分遵循随文件提供的 DINOv3 条款。[Marigold-IID-Lighting](https://huggingface.co/prs-eth/marigold-iid-lighting-v1-1) 按模型页及随权重的 OpenRAIL++ 条款使用。
 [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) 的权重和 ComfyUI 格式文件只在服务端读取，不随软件分发，按模型页的 Qwen Research License Agreement 与各组件随附声明使用，格式转换或量化不改变模型许可。局部修饰的独立进程调用已有 ComfyUI 编辑接口，明确指定检查点、BF16 文本编码的 CUDA/CPU 卸载与 VAE 分块布局，不复制 Qwen 推理源码。DynamicVRAM 使用服务已安装的 `comfy-aimdo`，其随包许可为 GPL-3.0；该原生库只在服务端使用，不随桌面包分发。
-[MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) 的检查点和 Comfy-Org 量化版本仅在模型服务端安装，不随本软件分发；采用其 [2026-11-10 社区许可](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/492fd8c4eca666f1085f57e30738c1e0d86b3439/LICENSE)，不是 Apache-2.0，也不由本项目 GPL 重新授权。许可排除欧盟、英国、韩国和美国；年化营收超过 100 万美元或向第三方提供托管服务需取得 MiniMax 另行书面授权。部署者应自行核对完整许可与适用地域，本适配仅调用独立安装的 ComfyUI 原生推理接口，不复制模型实现或分发提示词增强权重。
+[MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) 的检查点和 Comfy-Org 量化版本仅在模型服务端安装，不随本软件分发；采用其 [2026-11-10 社区许可](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/492fd8c4eca666f1085f57e30738c1e0d86b3439/LICENSE)，不是 Apache-2.0，也不由本项目 GPL 重新授权。许可排除欧盟、英国、韩国和美国；年化营收超过 100 万美元或向第三方提供托管服务需取得 MiniMax 另行书面授权。部署者应自行核对完整许可与适用地域，本适配仅调用独立安装的 ComfyUI 原生推理接口，DynamicVRAM 使用服务已有的 GPL-3.0 `comfy-aimdo`，不复制模型实现或分发提示词增强权重。
 Diffusers、Transformers、Accelerate 与 PEFT 仅在模型服务环境安装，各自的 Apache-2.0 许可随安装保留。[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) 用于用户明确选择的 NF4 底座加载，其 MIT 许可随服务环境安装保留；量化不改变底座或 LoRA 的许可。
 内置 `providers/prompts.json` 含 260 条分类摄影参考，每条保留来源；项目原创 4 条使用 GPL-3.0-or-later。
 其余条目来自以下明确授权的上游版本，随附许可证原文，不包含原始图片：

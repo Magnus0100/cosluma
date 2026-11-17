@@ -1,185 +1,147 @@
 # CosLuma
 
-**为 Cosplay 摄影设计的 AI 后期工作台。** 先讨论方向、比较真实样片，再批量制作；用原片人物细节参与合成，保留身份与摄影质感。
+Cosplay 摄影后期工作台。通过对话制作样片、批量成片，并保留手动精修与版本选择。
 
-简体中文 · [English](README.en.md)
+[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/tag/v0.44.0) · [English](README.en.md) · [开始使用](#开始使用) · [部署](#部署) · [许可](LICENSES/README.md)
 
-[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/tag/v0.44.0) · [第三方许可](LICENSES/README.md) · [开发约定](AGENTS.md)
+Windows x64 · 中文界面 · 源码 **0.46.0** · 下载包 **0.44.0**（尚未包含当前源码的全部更新）
 
-Windows x64 · 中文界面 · 源码 / 桌面发布版 0.44.0
+| 原片 | 成片 · 开启修发与重打光 |
+| :---: | :---: |
+| ![奶糕Naige原片](docs/images/readme/original.jpg) | ![修发与人物重打光成片](docs/images/readme/hair-relight.jpg) |
 
-## 能做什么
+出镜：抖音 **「奶糕Naige」**，已授权用于本项目 README 展示。
 
-- **对话或手动制作**：在聊天中明确要求探索三个方向、沿指定样片改稿、定稿或制作整组；同样保留全部操作按钮。
-- **从想法到样片**：结合角色、原片和讨论，为同一张代表原片制作三个完整方向；选中一张后可继续改稿。
-- **定稿后制作整组**：沿用选定方向和样片，默认四张并行；制作范围包含样片原片时直接复用成片。
-- **保留人物身份**：使用原片身份区域，进行整体等比对齐、光色匹配与浮点融合。修发、人物重打光独立可选，默认关闭。
-- **成片后精修**：按需美肤、瘦脸、补发、调整发束或修饰颈部；涂好局部范围后可通过对话记要求、生成或另存，保留基础成片与历史版本。
-- **对话或手动调色**：在已保存版本上调整整图曝光、明度曲线、暖冷、绿洋红与饱和度，使用固定算法另存光调版。
-- **项目与交付管理**：独立保存照片、讨论、样片和版本；逐张或明确采用一轮批量光色成功版，通过按钮或对话复制已有 PNG / JPEG，并保存逐张交付清单。
-- **围绕成片继续对话**：在交付页讨论当前照片，明确要求比较、采用、固定算法调光、批量另存光色，或沿所选分支制作一张新稿。
+## 功能
 
-## 开始使用
-
-下载 `CosLuma-0.44.0-windows-x64.zip`，**完整解压**，运行 `CosLuma/CosLuma.exe`。桌面包已包含 Python 和图像处理依赖。
-
-**模型服务、模型权重和账号需自行配置，不随桌面包提供。** 基础制作需要：
-
-| 服务 | 要求 |
+| 功能 | 用法 |
 | --- | --- |
-| 摄影 Agent | 兼容 Chat Completions，支持系统消息、图片输入、工具调用与 JSON 内容输出 |
-| 整图生图 | 图像编辑接口，支持 multipart `image[]`；原片加风格参考需要同时接收两张图，返回图片 URL 或 `b64_json` |
-| 分割与超分 | 部署 SAM3.1 和超分模型的 ComfyUI，可使用同一服务 |
+| 样片与批量 | 讨论要求，探索三个真实样片；定稿后沿用方向与参考批量制作 |
+| 身份保留 | 从原片提取身份区域，整体等比对齐并融合光色 |
+| 修发与重打光 | 基础制作的两个独立选项，默认关闭 |
+| 光色与人脸 | 固定算法调色；可选美肤与瘦脸，强度从零开始 |
+| 头发与衣物 | 在已保存版本上补发、调整发束造型或增加衣物动态 |
+| 版本与交付 | 比较、另存、选择交付版本，直接复制已有 PNG / JPEG |
 
-服务可以在本机或远端。使用远端服务时，照片和提示词会发送到所配置的服务。
+对话与手动控件共用处理入口。浏览、切页和恢复项目只读取记录；生成、另存、采用与导出由用户发起。
 
-### 使用流程
+![CosLuma创作界面与三个已保存样片](docs/images/readme/workspace.jpg)
 
-1. **新建项目、配置连接**：填写服务地址与密钥，选择模型，或导入已有配置。连接页的“模型下载”提供上游地址、安装位置和命令。
-2. **导入照片、填写角色**：支持常见图片、HEIC / HEIF 和相机 RAW。勾选决定制作范围，高亮行只改变预览；代表原片单独选择。
-3. **讨论并试样**：说明想保留和改变的内容，按需开启修发或重打光，再说“探索三个方向”或点击同名按钮。可说“沿这张改一稿”，也可重新探索。
-4. **明确定稿、批量制作**：选定满意的完整样片，或明确说“采用第二张并制作整组”，制作勾选照片。某张失败时，其他照片继续；错误显示在对应步骤。
-5. **选择版本、导出**：在“作品”中打开“全部作品”逐张采用版本，或明确采用最近一轮光调成功版；先设置交付位置，再通过按钮或对话导出已有文件。每次交付附带逐张清单，需要时再主动进行美化、局部修饰或单张改稿。
+## 效果
 
-项目恢复、切页和浏览读取已有记录；制作、改稿和可选精修由用户发起。
+| 碧荷映绯弦 | 金汀听玉声 | 晴水照白莲 |
+| :---: | :---: | :---: |
+| ![绿色莲池方向](docs/images/readme/style-1.jpg) | ![暖金水岸方向](docs/images/readme/style-2.jpg) | ![晴水白莲方向](docs/images/readme/style-3.jpg) |
 
-### 界面布局
+同一原片的三个基础样片，均关闭修发、重打光与人脸美化。
 
-连接设置按“摄影助手 / 图像编辑 / 分割与超分 / 保存位置”直接切换，保存按钮固定显示。填写或修改服务地址与密钥后，自动在后台读取模型列表；输入框支持搜索、选择和手动填写，不自动替换已有模型。摄影助手与图像编辑读取服务的 `/models`，分割与超分读取 ComfyUI 对应加载节点的已安装文件列表；读取失败显示原因，仍可手动保存，刷新按钮可主动重新读取。列表仅保留在本次设置窗口，不写入配置，不调用模型。切换分类不校验、不保存；已读取的列表不重复请求。未启用的重打光连接收起字段，填写值保留到本次保存或取消。已有本次制作结果时，定稿信息与批量制作按钮在“制作设置”中展开；没有制作记录时直接显示。制作记录中的精修入口集中在“调整照片”，文件入口集中在“文件”；照片列表显示文件名与状态，失败详情保留。
+| 仅修发 | 仅人物重打光 |
+| :---: | :---: |
+| ![整理碎发与长发飘动](docs/images/readme/hair.jpg) | ![暖金侧光重打光](docs/images/readme/relight.jpg) |
 
-左侧固定“项目 / 照片 / 创作 / 作品”导航，底部“设置”集中连接与配置导入；顶部显示所在页面和当前项目。项目首页按名称或角色搜索，显示真实项目状态与代表照片；没有项目、搜索无结果、项目未导入照片或读取失败时分别提供对应说明。照片页的列表用单行省略显示长文件名，勾选、行高亮与试样原片继续独立保存；“整理照片”和“文件”菜单保留批量选择与原文件入口，保存目录和输出尺寸在“更多设置”。创作页突出照片和对话，创作要求、历史轮次与比较按需展开。
-
-交付视图左侧选片、中间看图、右侧对话；精修入口集中在“调整照片”，交付目录、格式、比较对象和交付记录在右侧“交付设置”，导出按钮固定在底部。美化、光色和局部修饰默认打开“对话”，滑杆、参考图与详细要求在“手动调整 / 手动设置”；必要的选脸、涂画与生成入口仍可直接操作，另存按钮不随参数滚动。照片默认单张显示，可切换“对比”及 100% 查看。创作、交付与三个精修页面共用消息气泡和输入区，消息保留发送时的查看对象与执行状态。界面保留功能名称、实际状态和必要操作提示，不放宣传标题或示例要求；空对话显示“暂无对话”。各处对话支持 Ctrl + Enter 发送，Enter 换行；切页、展开和浏览不调用模型。
-
-## 输出与处理方式
-
-默认请求**长边 6000 像素**，保存带 sRGB 配置的 **16 位 PNG** 和同结果的 **8 位 JPEG**。原片只读，成片另存。
-
-```text
-原片 + 角色与方向 → 模板提示词编写 → 独立提示词审查 → 整图生图 → 必要时一次模型超分
-→ SAM3.1 原片身份区域 → SIFT 等比对齐 → MKL 仿色 / 可选重打光
-→ float32 蒙版融合 → 可选明度曲线 → PNG + JPEG
-```
-
-- 关闭修发时保留原片整头；开启时保留脸、耳与具体实体头饰，采用生成头发。原片服装与道具默认保留其设计。
-- 基础链不以局部形变塑脸。人物重打光使用预测光照场调制原片像素，替代普通 MKL 仿色。
-- 整图生图会重新生成画面；身体、背景等区域可能变化。发丝、半透明材质、硬阴影和大幅几何差异仍可能产生融合接缝。
-- 模型环节包含 8 位输入输出，16 位保存不代表全链具有原片精度。只超分一次，覆盖不足时按实际尺寸保存。
-- 失败保留已有文件与错误记录；重新制作由用户发起。模型和设备按连接配置使用。
-
-对话 Agent 只获得当前阶段的参考库查询和摄影操作工具，通过本机 Python 调用现有制作链；没有代码编辑、Shell 或任意文件操作工具。每条消息最多发起一次摄影操作，询问和浏览不自动制作，恢复历史记录不执行旧操作。创作对话支持探索、改稿、定稿与批量；交付页支持已有版本的比较、采用、调光与单张改稿；光色页的对话支持曝光、曲线、暖冷、绿洋红、饱和度和明确要求的另存。美化与局部范围选择保留在对应界面；局部修饰页可在已涂范围内对话发起操作。
-
-在“作品”的交付视图右侧直接与 Agent 对话。每条消息冻结发送时的照片、右侧交付版本、左侧比较对象和实际查看模式，只附上该模式中的图片；运行中继续浏览不会改写目标。`request_saved_photo` 只接受这张照片已有的版本 ID，通过与按钮相同的入口比较或采用；采用保留交付勾选。调光请求直接传给现有光调编辑器，不在那里重复调用模型；以指定的已保存 PNG 为底图，默认先预览，明确要求另存才保存，保存后将新版放到左侧比较，右侧交付选择保持原样。讨论、输入草稿和实际执行状态随项目保存，恢复与浏览不执行历史操作。
-
-明确说“沿左侧把背景改暗一稿”等要求时，交付对话复用“调整照片 → 重新创作这张”的单张制作入口。原文直接作为本张新要求，沿用指定版本所属基础成片的方向、JPEG 风格参考及该分支已采纳要求，其他分支与项目要求保持独立。修发与人物重打光默认沿用基础版，仅在本条明确要求时调整开关；美化、局部修饰与光调版本的后期像素不会继承到整图改稿。提示词编写和独立审查后只调用一次 `finish_photo`，仍以原片保留身份；整幅画面重新生成，不保证其他区域像素不变。完成后自动将新稿放到发送时那张照片的左侧比较，右侧交付选择与勾选保持原样。失败显示实际步骤并保留文件与记录，恢复讨论不继续旧任务。
-
-在局部修饰页默认显示的“对话”中，先手动选择补发、发束造型或颈部任务并涂出范围。`request_local_edit` 只可追加本条用户原文到具体要求、按当前范围生成或另存已有结果；不能修改任务、蒙版、形状标记、参考图、引擎或任意文件。对话附上保存底图的范围和标记预览；实际在看修饰结果时另附写回后的结果局部，已选参考图单独标明。每条记录保存发送时的底图、任务、要求、范围与标记散列和查看模式。普通讨论不修改草稿；“先记下”只追加原文，后者覆盖冲突要求。生成仍复用现有 `generate_local`、任务模板编写与独立审查，默认先预览；明确要求“生成并另存”则连续保存，或之后单独说“另存当前结果”，不重新生成。手动按钮保留，范围外继续沿用底图像素，保存不自动采用为交付。三个任务分别保存讨论、输入和涂画草稿；切任务、离页回来或恢复项目不重放操作，失败不自动继续生成或保存。
-
-在成片页点击**光色调整**，或从交付视图的“调整照片”打开光色调整，以当前选中的已保存 PNG 为底图。曝光范围为 ±2 EV；暖冷与绿洋红范围均为 −1 至 1，正值分别偏暖、偏洋红，属于相对 RGB 平衡，不是开尔文色温。饱和度范围为 0 至 2，0 为黑白、1 为原值。固定处理顺序是：解码到线性光 → 曝光 → RGB 通道增益（归一化以保留中性灰明度）→ 围绕线性明度调整饱和度 → 截断出色域值并编码回 sRGB → 整图明度曲线。曲线固定黑白端点，分别调节 25%、50%、75% 明度的输出，三个输出范围为 0.05–0.40、0.40–0.60、0.60–0.95。整图采用同一参数，脸部与其他区域共同调整，不改变几何或单独美化脸部；强曝光、色彩平衡或饱和度可能剪切通道。手动操作无需模型；编辑页的 `adjust_tone` 与交付页的 `request_saved_photo` 共用参数及处理函数，只使用 `llm` 理解对话，不调用生图。参数相对本次打开的版本，恢复初始值精确保留底图像素；曝光、暖冷、色调为 0，饱和度为 1，曲线为 0.25/0.5/0.75。修改只保存草稿，另存须点击按钮或明确提出；预览与另存均从原尺寸 float32 像素处理，100% 查看使用真实尺寸显示图。离页释放原尺寸缓冲，回来读取底图与草稿，不重放对话操作。新版本保留父版本与全部参数记录，保存为 16 位 PNG 与同结果 JPEG，在交付中明确采用后才改变交付选择。
-
-光色页的**按此参数另存交付勾选照片**将当前全部参数用于点击时交付勾选照片各自选定的已保存版本；成片页打开的普通单张编辑器不提供此批量按钮。也可在交付对话明确说“把这些光色参数应用到交付勾选照片并分别另存”，由 `request_saved_photo` 的 `tone_batch` 操作执行；照片、版本与参数冻结发送时状态，运行中浏览或改勾选不改变本次目标。批量复用 `save_tone`，逐张从原尺寸 float32 读取、处理和另存，完成后释放本张缓冲，不调用生图或逐张 LLM，也不自动匹配每张光色。统一参数未必适合曝光或受光不同的照片，可继续单张调整。成功结果放到各照片的比较侧，交付版本和勾选保持原样；部分失败保留成功文件和逐张错误，不自动重试或标成全部完成。项目内 `tone-batches/*/batch.json` 记录实际底图、父版本、参数、文件与状态，可从交付页的“管理作品”打开**最近批量光色记录**读取最近一轮，恢复项目不重新执行。
-
-**从成片到交付**：交付页右侧“交付设置”的“设置交付位置”只保存本项目的目标父目录，不导出；后续“导出所选”复用该位置。从“管理作品”选择“采用最近光调成功版”，或明确说“采用最近这轮光调成功版”，才将该轮已保存的成功结果设为各张交付版本，保留原勾选，并把之前版本放到比较侧；失败或缺失的结果逐张说明，不能用旧版顶替。
-
-对话的 `complete_delivery` 只提供三种操作：`adopt_batch` 采用资料中明确的一轮；`export` 复制发送时已勾选的交付版本；`adopt_batch_and_export` 采用该轮并只导出本轮成功采用且发送时已勾选的照片。每次讨论提供最近三轮的真实记录 ID、参数与逐张状态，范围和版本在发送时冻结，运行中浏览或改勾选不改写本次任务。导出目录来自界面已设置位置，不接受 Agent 任意路径；用户明确指定 PNG / JPEG 时只影响本次导出，未指定则沿用发送时界面格式。询问、比较、满意等表态不算采用或导出，也不自动衔接到后续任务。
-
-采用与导出均复用手动入口的本机函数，不调用生图、不重新编码。每次交付在新目录内写入 `delivery.json`，随逐张复制更新；记录发送时选择、来源版本、实际源文件和目标文件、尺寸、格式、成功或失败，联合采用导出还保留采用结果。部分失败保留已经复制的文件与错误，临时文件按次清理；旧交付目录不会随新制作或版本选择改变。项目恢复只读取位置、选择、讨论和交付记录，不重新采用或导出。
-
-整图生成、Qwen / H3 局部生成与 BeautyGRPO 美肤基础生成，都使用内置任务模板，由独立的提示词编写和审查子 Agent 顺序处理；两次调用复用 `llm` 连接，各自使用独立上下文。审查仅检查提示词是否符合任务，不做成片评分，也不要求用户额外校验；未通过时显示具体问题并保留响应，不自动改写或重试。BeautyGRPO 指令保持官方原文。分析、超分、滑杆、融合与保存继续使用各自固定实现，不经过这两个提示词调用。整图生成保留原有编写调用，新增一次审查；局部生成与美肤基础各新增编写和审查两次 LLM 调用。记录保存在该次工作目录的 `generation-prompt.json` 及原始响应中。
-
-人脸美化页默认显示“对话”，手动滑杆在“手动调整”。用户先手动框选人脸并分析；对话不能改变范围、模型或提示词。`request_face_beauty` 的 `adjust` 将美肤、瘦脸与五官保护设为完整参数，未提到的值沿用发送时设置，强度 0–1 对应手动滑杆 0–100；调整复用已有人脸分析、美肤基础和固定算法。没有美肤基础时不会自动生成。只有明确要求生成或重新生成美肤基础，才通过 `generate_skin` 调用原有 BeautyGRPO、模板编写与独立提示词审查；生成本身保持当前强度，用户明确要求参数才修改。明确要求另存才保存原尺寸 16 位 PNG 和同结果 JPEG，保存不改变交付采用版本。归零恢复底图像素，手动滑杆和按钮继续可用。
-
-美化讨论冻结发送时的底图、分析会话、参数与实际查看模式；附图只包含该模式的美化前、后或两个人脸局部，历史保留当时资料和执行状态。询问和满意表态不触发操作，普通对话失败不使已有结果失效；生成失败取消后续保存并保留错误，不自动重试。按钮与对话生成美肤基础都不会自动提高强度。讨论和未发送文字随底图保存，离页后释放原尺寸缓冲，回来只读取记录和更新显示；已明确发起的生成与另存可以在离页后完成，恢复记录不重放操作。
+这两张沿莲池样片整图改稿，背景也会变化。修发开启时保留原片脸、耳与实体头饰；关闭时保留原片整头。重打光协调人物、服装、道具与环境受光。
 
 <details>
-<summary><strong>模型服务部署与配置</strong></summary>
+<summary>尺寸与 100% 局部</summary>
 
-### 配置位置
+例图来自真实制作结果：原片 6000 × 4000，模型原生输出 1536 × 1024，经一次 4 倍模型超分及下采样，保存为 6000 × 4000 的 16 位 PNG 和同结果 JPEG。页面整图为缩略展示，未使用成片后的人脸美化或局部修饰。
 
-默认配置为 `~/CosplayWorkbench/config/cosluma.json`，可用 `--config` 或 `COSLUMA_CONFIG` 指定。项目默认保存在 `~/CosLuma/projects/`，每个项目有独立的 `project.json` 和工作目录。
-
-配置模板见 [settings.example.json](providers/settings.example.json)。密钥可由环境变量或独立文件提供；界面保存密钥时，JSON 只记录文件路径。
-
-| 配置项 | 用途 |
-| --- | --- |
-| `llm` / `image` | 摄影 Agent / 整图编辑的地址、模型和凭据 |
-| `head` / `sr` | 分割 / 超分的 ComfyUI 根地址与模型名 |
-| `relight` / `beauty` / `local_edit` | 可选重打光 / 美化 / 局部修饰 |
-| `workers` / `output_long_edge` | 并行张数 / 输出长边，默认 `4` / `6000` |
-| `prompt_library` | 留空或 `null` 使用内置分类参考库；自定义库为 JSON 数组，条目含 `title`、`text`、`source` |
-
-### 基础 ComfyUI
-
-服务需提供 `SAM3_Detect` 节点及标准图片上传、任务提交和结果接口。模型名称填写服务实际加载的文件名：
-
-| 目录 | 默认文件 |
-| --- | --- |
-| `models/checkpoints/` | `sam3.1_multiplex_fp16.safetensors` |
-| `models/upscale_models/` | `4xNomos2_hq_atd.safetensors` |
-
-若服务尚未包含 SAM3 文本编码器 512 维投影修正，可在 ComfyUI 目录应用 [投影补丁](providers/patches/comfyui-sam3-clip-projection.patch)：`git apply --ignore-space-change <CosLuma>/providers/patches/comfyui-sam3-clip-projection.patch`，然后重启。
-
-### 可选模型
-
-在服务端把所需的 `providers/comfyui_cosluma_*` 文件夹复制到 `ComfyUI/custom_nodes/`，用该服务已有 Python 安装缺少的依赖并重启。桌面更新后，节点代码需在服务端单独更新。下载入口提供具体文件与命令。
-
-| 功能 / 节点目录 | 权重与默认推理参数 |
-| --- | --- |
-| 重打光 · `comfyui_cosluma_relight` | 完整 PIXLRelight + Marigold-IID-Lighting v1.1；512 分析画布，网络 BF16，Marigold 单步 FP16，输出 float32 光照场；`cuda:0`、seed 42 |
-| 美化 · `comfyui_cosluma_beauty` | 完整 BeautyGRPO LoRA + 官方 `FluxKontextPipeline`；1024 输入、28 步、guidance 2.5、seed 42；FGTBT WFLW 98 点定位，FaceXFormer 皮肤解析 |
-| 局部修饰 · `comfyui_cosluma_local` | 默认 Qwen-Image-2.1 INT8 ConvRot，Qwen3-VL 8B 与 VAE 为 BF16；1024 面积分辨率、40 步、cfg 1、Euler/simple、seed 42 |
-| 局部修饰 · `comfyui_cosluma_h3` | 可选 MiniMax-H3-Image INT8 ConvRot，Qwen3-VL 32B NVFP4 AWQ，VAE FP16；2048 面积分辨率、6 步、cfg 1、Euler/simple、seed 42 |
-
-“面积分辨率”按输入宽高比换算，分别约 1 MP / 4 MP；模型文件位于服务机器，不随桌面分发。
-
-**重打光**：默认目录为 `models/cosluma_relight/pixlrelight`（上游源码、`model.safetensors`、`config.yaml`）与 `models/cosluma_relight/marigold-iid-lighting-v1-1`。可通过 `relight.model_directory`、`intrinsics_directory`、`device`、`seed` 指定；设备也可明确选 `cpu`。节点另需 `addict==2.4.0`、OmegaConf。
-
-**美化**：`models/diffusers/FLUX.1-Kontext-dev/` 放完整官方 Diffusers 目录；`models/loras/beautygrpo.safetensors` 放完整 LoRA；`models/cosluma_face/` 放 `facexformer.safetensors` 与 `fgtbt.safetensors`。原始分析权重用 [FaceXFormer 转换器](providers/convert_facexformer.py) 和 [FGTBT 转换器](providers/convert_fgtbt.py) 提取为推理文件。
-
-`beauty.memory=bnb_nf4` 为 16 GB 显存的默认布局：Transformer 使用 NF4 / double quant / BF16 计算，完整 BF16 T5 由 Accelerate CPU offload，CLIP 与 VAE 保持 BF16；完整 LoRA 保留。`cuda` 布局将整套模型放入显存。分析设备用 `beauty.analysis_device` 指定，生成设备为 `beauty.inference_device=cuda:0`。Windows 服务使用 `PYTORCH_ALLOC_CONF=backend:native`、`PYTORCH_CUDA_ALLOC_CONF=backend:native`，启动参数为 `--disable-dynamic-vram --disable-cuda-malloc`。全流程桌面与参与服务合计运行内存峰值要求不超过 30 GB。
-
-**局部修饰文件**：生成权重放 `models/diffusion_models/`，文本编码器放 `models/text_encoders/`，VAE 放 `models/vae/`。
-
-| 引擎 | 生成权重 / 文本编码器 / VAE |
-| --- | --- |
-| `local_edit.engine=qwen` | `qwen_image_2.1_int8_convrot.safetensors` / `qwen3vl_8b_bf16.safetensors` / `qwen_image_2.1_vae_bf16.safetensors` |
-| `local_edit.engine=h3` | `minimax_h3_image_pruned_int8_convrot.safetensors` / `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` / `minimax_h3_image_vae_fp16.safetensors` |
-
-Qwen 的独立推理进程显式初始化服务已有的 ComfyUI DynamicVRAM，以文件映射加载权重，避免复制完整文本编码器。BF16 文本编码器使用 CUDA 与 CPU 卸载，编码完成后释放，再加载扩散模型；权重、精度与 40 步推理参数保持配置值。VAE 分块 512、重叠 64。H3 参数在 `local_edit.h3`，需要原生 H3 支持；颈部输入整图，发丝输入细节图与长边 1536 的整图上下文。两种引擎仅将涂选区域写回原尺寸版本；H3 使用梯度域写回。局部修饰与美化完成后释放本次模型；已保存的结果可继续比较、调节与另存。
+未经缩放的 640 × 640 局部：[原片](docs/images/readme/original-face.png) · [基础成片](docs/images/readme/result-face.png) · [仅重打光](docs/images/readme/relight-face.png) · [修发与重打光](docs/images/readme/hair-relight-face.png)。
 
 </details>
 
-## 源码与接口
+## 开始使用
 
-使用 Python 3.12，模型服务独立部署：
+下载 `CosLuma-0.44.0-windows-x64.zip`，完整解压后运行 `CosLuma/CosLuma.exe`。桌面包包含 Python 和图像处理依赖，模型服务与权重另行配置。
+
+| 必需连接 | 要求 |
+| --- | --- |
+| 摄影助手 | Chat Completions 接口，支持图片、工具调用和 JSON 输出 |
+| 图像编辑 | multipart `image[]` 编辑接口，支持原片与风格参考两张图，返回图片 URL 或 `b64_json` |
+| 分割与超分 | ComfyUI，提供 SAM3.1、超分模型及标准任务接口 |
+
+1. **建项目**：填写连接，导入照片与角色信息。支持常见图片、HEIC / HEIF 和相机 RAW。
+2. **选照片**：勾选制作范围，单独指定代表原片；行高亮只控制预览。
+3. **做样片**：讨论要求，按需开启修发、重打光，再探索三个方向。
+4. **定稿制作**：采用满意样片，制作勾选照片；默认四张并行，逐张保存结果。
+5. **精修交付**：在“作品”中比较和精修，选择交付版本后导出已有文件。
+
+连接设置会按地址与凭据自动获取模型列表，也可手动填写。使用远端服务时，图片与提示词发送至该服务。
+
+### 成片精修
+
+从选中的保存版本打开编辑，结果另存，保留父版本。
+
+| 编辑 | 范围与操作 |
+| --- | --- |
+| 光色 | 整图曝光、暖冷、绿洋红、饱和度与明度曲线；可对交付勾选照片批量应用 |
+| 人脸美化 | 手动选脸并分析，主动生成美肤基础后调整美肤、瘦脸；归零恢复底图 |
+| 补发与露网修补 | 细节图加整图上下文，仅写回涂选范围 |
+| 发束造型、衣物动态 | 整图生成，按实际新旧部件轮廓提取，再排除原片前景与用户保护区 |
+
+三个局部任务统一使用连接中选择的 Qwen-Image-2.1 或 MiniMax-H3-Image。涂选定位原部件，形状标记与外观参考可选；新轮廓由模型结合完整画面决定。蓝色画笔保护需要保留的区域。
+
+生成后可调整蒙版，主动“按当前范围重新合成”，复用已有输出。修改文字或参考只保存草稿，再次生成需主动发起。衣物动态在成片后单独进行。
+
+## 部署
+
+配置模板：[settings.example.json](providers/settings.example.json)。默认配置为 `~/CosplayWorkbench/config/cosluma.json`，可用 `--config` 或 `COSLUMA_CONFIG` 指定。项目默认保存至 `~/CosLuma/projects/`。模型、照片与私人配置放在仓库外；密钥可使用环境变量或独立文件。
+
+<details>
+<summary>模型、权重与推理参数</summary>
+
+基础 ComfyUI 使用 `models/checkpoints/sam3.1_multiplex_fp16.safetensors` 与 `models/upscale_models/4xNomos2_hq_atd.safetensors`。服务缺少 SAM3 文本编码器投影修正时，应用 [对应补丁](providers/patches/comfyui-sam3-clip-projection.patch)。
+
+可选功能需将对应 `providers/comfyui_cosluma_*` 目录复制到服务的 `custom_nodes/`，在服务已有 Python 中安装所需依赖并重启。服务节点需单独更新；权重不随桌面包分发。
+
+| 功能 / 节点目录 | 默认模型与参数 |
+| --- | --- |
+| 重打光 / `comfyui_cosluma_relight` | PIXLRelight + Marigold-IID-Lighting v1.1；512 分析画布，BF16 网络、单步 FP16 Marigold、float32 光照场，`cuda:0`，seed 42 |
+| 美化 / `comfyui_cosluma_beauty` | 完整 BeautyGRPO LoRA + 官方 FluxKontextPipeline；1024 输入，28 步，guidance 2.5，seed 42；FGTBT WFLW 98 点与 FaceXFormer 皮肤解析 |
+| 局部编辑 / `comfyui_cosluma_local` | Qwen-Image-2.1 INT8 ConvRot，Qwen3-VL 8B / VAE BF16；1024 面积分辨率，40 步 |
+| 局部编辑 / `comfyui_cosluma_h3` | MiniMax-H3-Image INT8 ConvRot，Qwen3-VL 32B NVFP4 AWQ、FP16 VAE；2048 面积分辨率，6 步 |
+
+Qwen / H3 均使用 cfg 1、Euler/simple、seed 42。面积分辨率 1024 / 2048 约为 1 MP / 4 MP；实际请求结合原尺寸范围和一次超分倍率计算。
+
+| 目录 | Qwen 权重 | H3 权重 |
+| --- | --- | --- |
+| `models/diffusion_models/` | `qwen_image_2.1_int8_convrot.safetensors` | `minimax_h3_image_pruned_int8_convrot.safetensors` |
+| `models/text_encoders/` | `qwen3vl_8b_bf16.safetensors` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` |
+| `models/vae/` | `qwen_image_2.1_vae_bf16.safetensors` | `minimax_h3_image_vae_fp16.safetensors` |
+
+局部引擎由 `local_edit.engine` 选择，H3 参数位于 `local_edit.h3`。权重放在 NVMe SSD，通过 ComfyUI 的 `extra_model_paths.yaml` 配置路径。两个引擎使用服务已有 DynamicVRAM，以文件映射加载编码器和扩散权重，按阶段释放模型；Qwen VAE 分块 512、重叠 64，H3 VAE 解码固定 CUDA 驻留。补发整图上下文长边最多 1536。Qwen 接收蒙版参考，H3 不接收蒙版；H3 结果使用梯度域融合。
+
+BeautyGRPO 底座为 `models/diffusers/FLUX.1-Kontext-dev/`，LoRA 为 `models/loras/beautygrpo.safetensors`，分析权重为 `models/cosluma_face/{facexformer,fgtbt}.safetensors`，使用 [FaceXFormer](providers/convert_facexformer.py) / [FGTBT](providers/convert_fgtbt.py) 转换器提取。默认 `beauty.memory=bnb_nf4`：Transformer NF4 / double quant / BF16 计算，完整 BF16 T5 通过 Accelerate CPU offload，CLIP / VAE BF16；`cuda` 为整套显存布局。分析设备由 `beauty.analysis_device` 指定，生成设备为 `cuda:0`。Windows 美化服务设置 `PYTORCH_ALLOC_CONF=backend:native` 与 `PYTORCH_CUDA_ALLOC_CONF=backend:native`，使用 `--disable-dynamic-vram --disable-cuda-malloc`。
+
+重打光目录为 `models/cosluma_relight/pixlrelight`（上游源码、`model.safetensors`、`config.yaml`）及同级 `marigold-iid-lighting-v1-1`；节点另需 `addict==2.4.0` 与 OmegaConf。`relight.device` 可明确选择 `cuda:0` 或 `cpu`。连接中的“模型下载”提供文件与安装命令，各权重许可见 [LICENSES](LICENSES/README.md)。
+
+</details>
+
+<details>
+<summary>制作链与图像质量</summary>
+
+基础链：方向与参考 → 提示词编写与独立审查 → 整图生成 → 按需一次超分 → SAM3.1 原片身份提取 → SIFT 整体等比对齐 → MKL 仿色或 PIXLRelight 重打光 → float32 蒙版融合 → 可选明度曲线 → 保存。
+
+桌面与 CLI 共用 [finish_photo / finish_batch](scripts/photo_pipeline.py)。主对话仅调用注册的摄影工具；提示词按 [任务模板](providers/generation_templates.json) 编写并由独立上下文审查，复用摄影助手连接。非生成编辑使用固定算法。应用内部直接调用 Python API，外部模型服务使用 HTTP；失败保留输出与错误，不自动重试或更换模型。
+
+原片只读，默认请求长边 6000。原片身份 RGB 与蒙版同变换采样一次，合成使用 float32，保存带 sRGB 配置的 16 位 PNG 和 8 位 JPEG。模型与部分蒙版含 8 位环节；超分覆盖不足时按实际尺寸保存。整图改稿会改变未指定区域；局部修饰仅写回最终蒙版内。发丝、透明衣料及大幅几何变化仍可能出现分割或融合接缝。
+
+</details>
+
+<details>
+<summary>源码运行与构建</summary>
+
+在已有 Python 3.12 中运行，模型服务独立部署：
 
 ```powershell
 python -m pip install -r scripts/requirements-desktop.txt
 python -B scripts/qt_workbench.py
 ```
 
-CLI 提供 `styles`（三个样片）、`stylize`（批量）、`compose`（复用生成图）和 `beautify`（成片美化）。`--root`、`--config` 放在子命令前：
+CLI 支持 `styles`、`stylize`、`compose`、`beautify`；全局 `--root` 和 `--config` 放在子命令前。桌面包使用 `CosLuma.exe --cli`。构建安装 `scripts/requirements-build.txt` 后运行 `python -m PyInstaller --noconfirm CosLuma.spec`。开发约定见 [AGENTS.md](AGENTS.md)。
 
-```powershell
-python -B scripts/project_cli.py --root D:/output --config D:/config/cosluma.json styles --source D:/photos --sample D:/photos/a.jpg --character "角色名"
-```
-
-桌面包用 `CosLuma.exe --cli` 进入 CLI。0.28.0 源码移除了应用自己的 HTTP 服务和 `--server` 入口；桌面内部直接调用 Python API，外部模型服务仍通过其配置的 HTTP 接口连接。
-
-- [photo_pipeline.py](scripts/photo_pipeline.py)：唯一单张入口 `finish_photo` 与批量入口 `finish_batch`。
-- [model_clients.py](scripts/model_clients.py)：摄影 Agent、整图编辑与模型服务调用。
-- [photography_tools.py](scripts/photography_tools.py)：绑定消息中样片 ID 的摄影操作工具。
-- [delivery_chat.py](scripts/delivery_chat.py)：冻结成片查看上下文，提供比较、采用、调光、改稿与成组交付工具。
-- [delivery_store.py](scripts/delivery_store.py)：已有版本读取、显式采用与原样文件复制交付，保存逐张交付清单。
-- [local_chat.py](scripts/local_chat.py)：绑定当前局部任务与用户涂选范围的讨论、生成和另存工具。
-- [beauty_chat.py](scripts/beauty_chat.py) / [beauty_editor.py](scripts/beauty_editor.py)：用户选定人脸后的可选美化讨论，与手动参数、生成和保存共用入口。
-- [tone_edit.py](scripts/tone_edit.py) / [tone_editor.py](scripts/tone_editor.py)：固定曝光、明度曲线与色彩调整、受限对话工具、原尺寸编辑与另存。
-- [generation_prompts.py](scripts/generation_prompts.py) / [任务模板](providers/generation_templates.json)：生成提示词编写与独立审查。
-- [image_io.py](scripts/image_io.py) / [head_composite.py](scripts/head_composite.py)：图像读写、身份区域对齐与融合。
-- [providers/](providers/)：模型服务节点与连接模板。
-
-桌面构建：安装 [构建依赖](scripts/requirements-build.txt)，执行 `python -m PyInstaller --noconfirm CosLuma.spec`。开发边界见 [AGENTS.md](AGENTS.md)。
+</details>
 
 ## 许可
 
-代码采用 [GPL-3.0-or-later](LICENSE)。本项目不商用、不盈利；模型权重和第三方组件各自遵循上游许可，部分权重存在非商业或地区限制，详见 [第三方许可](LICENSES/README.md)。
+代码采用 [GPL-3.0-or-later](LICENSE)，项目不商用、不盈利。第三方代码、模型及权重遵循各自许可，见 [LICENSES/README.md](LICENSES/README.md)。例图、衍生图及截图中的照片仅授权本项目 README 展示，不随代码按 GPL 重新授权。

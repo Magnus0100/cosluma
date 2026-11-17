@@ -45,7 +45,7 @@ package = COLLECT(executable,analysis.binaries,analysis.datas,strip=False,upx=Fa
 destination = Path(DISTPATH)/'CosLuma'
 for name in ('README.md','README.en.md','AGENTS.md','LICENSE'):
     shutil.copyfile(root/name,destination/name)
-for name in ('LICENSES','providers'):
+for name in ('LICENSES','providers','docs/images/readme'):
     shutil.copytree(root/name,destination/name,dirs_exist_ok=True,
         ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo','*.tmp','*.log'))
 # Include notices from the versions actually present in the build, including

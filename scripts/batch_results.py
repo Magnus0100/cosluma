@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QLi
     QPushButton, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from studio_widgets import PhotoPreview, ui_label
-from delivery_store import project_photos, result_path, retouch_parent
+from delivery_store import saved_editor_context, beauty_editor_context, project_photos, result_path, retouch_parent
 
 
 class BatchResults(QWidget):
@@ -297,13 +297,7 @@ class BatchResults(QWidget):
             self.show_photo(row)
 
     def open_beauty(self):
-        try:
-            row = self.listing.currentRow()
-            run = json.loads((Path(self.work_directory)/'run.json').read_text(encoding='utf-8'))
-            self.beauty_requested.emit({'name':Path(self.sources[row]).name,'base':self.base_path,
-                'region':run['head']['region'],'directory':self.work_directory,'batch_directory':str(self.directory)})
-        except (OSError,ValueError,KeyError) as error:
-            self.details.setPlainText('无法打开人脸美化：'+str(error))
+        self.open_saved_editor(self.beauty_requested,'人脸美化',beauty=True)
 
     def open_retouch(self):
         self.open_saved_editor(self.retouch_requested,'局部修饰')
@@ -311,14 +305,12 @@ class BatchResults(QWidget):
     def open_tone(self):
         self.open_saved_editor(self.tone_requested,'光色调整')
 
-    def open_saved_editor(self, requested, label):
+    def open_saved_editor(self, requested, label, *, beauty=False):
         row = self.listing.currentRow()
         if row>=0 and self.base_path:
             try:
                 photo = next(photo for photo in project_photos([self.directory]) if photo['source']==self.sources[row])
                 version = next(version for version in photo['versions'] if version['files']['PNG']==self.png_path)
-                requested.emit({'name':Path(self.sources[row]).name,'base':self.png_path,
-                    'directory':self.work_directory,'batch_directory':str(self.directory),
-                    'parent_version':retouch_parent(version)})
+                requested.emit(beauty_editor_context(photo,version) if beauty else saved_editor_context(photo,version))
             except (OSError,ValueError,KeyError,StopIteration) as error:
                 self.details.setPlainText('无法打开'+label+'：'+str(error))

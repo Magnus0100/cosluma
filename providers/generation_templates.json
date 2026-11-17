@@ -1,18 +1,18 @@
 {
   "scene": {
-    "version": 1,
+    "version": 3,
     "writer": "依据本次场景编辑模板和任务资料编写单张整图编辑提示词，遵守下方本次设置与字段格式。仅编写提示词和头部定位，不调用生图，不修改文件或制作参数。",
     "reviewer": "独立审查 candidate 是否忠实表达已采纳的用户要求和本次场景模板。对照原片、摄影方向、风格参考、修发和重打光开关以及 writer_instruction，检查身份、构图、服装和道具取舍是否一致，光色是否连续，head_box 是否对应原片主体整头，开启修发时 headwear 是否来自实际原片。摄影措辞和合理创作差异无需否决；只有具体冲突、遗漏关键要求或图像职责错误才拒绝。不改写提示词，不追加审批或画质评分。返回 JSON：approved 布尔值，issues 具体问题字符串数组；通过时 issues 为空。"
   },
   "qwen_local": {
-    "version": 1,
-    "writer": "按提供的 template_prompt 编写 Qwen 局部编辑提示词。task 指定唯一修饰任务，user_request 是用户原话，image_roles 对应实际图片顺序。保持模板的原图、单独蒙版、造型标记和风格参考职责，只按用户要求细化目标，不增加美化、场景重设计或其他任务。蒙版为模型参考，软件最终只写回用户涂选范围。返回 JSON：prompt。",
-    "reviewer": "独立对照 task、user_request、template_prompt、实际图片和 image_roles 审查 candidate.prompt。检查是否完成本次修饰、使用正确的图片编号与蒙版含义，保留模板画幅，移除造型标记，不擅自美化脸或增加任务。不改写，不评分；仅具体违背要求时拒绝。返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+    "version": 16,
+    "writer": "按 template_prompt 编写 Qwen 局部编辑提示词。task 指定本次任务，user_request 是用户原话，image_roles 对应实际图片顺序。补发以细节图编辑，整图仅作上下文，输出第一张细节图；发束造型与衣物动态使用整图，定位图不限定新轮廓。用户形状标记和外观参考可选。范围保护由软件处理，提示词简短正向表达效果，返回 JSON：prompt。 衣物动态与发束造型先查阅参考库中适合本任务的质感、受光或风感描述，按用户要求简短表达目标。生图模型结合完整照片决定新轮廓与展开位置，具体形状仅取用户明确指定的要求或标记。Qwen 的定位图仅标识原部件，H3 不接收蒙版，图片顺序以 image_roles 为准。这两类造型任务另返回 parts 数组，每项描述原片：part、segment_query 英文部件名词、protected_objects 实际头饰及前景道具配饰、attachment_point 原片可见连接位置（整图 0..1000）。原部件位置用于实例识别，最终写回范围在生成后由实际新旧轮廓确定。补发修网是独立修补任务，按需借鉴参考库，不加入风感或重新造型。",
+    "reviewer": "独立对照 task、user_request、template_prompt、实际图片、image_roles 和已读参考审查 candidate.prompt。核对任务、图片编号与输出画幅，形状标记仅在实际提供时采用，完成图应移除标记；H3 不接收蒙版。发束造型与衣物的原部件定位不限制新轮廓，只有用户明确指定的展开位置与形状才作为要求。补发只修补涂选缺口与露网，不加入发束造型。只对具体冲突或遗漏关键用户要求拒绝，不改写、不评分。返回 JSON：approved 布尔值、issues 字符串数组，通过时为空数组。"
   },
   "h3_local": {
-    "version": 1,
-    "writer": "按提供的 template_prompt 编写 MiniMax-H3-Image 原生图片编辑提示词，使用 <Picture N> 图片标记。保留 task 的单一任务、user_request 原话意图和 image_roles 的实际图片职责；头发编辑输出第一张细节图，完整照片只供上下文，颈部编辑输出整图。H3 不接收蒙版，最终涂选范围由软件写回；不要臆造蒙版输入或像素锁定承诺。提示词简洁，不堆叠额外保护词和负面要求，不额外美化脸或重设计场景。返回 JSON：prompt。",
-    "reviewer": "独立对照 task、user_request、template_prompt、实际图片和 image_roles 审查 candidate.prompt。检查任务与图片编号，发丝细节图和整图参考职责，颈部整图输出，造型标记应从结果移除。H3 没有蒙版图片，不得要求依照虚构蒙版；不得擅自增加人脸美化或场景改造。合理措辞差异无需否决。不改写、不评分；返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+    "version": 16,
+    "writer": "按 template_prompt 编写 MiniMax-H3-Image 原生图片编辑提示词，以 <Picture N> 指代实际图片。task 指定本次任务，user_request 是用户原话，图片顺序以 image_roles 为准。补发输出第一张细节图，整图仅作上下文；发束造型与衣物动态输出整图。H3 不接收蒙版。用户形状标记和外观参考可选。范围保护由软件处理，提示词简短正向表达效果，返回 JSON：prompt。 衣物动态与发束造型先查阅参考库中适合本任务的质感、受光或风感描述，按用户要求简短表达目标。生图模型结合完整照片决定新轮廓与展开位置，具体形状仅取用户明确指定的要求或标记。Qwen 的定位图仅标识原部件，H3 不接收蒙版，图片顺序以 image_roles 为准。这两类造型任务另返回 parts 数组，每项描述原片：part、segment_query 英文部件名词、protected_objects 实际头饰及前景道具配饰、attachment_point 原片可见连接位置（整图 0..1000）。原部件位置用于实例识别，最终写回范围在生成后由实际新旧轮廓确定。补发修网是独立修补任务，按需借鉴参考库，不加入风感或重新造型。",
+    "reviewer": "独立对照 task、user_request、template_prompt、实际图片、image_roles 和已读参考审查 candidate.prompt。核对任务、图片编号与输出画幅，形状标记仅在实际提供时采用，完成图应移除标记；H3 不接收蒙版。发束造型与衣物的原部件定位不限制新轮廓，只有用户明确指定的展开位置与形状才作为要求。补发只修补涂选缺口与露网，不加入发束造型。只对具体冲突或遗漏关键用户要求拒绝，不改写、不评分。返回 JSON：approved 布尔值、issues 字符串数组，通过时为空数组。"
   },
   "beauty": {
     "version": 1,

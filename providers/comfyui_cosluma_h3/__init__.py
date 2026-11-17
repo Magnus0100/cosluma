@@ -60,7 +60,7 @@ class CosLumaH3ImageEdit:
         (directory/'request.json').write_text(json.dumps(settings,ensure_ascii=False,indent=2),encoding='utf-8')
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
-        command = [sys.executable,'-B','-X','utf8','-u',str(Path(__file__).with_name('infer_edit.py')),
+        command = [sys.executable,'-B','-X','utf8','-X','faulthandler','-u',str(Path(__file__).with_name('infer_edit.py')),
             '--comfy-root',str(Path(folder_paths.__file__).parent),'--directory',str(directory.resolve())]
         environment = {**os.environ,'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'}
         flags = subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0

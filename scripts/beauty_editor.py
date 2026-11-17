@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
@@ -212,7 +214,8 @@ class BeautyWorker(QThread):
                     painter.end()
             elif self.phase == 'save':
                 self.progress.emit('保存 16 位 PNG 和 JPEG 美化版')
-                result = save_beauty(self.pixels,self.session,self.parameters)
+                result = save_beauty(self.pixels,self.session,self.parameters,
+                    parent_version=self.context.get('parent_version'))
             self.ready.emit(result)
         except Exception as error:
             self.failed.emit((getattr(error,'provider_message','') or str(error))+
@@ -229,6 +232,9 @@ class BeautyEditor(QWidget):
         super().__init__(parent)
         self.context, self.config = dict(context),dict(config)
         self.llm_config = llm_config
+        key = os.path.relpath(context.get('edit_id',context['base']),context['directory'])
+        identifier = hashlib.sha256(key.encode('utf-8')).hexdigest()[:12]
+        self.draft_directory = Path(context['directory'])/'beauty-drafts'/identifier
         self.session = None
         self.pixels = None
         self.before = None
@@ -376,7 +382,7 @@ class BeautyEditor(QWidget):
         self.chat_history.show_messages(entries)
 
     def restore_discussion(self):
-        path = Path(self.context['directory'])/'beauty-discussion.json'
+        path = self.draft_directory/'discussion.json'
         if not path.is_file():
             return
         try:
@@ -446,12 +452,15 @@ class BeautyEditor(QWidget):
         if not self.isVisible() or self.worker is not None or not self.needs_restore:
             return
         self.needs_restore = False
-        path = Path(self.context['directory'])/'beauty-session.json'
+        path = self.draft_directory/'session.json'
         try:
             if path.is_file():
                 state = json.loads(path.read_text(encoding='utf-8'))
                 self.context['session'] = str(Path(self.context['directory'])/state['session'])
                 self.restored = BeautyParameters(**state['parameters'])
+                self.start('resume')
+            elif self.context.get('session'):
+                self.restored = BeautyParameters(**self.context['beauty_parameters'])
                 self.start('resume')
             else:
                 self.message.setText('点击“选择人脸并分析”，框住本张脸部后开始。')
@@ -618,12 +627,13 @@ class BeautyEditor(QWidget):
 
     def save_draft(self):
         try:
-            save_json(Path(self.context['directory'])/'beauty-discussion.json',
+            self.draft_directory.mkdir(parents=True,exist_ok=True)
+            save_json(self.draft_directory/'discussion.json',
                 {'base':self.context['base'],'messages':self.messages,'input':self.chat_input.toPlainText(),
                     'tab':self.editor_tabs.currentIndex()})
             if self.session is not None:
-                save_json(Path(self.context['directory'])/'beauty-session.json',
-                    {'session':self.session.directory.name,'parameters':asdict(self.parameters())})
+                save_json(self.draft_directory/'session.json',
+                    {'session':self.session.directory.name,'parameters':asdict(self.parameters()),'base':self.context['base']})
         except OSError as error:
             self.message.setText('保存美化草稿失败：'+str(error))
             return False

@@ -26,6 +26,7 @@
   },
   "sr": {
     "url": "http://127.0.0.1:8188",
-    "model": "4xNomos2_hq_atd.safetensors"
+    "model": "4xNomos2_hq_atd.safetensors",
+    "scale": 4
   }
 }

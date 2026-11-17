@@ -47,7 +47,7 @@ jobs:
           from relighting import RELIGHT_DEFAULTS
           for path in [*Path("scripts").glob("*.py"), *Path("providers").rglob("*.py")]:
               ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-          assert set(TASKS) == {"hair_repair", "hair_shape", "neck"}
+          assert set(TASKS) == {"hair_repair", "hair_shape", "clothing"}
           cv2.SIFT_create()
           source = np.random.default_rng(0).uniform(.1, .8, (16, 16, 3)).astype(np.float32)
           assert render_tone(source, ToneParameters()) is source

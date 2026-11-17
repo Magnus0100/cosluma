@@ -82,9 +82,15 @@ def project_photos(batches):
                     for kind,field in (('PNG','final'),('JPEG','jpeg')):
                         recorded = Path(saved['files'][field])
                         beauty_files[kind] = str(path.parent/(recorded.name if recorded.is_absolute() else recorded))
+                    parent = saved.get('parent_version') or {}
+                    beauty_common = {**common,'description':parent.get('description',common['description'])+
+                        f'\n人脸美化：美肤 {parameters["skin"]:g} / 瘦脸 {parameters["slim"]:g}'}
+                    for key in ('retouches','tone_parameters'):
+                        if key in parent:
+                            beauty_common[key] = deepcopy(parent[key])
                     photo['versions'].append({'id':str(path),'kind':'beauty','label':label,
                         'short_label':f'制作 {number}{revision_label} · {treatment} · 美化 {edit_number}','parameters':parameters,
-                        'files':beauty_files,**common})
+                        'files':beauty_files,'parent_version':parent,**beauty_common})
                 from local_retouch import TASKS
                 for edit_number,path in enumerate(sorted(Path(work).glob('retouch-*/edit-*/retouch.json')),1):
                     if any(version['id']==str(path) for version in photo['versions']):
@@ -92,17 +98,20 @@ def project_photos(batches):
                     saved = json.loads(path.read_text(encoding='utf-8'))
                     if saved['status']!='complete':
                         continue
-                    treatment_name = TASKS[saved['task']][0]
+                    treatment_name = saved.get('task_label') or TASKS.get(saved['task'],(saved['task'],))[0]
                     files = {kind:str(path.parent/Path(saved['files'][field]).name)
                         for kind,field in (('PNG','final'),('JPEG','jpeg'))}
                     parent = saved.get('parent_version') or {}
-                    retouches = parent.get('retouches',[])+[{'task':saved['task'],'brief':saved.get('brief','')}]
+                    retouches = parent.get('retouches',[])+[{'task':saved['task'],
+                        'task_label':treatment_name,'brief':saved.get('brief','')}]
                     local_common = {**common,'description':parent.get('description',common['description'])+'\n局部修饰：'+treatment_name+
                         ('\n具体要求：'+saved['brief'] if saved.get('brief') else '')}
-                    if parent.get('parameters') is not None:
-                        local_common['parameters'] = parent['parameters']
+                    for key in ('parameters','tone_parameters'):
+                        if key in parent:
+                            local_common[key] = deepcopy(parent[key])
                     inherited = ' · 美化' if 'parameters' in local_common else ''
-                    previous = ' · '+ '、'.join(TASKS[item['task']][0] for item in parent.get('retouches',[])) if parent.get('retouches') else ''
+                    previous = ' · '+ '、'.join(item.get('task_label') or TASKS.get(item['task'],(item['task'],))[0]
+                        for item in parent.get('retouches',[])) if parent.get('retouches') else ''
                     local_label = (f'制作 {number}{revision_label} · {treatment}{inherited}{previous} · '
                         f'局部修饰 {edit_number} · {treatment_name}')
                     photo['versions'].append({'id':str(path),'kind':'retouch',
@@ -138,6 +147,23 @@ def project_photos(batches):
 def retouch_parent(version):
     return {key:deepcopy(version[key]) for key in ('id','kind','label','description','parameters','retouches','tone_parameters')
         if key in version}
+
+
+def saved_editor_context(photo, version):
+    return {'name':photo['name'],'base':version['files']['PNG'],
+        'directory':version['work'],'batch_directory':version['batch'],
+        'parent_version':retouch_parent(version)}
+
+
+def beauty_editor_context(photo, version):
+    context = saved_editor_context(photo,version)
+    context['edit_id'] = version['id']
+    if version['kind']=='beauty':
+        record = Path(version['id'])
+        saved = json.loads(record.read_text(encoding='utf-8'))
+        context.update(base=saved['source'],session=str(record.parent.parent),
+            beauty_parameters=saved['parameters'],parent_version=saved.get('parent_version'))
+    return context
 
 
 def revision_context(photo, version):

@@ -117,13 +117,26 @@ def finish(code):
     os._exit(code)
 
 
-def _comfy_flags(comfy_root):
+def _comfy_flags(comfy_root, *, dynamic=True):
     sys.path.insert(0,comfy_root)
     # One layout, selected before loading; checkpoint quantization is explicit.
-    sys.argv = [sys.argv[0],'--disable-dynamic-vram','--disable-cuda-malloc',
+    sys.argv = [sys.argv[0],'--enable-dynamic-vram' if dynamic else '--disable-dynamic-vram','--disable-cuda-malloc',
         '--disable-pinned-memory','--cuda-device','0']
     import comfy.options
     comfy.options.enable_args_parsing()
+    if not dynamic:
+        print('VAE decode uses resident CUDA weights',flush=True)
+        return
+    import comfy_aimdo.control
+    comfy_aimdo.control.init(nvml_pressure=True)
+    import comfy.model_management as memory
+    import comfy.memory_management
+    import comfy.model_patcher
+    if not comfy_aimdo.control.init_devices([(memory.get_torch_device().index,0)]):
+        raise RuntimeError('H3 DynamicVRAM 初始化失败')
+    comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
+    comfy.memory_management.aimdo_enabled = True
+    print('ComfyUI DynamicVRAM initialized; model storage policy follows the actual disk',flush=True)
 
 
 def stage_condition(args, settings):
@@ -195,7 +208,9 @@ def stage_condition(args, settings):
         'requested_canvas':{'area_side':settings['resolution'],'width':width,'height':height},
         'image_1_pre_resize':references[0]['pre_resize'],'width':width,'height':height,
         'references':references,'vae_compute_dtype':vae_dtype,
-        'text_encoder_compute_dtype':'bfloat16','worker_memory':worker_memory()})
+        'text_encoder_compute_dtype':'bfloat16',
+        'storage_policy':{'dynamic_vram':True,'text_encoder_fast_disk':clip.patcher.fast_disk,
+            'vae_fast_disk':vae.patcher.fast_disk},'worker_memory':worker_memory()})
     finish(0)
 
 
@@ -230,13 +245,16 @@ def stage_sample(args, settings):
         'transformer_model_dtype':transformer_dtype,
         'full_grid_sigmas':[float(value) for value in schedule],
         'starting_sigma':float(schedule[0]),'effective_denoise_steps':max(len(schedule)-1,0),
-        'sampler_mask':'noise_mask' in latent,'worker_memory':worker_memory()})
+        'sampler_mask':'noise_mask' in latent,
+        'storage_policy':{'dynamic_vram':True,'transformer_fast_disk':model.fast_disk},
+        'worker_memory':worker_memory()})
     finish(0)
 
 
 def stage_decode(args, settings):
     """Sampled latent -> the raw model PNG at its native size."""
-    _comfy_flags(args.comfy_root)
+    # This small VAE fits on CUDA. Keep its weights resident across tiled rows.
+    _comfy_flags(args.comfy_root,dynamic=False)
     import numpy as np
     from PIL import Image
     import torch
@@ -259,7 +277,10 @@ def stage_decode(args, settings):
         Image.fromarray(pixels).save(directory/'model-output.png')
     write_json(directory/'stage-decode.json',{'seconds':time.perf_counter()-started,
         'output_width':int(pixels.shape[1]),'output_height':int(pixels.shape[0]),
-        'vae_compute_dtype':vae_dtype,'worker_memory':worker_memory()})
+        'vae_compute_dtype':vae_dtype,
+        'storage_policy':{'dynamic_vram':False,'vae_weight_layout':'resident CUDA',
+            'vae_load_device':str(vae.device)},
+        'worker_memory':worker_memory()})
     finish(0)
 
 
@@ -298,7 +319,7 @@ def orchestrate(args):
         environment = {**os.environ,'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'}
         flags = subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
         for stage in STAGES:
-            command = [sys.executable,'-B','-X','utf8','-u',str(Path(__file__).resolve()),
+            command = [sys.executable,'-B','-X','utf8','-X','faulthandler','-u',str(Path(__file__).resolve()),
                 '--comfy-root',args.comfy_root,'--directory',str(directory),'--stage',stage]
             log_path = directory/('stage-'+stage+'.log')
             stage_started = time.perf_counter()
@@ -307,7 +328,8 @@ def orchestrate(args):
                     creationflags=flags,check=False)
             record_path = directory/('stage-'+stage+'.json')
             record = json.loads(record_path.read_text(encoding='utf-8')) if record_path.is_file() else {}
-            stages[stage] = {'seconds':round(time.perf_counter()-stage_started,1),
+            elapsed = round(time.perf_counter()-stage_started,1)
+            stages[stage] = {'seconds':elapsed,'wall_seconds':elapsed,'returncode':result.returncode,
                 **record.pop('worker_memory',{}),**record}
             print('stage '+stage+': '+str(stages[stage]['seconds'])+' s, peak working set '
                 +str(stages[stage].get('peak_working_set_bytes'))+' bytes, peak commit '
@@ -316,7 +338,7 @@ def orchestrate(args):
                 error_path = directory/('stage-'+stage+'-error.json')
                 detail = json.loads(error_path.read_text(encoding='utf-8'))['error'] if error_path.is_file() else (
                     log_path.read_text(encoding='utf-8')[-1800:])
-                raise StageError(stage,detail)
+                raise StageError(stage,'退出码 '+str(result.returncode)+'；'+detail)
         condition,sample,decode = stages['condition'],stages['sample'],stages['decode']
         record = {'engine':'MiniMax-H3-Image',
             'implementation':'installed ComfyUI MiniMaxH3ImageConditioning and KSampler in three short-lived processes',
@@ -350,7 +372,9 @@ def orchestrate(args):
                     'so these are per-process measurements and not a memory budget'},
             'timings':{'conditioning_seconds':condition['seconds'],'sampling_seconds':sample['seconds'],
                 'decode_seconds':decode['seconds'],'total_seconds':time.perf_counter()-started},
-            'memory':'each stage process ends with its own weights; no retired model is moved back to CPU'}
+            'memory':'ComfyUI DynamicVRAM file-backed text encoder and transformer with per-model storage detection; '
+                'VAE decode uses resident CUDA weights; '
+                'each stage process ends with its own weights; no retired model is moved back to CPU'}
         write_json(directory/'model.json',record)
         return 0
     except Exception as error:

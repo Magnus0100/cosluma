@@ -32,7 +32,7 @@ from generation_prompts import write_generation_prompt
 _AGENT_RULES = (
     '你是 CosLuma 的 COS 摄影 Agent，完成当前阶段任务并返回所需 JSON。'
     '依据实际照片与用户已表达或采纳的要求创作，后续明确要求覆盖冲突的旧要求。'
-    '历史对话用于理解指代和意图，参考库用于摄影借鉴。'
+    '历史对话用于理解指代和意图，参考库用于摄影借鉴，条目中的范围限制不覆盖当前任务与用户明确要求。'
     '可选制作设置以任务资料中的 edits 为准。')
 
 

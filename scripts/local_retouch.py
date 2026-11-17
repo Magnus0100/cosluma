@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 import os
+import shutil
 from pathlib import Path
 import time
 import urllib.parse
@@ -38,18 +40,18 @@ TASKS = {'hair_repair':('补发与露网修补',
         'Repair only the marked wig gaps, exposed wig net, broken hair sections or missing strands. '
         'Continue the adjacent hair color, strand thickness, texture and hairstyle. Do not add wind or redesign the hairstyle.'),
     'hair_shape':('发束造型',
-        'Shape only the marked hair strands according to the requested silhouette, direction and drawing. '
-        'Keep the wig color, visible hairline, face, headwear and the rest of the hairstyle.'),
-    'neck':('双下巴修饰',
-        'Subtly refine only the marked submental and neck area to reduce the double chin. '
-        'Keep believable anatomy, original skin texture and lighting. Preserve the face identity, facial outline, collar and jewelry.')}
+        'Give the selected hair expressive, natural styling suited to the person and photograph, '
+        'following the user\'s request and the original hair color and texture.'),
+    'clothing':('衣物动态',
+        'Give the selected costume fabric expressive, natural movement in the wind, '
+        'suited to the person\'s pose and the photograph. Use the original fabric material and design.')}
 # Positive descriptions of the finished appearance, used only when the user left the brief empty. The
 # model redraws the whole photograph from noise, so naming a defect can put that defect into the result.
 H3_TASKS = {'hair_repair':
         'Repair the hair into continuous, natural strands that match the adjacent color and texture.',
     'hair_shape':
         'Shape the hair into flowing, natural strands in the direction the user asks for.',
-    'neck':'Gently smooth the neck skin for a natural portrait finish.'}
+    'clothing':'Give the costume fabric expressive, natural movement in the wind, suited to the person\'s pose.'}
 
 
 def h3_prompt(task, brief):
@@ -86,6 +88,19 @@ def _edit_box(mask):
     return tuple(int(value) for value in (max(0,np.floor(xx.min()-padding)),
         max(0,np.floor(yy.min()-padding)),min(width,np.ceil(xx.max()+padding+1)),
         min(height,np.ceil(yy.max()+padding+1))))
+
+
+def canvas_resolution(size, requested, sr_scale):
+    """Choose one 32-aligned native canvas that a single SR pass can cover.
+
+    Both image encoders round each aspect-preserving dimension to 32 pixels.
+    Account for that rounding before generation, rather than enlarging a short return.
+    The connection's resolution remains the minimum, and its saved settings are unchanged.
+    """
+    width,height = size
+    ratio = math.sqrt(width/height)
+    required = max((width/sr_scale+16)/ratio,(height/sr_scale+16)*ratio)
+    return max(requested,math.ceil(required/32)*32)
 
 
 def _blend_region(mask, size):
@@ -147,15 +162,15 @@ def prepare_local_output(directory, sr_config, progress=None):
 
 
 def generate_local(base, root, mask, guide, task, brief, reference, config, progress=None, *, pixels=None,
-        parent_version=None, sr_config=None, llm_config):
+        parent_version=None, sr_config=None, llm_config, head_config=None, protected=None, library_path=None):
     report = progress or (lambda message:None)
     if task not in TASKS:
-        raise ValueError('请选择补发、发束造型或双下巴修饰')
+        raise ValueError('请选择局部修饰任务')
     config = local_engine(config)
     engine = LOCAL_ENGINES[config['engine']]
     directory = Path(root)/('retouch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir()
-    state = {'status':'running','task':task,'brief':brief,'reference':reference,
+    state = {'status':'running','task':task,'task_label':TASKS[task][0],'brief':brief,'reference':reference,
         'source':str(Path(base).resolve()),'engine':config['engine'],
         'config':{key:config[key] for key in ('engine',)+LOCAL_KEYS},
         'parent_version':parent_version,
@@ -168,79 +183,167 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
             pixels = open_photo(base)
         height,width = pixels.shape[:2]
         selected = cv2.resize(np.asarray(mask.convert('L')),(width,height),interpolation=cv2.INTER_NEAREST)
+        protected = (protected or Image.new('L',mask.size)).convert('L').resize(
+            (width,height),Image.Resampling.NEAREST)
+        selected = selected.copy()
+        selected[np.asarray(protected)>0] = 0
         tight = _edit_box(selected)  # the same check: an empty selection still errors here
-        # H3-Image redraws what it is given. Skin is smooth enough for the 2K area canvas, so the neck
-        # pass hands it the whole photograph; hair is far finer, so its primary picture is the detail
-        # crop at original pixels and the full photograph follows as a separate context reference.
-        hair_detail = config['engine']=='h3' and task in ('hair_repair','hair_shape')
-        box = tight if hair_detail or config['engine']!='h3' else (0,0,width,height)
+        shape_edit = task in ('clothing','hair_shape')
+        kind,label_name = ('hair','头发') if task=='hair_shape' else ('cloth','衣物')
+        # Styling uses the full photograph; repairing a small wig defect retains its detail view.
+        hair_detail = config['engine']=='h3' and task=='hair_repair'
+        full_canvas = shape_edit
+        box = (0,0,width,height) if full_canvas else tight
         x0,y0,x1,y1 = box
+        requested_resolution = config['resolution']
+        if sr_config:
+            config['resolution'] = canvas_resolution((x1-x0,y1-y0),requested_resolution,sr_config.get('scale',4))
+        state['config'].update(resolution=config['resolution'],requested_resolution=requested_resolution)
         # Keep the user's exact selected support. Feathering only happens
         # inside that support, so every outside float32 pixel is unchanged.
         cropped = selected[y0:y1,x0:x1]
         save_image(Image.fromarray(cropped),directory/'mask.png')
+        save_image(Image.fromarray(cropped),directory/'generation-mask.png')
+        save_image(protected.crop(box),directory/'protected.png')
         source = to_preview(pixels[y0:y1,x0:x1])
         save_image(source,directory/'input.png')
-        # The two engines take different inputs: the Qwen graph reads a mask picture, while the
-        # MiniMax-H3-Image graph conditions on pictures only - the whole photograph for the neck, the
-        # detail crop plus a full-photo context picture for hair. In the H3 engine the selection only
-        # limits the writeback and is never sent to the model.
+        # Detail edits retain full-photo context; only the primary view is written back.
+        # Qwen also reads a mask reference. H3 receives photographs only.
         label = '<Picture {0}>' if config['engine']=='h3' else 'Image {0}'
         if config['engine']=='h3':
             roles = ['image1: selected detail crop at original pixels' if hair_detail
                 else 'image1: full saved photograph']
         else:
-            roles = ['image1: selected crop']
+            roles = ['image1: full saved photograph' if full_canvas else 'image1: selected crop']
         context = None
         if config['engine']=='h3':
             images = [source]
             prompt = h3_prompt(task,brief)
-            if hair_detail:
-                # 8-bit context picture for reference only: it is never pasted back, the writeback
-                # still comes from the detail crop. A 1536 long edge (max_edge) keeps the native VAE
-                # reference sane while the primary picture is pre-scaled onto the 2K area canvas.
-                context = to_preview(pixels,max_edge=1536)
-                save_image(context,directory/'context.png')
-                images.append(context)
-                roles.append('image2: the full photograph, scaled to a 1536 long-edge (max_edge) context reference')
-                prompt += (' '+label.format(2)+' is the full photograph for context; '
-                    'return the edited view of '+label.format(1)+'.')
         else:
             model_mask = Image.fromarray(cropped).convert('RGB')
-            roles.append('image2: separate edit mask, white editable and black unchanged')
+            roles.append('image2: white identifies the selected edit region in image1')
             prompt = (label.format(1)+' is the source photograph. '+label.format(2)+
-                ' is its separate edit mask: white is editable, '
-                'black must stay unchanged. '+TASKS[task][1]+' Do not display the mask or any guide marks in the output. '
-                'Return the same image framing and camera perspective. User request: '+brief.strip())
+                ' identifies the selected edit region in white. '+TASKS[task][1]+
+                ' Return the edited view of '+label.format(1)+', with the same framing and no visible marks. '
+                'User request: '+brief.strip())
             images = [source,model_mask]
+        if not full_canvas:
+            context = to_preview(pixels,max_edge=1536)
+            save_image(context,directory/'context.png')
+            images.append(context)
+            roles.append('image'+str(len(images))+': full photograph, reference context only (maximum long edge 1536)')
+            prompt += (' '+label.format(len(images))+' is the full photograph for context; '
+                'return the edited detail view of '+label.format(1)+'.')
         if guide.getbbox():
             marked = source.convert('RGBA')
             drawing = guide.resize((width,height),Image.Resampling.NEAREST).crop(box)
             marked.alpha_composite(drawing)
-            images.append(marked.convert('RGB'))
-            roles.append('colored guide marks on the same picture: the requested strand shape')
-            if config['engine']=='h3':
-                prompt += (' '+label.format(len(images))+' draws the intended strand shape as colored guide marks; '
-                    'follow that shape and remove the marks in the finished photograph.')
+            if config['engine']=='qwen' and not full_canvas:
+                # Keep all user inputs within the node's four image slots: detail + mask +
+                # context + optional appearance reference. The clean source is saved separately.
+                images[0] = marked.convert('RGB')
+                roles[0] += '; includes the user\'s colored edit marks'
+                guide_index = 1
+                save_image(images[0],directory/'marked-input.png')
             else:
-                prompt += (' '+label.format(3)+' shows the intended strand shape as colored guide marks on the same crop; '
-                    'remove these marks in the finished photograph.')
+                images.append(marked.convert('RGB'))
+                guide_index = len(images)
+                roles.append('image'+str(guide_index)+': user-colored edit marks on the same view')
+            prompt += (' '+label.format(guide_index)+' shows the user\'s edit marks; '
+                'apply the requested edit and remove the marks in the finished photograph.')
             save_image(drawing,directory/'guide.png')
         if reference:
             with open_rgb(reference) as image:
                 image.thumbnail((1536,1536),Image.Resampling.LANCZOS)
                 images.append(image.copy())
             save_image(images[-1],directory/'reference.png')
-            roles.append('style/strand reference only, not the person to render')
-            prompt += (f' {label.format(len(images))} is a style/strand reference only; '
+            roles.append('appearance reference only, not the person to render')
+            prompt += (f' {label.format(len(images))} is an appearance reference only; '
                 f'keep the person and scene from {label.format(1)}.')
-        from generation_prompts import write_generation_prompt
+        if shape_edit:
+            prompt = f'Edit {label.format(1)}, the full photograph. '+TASKS[task][1]+' User request: '+brief.strip()
+            if config['engine']=='qwen':
+                noun = 'hair' if task=='hair_shape' else 'garment'
+                roles[1] = f'image2: source {noun} locator only; white identifies the existing part, not its future shape or movement extent'
+                prompt += f' Image 2 identifies the original {noun}; its new shape may extend beyond the white locator.'
+            if guide.getbbox():
+                prompt += f' {label.format(guide_index)} shows the user\'s shape marks; remove marks in the finished photograph.'
+            if reference:
+                prompt += f' {label.format(len(images))} is an appearance reference only.'
+        from generation_prompts import (write_generation_prompt, write_prompt_candidate,
+            review_prompt_candidate)
         from image_io import preview_data_url
-        prompt = write_generation_prompt(config['engine']+'_local',
-            [(label.format(index)+': '+role,preview_data_url(image,1536))
-                for index,(role,image) in enumerate(zip(roles,images),1)],
-            llm_config,directory,task={'task':task,'user_request':brief.strip(),
-                'template_prompt':prompt,'image_roles':roles},progress=report)['prompt']
+        def prompt_images():
+            attached = [(label.format(index)+': '+role,preview_data_url(image,1536))
+                for index,(role,image) in enumerate(zip(roles,images),1)]
+            if shape_edit and config['engine']=='h3':
+                attached.append(('仅供编写与审查定位目标'+label_name+'的用户涂选，不发送给生图模型',
+                    preview_data_url(Image.fromarray(cropped).convert('RGB'),1536)))
+            return attached
+        task_inputs = {'task':task,'user_request':brief.strip(),
+            'template_prompt':prompt,'image_roles':roles}
+        if shape_edit:
+            from local_regions import part_regions, part_references, union_masks
+            from prompt_library import ReferenceLibrary
+            if not head_config:
+                raise ValueError(TASKS[task][0]+'需要连接中已配置的 SAM3.1 分割服务')
+            # Locate source parts only. The model decides their new shape in the full photograph;
+            # the compositor derives writeback from the actual generated hair or garments.
+            intent = Image.fromarray(cropped)
+            save_image(intent,directory/'intent-mask.png')
+            library = ReferenceLibrary(library_path)
+            instruction = ('根据照片与涂选识别要编辑的原有'+label_name+'部件，查阅参考库中与本任务相关的质感、受光或风感描述。'
+                '参考按本次任务取用，条目中服务于基础制作的不变要求不覆盖用户明确发起的局部造型。'
+                'prompt 用简短英文表达用户想要的效果与适合的质感，具体形状由生图模型结合整图决定。'
+                '只在用户明确指定时描述目标位置或形状；范围保护由软件负责。'
+                '返回 JSON 结构为 {"prompt":"英文生图提示词","parts":[{'
+                '"part":"原片部件",'
+                '"segment_query":"具体英文部件名词，不带计数",'
+                '"protected_objects":["原片实际头饰、前景道具或硬质配饰的简短英文类别名词"],'
+                '"attachment_point":[0,0]}]}。'
+                '每个独立目标部件分别列入 parts，单个部件也使用此数组。'
+                'attachment_point 仅定位原片可见连接处，以整图宽高各 0 到 1000 表示，不规划新形状。'
+                'protected_objects 填最多四类原片实际头饰、前景道具与硬质配饰；'
+                '脸、耳与手臂由软件单独提取。')
+            candidate = write_prompt_candidate(config['engine']+'_local',prompt_images(),
+                llm_config,directory,task=task_inputs,instruction=instruction,progress=report,references=library)
+            parts = candidate['parts']
+            structure = {'parts':parts}
+            state['edit_structure'] = structure
+            save_json(directory/'edit-structure.json',structure)
+            report('提取原'+label_name+'部件与前景保护区')
+            references = part_references(intent,parts,head_config.get('input_max_edge',2048))
+            source_parts = []
+            objects = list(dict.fromkeys(obj for part in parts for obj in part['protected_objects']))
+            for index,(part,part_intent) in enumerate(zip(parts,references)):
+                extracted = part_regions(source,{**part,'protected_objects':objects},head_config,
+                    directory,'source-'+str(index),reference_mask=part_intent,protect=index==0,task=task)
+                source_parts.append(extracted[kind])
+                if index==0:
+                    foreground = extracted['protected']
+            source_part = union_masks(source_parts)
+            save_image(source_part,directory/('source-'+kind+'.png'))
+            save_image(foreground,directory/'source-protected.png')
+            save_image(foreground,directory/'source-preserved.png')
+            source_part_view = source_part.resize((width,height),Image.Resampling.NEAREST).crop(box)
+            source_part_views = [part_mask.resize((width,height),Image.Resampling.NEAREST).crop(box)
+                for part_mask in source_parts]
+            preserved_view = foreground.resize((width,height),Image.Resampling.NEAREST).crop(box)
+            manual_view = protected.crop(box)
+            save_image(source_part_view,directory/'generation-mask.png')
+            if config['engine']=='qwen':
+                images[1] = source_part_view.convert('RGB')
+            candidate = review_prompt_candidate(config['engine']+'_local',candidate,prompt_images(),
+                llm_config,directory,task={**task_inputs,'edit_structure':structure,
+                    'selected_references':list(library.loaded.values())},
+                instruction=instruction,progress=report)
+        else:
+            from prompt_library import ReferenceLibrary
+            library = ReferenceLibrary(library_path)
+            candidate = write_generation_prompt(config['engine']+'_local',prompt_images(),
+                llm_config,directory,task=task_inputs,progress=report,references=library,
+                instruction='补发只修复涂选缺口与露网，按需借鉴参考库中的发丝质感和受光，不加入造型任务。')
+        prompt = candidate['prompt']
         names = [_upload(image,config) for image in images]
         # Only the pictures go to the model: no mask node, no sampler noise_mask and no grid tail on the
         # desktop path, so the edit is the plain full-context graph the released node documents.
@@ -259,9 +362,14 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
         else:
             method = engine['label']+' separate mask reference; software masked float32 writeback'
         state.update(box=list(box),source_dimensions=[width,height],prompt=prompt,
+            input_scope='full_saved_photo' if full_canvas else 'detail_crop_with_full_photo_context',
+            writeback_scope='painted_mask',model_inputs=roles,
             input_dimensions=list(source.size),draft_mask_dimensions=list(mask.size),
             mask_dimensions=[x1-x0,y1-y0],method=method,
             text_encoder_device='cuda:0',text_encoder_offload_device='cpu',text_encoder_dtype='bfloat16')
+        state['generation_mask_file'] = str((directory/'generation-mask.png').resolve())
+        if context is not None:
+            state['context_dimensions'] = list(context.size)
         if config['engine']=='h3':
             # The recorded roles are the pictures actually sent; the selection is not one of them.
             state.update(input_scope='detail_crop_with_full_photo_context' if hair_detail else 'full_saved_photo',
@@ -286,7 +394,7 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
         detail = str(config['steps'])+' 步'
         if config['engine']=='h3':
             detail = '完整 %d 段蒸馏网格 · 实际 %d 次去噪' % (config['steps'],config['steps'])
-        report(engine['label']+' · '+TASKS[task][0]+' · '+detail)
+        report(engine['label']+' · '+TASKS[task][0]+' · '+detail+' · 面积分辨率 '+str(config['resolution']))
         submission = post_json(endpoint+'/prompt',{'prompt':graph,'client_id':'cosluma-'+uuid.uuid4().hex})
         save_json(directory/'submission.json',submission)
         identifier = submission['prompt_id']
@@ -311,6 +419,25 @@ def generate_local(base, root, mask, guide, task, brief, reference, config, prog
         # Decode now; a corrupt model image must not be reported as ready.
         with open_rgb(directory/'model-output.png') as image:
             state['model_output_dimensions'] = list(image.size)
+            if shape_edit:
+                from local_regions import part_writeback
+                report('提取生成图中的同一'+label_name+'部件，合并原位置与新轮廓')
+                generated_parts = [part_regions(image,part,head_config,directory,
+                    'generated-'+str(index),reference_mask=part_mask,task=task)[kind]
+                    for index,(part,part_mask) in enumerate(zip(parts,source_part_views))]
+                generated_part = union_masks(generated_parts)
+                save_image(generated_part,directory/('generated-'+kind+'.png'))
+                writeback = part_writeback(source_part_view,generated_part,
+                    preserved_view,manual_view,(x1-x0,y1-y0))
+                save_image(writeback,directory/'mask.png')
+                region_key = 'hair_regions' if task=='hair_shape' else 'clothing_regions'
+                state.update(writeback_scope='hair_union_minus_protected' if task=='hair_shape' else 'garment_union_minus_protected',
+                    mask_role='old and generated part with boundary band, minus source foreground and user protection',
+                    **{region_key:{name:str((directory/filename).resolve()) for name,filename in {
+                        'source':'source-'+kind+'.png','generated':'generated-'+kind+'.png',
+                        'foreground':'source-preserved.png','user_protection':'protected.png',
+                        'intent':'intent-mask.png'}.items()}},
+                    region_config={key:head_config[key] for key in ('url','model')})
         save_json(directory/'session.json',state)
         state = prepare_local_output(directory,sr_config,report)
         state['status'] = 'ready'
@@ -412,9 +539,7 @@ def retouch_crop(pixels, directory):
         mask = np.array(image,dtype=np.uint8)
     if mask.shape != size[::-1]:
         raise ValueError('局部蒙版与生成区域尺寸不一致')
-    # Only the gradient-domain blend is a selection-local solve. The historical median
-    # offset reads unedited context up to min(size)*.03 around the selection, so it keeps
-    # the whole recorded crop exactly as before.
+    # Restrict the gradient-domain solve to the selected region and its boundary.
     region = (_blend_region(mask,size) if state.get('blend_mode')=='poisson_gradient'
         else (0,0,size[0],size[1]))
     rx0,ry0,rx1,ry1 = region
@@ -439,38 +564,82 @@ def retouch_crop(pixels, directory):
     alpha = local_mask.astype(np.float32)/255*(edge*edge*(3-2*edge))
     crop = pixels[y0:y1,x0:x1].copy()
     blend = crop[ry0:ry1,rx0:rx1]
-    colour_match = None
     gradient_match = None
     if state.get('blend_mode')=='poisson_gradient':
-        # New H3 sessions solve the colour field as a gradient-domain problem for every task; this
-        # replaces the plain paste and the historical median offset, with the accepted equations.
+        # H3 sessions solve the colour field as a gradient-domain problem.
         generated,gradient_match = _gradient_writeback(blend,generated,local_mask)
         if gradient_match and 'bbox' in gradient_match:
             left,top,right,bottom = gradient_match['bbox']
             gradient_match['bbox'] = [left+rx0,top+ry0,right+rx0,bottom+ry0]
-    elif state['task']=='neck':
-        # Historical H3 records and every Qwen session keep this estimate of the incidental RGB
-        # shift from neighbouring unedited context; never write that context or change the raw.
-        radius = min(size)*.03
-        outside = np.uint8(local_mask==0)
-        distance_outside = cv2.distanceTransform(outside,cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
-        context = (outside>0)&(distance_outside<=radius)
-        if np.any(context):
-            offset = np.median((generated-blend)[context],axis=0).astype(np.float32)
-            generated -= offset
-            colour_match = {'method':'median RGB offset from unedited context',
-                'radius_pixels':float(radius),'offset':offset.tolist()}
     support = local_mask>0
     blend[support] += (generated[support]-blend[support])*alpha[support,None]
     blend[support] = np.clip(blend[support],0,1)
     state['blend'] = {'method':('float32 gradient-domain writeback; inward smoothstep feather'
             if gradient_match else 'float32 masked writeback; inward smoothstep feather'),
-        'feather_pixels':float(feather),'resize':fit_description,'colour_match':colour_match,
+        'feather_pixels':float(feather),'resize':fit_description,
         'gradient_domain':gradient_match,'outside_mask':'unchanged source pixels'}
     # Sessions written before detail_fit existed still load; the recorded value
     # is derived from the actual model return instead of a stored assumption.
     state.setdefault('detail_fit',fit_description)
     return crop,state
+
+
+def revise_writeback(directory, mask, *, protected):
+    """Make a new mask revision of an existing generated canvas, without model calls."""
+    previous = Path(directory)
+    state = json.loads((previous/'session.json').read_text(encoding='utf-8'))
+    width,height = state['source_dimensions']
+    x0,y0,x1,y1 = state['box']
+    # Preserve native mask detail in cells the user did not edit on the smaller canvas.
+    native_mask = Image.new('L',(width,height))
+    with Image.open(previous/'mask.png') as saved:
+        native_mask.paste(saved.convert('L'),(x0,y0))
+    mask = mask.convert('L')
+    baseline = native_mask.resize(mask.size,Image.Resampling.NEAREST)
+    changed = Image.fromarray(np.uint8(np.asarray(mask)!=np.asarray(baseline))*255)
+    changed = np.asarray(changed.resize((width,height),Image.Resampling.NEAREST))>0
+    selected = np.array(native_mask)
+    painted = np.asarray(mask.resize((width,height),Image.Resampling.NEAREST))
+    selected[changed] = painted[changed]
+    protected = protected.convert('L').resize((width,height),Image.Resampling.NEAREST)
+    selected[np.asarray(protected)>0] = 0
+    for region_key in ('clothing_regions','hair_regions'):
+        if region_key in state:
+            # Display-size painting must not reopen the native foreground boundary through resampling.
+            with Image.open(state[region_key]['foreground']) as foreground:
+                selected[np.asarray(foreground.convert('L').resize((width,height),Image.Resampling.NEAREST))>127] = 0
+    _edit_box(selected)
+    if (selected[:y0].any() or selected[y1:].any() or
+            selected[y0:y1,:x0].any() or selected[y0:y1,x1:].any()):
+        raise ValueError('当前范围超出已有生成画布；请收回范围，或主动重新生成以覆盖新区域。')
+    revised = previous.parent/('retouch-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+    revised.mkdir()
+    state.update(status='running',generation_session=state.get('generation_session',str(previous.resolve())),
+        writeback_revision_of=str(previous.resolve()),
+        detail_file=str((previous/state['detail_file']).resolve()),
+        draft_mask_dimensions=list(mask.size),writeback_scope='painted_mask',
+        mask_role='manual revision; native mask preserved outside edited display cells')
+    state['generation_mask_file'] = state.get('generation_mask_file',
+        str(Path(state['generation_session'])/'mask.png'))
+    save_json(revised/'session.json',state)
+    try:
+        save_image(Image.fromarray(selected[y0:y1,x0:x1]),revised/'mask.png')
+        save_image(protected.crop((x0,y0,x1,y1)),revised/'protected.png')
+        for region_key in ('clothing_regions','hair_regions'):
+            if region_key in state:
+                state[region_key]['user_protection'] = str((revised/'protected.png').resolve())
+        shutil.copyfile(previous/'model-output.png',revised/'model-output.png')
+        if (previous/'prompt-sources.json').is_file():
+            shutil.copyfile(previous/'prompt-sources.json',revised/'prompt-sources.json')
+        if (previous/'generation-prompt.json').is_file():
+            record = json.loads((previous/'generation-prompt.json').read_text(encoding='utf-8'))
+            save_json(revised/'generation-prompt.json',{**record,'reused_from':state['generation_session']})
+        state['status'] = 'ready'
+        save_json(revised/'session.json',state)
+    except Exception as error:
+        save_json(revised/'session.json',{**state,'status':'failed','error':str(error)})
+        raise
+    return str(revised)
 
 
 def save_local(pixels, directory):
@@ -486,6 +655,9 @@ def save_local(pixels, directory):
     output = directory/('edit-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     output.mkdir()
     result = {**state,'status':'complete','directory':str(directory.resolve()),
+        'layer':{'kind':'masked_replacement','source':state['source'],
+            'session':str(directory.resolve()),'canvas_box':state['box'],
+            'mask':str((directory/'mask.png').resolve()),'blend_mode':state.get('blend_mode','float32_mask')},
         'files':{'final':save_image(final,output/'final.png'),'jpeg':save_jpeg(final,output/'final.jpg')}}
     save_json(output/'retouch.json',result)
     return result
