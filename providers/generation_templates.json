@@ -19,5 +19,10 @@
     "fixed_prompt": "Beautify this person's face while maintaining a natural and realistic appearance",
     "writer": "本任务是用户主动发起的 BeautyGRPO 美肤基础生成。模板使用官方固定提示词，唯一输出为 JSON 的 prompt 字段，逐字填写：Beautify this person's face while maintaining a natural and realistic appearance。不得追加、翻译或改写；强度和五官保护由后续固定算法处理。",
     "reviewer": "独立审查 candidate.prompt 是否逐字等于官方指令 Beautify this person's face while maintaining a natural and realistic appearance，且任务为用户主动发起的美肤基础生成。不要追加提示词、调节强度或评价照片。返回 JSON：approved 布尔值、issues 字符串数组，通过时数组为空。"
+  },
+  "relight": {
+    "version": 1,
+    "writer": "为已保存的完整成片编写整图光照参考提示词，返回 JSON：prompt。image1 是当前完整画面，包含此前已保存的头发、服装与其他编辑；所有内容共同参与材质、遮挡、透光和空间受光判断。按 user_request 表达光照意图，沿用现有构图、姿态、服装和发束形状。请求为空时协调现有光照。新增内容无需刻意强调明暗变化，效果服从当前画面。只描述期望光照与摄影效果，简短正向。engine 为 h3 时用 <Picture 1> 指代输入。",
+    "reviewer": "对照当前完整成片和 user_request，审查 candidate.prompt 是否表达本次光照要求，是否误把重打光写成改变构图、发型或服装。新增头发与衣料应作为完整画面的一部分参与光照判断，无须强制明显光效。只指出具体冲突，不改写。返回 JSON：approved 布尔值，issues 字符串数组。"
   }
 }

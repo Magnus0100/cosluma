@@ -2064,13 +2064,14 @@ class Workbench(QMainWindow):
 
     def beauty_saved(self, result):
         self.return_from_beauty()
-        if result.get('kind')=='tone' and self.beauty_return_delivery and self.beauty_editor.context.get('delivery_photo_key'):
+        if result.get('kind') in ('tone','relight') and self.beauty_return_delivery and self.beauty_editor.context.get('delivery_photo_key'):
             try:
                 self.delivery_view.compare_saved_result(self.beauty_editor.context['delivery_photo_key'],result['files']['final'])
             except (OSError,ValueError,KeyError,StopIteration) as error:
                 self.status.setText('光调版已保存，显示比较失败：'+str(error))
                 return
-        self.status.setText(('已另存光调版：' if result.get('kind')=='tone' else
+        self.status.setText(('已另存整图重打光版：' if result.get('kind')=='relight' else
+            '已另存光调版：' if result.get('kind')=='tone' else
             '已另存局部修饰版：' if result.get('task') else '已另存美化版：')+result['files']['final'])
 
 

@@ -152,9 +152,21 @@ class ToneActions:
             'parameters':{'type':'object','properties':{
                 **TONE_PROPERTIES,
                 'save':{'type':'boolean'}},
-                'required':[*TONE_PROPERTIES,'save']}}}]
+                'required':[*TONE_PROPERTIES,'save']}}},
+            {'type':'function','function':{'name':'relight_photo',
+                'description':'用户明确要求整图重打光并保存时调用。对当前保存版本生成光照参考，'
+                    '纳入已有头发与衣物编辑，使用光照场调制原尺寸像素并另存。未保存的手动光调不参与。'
+                    '仅曝光、暖冷等固定调整使用 adjust_tone。',
+                'parameters':{'type':'object','properties':{'relight_brief':{'type':'string',
+                    'description':'用户本条光照要求原文'}},'required':['relight_brief']}}}]
 
-    def call(self, exposure_ev, shadows, midtones, highlights, save=False, *, warmth=0, tint=0, saturation=1):
+    def call(self, *, relight_brief=None, **tone):
+        if relight_brief is not None:
+            self.request = {'kind':'relight','brief':relight_brief}
+            return {'status':'requested','operation':self.request,'message':'已登记重打光并另存，尚未执行。'}
+        return self.adjust_tone(**tone)
+
+    def adjust_tone(self, exposure_ev, shadows, midtones, highlights, save=False, *, warmth=0, tint=0, saturation=1):
         if not isinstance(save,bool):
             raise TypeError('save 须为布尔值')
         parameters = ToneParameters(exposure_ev,shadows,midtones,highlights,warmth,tint,saturation)
@@ -163,22 +175,27 @@ class ToneActions:
             'message':'参数已登记，本条回复保存后执行；图片尚未调整或保存。'}
 
 
-def discuss_tone(pixels, parameters, conversation, config, directory):
+def discuss_tone(pixels, parameters, conversation, config, directory, *, saved_pixels=None):
     from model_clients import _describe
     actions = ToneActions()
     directory = Path(directory)
     directory.mkdir(parents=True)
     with to_preview(pixels,1280) as image:
         images = [('当前参数的整图预览',preview_data_url(image,1280))]
+    if saved_pixels is not None and parameters!=ToneParameters():
+        with to_preview(saved_pixels,1280) as image:
+            images.append(('当前保存版本；重打光的完整输入',preview_data_url(image,1280)))
     history = [{'role':row['role'],'content':row['content']+
         ('\n实际操作状态：'+row['operation_status'] if 'operation_status' in row else '')}
         for row in conversation]
     result = _describe('你正在已保存照片的光色调整页。'
         '明确修改请求通过 adjust_tone 设置完整参数；其他参数沿用当前值。'
-        '整图统一调整，不修脸、不生成、不局部重打光。先在线性光中调整曝光、暖冷和绿洋红通道平衡、'
+        '固定光调整图统一处理。先在线性光中调整曝光、暖冷和绿洋红通道平衡、'
         '基于明度的饱和度，再截断超出色域的值，随后使用固定端点与三个控制点的平滑单调明度曲线。'
         '暖冷与绿洋红是 -1 至 1 的相对平衡，不是开尔文色温；正值分别偏暖、偏洋红；'
         '饱和度 0 为黑白，1 为原值。恢复初始值指曝光/暖冷/绿洋红 0、饱和度 1、曲线 0.25/0.5/0.75。'
+        '用户明确要求整图重打光并保存时用 relight_photo，输入是当前已保存版本，'
+        '包含已有局部编辑，不包含尚未保存的手动光调。重打光的光照参考生成另由模板编写与独立审查。'
         '只通过实际工具调用修改，返回 JSON 的 reply 字段作简洁回复。'
         '工具登记后说明即将执行，不声称已经完成；保存仅在本条用户明确要求时发起。',
         images,config,directory/'response.json',task={'parameters':parameters.record()},

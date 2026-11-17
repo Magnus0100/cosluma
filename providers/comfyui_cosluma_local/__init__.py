@@ -17,7 +17,7 @@ import folder_paths
 class CosLumaQwenLocalEdit:
     @classmethod
     def INPUT_TYPES(cls):
-        return {'required':{'image1':('IMAGE',),'image2':('IMAGE',),
+        return {'required':{'image1':('IMAGE',),
             'model':('STRING',{'default':'qwen_image_2.1_int8_convrot.safetensors'}),
             'clip':('STRING',{'default':'qwen3vl_8b_bf16.safetensors'}),
             'vae':('STRING',{'default':'qwen_image_2.1_vae_bf16.safetensors'}),
@@ -26,7 +26,7 @@ class CosLumaQwenLocalEdit:
             'resolution':('INT',{'default':1024,'min':512,'max':2048,'step':32}),
             'seed':('INT',{'default':42,'min':0,'max':2**32-1}),
             'filename_prefix':('STRING',{'default':'CosLuma/local'})},
-            'optional':{'image3':('IMAGE',),'image4':('IMAGE',),'image5':('IMAGE',)}}
+            'optional':{'image2':('IMAGE',),'image3':('IMAGE',),'image4':('IMAGE',),'image5':('IMAGE',)}}
 
     RETURN_TYPES = ()
     FUNCTION = 'edit'
@@ -34,8 +34,8 @@ class CosLumaQwenLocalEdit:
     OUTPUT_NODE = True
 
     @torch.inference_mode()
-    def edit(self,image1,image2,model,clip,vae,prompt,steps,resolution,seed,filename_prefix,
-            image3=None,image4=None,image5=None):
+    def edit(self,image1,model,clip,vae,prompt,steps,resolution,seed,filename_prefix,
+            image2=None,image3=None,image4=None,image5=None):
         output = Path(folder_paths.get_output_directory())
         directory = output/filename_prefix/uuid.uuid4().hex[:8]
         directory.mkdir(parents=True,exist_ok=False)

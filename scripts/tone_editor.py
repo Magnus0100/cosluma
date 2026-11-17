@@ -1,4 +1,4 @@
-"""Manual and conversational tone controls sharing the same fixed image operations."""
+"""Fixed tone controls and explicit full-frame relighting of saved photographs."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -20,11 +20,14 @@ from tone_edit import ToneParameters, discuss_tone, render_tone, save_tone
 class ToneWorker(QThread):
     ready = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
 
-    def __init__(self, phase, context, parameters, pixels=None, *, config_path=None, conversation=(), directory=None):
+    def __init__(self, phase, context, parameters, pixels=None, *, config_path=None, conversation=(), directory=None,
+            relight_brief=''):
         super().__init__()
         self.phase,self.context,self.parameters,self.pixels = phase,context,parameters,pixels
         self.config_path,self.conversation,self.directory = config_path,conversation,directory
+        self.relight_brief = relight_brief
 
     def run(self):
         try:
@@ -37,10 +40,14 @@ class ToneWorker(QThread):
             elif self.phase=='save':
                 pixels = self.pixels if self.pixels is not None else open_photo(self.context['base'])
                 self.ready.emit(save_tone(pixels,self.parameters,self.context))
+            elif self.phase=='relight':
+                from relighting import save_relight
+                self.ready.emit(save_relight(self.pixels,self.relight_brief,self.context,
+                    load_settings(self.config_path),progress=self.progress.emit))
             else:
                 config = load_settings(self.config_path)
                 self.ready.emit(discuss_tone(render_tone(self.pixels,self.parameters),self.parameters,
-                    self.conversation,config['llm'],self.directory))
+                    self.conversation,config['llm'],self.directory,saved_pixels=self.pixels))
         except Exception as error:
             self.failed.emit(str(error))
         finally:
@@ -63,6 +70,7 @@ class ToneEditor(QWidget):
         self.worker = self.pixels = self.before = self.after = None
         self.rendered = None
         self.pending_save = False
+        self.pending_relight = None
         self.save_message = None
         self.external_message = None
         self.messages = []
@@ -83,7 +91,7 @@ class ToneEditor(QWidget):
         heading.addWidget(back)
         layout.addLayout(heading)
         split = QSplitter(Qt.Horizontal)
-        self.preview = PhotoPreview(source_label='编辑前版本',output_label='光调预览')
+        self.preview = PhotoPreview(source_label='编辑前版本',output_label='调整预览')
         split.addWidget(self.preview)
         panel = QWidget()
         column = QVBoxLayout(panel)
@@ -150,8 +158,24 @@ class ToneEditor(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setWidget(manual)
         self.editor_tabs.addTab(scroll,'手动调整')
+        relight = QWidget()
+        relight_column = QVBoxLayout(relight)
+        hint = ui_label('对当前保存版本重打光，包含已编辑的头发与衣物。')
+        hint.setWordWrap(True)
+        relight_column.addWidget(hint)
+        self.relight_brief = QPlainTextEdit()
+        self.relight_brief.setPlaceholderText('描述光照；留空则协调当前画面')
+        self.relight_brief.textChanged.connect(self.draft_timer.start)
+        relight_column.addWidget(self.relight_brief)
+        relight_column.addStretch(1)
+        self.editor_tabs.addTab(relight,'重打光')
+        self.relight_save = QPushButton('重打光并另存')
+        self.relight_save.setProperty('kind','primary')
+        self.relight_save.clicked.connect(self.relight_version)
+        self.editor_tabs.currentChanged.connect(self.tab_changed)
         column.addWidget(self.editor_tabs,1)
         column.addWidget(self.save)
+        column.addWidget(self.relight_save)
         panel.setMinimumWidth(290)
         panel.setMaximumWidth(360)
         split.addWidget(panel)
@@ -186,6 +210,11 @@ class ToneEditor(QWidget):
     def is_busy(self):
         return self.worker is not None
 
+    def tab_changed(self):
+        if self.before is not None:
+            self.preview.set_image_pair(self.before,self.before if self.editor_tabs.currentIndex()==2 else self.after)
+        self.update_controls()
+
     def update_controls(self):
         busy = self.is_busy()
         editing = not busy or self.worker.phase=='render'
@@ -197,19 +226,27 @@ class ToneEditor(QWidget):
         self.batch_save.setEnabled(not busy and self.pixels is not None)
         self.send.setEnabled(not busy and self.pixels is not None)
         self.chat_input.setEnabled(not busy)
+        self.relight_brief.setEnabled(not busy)
+        lighting_tab = self.editor_tabs.currentIndex()==2
+        self.save.setVisible(not lighting_tab)
+        self.relight_save.setVisible(lighting_tab)
+        self.relight_save.setEnabled(not busy and self.pixels is not None)
 
-    def start(self, phase, *, directory=None):
+    def start(self, phase, *, directory=None, relight_brief=''):
         self.worker_failed = False
         worker = ToneWorker(phase,self.context,self.parameters(),self.pixels,
-            config_path=self.config_path,conversation=list(self.messages),directory=directory)
+            config_path=self.config_path,conversation=list(self.messages),directory=directory,
+            relight_brief=relight_brief)
         self.worker = worker
         worker.ready.connect(self.ready)
         worker.failed.connect(self.failed)
+        worker.progress.connect(self.message.setText)
         worker.finished.connect(self.finished)
         self.update_controls()
         self.busy_changed.emit()
         self.message.setText({'load':'正在读取已保存版本…','render':'正在更新光调预览…',
-            'save':'正在从原尺寸浮点像素另存光调版…','chat':'摄影 Agent 正在理解光调要求…'}[phase])
+            'save':'正在从原尺寸浮点像素另存光调版…','chat':'摄影 Agent 正在理解光色要求…',
+            'relight':'正在对当前保存版本重打光…'}[phase])
         worker.start()
 
     def render(self):
@@ -226,6 +263,12 @@ class ToneEditor(QWidget):
         if not self.is_busy() and self.save_draft():
             self.render_timer.stop()
             self.batch_requested.emit(self.parameters().record())
+
+    def relight_version(self):
+        if not self.is_busy() and self.save_draft():
+            self.render_timer.stop()
+            self.save_message = None
+            self.start('relight',relight_brief=self.relight_brief.toPlainText().strip())
 
     def accept_delivery(self, message, user_text):
         """Apply the delivery Agent's already parsed request without another model call."""
@@ -288,16 +331,21 @@ class ToneEditor(QWidget):
             self.messages.append(message)
             self.refresh_history()
             if self.save_draft() and operation is not None:
-                self.set_parameters(ToneParameters(**operation['parameters']))
-                self.pending_save = operation['save']
-                self.save_message = message if self.pending_save else None
-                message['operation_status'] = 'parameters_applied'
+                if operation.get('kind')=='relight':
+                    self.pending_relight = operation['brief']
+                    self.save_message = message
+                    message['operation_status'] = '正在重打光并另存'
+                else:
+                    self.set_parameters(ToneParameters(**operation['parameters']))
+                    self.pending_save = operation['save']
+                    self.save_message = message if self.pending_save else None
+                    message['operation_status'] = 'parameters_applied'
                 self.refresh_history()
                 self.save_draft()
         else:
             self.saved_result = result
         if phase in ('load','render') and self.isVisible():
-            self.preview.set_image_pair(self.before,self.after)
+            self.preview.set_image_pair(self.before,self.before if self.editor_tabs.currentIndex()==2 else self.after)
             self.message.setText('预览已更新')
         if phase in ('load','render') and self.worker.parameters==self.parameters():
             self.update_external('光调参数已应用，正在另存' if self.pending_save else '已更新光调预览，尚未另存',
@@ -306,13 +354,15 @@ class ToneEditor(QWidget):
     def failed(self, error):
         self.worker_failed = True
         self.pending_save = False
+        self.pending_relight = None
         self.update_external('光调失败：'+error,terminal=True)
-        self.message.setText('光调'+self.worker.phase+'失败：'+error)
+        label = {'load':'读取版本','render':'光调预览','save':'另存光调','chat':'光色对话','relight':'整图重打光'}[self.worker.phase]
+        self.message.setText(label+'失败：'+error)
         if self.worker.phase=='chat':
             self.messages.append({'role':'assistant','content':'本次对话失败：'+error})
             self.refresh_history()
             self.save_draft()
-        elif self.worker.phase=='save' and self.save_message is not None:
+        elif self.worker.phase in ('save','relight') and self.save_message is not None:
             self.save_message['operation_status'] = 'save_failed: '+error
             self.save_message = None
             self.refresh_history()
@@ -322,16 +372,22 @@ class ToneEditor(QWidget):
         worker,self.worker = self.worker,None
         phase = worker.phase
         worker.deleteLater()
-        if phase=='save' and not self.worker_failed:
+        if phase in ('save','relight') and not self.worker_failed:
             result = self.saved_result
             del self.saved_result
-            self.update_external('已另存光调版：'+result['files']['final'],terminal=True)
+            self.update_external(('已另存重打光版：' if phase=='relight' else '已另存光调版：')+
+                result['files']['final'],terminal=True)
             if self.save_message is not None:
                 self.save_message['operation_status'] = 'saved: '+result['files']['final']
                 self.save_message = None
                 self.refresh_history()
                 self.save_draft()
             self.saved.emit(result)
+        elif not self.worker_failed and self.pending_relight is not None:
+            brief,self.pending_relight = self.pending_relight,None
+            self.render_timer.stop()
+            self.start('relight',relight_brief=brief)
+            return
         elif not self.worker_failed and self.pending_save:
             self.pending_save = False
             self.render_timer.stop()
@@ -353,7 +409,8 @@ class ToneEditor(QWidget):
             if status=='parameters_applied':
                 status = '已应用光调参数。'
             elif status.startswith('saved: '):
-                status = '已另存光调版：'+status[len('saved: '):]
+                label = '重打光版' if row.get('operation',{}).get('kind')=='relight' else '光调版'
+                status = '已另存'+label+'：'+status[len('saved: '):]
             elif status.startswith('save_failed: '):
                 status = '另存失败：'+status[len('save_failed: '):]
             entries.append(dict(row,context=None,operation_status=status))
@@ -363,7 +420,8 @@ class ToneEditor(QWidget):
         try:
             self.directory.mkdir(parents=True,exist_ok=True)
             save_json(self.draft_path,{'base':self.context['base'],'parameters':self.parameters().record(),
-                'messages':self.messages,'input':self.chat_input.toPlainText()})
+                'messages':self.messages,'input':self.chat_input.toPlainText(),
+                'relight_brief':self.relight_brief.toPlainText()})
             return True
         except OSError as error:
             self.message.setText('保存光调草稿失败：'+str(error))
@@ -377,6 +435,7 @@ class ToneEditor(QWidget):
             self.set_parameters(ToneParameters(**state['parameters']))
             self.messages = state['messages']
             self.chat_input.setPlainText(state['input'])
+            self.relight_brief.setPlainText(state.get('relight_brief',''))
             self.refresh_history()
         except (OSError,ValueError,KeyError,TypeError) as error:
             self.message.setText('读取光调草稿失败：'+str(error))

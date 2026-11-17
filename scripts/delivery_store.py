@@ -139,6 +139,23 @@ def project_photos(batches):
                         'tone_parameters':parameters,'parent_version':parent,
                         'files':{kind:str(path.parent/Path(saved['files'][field]).name)
                             for kind,field in (('PNG','final'),('JPEG','jpeg'))},**tone_common})
+                for edit_number,path in enumerate(sorted(Path(work).glob('relight-*/relight.json')),1):
+                    if any(version['id']==str(path) for version in photo['versions']):
+                        continue
+                    saved = json.loads(path.read_text(encoding='utf-8'))
+                    if saved['status']!='complete':
+                        continue
+                    parent = saved['parent_version']
+                    label = f'制作 {number}{revision_label} · {treatment} · 整图重打光 {edit_number}'
+                    relight_common = {**common,'description':parent.get('description',description)+
+                        '\n整图重打光：'+(saved['brief'] or '协调当前完整画面的光照')}
+                    for key in ('parameters','retouches','tone_parameters'):
+                        if key in parent:
+                            relight_common[key] = deepcopy(parent[key])
+                    photo['versions'].append({'id':str(path),'kind':'relight','label':label,'short_label':label,
+                        'parent_version':parent,
+                        'files':{kind:str(path.parent/Path(saved['files'][field]).name)
+                            for kind,field in (('PNG','final'),('JPEG','jpeg'))},**relight_common})
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise ValueError(f'读取项目成片失败：{directory}\n{error}') from error
     return list(photos.values())

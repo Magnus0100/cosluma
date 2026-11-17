@@ -2,9 +2,9 @@
 
 A photo-editing workspace for cosplay photography. Discuss a look, compare samples and finish a batch, with manual adjustments when needed.
 
-[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.46.1) · [Getting started](#getting-started) · [简体中文](README.md)
+[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.47.0) · [Getting started](#getting-started) · [简体中文](README.md)
 
-Windows 64-bit · Chinese interface · 0.46.1
+Windows 64-bit · Chinese interface · 0.47.0
 
 | Original | Finished photograph |
 | :---: | :---: |
@@ -32,12 +32,14 @@ Three initial samples from the same original, with hair editing, relighting and 
 
 | What to adjust | What you can do |
 | --- | --- |
-| Light and color | Adjust exposure, warmth, saturation and brightness, including batch changes |
+| Light and color | Adjust exposure, warmth, saturation and brightness, including batch changes; relight the complete frame after local edits |
 | Face | Select a face and control skin retouching and slimming yourself |
 | Hair and clothing | Paint the part to edit, style strands or add flowing fabric |
 | Delivery | Keep originals and saved versions; choose the PNG or JPEG to export |
 
 Hair editing and subject relighting are optional. Clothing motion is a separate edit after production. You initiate generation, saving and adoption.
+
+After saving hair or clothing edits, select that version and open **Light and color → Relighting**, or request relighting and saving in its chat. The model sees the complete frame, including the added content. Unsaved manual tone changes are excluded.
 
 <details>
 <summary>See hair editing and relighting separately</summary>
@@ -71,7 +73,7 @@ Delivery copies existing saved files. New edits do not automatically replace the
 
 ## Getting started
 
-Download `CosLuma-0.46.1-windows-x64.zip`, extract the complete archive and open `CosLuma/CosLuma.exe`. Enter service addresses and credentials in Connections, then create a project and import photos.
+Download `CosLuma-0.47.0-windows-x64.zip`, extract the complete archive and open `CosLuma/CosLuma.exe`. Enter service addresses and credentials in Connections, then create a project and import photos.
 
 **Photography-assistant, image-editing, and segmentation / upscaling services must be configured before use.** The desktop package includes the runtime, with models and weights configured separately. Connection settings fetch model lists automatically, with manual entry available. Remote services receive the photos and prompts sent to them.
 
@@ -89,7 +91,7 @@ Download `CosLuma-0.46.1-windows-x64.zip`, extract the complete archive and open
 Template: [settings.example.json](providers/settings.example.json). Configuration defaults to `~/CosplayWorkbench/config/cosluma.json`, overridable with `--config` or `COSLUMA_CONFIG`. Projects default to `~/CosLuma/projects/`. Keep models, photographs and private configuration outside the repository. Credentials can use environment variables or separate files.
 
 <details>
-<summary>Version 0.46.1 desktop models, weights and inference parameters</summary>
+<summary>Version 0.47.0 desktop models, weights and inference parameters</summary>
 
 Basic ComfyUI uses `models/checkpoints/sam3.1_multiplex_fp16.safetensors` and `models/upscale_models/4xNomos2_hq_atd.safetensors`. Apply the [SAM3 text-encoder projection patch](providers/patches/comfyui-sam3-clip-projection.patch) if the service lacks that fix.
 
@@ -125,7 +127,7 @@ Relighting uses `models/cosluma_relight/pixlrelight` (upstream source, `model.sa
 <details>
 <summary>Showcase dimensions and native-pixel crops</summary>
 
-The opening result passes the complete composite, including edited hair and clothing, into its final relighting step. The example was made in stages through the existing editing and relighting interfaces. The desktop application does not yet provide full-frame relighting of a saved result.
+The opening result passes the complete composite, including edited hair and clothing, into its final relighting step. The example was made in stages through existing interfaces. Full-frame relighting of saved versions is available from 0.47.0.
 
 The original and saved result are 6000 × 4000. Base generation and clothing editing each produce 1536 × 1024 images, with one 4× model upscale and downsampling where needed in each stage. Final PIXLRelight estimates fields on a 512 analysis canvas and modulates the full-size float32 composite; lighting-reference RGB does not replace its detail. A subsequent 0.2 EV exposure adjustment uses the tone tool. Outputs are an sRGB 16-bit PNG and matching JPEG. Full photographs on this page are reduced copies. Face beauty was not used.
 
@@ -137,6 +139,8 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
 <summary>Production chain and image quality</summary>
 
 Base chain: direction and references → prompt writing and independent review → full-image generation → one upscale if needed → SAM3.1 original identity extraction → SIFT similarity alignment → MKL color matching or PIXLRelight → float32 mask compositing → optional luminance curve → save.
+
+Final relighting uses the selected Qwen / H3 engine and prompt writing with independent review. The generated reference is registered to the saved frame with a SIFT similarity transform before PIXLRelight estimates its light fields. Native float32 photo pixels receive only lighting modulation, with no warping, generated detail replacement or upscaling. Separate 16-bit PNG and JPEG files retain the parent version; adoption remains explicit.
 
 Desktop and CLI share [finish_photo / finish_batch](scripts/photo_pipeline.py). Main chat calls registered photography tools. Prompts follow [task templates](providers/generation_templates.json) with independent-context review, reusing the photography-assistant connection. Non-generative edits use fixed algorithms. The application calls Python APIs directly; external model services use HTTP. Failures retain outputs and errors without automatic retries or model switching.
 
