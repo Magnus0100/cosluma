@@ -4,9 +4,9 @@
 
 [简体中文](README.md) · English
 
-[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.27.5) · [Third-party licenses](LICENSES/README.md) · [Development guidelines](AGENTS.md)
+[Download for Windows](https://github.com/Magnus0100/cosluma/releases/tag/v0.44.0) · [Third-party licenses](LICENSES/README.md) · [Development guidelines](AGENTS.md)
 
-Windows x64 · Chinese UI · Source / local build 0.44.0 (not publicly released) · Public release 0.27.5
+Windows x64 · Chinese UI · Source / desktop release 0.44.0
 
 ## What it does
 
@@ -21,7 +21,7 @@ Windows x64 · Chinese UI · Source / local build 0.44.0 (not publicly released)
 
 ## Get started
 
-Download `CosLuma-0.27.5-windows-x64.zip`, **extract the entire archive**, and launch `CosLuma/CosLuma.exe`. The desktop package includes Python and image processing dependencies.
+Download `CosLuma-0.44.0-windows-x64.zip`, **extract the entire archive**, and launch `CosLuma/CosLuma.exe`. The desktop package includes Python and image processing dependencies.
 
 **Model services, weights and accounts are configured separately and are not bundled.** Basic finishing requires:
 
@@ -35,7 +35,7 @@ Services may run locally or remotely. Remote services receive the photos and pro
 
 ### Workflow
 
-1. **Create a project and connect services.** Follow the setup wizard or import an existing configuration. “模型下载” in connection settings provides upstream links, target paths and commands.
+1. **Create a project and connect services.** Enter service addresses and credentials, then select models, or import an existing configuration. “模型下载” in connection settings provides upstream links, target paths and commands.
 2. **Import photos and enter the character.** Common image formats, HEIC / HEIF and camera RAW are supported. Checkboxes select photos for production; row highlighting only changes the preview. Choose a representative photo separately.
 3. **Discuss and sample.** Describe what to keep and change. Enable hair editing or relighting if needed, then say “探索三个方向” or use its button. Ask for a revision from the viewed sample or explore three new directions.
 4. **Approve and run the batch.** Finalize a complete sample, or explicitly ask to adopt the second sample and produce the batch. Production uses checked photos. A failed photo does not stop the others; its error appears at the relevant step.
@@ -45,7 +45,7 @@ Opening projects, switching pages and browsing load saved records. Production, r
 
 ### Interface layout
 
-Connection settings switch directly between Photography assistant, Image editing, Segmentation and upscaling, and Save location, with Save always visible. Switching sections does not validate, save or call a service. Disabled relighting connections collapse their fields while retaining edits until save or cancel. When current production results exist, approval information and batch-production controls expand under Production settings; without production records they remain directly visible. Production records group optional edits under Adjust photo and saved-file actions under File; the photo list shows filenames and status, and retains failure details.
+Connection settings switch directly between Photography assistant, Image editing, Segmentation and upscaling, and Save location, with Save always visible. Entering or changing an address and credentials automatically reads available models in the background. Model fields support search, selection and manual input, and never replace the current model automatically. The assistant and image editor read the service's `/models`; segmentation and upscaling read installed filenames from their respective ComfyUI loaders. Failures show the reason without blocking a manual save; the refresh button explicitly reads the list again. Lists remain in this settings window, are not persisted, and never invoke models. Switching sections does not validate or save, and does not refetch lists already read. Disabled relighting connections collapse their fields while retaining edits until save or cancel. When current production results exist, approval information and batch-production controls expand under Production settings; without production records they remain directly visible. Production records group optional edits under Adjust photo and saved-file actions under File; the photo list shows filenames and status, and retains failure details.
 
 A fixed left rail provides Projects, Photos, Create and Works, with Settings at the bottom for connections and configuration import. The header shows the current page and project. The project home searches by name or character and displays recorded project status and a representative photo. Empty libraries, unmatched searches, projects without photos and unreadable projects have separate guidance. Photo filenames stay on one line with middle elision; production checkboxes, highlighted rows and the sample source remain independent. Organize and File menus keep selection and file actions available; save location and output size are under More settings. Creative requirements, saved rounds and comparisons expand when needed.
 
