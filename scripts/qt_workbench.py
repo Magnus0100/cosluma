@@ -1774,6 +1774,7 @@ class Workbench(QMainWindow):
             workspace.discussion_saved.connect(self.remember_discussion)
             workspace.style_selected.connect(self.select_style)
             workspace.batch_requested.connect(self.produce_from_chat)
+            workspace.manual_batch_requested.connect(self.produce)
             workspace.state_changed.connect(self.creative_state_changed)
             workspace.back_requested.connect(lambda: self.navigate(0))
             self.creative_layout.addWidget(workspace)

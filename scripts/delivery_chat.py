@@ -34,7 +34,7 @@ class DeliveryActions:
             'parameters':{'type':'object','properties':{
                 'action':{'type':'string','enum':['tone','tone_batch','compare','adopt','revise','local']},
                 'version_id':{'type':['string','null'],'enum':[*self.versions,None],
-                    'description':'任务资料中的完整版本 ID；tone / revise / local 为 null 时使用发送时交付版本；compare 为 null 时查看原片，tone_batch 填 null。'},
+                    'description':'tone / revise / local 针对当前画面时填 null，使用发送时的 edit_target；明确指定其他版本时填完整 ID。compare 为 null 时查看原片，tone_batch 填 null。'},
                 'parameters':{'type':['object','null'],'properties':TONE_PROPERTIES,
                     'required':list(TONE_PROPERTIES),
                     'description':'tone / tone_batch 填完整参数；曝光/暖冷/色调默认 0，曲线 0.25/0.5/0.75，饱和度 1；其他操作为 null。'},
@@ -76,7 +76,9 @@ class DeliveryActions:
         if not isinstance(save,bool):
             raise TypeError('save 须为布尔值')
         if action in ('tone','revise','local') and version_id is None:
-            version_id = self.context['selected_version']
+            version_id = self.context['edit_target']
+            if version_id is None:
+                raise ValueError('发送时查看的是原片，请切换到要编辑的已保存版本')
         if version_id is not None:
             self.versions[version_id]
         elif action=='adopt':
@@ -143,7 +145,8 @@ def discuss_delivery(context, conversation, config, directory):
         '单独 export 复制发送时已勾选的交付版本；目标位置由界面设置，格式未明确时沿用界面格式。'
         '没有交付位置时请用户先设置；不从消息中直接接受任意路径。询问、比较、满意等表态不算明确采用或导出。'
         '只提供当前照片的版本 ID；“左边”按 comparison_version，“右边”按 selected_version 理解。'
-        '左侧为原片时不可采用、调光或作为改稿版本，请用户先选一个已保存版本。'
+        '未指定左右或版本、只要求改当前画面时，tone、local、revise 填 version_id=null，使用 edit_target。'
+        '只看左侧原片时 edit_target 为空；原片不可采用、调光或作为改稿版本，请用户先选一个已保存版本。'
         'tone 参数相对所选已保存版本，曝光/暖冷/色调默认 0，曲线 0.25/0.5/0.75，饱和度 1；'
         '先在线性光中计算曝光、RGB 平衡与明度饱和度，再截断出色域值，随后用固定黑白端点的单调明度曲线。'
         '暖冷与绿洋红为 -1 至 1 的相对平衡，不是开尔文色温；正值分别偏暖、偏洋红；饱和度 0 黑白、1 原值。'

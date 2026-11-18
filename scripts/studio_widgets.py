@@ -165,6 +165,11 @@ def apply_theme(app):
         QToolButton[role="samplePreview"]:hover { border-color: #8cb4d4; }
         QToolButton[role="samplePreview"]:checked { border: 2px solid #5e9bca; background: #243b50; }
         QGraphicsView[role="photoCanvas"] { background: #252e2b; border: 1px solid #252e2b; border-radius: 10px; }
+        QGraphicsView[role="workbenchCanvas"] { background: #222323; border: none; }
+        QToolButton[role="photoMode"] { background: transparent; color: #344541; border: 1px solid transparent; border-radius: 4px; padding: 5px 11px; }
+        QToolButton[role="photoMode"]:hover { background: #e9eeeb; }
+        QToolButton[role="photoMode"]:checked { background: #dfe8e3; color: #174b41; }
+        QToolButton[role="photoMode"]:focus { border-color: #45968a; }
 
         QFrame#workspaceRail { background: #182f33; border: none; }
         QLabel[role="brand"] { color: #eff6f2; font-size: 14px; font-weight: 600; }
@@ -461,6 +466,10 @@ class PhotoCanvas(QGraphicsView):
         self.fitting = True
         self.zoom_intent = None
         self.empty_message = ''
+        self.split_pixels = None
+        self.split_error = ''
+        self.split_fraction = .5
+        self.drag_split = False
 
     def setPixmap(self, pixels, *, preserve_view=False):
         if self.photo.pixmap().cacheKey() == pixels.cacheKey():
@@ -551,13 +560,12 @@ class PhotoCanvas(QGraphicsView):
         else:
             super().mouseDoubleClickEvent(event)
 
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        if event.buttons() & Qt.LeftButton and not self.photo.pixmap().isNull():
-            self.pan_changed.emit()
-
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_0:
+        if self.split_pixels is not None and event.key() in (Qt.Key_Left,Qt.Key_Right):
+            step = .05 if event.key()==Qt.Key_Right else -.05
+            self.split_fraction = max(0.0,min(1.0,self.split_fraction+step))
+            self.viewport().update()
+        elif event.key() == Qt.Key_0:
             self.fit_photo()
         elif event.key() == Qt.Key_1:
             self.actual_size()
@@ -590,8 +598,97 @@ class PhotoCanvas(QGraphicsView):
         super().showEvent(event)
         self.update_display_copy()
 
+    def set_split(self, pixels, labels=(), error=''):
+        self.split_pixels = pixels
+        self.split_labels = labels
+        self.split_error = error
+        self.setAccessibleDescription('左右方向键移动对比分界线' if pixels is not None else '')
+        self.viewport().update()
+
+    def split_bounds(self):
+        return self.mapFromScene(self.sceneRect()).boundingRect().intersected(self.viewport().rect())
+
+    def move_split(self, event):
+        bounds = self.split_bounds()
+        self.split_fraction = max(0.0,min(1.0,(event.position().x()-bounds.left())/max(1,bounds.width()-1)))
+        self.viewport().update()
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if self.split_pixels is not None and event.button()==Qt.LeftButton:
+            bounds = self.split_bounds()
+            x = bounds.left()+self.split_fraction*(bounds.width()-1)
+            if bounds.contains(event.position().toPoint()) and abs(event.position().x()-x)<=18:
+                self.setFocus()
+                self.drag_split = True
+                self.move_split(event)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_split:
+            self.move_split(event)
+        else:
+            super().mouseMoveEvent(event)
+            if event.buttons() & Qt.LeftButton and not self.photo.pixmap().isNull():
+                self.pan_changed.emit()
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_split and event.button()==Qt.LeftButton:
+            self.drag_split = False
+            self.move_split(event)
+        else:
+            super().mouseReleaseEvent(event)
+
     def drawForeground(self, painter, rect):
         super().drawForeground(painter,rect)
+        if self.split_pixels is not None and not self.photo.pixmap().isNull():
+            bounds = self.split_bounds()
+            if not bounds.isEmpty():
+                x = round(bounds.left()+self.split_fraction*(bounds.width()-1))
+                image_rect = self.sceneRect()
+                divider = self.mapToScene(x,bounds.top()).x()
+                painter.save()
+                painter.setClipRect(QRectF(image_rect.left(),image_rect.top(),
+                    max(0,divider-image_rect.left()),image_rect.height()),Qt.IntersectClip)
+                area = QRectF(self.split_pixels.rect())
+                area.setSize(area.size().scaled(image_rect.size(),Qt.KeepAspectRatio))
+                area.moveCenter(image_rect.center())
+                painter.fillRect(image_rect,self.backgroundBrush())
+                painter.drawPixmap(area,self.split_pixels,QRectF(self.split_pixels.rect()))
+                painter.restore()
+                painter.save()
+                painter.resetTransform()
+                painter.setPen(QPen(QColor('#ffffff'),2))
+                painter.drawLine(x,bounds.top(),x,bounds.bottom())
+                painter.setBrush(QColor('#ffffff'))
+                painter.setPen(QPen(QColor('#222323'),1))
+                painter.setRenderHint(QPainter.Antialiasing)
+                centre = bounds.center().y()
+                handle = QRectF(x-15,centre-15,30,30)
+                painter.drawEllipse(handle)
+                painter.drawLine(x-8,centre,x+8,centre)
+                painter.drawLine(x-8,centre,x-4,centre-4)
+                painter.drawLine(x-8,centre,x-4,centre+4)
+                painter.drawLine(x+8,centre,x+4,centre-4)
+                painter.drawLine(x+8,centre,x+4,centre+4)
+                for label, align in zip(self.split_labels,(Qt.AlignLeft,Qt.AlignRight)):
+                    width = min(bounds.width()//2-10,painter.fontMetrics().horizontalAdvance(label)+16)
+                    if width>20:
+                        tag = QRectF(bounds.left()+10 if align==Qt.AlignLeft else bounds.right()-10-width,
+                            bounds.top()+10,width,25)
+                        painter.fillRect(tag,QColor('#252525'))
+                        painter.setPen(QColor('#ffffff'))
+                        painter.drawText(tag.adjusted(8,0,-8,0),Qt.AlignVCenter|align,
+                            painter.fontMetrics().elidedText(label,Qt.ElideRight,int(width-16)))
+                painter.restore()
+        if self.split_error:
+            painter.save()
+            painter.resetTransform()
+            painter.setPen(QColor('#ffffff'))
+            painter.drawText(self.viewport().rect().adjusted(16,10,-16,-10),
+                Qt.AlignTop|Qt.TextWordWrap,self.split_error)
+            painter.restore()
         if self.empty_message:
             painter.save()
             painter.resetTransform()
@@ -663,7 +760,7 @@ class PhotoPreview(QWidget):
         QPixmapCache.clear()
         PhotoPreview.errors.clear()
 
-    def __init__(self, parent=None, *, source_label='原片', output_label='成片'):
+    def __init__(self, parent=None, *, source_label='原片', output_label='成片', workbench=False):
         super().__init__(parent)
         QPixmapCache.setCacheLimit(64*1024)
         self.source = None
@@ -680,6 +777,9 @@ class PhotoPreview(QWidget):
         self.keys = {}
         self.loader = None
         self.syncing = False
+        self.workbench = workbench
+        self.mode_buttons = {}
+        self.split_layout = False
         self.load_timer = QTimer(self)
         self.load_timer.setSingleShot(True)
         self.load_timer.setInterval(80)
@@ -687,15 +787,36 @@ class PhotoPreview(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         toolbar = QHBoxLayout()
-        toolbar.addStretch(1)
-        self.mode = QComboBox()
+        self.mode = QComboBox(self)
         self.mode.setAccessibleName('查看方式')
         for label, value in ((output_label, 'output'), (source_label, 'source'), ('对比', 'compare')):
             self.mode.addItem(label, value)
         self.mode.currentIndexChanged.connect(self.change_mode)
         self.source_caption = None
         self.output_caption = None
-        toolbar.addWidget(self.mode)
+        self.split_view = QToolButton()
+        self.split_view.setText('拖动分界')
+        self.split_view.setProperty('kind','quiet')
+        self.split_view.setToolTip('同一画幅对比；拖动分界线，或将焦点放在画面上按左右方向键')
+        self.split_view.clicked.connect(lambda:self.set_split_layout(not self.split_layout))
+        self.split_view.hide()
+        if workbench:
+            self.workbench_tools = toolbar
+            self.mode.hide()
+            for kind, label in (('source', source_label), ('output', output_label), ('compare', '对比')):
+                button = QToolButton()
+                button.setProperty('role','photoMode')
+                button.setText(label)
+                button.setCheckable(True)
+                button.setAutoExclusive(True)
+                button.clicked.connect(lambda _checked=False,kind=kind:self.mode.setCurrentIndex(self.mode.findData(kind)))
+                self.mode_buttons[kind] = button
+                toolbar.addWidget(button)
+            toolbar.addStretch(1)
+            toolbar.addWidget(self.split_view)
+        else:
+            toolbar.addStretch(1)
+            toolbar.addWidget(self.mode)
         layout.addLayout(toolbar)
         self.pages = QStackedWidget()
         self.preview = self.image_label()
@@ -742,6 +863,9 @@ class PhotoPreview(QWidget):
         tools.addWidget(actual)
         layout.addLayout(tools)
         for view in (self.preview,self.before,self.after):
+            if workbench:
+                view.setProperty('role','workbenchCanvas')
+                view.setBackgroundBrush(QColor('#222323'))
             view.zoom_changed.connect(self.update_zoom_label)
             view.zoom_changed.connect(lambda view=view:self.view_mode_changed(view))
         for view in (self.before,self.after):
@@ -755,6 +879,9 @@ class PhotoPreview(QWidget):
         self.mode.setItemText(0,output_label)
         self.mode.setItemText(1,source_label)
         self.mode.setItemText(2,'对比')
+        if self.workbench:
+            self.mode_buttons['source'].setText(source_label)
+            self.mode_buttons['output'].setText(output_label)
 
     @staticmethod
     def image_label():
@@ -915,24 +1042,36 @@ class PhotoPreview(QWidget):
         if self.isVisible():
             self.load_timer.start()
 
+    def set_split_layout(self, split):
+        self.split_layout = split
+        self.update_preview()
+
     def update_preview(self):
         mode = self.mode.currentData()
         has_output = bool(self.output) or self.direct_images
-        page = 1 if mode == 'compare' and has_output else 0
+        comparing = mode=='compare' and has_output
+        split = comparing and self.split_layout
+        page = int(comparing and not split)
+        if self.workbench:
+            for kind, button in self.mode_buttons.items():
+                button.setVisible(bool(self.source or has_output) and (kind=='source' or has_output))
+                button.setChecked(kind==mode)
+            self.split_view.setVisible(comparing)
+            self.split_view.setText('并排' if split else '拖动分界')
         if self.pages.currentIndex() != page:
             self.pages.setCurrentIndex(page)
             QTimer.singleShot(0, self.update_preview)
         if not self.isVisible():
             return
         targets = ((self.before, 'source'), (self.after, 'output')) if self.pages.currentIndex() else (
-            (self.preview, mode if has_output else 'source'),)
+            (self.preview, 'output' if split else mode if has_output else 'source'),)
         self.syncing = True
         active = {label for label,kind in targets}
         for view in (self.preview,self.before,self.after):
             if view not in active:
                 view.setText('')
         if not self.direct_images:
-            visible = {kind for label,kind in targets}
+            visible = {'source','output'} if split else {kind for label,kind in targets}
             self.images = {kind:pixels for kind,pixels in self.images.items() if kind in visible}
         for label, kind in targets:
             pixels = self.images.get(kind)
@@ -967,6 +1106,10 @@ class PhotoPreview(QWidget):
                 label.setText('原片暂时无法预览\n可使用“打开原片”查看文件')
         for view in (self.preview,self.before,self.after):
             view.zoom_intent = None
+        left_error = self.errors.get(self.keys.get('source')) if split else None
+        self.preview.set_split(self.images.get('source') if split else None,
+            (self.source_caption.text(),self.output_caption.text()),
+            '比较版本读取失败：'+left_error if left_error else '')
         self.syncing = False
         self.linked.setEnabled(bool(page))
         self.linked.setVisible(bool(page))
@@ -985,6 +1128,7 @@ class PhotoPreview(QWidget):
         if not self.direct_images:
             self.rebuild_keys()
         self.syncing = True
+        self.preview.set_split(None)
         for view in (self.preview,self.before,self.after):
             if not view.fitting and not view.photo.pixmap().isNull():
                 self.saved_views[view] = (view.photo.pixmap().size(),view.transform().m11(),

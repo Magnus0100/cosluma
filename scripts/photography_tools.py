@@ -14,17 +14,18 @@ class PhotographyActions:
         samples = [identifier for identifier,sample in self.samples.items() if sample['status']=='complete']
         return [{'type':'function','function':{
             'name':'request_photography',
-            'description':('按用户本条明确指令开始摄影操作。explore 制作三个新方向；revise 沿指定样片改一张；'
+            'description':('按用户本条明确指令开始摄影操作。make_first_draft 对代表原片给建议并制作一张首稿；'
+                '用户明确要看多个方向时用 explore 制作三个新方向；revise 沿指定样片改一张；'
                 'select 明确定稿；batch 制作当前勾选照片。batch 提供 sample_id 时先采用该样片，'
                 '不提供时沿用已定稿。询问、建议、比较和浏览不调用。每条消息最多发起一次操作。'),
             'parameters':{'type':'object','properties':{
-                'action':{'type':'string','enum':['explore','revise','select','batch']},
+                'action':{'type':'string','enum':['make_first_draft','explore','revise','select','batch']},
                 'sample_id':{'type':['string','null'],'enum':[*samples,None],
-                    'description':'使用任务资料中的完整样片 ID；explore 填 null。'}},
+                    'description':'使用任务资料中的完整样片 ID；make_first_draft 和 explore 填 null。'}},
                 'required':['action','sample_id']}}}]
 
     def call(self, action, sample_id=None):
-        if action not in ('explore','revise','select','batch'):
+        if action not in ('make_first_draft','explore','revise','select','batch'):
             raise ValueError('未知摄影操作：'+action)
         if sample_id is not None:
             sample = self.samples[sample_id]

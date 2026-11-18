@@ -246,8 +246,8 @@ def _reuse_style_sample(selected, directory):
 
 def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
         progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None, edits=None,
-        base_style=None):
-    """Render three directions, or explicitly revise one complete sample, through finish_photo."""
+        base_style=None, option_count=3):
+    """Render a recommended draft, several directions, or one revision through finish_photo."""
     report = progress or (lambda message: None)
     edits = normalise_edits(edits)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -256,18 +256,22 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
         raise ValueError('样片原片须从当前照片队列中选择')
     directory = Path(root).expanduser().resolve()/('styles-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
-    state = {'status':'planning','sample_source':str(sample_source),'sources':[str(source) for source in sources],
+    count = 1 if base_style is not None else option_count
+    kind = 'revision' if base_style is not None else 'first_draft' if count==1 else 'exploration'
+    state = {'status':'planning','kind':kind,'option_count':count,
+        'sample_source':str(sample_source),'sources':[str(source) for source in sources],
         'character':character,'brief':brief,'creative_direction':creative_direction,'edits':edits,'options':{},
         'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
     if base_style is not None:
-        state.update(kind='revision',revision_of=base_style['selection_file'],option_count=1,
+        state.update(revision_of=base_style['selection_file'],
             revision_brief=creative_direction)
     if discussion is not None:
         state['discussion'] = discussion
     save_json(directory/'styles.json',state)
     if started is not None:
         started(str(directory))
-    report('沿用完整样片，准备单张改稿' if base_style is not None else '设计三个不同的摄影方向')
+    report('沿用完整样片，准备单张改稿' if base_style is not None else
+        '看原片，给出首稿建议' if count==1 else '设计三个不同的摄影方向')
     try:
         if base_style is not None:
             if base_style['status']!='complete' or base_style['result']['status']!='complete':
@@ -288,7 +292,7 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
         else:
             represented = [sample_source] + [source for source in sources if source != sample_source]
             plans = plan_photos(represented,character,brief,config['prompt_library'],config['llm'],directory,
-                option_count=3,creative_direction=creative_direction,discussion=discussion,edits=edits)
+                option_count=count,creative_direction=creative_direction,discussion=discussion,edits=edits)
     except Exception as error:
         message = getattr(error,'provider_message','') or str(error)
         state.update(status='failed',error=message)

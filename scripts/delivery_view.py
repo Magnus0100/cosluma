@@ -264,8 +264,10 @@ class DeliveryView(QWidget):
         self.base_path = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
-        layout.setSpacing(8)
-        tools = QHBoxLayout()
+        layout.setSpacing(5)
+        filters = QWidget()
+        tools = QHBoxLayout(filters)
+        tools.setContentsMargins(0,0,0,0)
         self.search = QLineEdit()
         self.search.setPlaceholderText('搜索原片文件名')
         self.search.setClearButtonEnabled(True)
@@ -274,8 +276,16 @@ class DeliveryView(QWidget):
         self.only_selected = QCheckBox('只看已选交付')
         self.only_selected.toggled.connect(self.apply_filters)
         tools.addWidget(self.only_selected)
+        filters.hide()
+        layout.addWidget(filters)
+        self.filter_button = QToolButton()
+        self.filter_button.setText('筛选')
+        self.filter_button.setProperty('kind','quiet')
+        self.filter_button.setCheckable(True)
+        self.filter_button.toggled.connect(filters.setVisible)
         more = QToolButton()
-        more.setText('管理作品')
+        more.setText('更多')
+        more.setProperty('kind','quiet')
         more.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(more)
         self.select_all = menu.addAction('勾选当前显示',lambda:self.mark_visible(True))
@@ -285,8 +295,6 @@ class DeliveryView(QWidget):
         self.tone_batch_record = menu.addAction('最近批量光色记录',self.show_tone_batch_record)
         self.adopt_tone_batch = menu.addAction('采用最近光调成功版',self.adopt_latest_tone_batch)
         more.setMenu(menu)
-        tools.addWidget(more)
-        layout.addLayout(tools)
         delivery_settings = QWidget()
         settings_column = QVBoxLayout(delivery_settings)
         settings_column.addWidget(ui_label('交付位置','heading'))
@@ -303,69 +311,67 @@ class DeliveryView(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(12)
-        left = QWidget()
-        left.setMinimumWidth(194)
-        column = QVBoxLayout(left)
-        column.setContentsMargins(0,0,0,0)
         self.listing = QListWidget()
         self.listing.setObjectName('deliverySheet')
         self.listing.setViewMode(QListView.IconMode)
+        self.listing.setFlow(QListView.LeftToRight)
+        self.listing.setWrapping(False)
+        self.listing.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.listing.setResizeMode(QListView.Adjust)
         self.listing.setMovement(QListView.Static)
         self.listing.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.listing.setIconSize(QSize(160,150))
-        self.listing.setGridSize(QSize(178,210))
-        self.listing.setSpacing(4)
-        self.listing.setWordWrap(True)
+        self.listing.setIconSize(QSize(104,57))
+        self.listing.setGridSize(QSize(128,87))
+        self.listing.setFixedHeight(106)
+        self.listing.setSpacing(2)
         self.listing.setTextElideMode(Qt.ElideRight)
         self.listing.currentRowChanged.connect(self.browse_photo)
         self.listing.itemChanged.connect(self.change_inclusion)
-        self.listing.verticalScrollBar().valueChanged.connect(lambda _value:self.thumbnail_timer.start(80))
+        self.listing.horizontalScrollBar().valueChanged.connect(lambda _value:self.thumbnail_timer.start(80))
         self.listing.viewport().installEventFilter(self)
-        column.addWidget(self.listing,1)
         self.empty = ui_label('暂无成片')
         self.empty.setWordWrap(True)
-        column.addWidget(self.empty)
         chat_host = QWidget()
         discussion_column = QVBoxLayout(chat_host)
         discussion_column.setContentsMargins(0,0,0,0)
-        splitter.addWidget(left)
         right = QWidget()
         right.setMinimumWidth(300)
         column = QVBoxLayout(right)
         column.setContentsMargins(0,0,0,0)
         self.photo_title = ui_label('选择作品','heading')
         self.photo_title.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
-        column.addWidget(self.photo_title)
+        title_row = QHBoxLayout()
+        title_row.addWidget(self.photo_title,1)
+        title_row.addWidget(self.filter_button)
+        title_row.addWidget(more)
+        column.addLayout(title_row)
         self.delivery_version = ui_label('')
         self.delivery_version.setTextFormat(Qt.PlainText)
-        self.delivery_version.setWordWrap(True)
+        self.delivery_version.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
         version_row = QHBoxLayout()
-        version_row.addWidget(ui_label('右侧 · 交付版本'))
+        version_row.addWidget(ui_label('当前交付：'))
         version_row.addWidget(self.delivery_version,1)
-        column.addLayout(version_row)
-        comparison_row = QHBoxLayout()
-        comparison_row.addWidget(ui_label('左侧 · 比较对象'))
         self.reference = QComboBox()
+        self.reference.setMinimumWidth(190)
         self.reference.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Fixed)
-        self.reference.setToolTip('选择左侧比较对象；只改变查看，不改变交付版本')
+        self.reference.setAccessibleName('比较版本')
+        self.reference.setToolTip('选择比较版本只改变查看，不改变当前交付')
         self.reference.currentIndexChanged.connect(self.change_reference)
-        comparison_row.addWidget(self.reference,1)
-        column.addLayout(comparison_row)
         self.comparison_note = ui_label('')
         self.comparison_note.setWordWrap(True)
         self.comparison_note.hide()
         column.addWidget(self.comparison_note)
-        self.preview = PhotoPreview(source_label='比较对象',output_label='交付版本')
+        self.preview = PhotoPreview(source_label='比较版本',output_label='交付版',workbench=True)
+        mode_tools = self.preview.workbench_tools
+        mode_tools.insertWidget(3,self.reference,1)
         self.preview.linked.setChecked(self.state.get('linked_comparison',True))
         self.preview.linked.toggled.connect(self.change_linked_comparison)
         column.addWidget(self.preview,1)
         details = QHBoxLayout()
-        self.details = ui_label('')
-        self.details.setWordWrap(True)
-        details.addWidget(self.details,1)
+        details.addLayout(version_row,1)
         edit_button = QToolButton()
         edit_button.setText('调整照片')
+        edit_button.setProperty('kind','quiet')
         edit_button.setPopupMode(QToolButton.InstantPopup)
         edit_menu = QMenu(edit_button)
         self.beauty = edit_menu.addAction('人脸美化',self.open_beauty)
@@ -376,18 +382,18 @@ class DeliveryView(QWidget):
         self.tone = edit_menu.addAction('光色调整',self.open_tone)
         self.tone.setEnabled(False)
         edit_button.setMenu(edit_menu)
-        details.addWidget(edit_button)
-        column.addLayout(details)
-        revision_row = QHBoxLayout()
         edit_menu.addSeparator()
         self.revise = edit_menu.addAction('重新创作这张',self.open_revision)
         self.compare_revision = QPushButton('比较新稿')
+        self.compare_revision.setProperty('kind','quiet')
         self.compare_revision.clicked.connect(self.compare_new_revision)
-        revision_row.addWidget(self.compare_revision,1)
-        self.adopt_revision = QPushButton('采用左侧版本用于交付')
+        details.addWidget(self.compare_revision)
+        details.addWidget(edit_button)
+        column.addLayout(details)
+        self.adopt_revision = QPushButton('采用比较版')
+        self.adopt_revision.setProperty('kind','primary')
         self.adopt_revision.clicked.connect(self.adopt_comparison)
-        revision_row.addWidget(self.adopt_revision,1)
-        column.addLayout(revision_row)
+        self.preview.mode.currentIndexChanged.connect(self.update_revision_controls)
         self.chat_panel = QWidget()
         chat_column = QVBoxLayout(self.chat_panel)
         chat_column.setContentsMargins(0,0,0,0)
@@ -407,18 +413,25 @@ class DeliveryView(QWidget):
         self.sidebar_tabs = QTabWidget()
         self.sidebar_tabs.setMinimumWidth(280)
         self.sidebar_tabs.setMaximumWidth(360)
-        self.sidebar_tabs.addTab(chat_host,'对话')
+        self.sidebar_tabs.addTab(chat_host,'修图要求')
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setWidget(delivery_settings)
         self.sidebar_tabs.addTab(settings_scroll,'交付设置')
         splitter.addWidget(self.sidebar_tabs)
-        splitter.setStretchFactor(1,1)
-        splitter.setSizes([200,700,310])
+        splitter.setStretchFactor(0,1)
+        splitter.setStretchFactor(1,0)
+        splitter.setSizes([820,310])
+        self.sidebar_tabs.hide()
         layout.addWidget(splitter,1)
+        layout.addWidget(self.listing)
+        layout.addWidget(self.empty)
         footer = QHBoxLayout()
         self.summary = ui_label('已选交付 0 张')
         footer.addWidget(self.summary,1)
+        self.include_photo = QCheckBox('交付这张')
+        self.include_photo.toggled.connect(self.set_current_inclusion)
+        footer.addWidget(self.include_photo)
         settings_column.addWidget(ui_label('导出格式','heading'))
         self.formats = {}
         for name,text in (('JPEG','JPEG（8 位）'),('PNG','PNG（16 位）')):
@@ -439,10 +452,13 @@ class DeliveryView(QWidget):
         self.open_export.clicked.connect(self.open_selected_export)
         settings_column.addWidget(self.open_export)
         settings_column.addStretch(1)
-        settings_button = QPushButton('导出设置')
-        settings_button.setProperty('kind','quiet')
-        settings_button.clicked.connect(lambda:self.sidebar_tabs.setCurrentIndex(1))
-        footer.addWidget(settings_button)
+        for index, title in enumerate(('修图要求','导出设置')):
+            button = QToolButton()
+            button.setText(title)
+            button.setProperty('kind','quiet')
+            button.clicked.connect(lambda _checked=False,index=index:self.toggle_sidebar(index))
+            footer.addWidget(button)
+        footer.addWidget(self.adopt_revision)
         self.export = QPushButton('导出所选作品')
         self.export.setProperty('kind','primary')
         self.export.clicked.connect(self.export_selected)
@@ -454,6 +470,11 @@ class DeliveryView(QWidget):
         self.refresh_history()
         self.refresh_discussion()
         self.refresh()
+
+    def toggle_sidebar(self, index):
+        showing = not self.sidebar_tabs.isVisible() or self.sidebar_tabs.currentIndex()!=index
+        self.sidebar_tabs.setCurrentIndex(index)
+        self.sidebar_tabs.setVisible(showing)
 
     def is_busy(self):
         return self.worker is not None or self.chat_worker is not None
@@ -499,7 +520,7 @@ class DeliveryView(QWidget):
             item = QListWidgetItem()
             item.setFlags(item.flags()|Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if self.state['choices'][photo['key']]['included'] else Qt.Unchecked)
-            item.setSizeHint(QSize(180,206))
+            item.setSizeHint(QSize(126,85))
             item.setData(Qt.UserRole,photo['key'])
             self.listing.addItem(item)
             self.update_tile(photo)
@@ -514,7 +535,7 @@ class DeliveryView(QWidget):
         item = self.listing.item(self.rows[photo['key']])
         try:
             version = selected_version(photo,self.state['choices'][photo['key']])
-            item.setText(photo['name']+'\n'+version['short_label'])
+            item.setText(photo['name'])
             path = version['files']['JPEG']
             key = (path,Path(path).stat().st_mtime_ns)
         except (OSError,ValueError) as error:
@@ -533,7 +554,7 @@ class DeliveryView(QWidget):
         if not self.isVisible():
             return
         viewport = self.listing.viewport().rect()
-        area = viewport.adjusted(0,-216,0,216)
+        area = viewport.adjusted(-128,0,128,0)
         rows = {row for row in range(self.listing.count())
             if not self.listing.item(row).isHidden() and
                 self.listing.visualItemRect(self.listing.item(row)).intersects(area)}
@@ -623,6 +644,7 @@ class DeliveryView(QWidget):
         self.empty.setText('没有匹配的作品，请调整文件名或“只看已选交付”。' if self.photos else
             '暂无成片')
         self.empty.setVisible(not visible)
+        self.listing.setVisible(bool(visible))
         self.show_photo(self.listing.currentRow())
         self.update_controls()
         if self.isVisible():
@@ -643,6 +665,11 @@ class DeliveryView(QWidget):
         self.state['choices'][item.data(Qt.UserRole)]['included'] = item.checkState()==Qt.Checked
         self.save_state()
         self.apply_filters()
+
+    def set_current_inclusion(self, included):
+        item = self.listing.currentItem()
+        if item is not None:
+            item.setCheckState(Qt.Checked if included else Qt.Unchecked)
 
     def browse_photo(self, row):
         self.show_photo(row)
@@ -682,6 +709,11 @@ class DeliveryView(QWidget):
             entries.append(dict(row,context={'label':label} if label else None))
         self.chat_history.show_messages(entries)
 
+    def edit_target_id(self, photo):
+        if self.preview.mode.currentData() == 'source':
+            return self.state['comparisons'].get(photo['key'])
+        return self.state['choices'][photo['key']]['version']
+
     def chat_context(self):
         photo = self.current_photo()
         if photo is None:
@@ -697,9 +729,11 @@ class DeliveryView(QWidget):
         if mode in ('output','compare'):
             images.append({'label':'右侧交付版本：'+version['label'],'path':version['files']['JPEG']})
         bases = {item['work']:item['id'] for item in photo['versions'] if item['kind']=='base'}
+        view_mode = {'source':'只看比较版','output':'只看交付版','compare':'拖动分界对比' if self.preview.split_layout else '并排对比'}[mode]
         return {'photo_key':photo['key'],'name':photo['name'],'selected_version':version['id'],
+            'edit_target':self.edit_target_id(photo),
             'selected_label':version['label'],'comparison_version':comparison,
-            'view_mode':{'source':'只看左侧比较对象','output':'只看右侧交付版本','compare':'左右比较'}[mode],
+            'view_mode':view_mode,
             'versions':[{'id':item['id'],'label':item['label'],'description':item['description'],
                 'kind':item['kind'],'edits':deepcopy(item['edits']),
                 'revision_basis':bases[item['work']]}
@@ -743,7 +777,7 @@ class DeliveryView(QWidget):
         try:
             context = self.chat_context()
             frozen = {key:context[key] for key in ('photo_key','name','selected_version','selected_label',
-                'comparison_version','view_mode')}
+                'comparison_version','view_mode','edit_target')}
             frozen['attached_images'] = [image['label'] for image in context['images']]
             frozen['tone_targets'] = tone_target_summary(context['tone_targets'])
             frozen['export'] = {'parent':context['export']['parent'],'formats':context['export']['formats'],
@@ -845,27 +879,27 @@ class DeliveryView(QWidget):
         self.save_state()
 
     def show_photo(self, row):
-        self.update_revision_controls()
         self.reference.blockSignals(True)
         self.reference.clear()
         self.comparison_note.hide()
         if row<0:
             self.reference.blockSignals(False)
             self.photo_title.setText('选择作品')
+            self.photo_title.setToolTip('')
             self.delivery_version.clear()
             self.delivery_version.setToolTip('')
             self.preview.set_photo()
             self.preview_key = None
             self.preview_photo = None
             self.base_path = None
-            self.details.setText('')
-            self.details.setToolTip('')
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
             self.tone.setEnabled(False)
+            self.update_current_photo_controls()
             return
         photo = self.photos[row]
         self.photo_title.setText(photo['name'])
+        self.photo_title.setToolTip(photo['name'])
         self.reference.addItem('原片',None)
         for version in reversed(photo['versions']):
             self.reference.addItem(version['label'],version['id'])
@@ -887,25 +921,26 @@ class DeliveryView(QWidget):
             self.base_path = None
             self.delivery_version.setText('所选交付版本无法读取')
             self.delivery_version.setToolTip(str(error))
-            self.details.setText('请选择一个已保存版本进行比较，再明确采用。')
-            self.details.setToolTip('')
+            self.comparison_note.setText('当前交付版本无法读取。可以在「比较版本」中选用其他保存版。')
+            self.comparison_note.show()
             self.beauty.setEnabled(False)
             self.retouch.setEnabled(False)
             self.tone.setEnabled(False)
+            self.update_current_photo_controls()
             return
         width,height = version['dimensions']
         self.delivery_version.setText(version['label'])
-        self.delivery_version.setToolTip(version['description'])
+        self.delivery_version.setToolTip(version['label']+f'\n{width} × {height}\n'+version['description'])
         self.base_path = version['base']
-        self.details.setText(f'{width} × {height}')
-        self.details.setToolTip(version['description']+('\n摄影方向：'+version['direction'] if version['direction'] else ''))
         self.update_comparison(photo,version)
         self.beauty.setEnabled(not self.is_busy() and not self.production_busy and Path(version['base']).is_file())
         self.retouch.setEnabled(not self.is_busy() and not self.production_busy and Path(version['files']['PNG']).is_file())
         self.tone.setEnabled(self.retouch.isEnabled())
+        self.update_current_photo_controls()
 
     def update_comparison(self, photo, version):
         reference = self.reference.currentData()
+        same_frame = False
         if reference is None:
             source = photo['source']
         else:
@@ -919,8 +954,11 @@ class DeliveryView(QWidget):
                 self.comparison_note.show()
                 return
             source = previous['files']['JPEG']
+            same_frame = ((version['kind'] in ('tone','relight') and version.get('parent_version',{}).get('id')==previous['id'])
+                or (previous['kind'] in ('tone','relight') and previous.get('parent_version',{}).get('id')==version['id']))
         preview_key = (source,version['files']['JPEG'])
         if preview_key!=self.preview_key:
+            self.preview.set_split_layout(same_frame)
             self.preview.set_photo(*preview_key,preserve_view=self.preview_photo==photo['key'])
             self.preview_key = preview_key
             self.preview_photo = photo['key']
@@ -935,7 +973,7 @@ class DeliveryView(QWidget):
     def compare_saved_version(self, photo, identifier):
         self.state['comparisons'][photo['key']] = identifier
         self.preview.choice = 'compare'
-        self.preview_key = None
+        self.preview.mode.setCurrentIndex(self.preview.mode.findData('compare'))
         self.show_photo(self.rows[photo['key']])
         self.save_state()
 
@@ -962,6 +1000,7 @@ class DeliveryView(QWidget):
             f' · 另有 {retained} 张选择的原片不在当前作品中' if retained else ''))
         self.summary.setToolTip('这些交付选择没有对应的当前作品；选择仍保留，导出时会在交付记录中'
             '列出失败并说明原因。' if retained else '')
+        self.filter_button.setText('筛选（已启用）' if self.search.text().strip() or self.only_selected.isChecked() else '筛选')
         busy = self.is_busy()
         self.listing.setEnabled(not busy or self.operation in ('revision','chat','tone_batch'))
         self.reference.setEnabled(self.current_photo() is not None)
@@ -973,7 +1012,8 @@ class DeliveryView(QWidget):
         self.tone_batch_record.setEnabled(not busy and bool(self.state.get('tone_batches')))
         for check in self.formats.values():
             check.setEnabled(not busy)
-        self.export.setText(f'导出所选 {count} 张' if count else '先勾选交付作品')
+        self.export.setText(f'导出 {count} 张')
+        self.export.setVisible(count>0)
         self.export.setEnabled(not busy and not self.production_busy and self.loaded and count>0 and bool(self.state['formats']))
         self.open_export.setEnabled(bool(self.state['exports']))
         self.history.setEnabled(not busy and bool(self.state['exports']))
@@ -991,7 +1031,7 @@ class DeliveryView(QWidget):
             self.retouch.setEnabled(False)
             self.tone.setEnabled(False)
         self.clothing.setEnabled(self.retouch.isEnabled())
-        self.update_revision_controls()
+        self.update_current_photo_controls()
         self.chat_send.setEnabled(not busy and not self.production_busy and self.current_photo() is not None)
         self.chat_input.setEnabled(self.chat_worker is None)
 
@@ -1003,9 +1043,24 @@ class DeliveryView(QWidget):
         self.compare_revision.setVisible(photo is not None and photo['key'] in self.state['latest_revisions'])
         reference = self.state['comparisons'].get(photo['key']) if photo is not None else None
         chosen = self.state['choices'][photo['key']]['version'] if photo is not None else None
-        self.adopt_revision.setVisible(reference is not None and reference!=chosen)
+        adopt = reference is not None and reference!=chosen and self.preview.choice!='output'
+        self.adopt_revision.setVisible(adopt)
         self.adopt_revision.setEnabled(not self.is_busy() and not self.production_busy)
-        self.adopt_revision.setToolTip('明确将左侧已保存版本设为交付版本；保留当前交付勾选，不发起制作')
+        self.adopt_revision.setToolTip('采用：'+self.reference.currentText()+'\n保留这张照片的交付勾选')
+        if hasattr(self,'export'):
+            kind = 'quiet' if adopt else 'primary'
+            if self.export.property('kind')!=kind:
+                self.export.setProperty('kind',kind)
+                self.export.style().unpolish(self.export)
+                self.export.style().polish(self.export)
+
+    def update_current_photo_controls(self):
+        photo = self.current_photo()
+        self.include_photo.setVisible(photo is not None)
+        self.include_photo.setEnabled(self.listing.isEnabled())
+        with QSignalBlocker(self.include_photo):
+            self.include_photo.setChecked(bool(photo and self.state['choices'][photo['key']]['included']))
+        self.update_revision_controls()
 
     def adopt_comparison(self):
         if self.is_busy() or self.production_busy:
@@ -1026,6 +1081,7 @@ class DeliveryView(QWidget):
         if item['status']=='failed':
             raise ValueError(item['error'])
         self.state['comparisons'][photo['key']] = item['previous_version']
+        self.preview.choice = 'output'
         with QSignalBlocker(self.listing):
             self.update_tile(photo)
         self.show_photo(self.listing.currentRow())
@@ -1275,7 +1331,10 @@ class DeliveryView(QWidget):
     def open_saved_editor(self, requested, label, *, beauty=False, local_task=None):
         try:
             photo = self.current_photo()
-            version = selected_version(photo,self.state['choices'][photo['key']])
+            identifier = self.edit_target_id(photo)
+            if identifier is None:
+                raise ValueError('当前查看的是原片，请切换到要编辑的已保存版本')
+            version = selected_version(photo,{'version':identifier})
             context = beauty_editor_context(photo,version) if beauty else saved_editor_context(photo,version)
             requested.emit({**context,'return_to_delivery':True,'local_task':local_task})
         except (OSError,ValueError,KeyError) as error:

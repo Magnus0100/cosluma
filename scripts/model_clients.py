@@ -476,6 +476,7 @@ def discuss_style(sources, character, brief, library_path, config, directory, co
         'has_image 标记本次实际附图，其他历史样片可依据已有文字资料讨论。'
         '创作建议由当前素材形成；修发与重打光按 edits 状态讨论，特效按单张构图决定。'
         '用户本条明确要求试样、改稿、采用样片或制作整组时，调用 request_photography。'
+        '明确说先做一张首稿时使用 make_first_draft，明确想看多个方向才使用 explore。'
         '操作只在回复保存后执行，reply 说明即将开始，不声称操作已完成。普通讨论、建议、比较与浏览不调用。'
         '改稿和定稿使用上下文的完整样片 ID；明确采用并制作可用 batch 和该 sample_id。'
         '只说开始批量时沿用 selected_sample；未定稿且用户未指定时先询问选哪张，不自行替用户定稿。'
@@ -515,6 +516,15 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
     if option_count is None:
         task = ('直接定一个有角色氛围、精致、真实且可执行的整组摄影方向，不反问、不列候选。'
             '返回 JSON，只有 direction 和 reference_ids。')
+    elif option_count == 1:
+        task = (
+            '像接到这一组原片的专业后期师，直接给出你推荐制作的一张首稿，不要求客户先选风格。'
+            '从本次试样原片指出一个已经成立、值得保留的画面特点，以及怎样通过一项明确的处理让它更好。'
+            '要求留空时，从原片已有的妆造、构图和现场光出发。让光照在肤色上留下现场本来的冷暖；'
+            '把处理落到看得见的地方及想达到的效果。发现原片已经成立的地方，直接沿用。'
+            '返回 JSON，只有 options，值为一个对象组成的数组，包含 title、summary、direction、reference_ids。'
+            'title 按这张图的处理建议命名；summary 用一到两句向客户交代本次要做的改动。'
+            'direction 是同一份建议给修图师的执行说明，写清主处理和必要的配合，范围与 summary 一致。')
     else:
         task = (f'为用户设计 {option_count} 个可供真实样片比较的整组摄影方向。'
             '方向须在用户允许的修改范围内有可辨认的视觉差异，不只改名称。'
@@ -535,23 +545,18 @@ def plan_photos(sources, character, brief, library_path, config, directory, *, o
             '用户明确沿用样片时填写对应 ID，浏览或比较时填 null。样片只作风格参考，身份与构图来自本张原片。'
             'successful_discussion 的消息上下文记录当时轮次、ID 与查看方式；has_image 表示本次附图。'
             'comparison_sample 为改稿前样片，viewed_sample 为当前稿，viewed_source 为原片。'
-            '三个方向均在当前要求与明确沿用的场景范围内设计。')
+            '按当前要求与明确沿用的场景范围设计。')
         inputs.update(discussion_context=_discussion_details(discussion['context'],samples,image_ids),
             successful_discussion=_discussion_messages(discussion['messages']))
     instruction = (
         '你负责 COS 摄影后期的方向设计。观察代表原片的实物妆造、道具、构图与受光，'
         '结合角色、用户要求和实际参考形成摄影意图、方向与名称。' + task +
-        '修改范围服从当前用户要求，不以改动幅度衡量完成程度。'
-        'direction 用约 300 到 600 字说明具体场景、时间氛围、色彩、曝光层次、自然光来源、背景取舍和特效原则；'
-        'reference_ids 使用本次读到的稳定 ID，通常 2 到 4 条，无相关内容可为空数组。'
-        'current_creative_direction 是当前完整要求，覆盖 initial_brief 中的冲突；尚无要求时依据角色和原片设计。'
-        '角色信息以用户说明、可靠常识和可见素材为依据，用于环境与情绪；实物衣装、配件和道具默认保持，具体修补按用户要求。'
-        '保留人物身份、机位、尺度、支撑和接触关系，场景设计符合实拍透视、材质与景深。'
-        '统一场景语义、色彩与光质，各张按实际机位和原片受光细化；头部、颈部、身体及近处景物光色连续。'
-        '人物保留五官、脸型、表情、脸部体积与真实细节，曝光及色温与环境协调。'
-        '背景按当前主题与用户要求取舍，处理干扰内容并维护合理遮挡、纹理与接触关系。'
-        '特效根据每张手势、视线、情绪和留白决定，可不加；方向说明适用理由与视觉语言。')
-    instruction += edit_instructions(edits)
+        'direction 写给单张修图师：说明想让观众先看到什么，哪些可见区域需要怎样处理，处理后应是什么样。'
+        '只写这组照片实际要用的决定；换景、重打光等复杂创作可以写足必要细节。'
+        'reference_ids 只列本次实际读过且用到的条目 ID。'
+        'current_creative_direction 覆盖 initial_brief 中的冲突。依据角色与原片设计，默认沿用原片妆造、衣装和道具。'
+        '修肤、磨皮或单独调整肤色属于用户点名才做的精修；光色方案可以照顾人物受光。'
+        '未启用修发或重打光时，分别沿用原发型或现场光向；开启时按对应要求设计。')
     name = 'style-options' if option_count is not None else 'art-direction'
     description = _describe(instruction,images,config,directory/(name+'-response.json'),task=inputs,references=references)
     descriptions = description['options'] if option_count is not None else [description]
@@ -590,24 +595,21 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
     schema = ('返回一个 JSON 对象，只有 prompt、head_box 和 headwear 三个字段。' if edits['hair'] else
         '返回一个 JSON 对象，只有 prompt 和 head_box 两个字段。')
     instruction = (
-        '为本张 COS 原片编写整图编辑指令，结合当前方向、用户要求和摄影参考。'
-        +schema+'prompt 是直接交给图像编辑模型的完整提示词。'
-        'head_box 是原片中需要保留的一个主体整头的边界框 [左,上,右,下]，坐标归一化到 0 到 1000。'
+        schema+'head_box 是本张原片主体整头的边界框 [左,上,右,下]，坐标归一化到 0 到 1000。'
         '范围完整包住主体的脸、假发和头饰并留少量空间；镜中正脸为作品主体时定位该头部。'
-        'group_direction 是整组方向，current_creative_direction 是后续完整要求；冲突处以后续要求为准。'
-        'revision_requirements 按从早到晚列出所选父版本分支已采纳的单张要求，latest_revision_brief 是最新修改。'
-        '单张改稿保留未冲突的要求与既有摄影方向，并按本张构图、姿态和受光细化。'
-        '有风格样片时，在 prompt 中说明第一张是本张原片，提供身份、构图与姿态；第二张提供场景、材质、配色和光质参考。'
-        'head_box 始终依据本张原片。'
-        '复用已有生成图且未提供方向时，只确定原片主体头部，不重新设计场景。'
-        '保持原片身份、脸型骨相、人物位置与大小、姿态、身体比例、机位和画幅。'
-        '实物服装和道具默认保持结构与轮廓，具体修补、补齐或还原按用户要求。'
-        '统一设计人物、颈部、身体、道具和环境的主光、反光、接触阴影、曝光与色温，保留脸部体积和真实细节。'
-        '背景按当前方向与用户要求取舍，处理干扰内容，维护实拍透视、景深、倒影、遮挡和接触关系。'
-        '特效按本张动作、视线、留白与情绪决定，可不加；输出一张完整摄影成片。'
-        '后续身份融合保留原片细节，生成头部的光色作为融合参考，身体与环境使用生成结果。'
-        'prompt 简洁写清保留内容、修改对象与目标效果，合并重复要求，只描述本张最终编辑意图。'
-        + edit_instructions(edits))
+        'group_direction 是摄影建议，current_creative_direction 是用户采纳的当前要求。'
+        'revision_requirements 是父版本分支已采纳的要求，latest_revision_brief 是本次修改；沿用其中未被替换的要求。'
+        '有风格样片时，在 prompt 说明第一张决定人物和构图，第二张只提供本次需要沿用的摄影风格。')
+    if edits['hair']:
+        instruction += (
+            '按 edits.hair_brief 修发；留空时修补露网、缺口和杂发，沿用原有发型。'
+            '有明确造型要求时写出目标，让生图结合原发束与整图决定未指定的细节。')
+    else:
+        instruction += '沿用原片整头与发型。'
+    if edits['relight']:
+        instruction += '按 edits.lighting_brief 或摄影方向重建人物和环境的统一受光，同一面部几何用于光照迁移。'
+    else:
+        instruction += '沿用现场受光方向，可协调曝光与色温。'
     if edits['hair']:
         instruction += (
             '\nheadwear 是本张原片实际可见、须保留的实体头饰英文名称数组，每项为具体物体名，无头饰时为空数组。'
@@ -626,6 +628,7 @@ def write_prompt(source, character, brief, library, config, directory, *, direct
         description = write_generation_prompt('scene',images,config,directory,
             task=task,instruction=instruction,progress=progress)
     else:
+        instruction += '复用已有生成图，按原片定位；未提供方向时 prompt 留空。'
         description = _describe(instruction,images,config,directory/'llm-response.json',task=task)
     box = description['head_box']
     left,top,right,bottom = box

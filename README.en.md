@@ -1,6 +1,6 @@
 # CosLuma
 
-Photo editing for cosplay. Discuss a look, produce finished photographs and retouch the details yourself.
+Photo editing for cosplay. Get a recommendation and a first draft based on your character and photos, then retouch the details yourself.
 
 **[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
@@ -23,15 +23,15 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
   <img src="docs/images/readme/honest-retouch-meme.png" alt="老实修图，很枯燥吧 — Isn't honest retouching boring?" width="400">
 </p>
 
-## Compare samples, then choose a look
+## Start with one draft
 
-Describe the setting and mood, compare three directions, then use your chosen direction for the set.
+In the current source, import your photos, enter the character and click **Make first draft**. Open **Editing brief** to leave a note, or leave it blank. The app recommends an edit beside the photo and makes one draft. Revise it, or click **Use as sample** and then **Make the set**. To see more options, choose **Explore three directions** in **Sample history**. The downloadable 1.0.0 portable release still starts with three directions.
 
 | Lotus pond | Golden light | Clear water |
 | :---: | :---: | :---: |
 | ![Lotus pond sample](docs/images/readme/style-1.jpg) | ![Golden light sample](docs/images/readme/style-2.jpg) | ![Clear water sample](docs/images/readme/style-3.jpg) |
 
-Initial samples from the same original, with hair editing, relighting and face beauty disabled.
+Three example directions from the same original, with hair editing, relighting and face beauty disabled.
 
 ## Refine the details
 
@@ -50,9 +50,9 @@ Keep the original and saved versions. Choose the version to deliver, then export
 ## From selection to export
 
 1. **Import photos**, enter character information and check the photos to process.
-2. **Discuss the look**, compare samples and finalize one before producing the set. Check each result in **Works → Production history**.
-3. **Retouch and compare as needed**. Select a finished photo in production history and click **Compare and deliver** to browse its other saved versions on the left.
-4. **Confirm the delivery version and export**. The right side shows the version set for delivery. When ready, click **Use left version for delivery**, check the photos to deliver, and export JPEG or PNG.
+2. **Make a first draft** and review the recommendation and sample. Revise the sample as needed, then finalize it before producing the set. Check each result in **Works → Production history**.
+3. **Retouch and compare as needed**. Open **Compare and deliver** from production history. Pick a saved version above the canvas, then compare side by side or drag a divider across the same frame. The divider is the default when comparing a saved photo with its direct light and color edit.
+4. **Confirm the delivery version and export**. **Current delivery** is always shown below the canvas. To switch versions, click **Use comparison version**. Use **Deliver this photo** or check several photos in the filmstrip, then export JPEG or PNG.
 
 ![Actual CosLuma interface comparing three samples](docs/images/readme/workspace.jpg)
 
@@ -70,6 +70,8 @@ After generation, adjust the selection and explicitly recompose to reuse the exi
 After saving hair or clothing edits, select that version and open **Light and color → Relighting**, or request relighting and saving in its chat. The model sees the complete frame. Unsaved manual tone changes are excluded.
 
 Changing the comparison or saving another edit leaves the delivery version in place. Adopting a version changes only that photo's delivery version and keeps the existing checkboxes. Export copies the saved files for checked photos, and the delivery record lists the version actually exported for each one.
+
+When viewing only the saved version on the left, opening light and color, face beauty, or local retouching uses that version as the starting image. A chat request such as “brighten this a little” also targets the version shown alone when you sent it. In side-by-side comparison, edits default to the right; say “the left one” to target the saved version on the left. The original is for viewing only.
 
 </details>
 
@@ -145,6 +147,8 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
 <summary>Production chain and image quality</summary>
 
 Base chain: direction and references → prompt writing and independent review → full-image generation → one upscale if needed → SAM3.1 original identity extraction → SIFT similarity alignment → MKL color matching or PIXLRelight → float32 mask compositing → optional luminance curve → save.
+
+The full-image prompt starts with what to edit in this photo, how to edit it, and what the result should look like. It carries over the existing makeup and skin tones. Direct skin edits require an explicit request.
 
 Final relighting uses the selected Qwen / H3 engine and prompt writing with independent review. The generated reference is registered to the saved frame with a SIFT similarity transform before PIXLRelight estimates its light fields. Native float32 photo pixels receive only lighting modulation, with no warping, generated detail replacement or upscaling. Separate 16-bit PNG and JPEG files retain the parent version; adoption remains explicit.
 
