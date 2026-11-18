@@ -507,9 +507,9 @@ class Workbench(QMainWindow):
         self.production_settings.setCheckable(True)
         self.production_settings.toggled.connect(self.update_actions)
         results_header.addWidget(self.production_settings)
-        self.delivery_button = QPushButton('全部作品')
+        self.delivery_button = QPushButton('比较与交付')
         self.delivery_button.setProperty('kind','quiet')
-        self.delivery_button.clicked.connect(self.show_delivery)
+        self.delivery_button.clicked.connect(self.show_delivery_from_results)
         results_header.addWidget(self.delivery_button)
         self.last_batch_button = QToolButton()
         self.last_batch_button.setText('制作记录')
@@ -1424,7 +1424,7 @@ class Workbench(QMainWindow):
         self.delivery_button.setVisible(not delivering)
         self.open_folder_button.setVisible(not delivering)
         self.open_folder_button.setEnabled(isinstance(view, BatchResults))
-        self.results_caption.setText('挑选与交付' if delivering else
+        self.results_caption.setText('比较与交付' if delivering else
             ('成片后的光色调整' if isinstance(self.beauty_editor,ToneEditor) else
                 '成片后的可选局部修饰' if isinstance(self.beauty_editor,LocalRetouchEditor) else '成片后的可选人脸美化') if beautifying else
             '已有批次：' + self.archive_view.directory.name if archived else '本次制作')
@@ -2054,6 +2054,15 @@ class Workbench(QMainWindow):
             self.delivery_view.refresh()
         self.result_views.setCurrentWidget(self.delivery_view)
         self.navigate(2)
+
+    def show_delivery_from_results(self):
+        view = self.result_views.currentWidget()
+        source = None
+        if isinstance(view,BatchResults) and view.png_path:
+            source = view.sources[view.listing.currentRow()]
+        self.show_delivery()
+        if source is not None:
+            self.delivery_view.focus_saved_photo(source)
 
     def delivery_busy_changed(self):
         self.update_actions()

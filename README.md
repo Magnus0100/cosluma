@@ -2,7 +2,7 @@
 
 Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精修。
 
-**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v0.47.2/CosLuma-0.47.2-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
+**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
 
 | 原片 | 最终成片 |
 | :---: | :---: |
@@ -50,8 +50,9 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 ## 从选片到导出
 
 1. **导入照片**，填写角色信息，勾选要制作的照片。
-2. **讨论风格**，查看样片，确定方向后制作整组。
-3. **按需精修**，比较保存的版本，选择并导出。
+2. **讨论风格**，查看样片，定稿后制作整组。在「作品 → 制作记录」查看逐张结果。
+3. **按需精修和比较**。从制作记录选中一张成片，点击「比较与交付」，直接在左侧查看其他保存版。
+4. **确认交付版并导出**。右侧显示该照片的交付版本；满意时点击「采用左侧版本用于交付」，勾选要交付的照片，导出 JPEG 或 PNG。
 
 ![CosLuma中比较三个样片的实际界面](docs/images/readme/workspace.jpg)
 
@@ -68,7 +69,7 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 
 头发、衣物编辑保存后，选中该版本，进入「光色调整 → 重打光」，或在该页对话中要求重打光并另存。完整画面参与光照判断，未保存的手动光调不参与。
 
-交付直接复制已有文件，新修改不会自动替换已选交付版本。
+切换比较对象或另存精修版不会改变交付版本。采用只切换这一张的交付版本，保留原有勾选。导出直接复制勾选照片的保存文件，交付记录列出每张实际导出的版本。
 
 </details>
 
@@ -76,7 +77,7 @@ Cosplay 照片后期。用对话确定风格、制作成片，也可以自己精
 
 Windows 64 位，中文界面。
 
-1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v0.47.2/CosLuma-0.47.2-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
+1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
 2. 新建项目，在照片页选择照片并填写角色。
 3. 进入「创作」。首次按页填写模型服务地址与密钥，软件会自动获取模型列表。保存后即可开始制作样片。
 
@@ -96,7 +97,7 @@ Windows 64 位，中文界面。
 配置模板：[settings.example.json](providers/settings.example.json)。默认配置为 `~/CosplayWorkbench/config/cosluma.json`，可用 `--config` 或 `COSLUMA_CONFIG` 指定。项目默认保存至 `~/CosLuma/projects/`。模型、照片与私人配置放在仓库外；密钥可使用环境变量或独立文件。
 
 <details>
-<summary>0.47.2 桌面版模型、权重与推理参数</summary>
+<summary>1.0.0 桌面版模型、权重与推理参数</summary>
 
 基础 ComfyUI 使用 `models/checkpoints/sam3.1_multiplex_fp16.safetensors` 与 `models/upscale_models/4xNomos2_hq_atd.safetensors`。服务缺少 SAM3 文本编码器投影修正时，应用 [对应补丁](providers/patches/comfyui-sam3-clip-projection.patch)。
 

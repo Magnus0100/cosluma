@@ -2,7 +2,7 @@
 
 Photo editing for cosplay. Discuss a look, produce finished photographs and retouch the details yourself.
 
-**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v0.47.2/CosLuma-0.47.2-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
+**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
 | Original | Finished photograph |
 | :---: | :---: |
@@ -50,8 +50,9 @@ Keep the original and saved versions. Choose the version to deliver, then export
 ## From selection to export
 
 1. **Import photos**, enter character information and check the photos to process.
-2. **Discuss the look**, compare samples and finish the set in your chosen direction.
-3. **Retouch as needed**, compare saved versions and export your selection.
+2. **Discuss the look**, compare samples and finalize one before producing the set. Check each result in **Works → Production history**.
+3. **Retouch and compare as needed**. Select a finished photo in production history and click **Compare and deliver** to browse its other saved versions on the left.
+4. **Confirm the delivery version and export**. The right side shows the version set for delivery. When ready, click **Use left version for delivery**, check the photos to deliver, and export JPEG or PNG.
 
 ![Actual CosLuma interface comparing three samples](docs/images/readme/workspace.jpg)
 
@@ -68,7 +69,7 @@ After generation, adjust the selection and explicitly recompose to reuse the exi
 
 After saving hair or clothing edits, select that version and open **Light and color → Relighting**, or request relighting and saving in its chat. The model sees the complete frame. Unsaved manual tone changes are excluded.
 
-Delivery copies existing saved files. New edits do not automatically replace the chosen delivery version.
+Changing the comparison or saving another edit leaves the delivery version in place. Adopting a version changes only that photo's delivery version and keeps the existing checkboxes. Export copies the saved files for checked photos, and the delivery record lists the version actually exported for each one.
 
 </details>
 
@@ -76,7 +77,7 @@ Delivery copies existing saved files. New edits do not automatically replace the
 
 Windows 64-bit. Chinese interface.
 
-1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v0.47.2/CosLuma-0.47.2-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
+1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
 2. Create a project, select photos on the Photos page and enter the character.
 3. Open **Create**. On first use, enter model-service addresses and credentials one page at a time. The application fetches model lists automatically. Save the connection settings to start making samples.
 
@@ -96,7 +97,7 @@ Windows 64-bit. Chinese interface.
 Template: [settings.example.json](providers/settings.example.json). Configuration defaults to `~/CosplayWorkbench/config/cosluma.json`, overridable with `--config` or `COSLUMA_CONFIG`. Projects default to `~/CosLuma/projects/`. Keep models, photographs and private configuration outside the repository. Credentials can use environment variables or separate files.
 
 <details>
-<summary>Version 0.47.2 desktop models, weights and inference parameters</summary>
+<summary>Version 1.0.0 desktop models, weights and inference parameters</summary>
 
 Basic ComfyUI uses `models/checkpoints/sam3.1_multiplex_fp16.safetensors` and `models/upscale_models/4xNomos2_hq_atd.safetensors`. Apply the [SAM3 text-encoder projection patch](providers/patches/comfyui-sam3-clip-projection.patch) if the service lacks that fix.
 

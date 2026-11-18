@@ -1,3 +1,3 @@
 """Version shared by desktop, CLI and the Windows package."""
 
-VERSION = '0.47.2'
+VERSION = '1.0.0'
