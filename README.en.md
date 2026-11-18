@@ -2,7 +2,7 @@
 
 Photo editing for cosplay. Get a recommendation and a first draft based on your character and photos, then retouch the details yourself.
 
-**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
+**[Download for Windows](https://github.com/Magnus0100/cosluma/releases/download/v1.1.0/CosLuma-1.1.0-windows-x64.zip)**　[Getting started](#getting-started)　[简体中文](README.md)
 
 | Original | Finished photograph |
 | :---: | :---: |
@@ -25,7 +25,9 @@ Unresized 640 × 640 crops: [original](docs/images/readme/original-face.png) · 
 
 ## Start with one draft
 
-In the current source, import your photos, enter the character and click **Make first draft**. Open **Editing brief** to leave a note, or leave it blank. The app recommends an edit beside the photo and makes one draft. Revise it, or click **Use as sample** and then **Make the set**. To see more options, choose **Explore three directions** in **Sample history**. The downloadable 1.0.0 portable release still starts with three directions.
+Import your photos, enter the character and click **Make first draft**. Open **Editing brief** to leave a note, or leave it blank. The app recommends an edit beside the photo and makes one draft. Revise it, or click **Use as sample** and then **Make the set**. To see more options, choose **Explore three directions** in **Sample history**.
+
+If the plan is ready but image generation fails, use **Render with this plan**. CosLuma makes one new image request using the same original and the already reviewed prompt, records it as a new round, and keeps the current finalized sample.
 
 | Lotus pond | Golden light | Clear water |
 | :---: | :---: | :---: |
@@ -54,8 +56,6 @@ Keep the original and saved versions. Choose the version to deliver, then export
 3. **Retouch and compare as needed**. Open **Compare and deliver** from production history. Pick a saved version above the canvas, then compare side by side or drag a divider across the same frame. The divider is the default when comparing a saved photo with its direct light and color edit.
 4. **Confirm the delivery version and export**. **Current delivery** is always shown below the canvas. To switch versions, click **Use comparison version**. Use **Deliver this photo** or check several photos in the filmstrip, then export JPEG or PNG.
 
-![Actual CosLuma interface comparing three samples](docs/images/readme/workspace.jpg)
-
 <details>
 <summary>More usage details</summary>
 
@@ -79,7 +79,7 @@ When viewing only the saved version on the left, opening light and color, face b
 
 Windows 64-bit. Chinese interface.
 
-1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
+1. [Download the Windows portable package](https://github.com/Magnus0100/cosluma/releases/download/v1.1.0/CosLuma-1.1.0-windows-x64.zip), extract the complete archive and open `CosLuma/CosLuma.exe`.
 2. Create a project, select photos on the Photos page and enter the character.
 3. Open **Create**. On first use, enter model-service addresses and credentials one page at a time. The application fetches model lists automatically. Save the connection settings to start making samples.
 
@@ -99,7 +99,7 @@ Windows 64-bit. Chinese interface.
 Template: [settings.example.json](providers/settings.example.json). Configuration defaults to `~/CosplayWorkbench/config/cosluma.json`, overridable with `--config` or `COSLUMA_CONFIG`. Projects default to `~/CosLuma/projects/`. Keep models, photographs and private configuration outside the repository. Credentials can use environment variables or separate files.
 
 <details>
-<summary>Version 1.0.0 desktop models, weights and inference parameters</summary>
+<summary>Version 1.1.0 desktop models, weights and inference parameters</summary>
 
 Basic ComfyUI uses `models/checkpoints/sam3.1_multiplex_fp16.safetensors` and `models/upscale_models/4xNomos2_hq_atd.safetensors`. Apply the [SAM3 text-encoder projection patch](providers/patches/comfyui-sam3-clip-projection.patch) if the service lacks that fix.
 

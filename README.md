@@ -2,7 +2,7 @@
 
 Cosplay 照片后期。根据角色和你的照片给出修图建议、做一张首稿，也可以自己精修。
 
-**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
+**[下载 Windows 版](https://github.com/Magnus0100/cosluma/releases/download/v1.1.0/CosLuma-1.1.0-windows-x64.zip)**　[开始使用](#开始使用)　[English](README.en.md)
 
 | 原片 | 最终成片 |
 | :---: | :---: |
@@ -25,7 +25,9 @@ Cosplay 照片后期。根据角色和你的照片给出修图建议、做一张
 
 ## 先做一张首稿
 
-在当前源码中，导入照片、填写角色后可直接点「制作首稿」。点「修图要求」可留言，也可以留空。软件先在照片旁说明处理建议，再制作一张样片。看完可沿这张改稿，或点「定为样片」后「制作整组」。想多看看时，在「样片记录」里选择「探索三个方向」。下载的 1.0.0 便携版仍以三方向开始试样。
+导入照片、填写角色后可直接点「制作首稿」。点「修图要求」可留言，也可以留空。软件先在照片旁说明处理建议，再制作一张样片。看完可沿这张改稿，或点「定为样片」后「制作整组」。想多看看时，在「样片记录」里选择「探索三个方向」。
+
+看到「方案已就绪，出图失败」时，可以点「沿用本稿方案出图」。软件会用这张原片和已经审过的提示词再出图一次，结果另记为一轮，已有定稿保留。
 
 | 莲池 | 暖金 | 晴水 |
 | :---: | :---: | :---: |
@@ -54,8 +56,6 @@ Cosplay 照片后期。根据角色和你的照片给出修图建议、做一张
 3. **按需精修和比较**。从制作记录进入「比较与交付」。从画布上方选择要比较的保存版；可以并排看，也可以在同一画幅拖动分界。同一成片和它直接另存的光色版默认使用分界对比。
 4. **确认交付版并导出**。画布下方始终显示「当前交付」；如果要换版，点「采用比较版」。勾选「交付这张」或在缩略图条勾选多张，再导出 JPEG 或 PNG。
 
-![CosLuma中比较三个样片的实际界面](docs/images/readme/workspace.jpg)
-
 <details>
 <summary>更多操作说明</summary>
 
@@ -79,7 +79,7 @@ Cosplay 照片后期。根据角色和你的照片给出修图建议、做一张
 
 Windows 64 位，中文界面。
 
-1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v1.0.0/CosLuma-1.0.0-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
+1. [下载 Windows 便携包](https://github.com/Magnus0100/cosluma/releases/download/v1.1.0/CosLuma-1.1.0-windows-x64.zip)，完整解压后打开 `CosLuma/CosLuma.exe`。
 2. 新建项目，在照片页选择照片并填写角色。
 3. 进入「创作」。首次按页填写模型服务地址与密钥，软件会自动获取模型列表。保存后即可开始制作样片。
 
@@ -99,7 +99,7 @@ Windows 64 位，中文界面。
 配置模板：[settings.example.json](providers/settings.example.json)。默认配置为 `~/CosplayWorkbench/config/cosluma.json`，可用 `--config` 或 `COSLUMA_CONFIG` 指定。项目默认保存至 `~/CosLuma/projects/`。模型、照片与私人配置放在仓库外；密钥可使用环境变量或独立文件。
 
 <details>
-<summary>1.0.0 桌面版模型、权重与推理参数</summary>
+<summary>1.1.0 桌面版模型、权重与推理参数</summary>
 
 基础 ComfyUI 使用 `models/checkpoints/sam3.1_multiplex_fp16.safetensors` 与 `models/upscale_models/4xNomos2_hq_atd.safetensors`。服务缺少 SAM3 文本编码器投影修正时，应用 [对应补丁](providers/patches/comfyui-sam3-clip-projection.patch)。
 

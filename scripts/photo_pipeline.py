@@ -33,7 +33,7 @@ def _covered_size(requested, available):
 
 
 def finish_photo(source, character, root, config, *, brief='', size=None, generated=None,
-        superresolved=None, art_direction=None, edits=None, progress=None):
+        superresolved=None, art_direction=None, edits=None, progress=None, resume_from=None):
     report = progress or (lambda message: None)
     if art_direction is not None:
         chosen_edits = normalise_edits(art_direction.get('edits'))
@@ -82,17 +82,34 @@ def finish_photo(source, character, root, config, *, brief='', size=None, genera
         if art_direction is not None:
             save_json(directory/'art-direction.json',art_direction)
             record['direction'] = art_direction['direction']
-        stage('编写提示词与确定主体头部')
-        library = art_direction['references'] if art_direction is not None else []
-        description = write_prompt(source_image,character,brief,library,config['llm'],directory,
-            direction=art_direction['direction'] if art_direction is not None else '',
-            style_reference=art_direction.get('style_reference') if art_direction is not None else None,
-            creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',
-            user_requirements=art_direction.get('user_requirements') if art_direction is not None else None,
-            revision_brief=art_direction.get('revision_brief','') if art_direction is not None else '',
-            revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],
-            revision_user_text=art_direction.get('revision_user_text','') if art_direction is not None else '',
-            edits=edits,generate=generated is None,progress=stage)
+        if resume_from is not None:
+            stage('读取已审方案')
+            previous = Path(resume_from)
+            run = json.loads((previous/'run.json').read_text(encoding='utf-8'))
+            reviewed = json.loads((previous/'generation-prompt.json').read_text(encoding='utf-8'))
+            if (run['status']!='failed' or run['stage']!='生成画面' or Path(run['source'])!=source
+                    or reviewed['review']['approved'] is not True):
+                raise ValueError('这次制作没有可沿用的已审出图方案')
+            record['resumed_from'] = str(previous/'run.json')
+            requested = tuple(run['requested_dimensions'])
+            record['requested_dimensions'] = list(requested)
+            description = {'prompt':reviewed['candidate']['prompt'],'head_box':run['head_box']}
+            if edits['hair']:
+                description['headwear'] = run['headwear']
+            save_json(directory/'generation-prompt.json',reviewed)
+            shutil.copyfile(previous/'prompt-sources.json',directory/'prompt-sources.json')
+        else:
+            stage('编写提示词与确定主体头部')
+            library = art_direction['references'] if art_direction is not None else []
+            description = write_prompt(source_image,character,brief,library,config['llm'],directory,
+                direction=art_direction['direction'] if art_direction is not None else '',
+                style_reference=art_direction.get('style_reference') if art_direction is not None else None,
+                creative_direction=art_direction.get('creative_direction','') if art_direction is not None else '',
+                user_requirements=art_direction.get('user_requirements') if art_direction is not None else None,
+                revision_brief=art_direction.get('revision_brief','') if art_direction is not None else '',
+                revision_requirements=art_direction.get('revision_requirements',[]) if art_direction is not None else [],
+                revision_user_text=art_direction.get('revision_user_text','') if art_direction is not None else '',
+                edits=edits,generate=generated is None,progress=stage)
         prompt = description['prompt']
         record['head_box'] = description['head_box']
         if edits['hair']:
@@ -246,8 +263,8 @@ def _reuse_style_sample(selected, directory):
 
 def make_style_samples(sources, sample_source, character, root, config, *, brief='', size=None,
         progress=None, planned=None, sample_progress=None, started=None, creative_direction='', discussion=None, edits=None,
-        base_style=None, option_count=3):
-    """Render a recommended draft, several directions, or one revision through finish_photo."""
+        base_style=None, option_count=3, resume_option=None):
+    """Render one or more samples, or continue a reviewed plan, through finish_photo."""
     report = progress or (lambda message: None)
     edits = normalise_edits(edits)
     sources = sorted(dict.fromkeys(Path(source).expanduser().resolve() for source in sources))
@@ -256,13 +273,20 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
         raise ValueError('样片原片须从当前照片队列中选择')
     directory = Path(root).expanduser().resolve()/('styles-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
     directory.mkdir(parents=True,exist_ok=False)
-    count = 1 if base_style is not None else option_count
-    kind = 'revision' if base_style is not None else 'first_draft' if count==1 else 'exploration'
+    count = 1 if base_style is not None or resume_option is not None else option_count
+    kind = 'resume' if resume_option is not None else 'revision' if base_style is not None else 'first_draft' if count==1 else 'exploration'
+    if resume_option is not None:
+        size = resume_option['requested_size']
+        config = {**config,'output_long_edge':resume_option['output_long_edge']}
     state = {'status':'planning','kind':kind,'option_count':count,
         'sample_source':str(sample_source),'sources':[str(source) for source in sources],
         'character':character,'brief':brief,'creative_direction':creative_direction,'edits':edits,'options':{},
         'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
-    if base_style is not None:
+    if resume_option is not None:
+        state['resumed_from'] = resume_option['selection_file']
+        if 'revision_of' in resume_option:
+            state.update(revision_of=resume_option['revision_of'],revision_brief=resume_option['revision_brief'])
+    elif base_style is not None:
         state.update(revision_of=base_style['selection_file'],
             revision_brief=creative_direction)
     if discussion is not None:
@@ -270,10 +294,13 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
     save_json(directory/'styles.json',state)
     if started is not None:
         started(str(directory))
-    report('沿用完整样片，准备单张改稿' if base_style is not None else
+    report('沿用已审方案，准备出图' if resume_option is not None else '沿用完整样片，准备单张改稿' if base_style is not None else
         '看原片，给出首稿建议' if count==1 else '设计三个不同的摄影方向')
     try:
-        if base_style is not None:
+        if resume_option is not None:
+            plans = [deepcopy(resume_option['art_direction'])]
+            save_json(directory/'style-options.json',plans)
+        elif base_style is not None:
             if base_style['status']!='complete' or base_style['result']['status']!='complete':
                 raise ValueError('请从已完成的真实样片开始改稿')
             plan = deepcopy(base_style['art_direction'])
@@ -311,11 +338,14 @@ def make_style_samples(sources, sample_source, character, root, config, *, brief
             'sample_source':str(sample_source),'styles_directory':str(directory),
             'selection_file':str(directory/f'style-{index+1}.json'),
             'requested_size':list(size) if size is not None else None,'output_long_edge':config.get('output_long_edge',6000)}
-        if base_style is not None:
+        if 'revision_of' in plan:
             option.update(kind='revision',revision_of=plan['revision_of'],revision_brief=plan['revision_brief'])
+        if resume_option is not None:
+            option['resumed_from'] = resume_option['selection_file']
+        resume = {'resume_from':resume_option['result']['directory']} if resume_option is not None else {}
         try:
             result = finish_photo(sample_source,character,directory,config,brief=brief,size=size,
-                art_direction=plan,progress=stage)
+                art_direction=plan,progress=stage,**resume)
         except Exception as error:
             result = _failed_photo(sample_source,error)
         option.update(status=result['status'],result=result)
