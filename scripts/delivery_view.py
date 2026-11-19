@@ -19,7 +19,7 @@ from delivery_store import (saved_editor_context, beauty_editor_context, adopt_d
     retouch_parent, revision_context, saved_tone_batch, selected_version, source_key)
 from creative_edits import normalise_edits
 from image_io import open_display
-from delivery_chat import discuss_delivery, tone_target_summary
+from delivery_chat import DETAIL_MAX_EDGE, discuss_delivery, tone_target_summary
 from settings import load_settings
 from studio_widgets import PhotoPreview, StatusText, chat_shortcuts, chat_composer, ConversationView, ui_label
 from tone_edit import ToneParameters, save_tone_batch
@@ -728,12 +728,19 @@ class DeliveryView(QWidget):
                 'path':previous['files']['JPEG'] if previous else photo['source']})
         if mode in ('output','compare'):
             images.append({'label':'右侧交付版本：'+version['label'],'path':version['files']['JPEG']})
+        detail = None
+        if mode=='compare' and previous is not None and previous['id']!=version['id'] and previous['work']==version['work']:
+            detail = self.preview.comparison_detail(DETAIL_MAX_EDGE)
+        if detail is not None:
+            box,crops = detail
+            images.extend({'label':image['label']+' · 同位置 100% 局部','pixels':crop}
+                for image,crop in zip(images[:2],crops))
         bases = {item['work']:item['id'] for item in photo['versions'] if item['kind']=='base'}
         view_mode = {'source':'只看比较版','output':'只看交付版','compare':'拖动分界对比' if self.preview.split_layout else '并排对比'}[mode]
         return {'photo_key':photo['key'],'name':photo['name'],'selected_version':version['id'],
             'edit_target':self.edit_target_id(photo),
             'selected_label':version['label'],'comparison_version':comparison,
-            'view_mode':view_mode,
+            'view_mode':view_mode,**({'detail_box':box} if detail is not None else {}),
             'versions':[{'id':item['id'],'label':item['label'],'description':item['description'],
                 'kind':item['kind'],'edits':deepcopy(item['edits']),
                 'revision_basis':bases[item['work']]}
@@ -779,6 +786,8 @@ class DeliveryView(QWidget):
             frozen = {key:context[key] for key in ('photo_key','name','selected_version','selected_label',
                 'comparison_version','view_mode','edit_target')}
             frozen['attached_images'] = [image['label'] for image in context['images']]
+            if 'detail_box' in context:
+                frozen['detail_box'] = context['detail_box']
             frozen['tone_targets'] = tone_target_summary(context['tone_targets'])
             frozen['export'] = {'parent':context['export']['parent'],'formats':context['export']['formats'],
                 'choices':{key:choice for key,choice in context['export']['choices'].items() if choice['included']}}

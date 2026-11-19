@@ -209,10 +209,15 @@ def open_display(path, *, max_edge=None):
     return image
 
 
-def open_rgb(path, *, max_edge=None):
-    image = open_display(path, max_edge=max_edge)
+def display_rgb(image):
+    """Copy an sRGB display image into PIL without altering its dimensions."""
+    image = image.convertToFormat(QImage.Format_RGB888)
     pixels = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
     return Image.fromarray(pixels[:, :image.width() * 3].reshape(image.height(), image.width(), 3).copy())
+
+
+def open_rgb(path, *, max_edge=None):
+    return display_rgb(open_display(path, max_edge=max_edge))
 
 
 def save_image(image, path):

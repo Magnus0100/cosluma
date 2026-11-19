@@ -5,8 +5,11 @@ import json
 from pathlib import Path
 
 from creative_edits import normalise_edits
+from image_io import display_rgb, preview_data_url
 from local_retouch import TASKS
 from tone_edit import TONE_PROPERTIES, ToneParameters
+
+DETAIL_MAX_EDGE = 1280
 
 
 def tone_target_summary(targets):
@@ -113,7 +116,8 @@ class DeliveryActions:
 def discuss_delivery(context, conversation, config, directory):
     from model_clients import _describe, discussion_preview
     actions = DeliveryActions(context,conversation[-1]['content'])
-    images = [(image['label'],discussion_preview(image['path'])) for image in context['images']]
+    images = [(image['label'],preview_data_url(display_rgb(image['pixels']),DETAIL_MAX_EDGE)
+        if 'pixels' in image else discussion_preview(image['path'])) for image in context['images']]
     history = []
     for row in conversation:
         content = row['content']
@@ -130,8 +134,11 @@ def discuss_delivery(context, conversation, config, directory):
     task['attached_images'] = [image['label'] for image in context['images']]
     directory = Path(directory)
     directory.mkdir(parents=True)
+    detail_note = ('同位置 100% 局部来自发送时两版共同可见的原像素，整图提供光色与构图背景。'
+        if 'detail_box' in context else '')
     result = _describe('你在项目作品与交付页，围绕当前照片讨论已有成片。'
         '任务资料冻结发送时的照片、交付版本、左侧比较对象与实际查看模式；历史不随浏览改变。'
+        f'{detail_note}'
         '只对本次附图声称看到了细节，其他版本仅有文字资料。'
         '用户本条明确要求时用 request_saved_photo：compare 查看比较对象，adopt 明确采用已保存版本，'
         'tone 调整指定已保存 PNG 的整图曝光、明度曲线与色彩，revise 沿指定版本改一张新稿。'

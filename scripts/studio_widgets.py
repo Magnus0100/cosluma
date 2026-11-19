@@ -7,7 +7,7 @@ import os
 import sys
 from threading import Event
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot, QRectF
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot, QRect, QRectF
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPalette, QPixmap, QPixmapCache, QShortcut, QTextDocument, QTransform
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsScene,
     QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QStackedWidget, QToolButton,
@@ -858,7 +858,8 @@ class PhotoPreview(QWidget):
         actual = QToolButton()
         actual.setProperty('kind','quiet')
         actual.setText('100%')
-        actual.setToolTip('按图片原始像素查看细节')
+        actual.setToolTip('按图片原始像素查看细节。对比同一成片的两个版本时，发送修图要求会附上共同可见的局部。'
+            if workbench else '按图片原始像素查看细节')
         actual.clicked.connect(lambda:self.zoom_views('actual_size'))
         tools.addWidget(actual)
         layout.addLayout(tools)
@@ -923,6 +924,29 @@ class PhotoPreview(QWidget):
         """True only while the canvas holds pixels for this key and read size."""
         key = self.keys.get(kind)
         return key is not None and kind in self.images and self.image_edges.get(kind)==key[2]
+
+    def comparison_detail(self, max_edge):
+        """Snapshot the shared visible rectangle from the ready native canvases."""
+        if self.mode.currentData()!='compare' or not self.native_requested or self.native_zoom!='actual':
+            return None
+        if not all(self.image_ready(kind) for kind in ('source','output')):
+            return None
+        before,after = self.images['source'],self.images['output']
+        if before.size()!=after.size():
+            return None
+        views = (self.preview,) if self.split_layout else (self.before,self.after)
+        if any(view.fitting or round(view.transform().m11()*view.devicePixelRatioF()*100)!=100 for view in views):
+            return None
+        area = after.rect()
+        for view in views:
+            visible = view.mapToScene(view.viewport().rect()).boundingRect().toAlignedRect()
+            area = area.intersected(visible)
+        if area.isEmpty() or area==after.rect():
+            return None
+        width,height = min(area.width(),max_edge),min(area.height(),max_edge)
+        area = QRect(area.x()+(area.width()-width)//2,area.y()+(area.height()-height)//2,width,height)
+        box = [area.x(),area.y(),area.x()+width,area.y()+height]
+        return box,(before.copy(area).toImage(),after.copy(area).toImage())
 
     def set_photo(self, source=None, output=None, *, preserve_view=False):
         self.direct_images = False
